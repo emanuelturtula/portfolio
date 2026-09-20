@@ -358,18 +358,144 @@ def test_from_base_units_does_not_divide() -> None:
     [
         pytest.param(lambda: to_base_units(Decimal("1.5"), 8), id="to_base_units"),
         pytest.param(lambda: from_base_units(150_000_000, 8), id="from_base_units"),
+        # This entry is the one that was missing. The parametrization covered both
+        # conversions and not `quantize`, and `quantize` was the function that actually
+        # read the ambient context -- so the omission is what let the bug through.
+        pytest.param(lambda: quantize(Decimal("1234567890.12345"), 2), id="quantize"),
     ],
 )
 def test_conversion_does_not_depend_on_the_ambient_precision(
     conversion: Callable[[], object],
 ) -> None:
-    """Lowering the context to 1 digit must not change either answer.
+    """Lowering the context to 1 digit must not change any of the three answers.
 
     The conversions build their results from `Decimal` tuples rather than by arithmetic,
-    so a caller running inside a narrowed context still gets the exact value.
+    and `quantize` passes an explicit `decimal.Context`, so a caller running inside a
+    narrowed context still gets the exact value.
     """
     expected = conversion()
     with decimal.localcontext() as context:
         context.prec = 1
 
         assert conversion() == expected
+
+
+def test_quantize_ignores_a_narrowed_ambient_context() -> None:
+    """The regression, spelled out at the precision that produced it.
+
+    `Decimal.quantize` uses the calling thread's context unless one is passed. Inside
+    `localcontext(prec=9)` this value needs 12 significant digits, so the same call that
+    succeeds outside used to raise `InvalidOperation` inside -- an answer that depended on
+    ambient state a caller three frames up could change.
+    """
+    value = Decimal("1234567890.12345")
+
+    with decimal.localcontext() as context:
+        context.prec = 9
+        inside = quantize(value, 2)
+
+    assert inside == Decimal("1234567890.12")
+    assert inside == quantize(value, 2)
+
+
+def test_quantize_does_not_widen_past_money_precision_either() -> None:
+    """The explicit context is a bound, not merely an escape from the ambient one.
+
+    Raising the caller's context to 60 digits must not buy a value more room than this
+    application represents, or the ceiling would be whatever the last caller set.
+    """
+    too_wide = Decimal("1" * (MONEY_PRECISION + 1))
+
+    with decimal.localcontext() as context:
+        context.prec = 60
+
+        with pytest.raises(decimal.InvalidOperation):
+            quantize(too_wide, 0)
+
+
+# --------------------------------------------------------------------------------------
+# Both conversions guard their arguments, on both sides.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "units",
+    [
+        pytest.param(True, id="bool"),
+        pytest.param(1.5, id="float"),
+        pytest.param(1.0, id="whole-float"),
+        pytest.param(Decimal("1"), id="decimal"),
+        pytest.param("1", id="str"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_from_base_units_rejects_units_that_are_not_an_int(units: object) -> None:
+    """Two real failures, one of them silent.
+
+    `from_base_units(True, 2)` returned `Decimal("0.01")` -- a boolean reported as a
+    holding of one base unit, with nothing raised. `from_base_units(1.5, 2)` raised
+    `ValueError: invalid literal for int() with base 10: '.'`, which is an error from deep
+    inside a string comprehension and says nothing about base units.
+    """
+    with pytest.raises(TypeError, match="from_base_units requires an int"):
+        from_base_units(units, 2)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "conversion",
+    [
+        pytest.param(to_base_units, id="to_base_units"),
+        pytest.param(from_base_units, id="from_base_units"),
+    ],
+)
+@pytest.mark.parametrize(
+    "decimals",
+    [
+        pytest.param(True, id="bool"),
+        pytest.param(2.0, id="float"),
+        pytest.param(Decimal("2"), id="decimal"),
+        pytest.param("2", id="str"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_both_conversions_reject_a_decimals_that_is_not_an_int(
+    conversion: Callable[[object, object], object], decimals: object
+) -> None:
+    """The exponent is a count of places; a `bool` or a float is not one."""
+    amount: object = Decimal("1") if conversion is to_base_units else 1
+
+    with pytest.raises(TypeError, match="requires an int number of decimals"):
+        conversion(amount, decimals)
+
+
+@pytest.mark.parametrize(
+    "conversion",
+    [
+        pytest.param(to_base_units, id="to_base_units"),
+        pytest.param(from_base_units, id="from_base_units"),
+    ],
+)
+@pytest.mark.parametrize("decimals", [-1, -2, -18])
+def test_both_conversions_reject_a_negative_decimals(
+    conversion: Callable[[object, object], object], decimals: int
+) -> None:
+    """Its own rejection, rather than a sentence that sends the reader to the wrong place.
+
+    `to_base_units(Decimal("1"), -2)` used to complain that `1` "carries more than -2
+    decimal places", which is not a sentence, and points at the amount rather than at the
+    exponent the caller got wrong.
+    """
+    amount: object = Decimal("1") if conversion is to_base_units else 1
+
+    with pytest.raises(ValueError, match="requires a non-negative number of decimals"):
+        conversion(amount, decimals)
+
+
+def test_the_negative_decimals_message_no_longer_blames_the_amount() -> None:
+    """Pinned as text because the whole point of the fix was the wording."""
+    with pytest.raises(ValueError, match="to_base_units") as caught:
+        to_base_units(Decimal("1"), -2)
+
+    message = str(caught.value)
+    assert "non-negative number of decimals" in message
+    assert "carries more than" not in message
