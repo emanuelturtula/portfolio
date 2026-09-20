@@ -27,7 +27,7 @@ from alembic import context
 
 from portfolio.config import get_settings
 from portfolio.db.alembic_config import DATABASE_URL_ATTRIBUTE
-from portfolio.db.engine import create_database_engine
+from portfolio.db.engine import create_migration_engine
 from portfolio.db.migration_guards import (
     assert_no_dangling_foreign_keys,
     disable_foreign_key_enforcement,
@@ -92,6 +92,11 @@ def do_run_migrations(connection: Connection) -> None:
     committed, and raising would stamp the revision anyway. Beginning the transaction here
     instead puts Alembic into its external-transaction mode: it stops managing commits,
     and the check below genuinely gates the commit rather than merely reporting on it.
+
+    That bracket only covers DDL because the engine is built by `create_migration_engine`.
+    pysqlite emits `BEGIN` for DML and never for DDL, so on an ordinary engine this
+    transaction would roll back the rows and the `alembic_version` stamp while leaving
+    every `CREATE TABLE` in place -- a database no later `upgrade head` could migrate.
     """
     disable_foreign_key_enforcement(connection)
 
@@ -108,8 +113,8 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_async_migrations() -> None:
-    """Open the application's own engine -- pragmas included -- and migrate through it."""
-    engine = create_database_engine(resolve_database_url())
+    """Open the migration engine -- the runtime pragmas, plus transactional DDL."""
+    engine = create_migration_engine(resolve_database_url())
     try:
         async with engine.connect() as connection:
             await connection.run_sync(do_run_migrations)

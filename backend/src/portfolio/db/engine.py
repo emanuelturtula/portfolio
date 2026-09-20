@@ -15,13 +15,14 @@ The event fires for every connection the pool creates, including the ones Alembi
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from sqlalchemy import event
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 if TYPE_CHECKING:
+    from sqlalchemy.engine import Connection
     from sqlalchemy.engine.interfaces import DBAPIConnection
     from sqlalchemy.ext.asyncio import AsyncEngine
     from sqlalchemy.pool import ConnectionPoolEntry
@@ -67,6 +68,64 @@ def create_database_engine(database_url: str) -> AsyncEngine:
         # Registered on the sync engine: the `connect` event is a DBAPI-level event, and
         # the async engine is a wrapper around the sync one rather than a separate pool.
         event.listen(engine.sync_engine, "connect", apply_sqlite_pragmas)
+    return engine
+
+
+def take_transaction_control(
+    dbapi_connection: DBAPIConnection,
+    connection_record: ConnectionPoolEntry,
+) -> None:
+    """Stop pysqlite deciding when a transaction starts. Migration connections only.
+
+    In its default mode the driver emits `BEGIN` before `INSERT`, `UPDATE`, `DELETE` and
+    `REPLACE`, and before nothing else -- so `CREATE TABLE` and `DROP TABLE` run outside
+    any transaction and survive a rollback. Setting `isolation_level` to `None` hands
+    transaction control to us; `begin_migration_transaction` is the other half.
+    """
+    del connection_record  # Part of the event signature, not needed here.
+    # `isolation_level` is a pysqlite attribute rather than part of the DBAPI protocol,
+    # so it is not on the `DBAPIConnection` type.
+    driver_connection: Any = dbapi_connection
+    driver_connection.isolation_level = None
+
+
+def begin_migration_transaction(connection: Connection) -> None:
+    """Emit `BEGIN` ourselves, so the transaction brackets DDL as well as DML.
+
+    A connection running under AUTOCOMMIT is left alone. SQLAlchemy still creates a
+    transaction object and still fires this event there, but emitting `BEGIN` would defeat
+    the reason the caller asked for AUTOCOMMIT: `disable_foreign_key_enforcement` switches
+    to it so that its `PRAGMA foreign_keys=OFF` lands outside a transaction, where the
+    pragma is not a no-op.
+
+    Otherwise `isolation_level` is re-asserted here rather than only on connect, because
+    changing the isolation level hands transaction control back to the driver and that
+    guard has to change it. This is the last point before a transaction actually starts.
+    """
+    if connection.get_execution_options().get("isolation_level") == "AUTOCOMMIT":
+        return
+    driver_connection: Any = connection.connection.dbapi_connection
+    driver_connection.isolation_level = None
+    connection.exec_driver_sql("BEGIN")
+
+
+def create_migration_engine(database_url: str) -> AsyncEngine:
+    """Build an engine for running migrations, with transactional DDL on SQLite.
+
+    A separate engine rather than a flag on the runtime one: the application's
+    transaction behaviour must not change, and a rollback that silently kept a
+    `CREATE TABLE` is exactly the class of bug this exists to prevent. Everything the
+    runtime engine does -- the four pragmas included -- still applies here; this only
+    adds explicit transaction control on top.
+
+    Without it a refused run is unrecoverable rather than merely failed: the integrity
+    check rolls back the rows and the `alembic_version` stamp, the schema changes stay,
+    and every later `upgrade head` dies with "table already exists".
+    """
+    engine = create_database_engine(database_url)
+    if engine.dialect.name == "sqlite":
+        event.listen(engine.sync_engine, "connect", take_transaction_control)
+        event.listen(engine.sync_engine, "begin", begin_migration_transaction)
     return engine
 
 
