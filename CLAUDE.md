@@ -58,13 +58,17 @@ pre-push hooks, the `Secrets scan` CI job over full history, GitHub push protect
 ### 4. Business logic is never in a router
 
 ```
-api.routers -> services -> { repositories , providers } -> { db , domain }
+api.routers -> services -> { repositories , providers } -> db -> domain
 domain      -> nothing
 ```
 
 Routers parse, call a service, and serialize. They may not import `repositories`,
 `providers`, `sqlalchemy` or `httpx`. Services may not import `fastapi`. `domain` is pure:
 no I/O, no clock, no network, no ORM.
+
+`db` sits *above* `domain` rather than beside it: a column type has to round money by the
+same rule the domain defines, and two copies of a rounding rule is how they drift apart.
+The direction that matters is the one that has not changed — `domain` imports nothing.
 
 *Enforced by:* `import-linter` contracts in `backend/.importlinter`, run in CI.
 
