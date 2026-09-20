@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from http.cookies import SimpleCookie
 from time import perf_counter_ns
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
@@ -32,7 +33,6 @@ from tests.auth.conftest import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    import pytest
     from fastapi import FastAPI
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -131,6 +131,67 @@ async def test_unknown_user_and_wrong_password_are_indistinguishable(
     assert "set-cookie" not in unknown.headers
     assert "set-cookie" not in wrong.headers
 
+    # Byte for byte, so `content-length` cannot differ either, and every header compared
+    # rather than only the content type. A `WWW-Authenticate` on one branch and not the
+    # other would be an oracle as surely as a different message would.
+    assert unknown.content == wrong.content
+    volatile = {"date", "server"}
+    assert {k: v for k, v in unknown.headers.items() if k not in volatile} == {
+        k: v for k, v in wrong.headers.items() if k not in volatile
+    }
+    assert "www-authenticate" not in unknown.headers
+
+
+async def test_both_login_failures_perform_exactly_one_password_verification(
+    auth_app: FastAPI,
+    auth_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Criterion 8, proven by counting the work instead of by timing it.
+
+    The clock cannot carry this claim in this suite and the timing test below should not
+    be read as though it does. The fixtures run Argon2id at `time_cost=1` and
+    `memory_cost=64` KiB, where one verification measures about 30 microseconds against a
+    login request of about 1900 -- under two per cent. Deleting the dummy-hash
+    verification altogether, which is precisely the leak this criterion exists to prevent,
+    moves the ratio from roughly 1.04 to roughly 1.02 and sails through a band of 0.2 to
+    5.0. Raising the parameters until the hash dominated would buy a test that took a
+    quarter of a second per sample and was flaky anyway.
+
+    Counting is exact, costs nothing and cannot be flaky: both branches must call the
+    hasher once, and the absent-user branch must call it against the dummy hash -- because
+    "the same amount of work" is the property that makes the two paths take the same time
+    on the hardware where the parameters are real.
+    """
+    hasher: PasswordHasher = auth_app.state.password_hasher
+    throttle: LoginThrottle = auth_app.state.login_throttle
+    dummy = hasher.dummy_hash  # Warmed here so the first request does not pay to build it.
+    real_verify = hasher.verify
+    verified_against: list[str] = []
+
+    def counting_verify(encoded_hash: str, password: str) -> bool:
+        verified_against.append(encoded_hash)
+        return real_verify(encoded_hash, password)
+
+    monkeypatch.setattr(hasher, "verify", counting_verify)
+
+    payloads = {
+        "unknown": {"username": "nobody", "password": OWNER_PHRASE},
+        "wrong": {"username": OWNER_USERNAME, "password": WRONG_PHRASE},
+    }
+    seen: dict[str, list[str]] = {}
+    for kind, payload in payloads.items():
+        throttle.clear(payload["username"])
+        verified_against.clear()
+        response = await auth_client.post(LOGIN_PATH, json=payload, headers=JSON_HEADERS)
+        assert response.status_code == 401
+        seen[kind] = list(verified_against)
+
+    assert len(seen["unknown"]) == 1, "an absent username must still cost one verification"
+    assert len(seen["wrong"]) == 1, "a wrong password must cost exactly one verification"
+    assert seen["unknown"] == [dummy], "the absent branch must verify against the dummy hash"
+    assert seen["wrong"] != [dummy], "the present branch must verify against the stored hash"
+
 
 async def test_unknown_user_and_wrong_password_take_similar_time(
     auth_app: FastAPI,
@@ -194,6 +255,55 @@ async def test_logout_revokes_the_session_server_side(
     auth_client.cookies.set(SECURE_SESSION_COOKIE_NAME, token)
     replayed = await auth_client.get(SESSION_PATH)
     assert replayed.status_code == 401
+
+
+@pytest.mark.parametrize("value", ["", " ", "\t", "   "])
+async def test_a_blank_session_cookie_is_refused(auth_client: AsyncClient, value: str) -> None:
+    """A cookie that is present but carries nothing is not a session.
+
+    `AuthService.resolve_session` is annotated `token: str` rather than `str | None`, on
+    the stated grounds that the middleware refuses an empty cookie first. Nothing asserted
+    that, and the two values take different routes to the same answer -- an empty string
+    is falsy and stops at the middleware, while a whitespace-only one is truthy, reaches
+    the service and fails to match any stored digest. Both must end in 401, and the
+    narrowed annotation is only safe while the first of them does.
+
+    Sent as a raw header rather than through the cookie jar, because a jar is entitled to
+    drop a valueless cookie and this is a test about what the server does with one.
+    """
+    response = await auth_client.get(
+        SESSION_PATH,
+        headers={"Cookie": f"{SECURE_SESSION_COOKIE_NAME}={value}"},
+    )
+
+    assert response.status_code == 401
+
+
+async def test_an_empty_session_cookie_is_refused_without_opening_a_database_session(
+    auth_app: FastAPI,
+    auth_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the claim: an unauthenticated caller cannot make the server work.
+
+    The middleware answers an absent or empty cookie without reaching for the session
+    factory at all, so a scan cannot cost a database connection per request. The factory
+    is replaced with something that fails the test if it is called.
+    """
+
+    def refuse_to_open(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        message = "a blank cookie must be refused before a database session is opened"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(auth_app.state, "db_sessionmaker", refuse_to_open)
+
+    response = await auth_client.get(
+        SESSION_PATH,
+        headers={"Cookie": f"{SECURE_SESSION_COOKIE_NAME}="},
+    )
+
+    assert response.status_code == 401
 
 
 async def test_login_rehashes_a_password_stored_at_a_lower_cost(

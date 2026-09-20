@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import select
 
+from portfolio.config import Settings
 from portfolio.db.models import Session
 from portfolio.domain.auth import LAST_SEEN_REFRESH_INTERVAL, SessionLifetime, hash_token
 from tests.auth.conftest import SESSION_PATH, sign_in
@@ -21,6 +22,11 @@ if TYPE_CHECKING:
 # `secrets.token_urlsafe(32)` renders 32 bytes as 43 base64url characters with no padding.
 EXPECTED_TOKEN_LENGTH: Final = 43
 URL_SAFE_ALPHABET: Final = frozenset(string.ascii_letters + string.digits + "-_")
+
+# The two windows criterion 4 names, and the interval the design names, as literals.
+SPEC_IDLE_DAYS: Final = 7
+SPEC_ABSOLUTE_DAYS: Final = 30
+SPEC_LAST_SEEN_REFRESH_INTERVAL: Final = timedelta(seconds=60)
 
 
 async def read_session(factory: async_sessionmaker[AsyncSession]) -> Session:
@@ -81,6 +87,39 @@ async def test_database_never_contains_the_plaintext_token(
     for path in (auth_environment, auth_environment.with_suffix(".db-wal")):
         if path.is_file():
             assert encoded not in path.read_bytes(), path
+
+
+def test_the_two_windows_are_the_ones_the_criterion_names() -> None:
+    """Criterion 4's numbers, pinned against the shipped defaults rather than the live ones.
+
+    Asserted on `model_fields` for the same reason the OWASP floor is: this suite overrides
+    settings through the environment, so a check that read a live `Settings()` would be a
+    check the suite could switch off.
+    """
+    defaults = Settings.model_fields
+
+    assert defaults["session_idle_days"].default == SPEC_IDLE_DAYS
+    assert defaults["session_absolute_days"].default == SPEC_ABSOLUTE_DAYS
+    assert LAST_SEEN_REFRESH_INTERVAL == SPEC_LAST_SEEN_REFRESH_INTERVAL
+
+
+async def test_the_absolute_expiry_is_thirty_days_from_creation(
+    auth_client: AsyncClient,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Criterion 4: the ceiling a login writes is thirty days, end to end.
+
+    The two tests below prove the ceiling is enforced and that activity cannot move it, but
+    both reach it by writing `expires_at` into the past by hand -- which they would still
+    do if a login set the ceiling to one day, or to ten years. This asserts the value the
+    application actually stores.
+    """
+    await sign_in(auth_client)
+    row = await read_session(sessionmaker)
+
+    assert row.expires_at - row.created_at == timedelta(days=SPEC_ABSOLUTE_DAYS)
+    # And the ceiling is beyond the idle window, or the sliding window could never matter.
+    assert row.expires_at - row.created_at > timedelta(days=SPEC_IDLE_DAYS)
 
 
 async def test_session_expires_after_the_idle_window(

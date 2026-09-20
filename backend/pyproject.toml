@@ -145,19 +145,26 @@ concurrency = ["thread", "greenlet"]
 # behaviour lands, never lower it to make a red build green.
 #
 # 70 -> 97 with the database foundation (#1). 97 -> 98 with money persistence (#2),
-# measured at 99.42%.
+# measured at 99.42%. 98 -> 99 with authentication (#3), measured at 99.70% over 1136
+# statements and 176 branches.
 #
 # Exactly what is uncovered, because the note written here at the 98 ratchet said "the
 # same three misses, none of them reachable" and that was wrong on both counts. There are
 # three, and one of them was reachable by a single request -- `spa.py`'s third cache-header
 # arm, now covered by a test for a root file that is neither hashed nor the entry point.
 #
-# What is left: one statement, `web/spa.py:52` (the re-raise of a non-404), and two
-# branches, the `if dialect.name == "sqlite"` guards in the two engine factories. Those
-# genuinely need a non-SQLite async driver that is not a dependency and should not become
-# one. A floor of 99 would leave 0.4 points, which is inside the noise a single refactor
-# makes in branch coverage.
-fail_under = 98
+# What is left is unchanged by #3: one statement, `web/spa.py:52` (the re-raise of a
+# non-404), and its partial branch, plus the two `if dialect.name == "sqlite"` guards in
+# the engine factories. Those genuinely need a non-SQLite async driver that is not a
+# dependency and should not become one. Together they are 0.30 points, and no test can
+# take them back.
+#
+# 99 rather than 99.5: the gap between the floor and the measured 99.70 is the headroom a
+# refactor gets before it has to argue about coverage, and 0.70 points is roughly nine
+# statements or branches. At 99.5 it would be two or three, which is not headroom -- it is
+# a floor that fails on a change that has nothing to do with testing, and a floor that
+# fails for the wrong reason is one the next person lowers. That is how a ratchet breaks.
+fail_under = 99
 show_missing = true
 skip_covered = true
 exclude_also = [

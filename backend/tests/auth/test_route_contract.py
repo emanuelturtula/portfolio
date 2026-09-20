@@ -37,6 +37,14 @@ EXPECTED_PUBLIC_PATHS: Final = {
     "/api/auth/login": "it is how a session comes to exist",
 }
 
+# Routes FastAPI registers itself, which therefore appear in `app.routes` but not in the
+# schema it generates. They are protected like everything else under `/api`.
+FRAMEWORK_DOC_ROUTES: Final = {
+    ("GET", "/api/openapi.json"),
+    ("GET", "/api/docs"),
+    ("GET", "/api/docs/oauth2-redirect"),
+}
+
 
 def walk_routes(routes: Iterable[object]) -> list[tuple[str, str]]:
     """Every `(method, path)` an application serves, however its framework stores them.
@@ -81,6 +89,31 @@ def test_the_walk_actually_finds_the_routes(auth_app: FastAPI) -> None:
     # FastAPI's own documentation endpoints are routes like any other, and are covered.
     assert ("GET", "/api/openapi.json") in routes
     assert ("GET", "/api/docs") in routes
+
+
+def test_the_walk_finds_every_route_the_openapi_schema_declares(auth_app: FastAPI) -> None:
+    """The walk is duck-typed, so what it might silently miss is a route *class*.
+
+    `test_the_walk_actually_finds_the_routes` names six routes it expects to find, which
+    proves the walk is not empty but cannot notice a seventh that it failed to see -- and
+    a route the walk does not return is a route `test_every_api_route_requires_a_session`
+    never asks for a 401. That is the failure mode the docstring on `walk_routes` records
+    having already happened once, when FastAPI 0.141 changed how an included router is
+    stored.
+
+    The OpenAPI schema is built by the framework through a different code path, so it is an
+    independent witness. Equality rather than containment in both directions: a route the
+    walk invents is as wrong as one it drops.
+    """
+    declared = {
+        (method.upper(), path)
+        for path, operations in auth_app.openapi()["paths"].items()
+        for method in operations
+    }
+    walked = set(api_routes(auth_app))
+
+    assert declared - walked == set(), "the walk missed a route the schema declares"
+    assert walked == declared | FRAMEWORK_DOC_ROUTES
 
 
 async def test_every_api_route_requires_a_session(

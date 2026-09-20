@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from portfolio.services.auth import LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW, LoginThrottle
 from tests.auth.conftest import (
@@ -22,6 +22,19 @@ if TYPE_CHECKING:
 
 WRONG_CREDENTIALS = {"username": OWNER_USERNAME, "password": WRONG_PHRASE}
 
+# The two numbers criterion 7 actually names, written out as literals rather than read
+# from the module under test.
+#
+# This matters more than it looks. Every other test in this file expresses its expectation
+# in terms of `LOGIN_FAILURE_LIMIT` and `LOGIN_FAILURE_WINDOW`, so each one re-derives its
+# own boundary from whatever the implementation currently says: raising the limit from five
+# to fifty leaves all of them green while the throttle stops throttling, and shrinking the
+# window to five minutes does the same. A test whose expected value is imported from the
+# code it is checking can only prove the code is self-consistent. The criterion is about
+# the numbers, so the numbers are pinned here.
+SPEC_FAILURE_LIMIT: Final = 5
+SPEC_FAILURE_WINDOW: Final = timedelta(minutes=15)
+
 
 async def fail_login(client: AsyncClient, times: int) -> list[int]:
     """Attempt a wrong password `times` times, returning the status codes."""
@@ -30,6 +43,44 @@ async def fail_login(client: AsyncClient, times: int) -> list[int]:
         response = await client.post(LOGIN_PATH, json=WRONG_CREDENTIALS, headers=JSON_HEADERS)
         statuses.append(response.status_code)
     return statuses
+
+
+def test_the_limit_and_window_are_the_ones_the_criterion_names() -> None:
+    """Criterion 7's two constants, pinned against literals."""
+    assert LOGIN_FAILURE_LIMIT == SPEC_FAILURE_LIMIT
+    assert LOGIN_FAILURE_WINDOW == SPEC_FAILURE_WINDOW
+
+
+async def test_exactly_five_failures_are_tolerated_and_the_sixth_is_refused(
+    auth_client: AsyncClient,
+) -> None:
+    """Criterion 7, counted out end to end in literals: 401 five times, then 429.
+
+    The off-by-one is the whole criterion, so the expected sequence is written down rather
+    than generated from the limit. `test_sixth_failure_within_the_window_is_rejected` above
+    asserts the same shape relative to the constant and therefore cannot see the constant
+    move; this one can.
+    """
+    statuses = await fail_login(auth_client, 6)
+
+    assert statuses == [401, 401, 401, 401, 401, 429]
+
+
+def test_the_window_is_fifteen_minutes_either_side_of_the_boundary() -> None:
+    """Criterion 7's window, probed just inside and just outside fifteen minutes.
+
+    `test_failures_outside_the_window_do_not_count` probes at `started + WINDOW`, which is
+    the boundary wherever the boundary happens to be -- true for a window of five minutes
+    and for one of a day. These two probes are absolute, so only fifteen minutes passes
+    both.
+    """
+    throttle = LoginThrottle()
+    started = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    for _ in range(SPEC_FAILURE_LIMIT):
+        throttle.record_failure(OWNER_USERNAME, started)
+
+    assert throttle.is_throttled(OWNER_USERNAME, started + timedelta(minutes=14, seconds=59))
+    assert not throttle.is_throttled(OWNER_USERNAME, started + timedelta(minutes=15, seconds=1))
 
 
 async def test_sixth_failure_within_the_window_is_rejected(auth_client: AsyncClient) -> None:
