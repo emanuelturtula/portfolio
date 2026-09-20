@@ -61,7 +61,12 @@ def shared_steps(fast: bool) -> list[Step]:
             "deployment guardrails",
             [sys.executable, "-m", "unittest", "discover", "-s", "tests/deploy"],
             REPO_ROOT,
-        )
+        ),
+        (
+            "agent hook guardrails",
+            [sys.executable, "-m", "unittest", "discover", "-s", "tests/agent"],
+            REPO_ROOT,
+        ),
     ]
     if not fast:
         # The history scan is the slow one, so the fast gate skips it. The pre-push hook
