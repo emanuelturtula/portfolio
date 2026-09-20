@@ -5,8 +5,10 @@ Two settings here are not optional on SQLite:
 * `render_as_batch=True` -- SQLite has no `ALTER COLUMN` and no `DROP CONSTRAINT`, so
   Alembic changes one by rebuilding the table. Without batch mode, any migration that
   alters or drops a column simply cannot be written.
-* `compare_type=True` -- autogenerate ignores type changes otherwise, which on a database
-  with no declared type affinity means a column silently keeps the wrong type forever.
+* `compare_type=True` -- this has been Alembic's default since 1.12 and the installed
+  version is 1.20, so it changes nothing today. It is declared anyway to pin the
+  behaviour against a future default flip: on a database with no declared type affinity,
+  autogenerate missing a type change means a column silently keeps the wrong type.
 
 Batch mode is also why the migration connection runs with foreign key enforcement off and
 is checked for orphaned references before it commits. `portfolio.db.migration_guards`
