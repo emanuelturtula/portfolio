@@ -120,13 +120,19 @@ def test_the_processor_does_not_mutate_the_event_it_was_given() -> None:
     assert event == {"api_key": CANARY_VALUE}
 
 
+# A fictional origin, never a real hostname (rule 3). `Settings` refuses to build with
+# `environment="prod"` while `allowed_origin` is still the development default, so a
+# production settings object in a test has to name one.
+PRODUCTION_ORIGIN = "https://portfolio.example"
+
+
 @pytest.mark.parametrize("environment", ["prod", "dev"])
 def test_configured_pipeline_writes_no_secret_to_stdout(
     environment: Literal["dev", "prod"],
     capsys: pytest.CaptureFixture[str],
     restore_logging: None,
 ) -> None:
-    configure_logging(Settings(environment=environment))
+    configure_logging(Settings(environment=environment, allowed_origin=PRODUCTION_ORIGIN))
     structlog.get_logger("test").warning(
         "provider_rejected_request",
         api_key=CANARY_VALUE,

@@ -364,13 +364,21 @@ def test_a_negative_amount_that_is_not_zero_keeps_its_sign() -> None:
 
 
 def test_the_shipped_application_gained_no_money_operation(app: FastAPI) -> None:
-    """No endpoint returns money yet, so the generated client must not change.
+    """No endpoint returns money yet, so no operation may carry an `Amount`.
 
-    `app` is the real application from the suite-wide conftest. If this ever fails, the
-    OpenAPI drift job is about to fail too, and `frontend/src/api/generated/schema.ts`
-    needs regenerating -- which is out of scope for this issue by design.
+    `app` is the real application from the suite-wide conftest. The path set is pinned so
+    that a new operation is a deliberate line in a diff -- when it changes, the OpenAPI
+    drift job is about to fail too and `frontend/src/api/generated/schema.ts` needs
+    regenerating. The authentication endpoints (#3) are listed here for that reason; none
+    of them carries a monetary value, which is what this test actually asserts.
     """
     schema: dict[str, Any] = app.openapi()
 
-    assert set(schema["paths"]) == {"/api/health"}
+    assert set(schema["paths"]) == {
+        "/api/health",
+        "/api/auth/login",
+        "/api/auth/logout",
+        "/api/auth/session",
+        "/api/auth/password",
+    }
     assert "Amount" not in schema.get("components", {}).get("schemas", {})

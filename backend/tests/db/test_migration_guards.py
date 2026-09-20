@@ -42,6 +42,10 @@ if TYPE_CHECKING:
 # Invented, unique, and asserted absent from every rendered log line. This goes into
 # `sessions.token_hash`, a real column on the table these tests damage, so a guard that
 # logged the offending row would put this exact string into the log stream.
+# A fictional origin, never a real hostname (rule 3). `Settings` refuses to build with
+# `environment="prod"` while `allowed_origin` is still the development default.
+PRODUCTION_ORIGIN = "https://portfolio.example"
+
 SENTINEL_COLUMN_VALUE = "sentinel-value-that-must-never-be-logged"
 SENTINEL_USER_ID = 424242
 INTRODUCED_USER_ID = 515151
@@ -315,7 +319,7 @@ def test_the_pre_existing_warning_carries_no_column_value(
     upgrade_to_head(database_url)
     with sync_engine.begin() as connection:
         insert_orphan(connection, SENTINEL_USER_ID, SENTINEL_COLUMN_VALUE)
-    configure_logging(Settings(environment="prod"))
+    configure_logging(Settings(environment="prod", allowed_origin=PRODUCTION_ORIGIN))
 
     with sync_engine.connect() as connection:
         snapshot_foreign_key_violations(connection)
@@ -338,7 +342,7 @@ def test_a_value_logged_under_an_innocuous_key_would_reach_stdout(
     the point -- nothing downstream would catch a column value logged under a key like
     this, so the guard itself has to not pass one.
     """
-    configure_logging(Settings(environment="prod"))
+    configure_logging(Settings(environment="prod", allowed_origin=PRODUCTION_ORIGIN))
 
     structlog.get_logger("test").warning("deliberate_leak", detail=SENTINEL_COLUMN_VALUE)
 
