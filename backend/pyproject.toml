@@ -111,7 +111,13 @@ branch = true
 [tool.coverage.report]
 # The skeleton starts at 70 and this number only ever ratchets upward: raise it as
 # behaviour lands, never lower it to make a red build green.
-fail_under = 70
+#
+# 70 -> 85 with the database foundation (#1), measured at 87.19%. The remaining gap is
+# almost entirely `db/migrations/env.py`, which reports 0% although it demonstrably runs:
+# Alembic loads it through `spec_from_file_location` and it executes inside SQLAlchemy's
+# greenlet, and coverage records no arcs for either. 85 leaves margin for that artifact
+# without rewarding it.
+fail_under = 85
 show_missing = true
 skip_covered = true
 exclude_also = [
