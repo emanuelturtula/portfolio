@@ -17,16 +17,19 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
 import pytest
-from sqlalchemy import delete, event, func, select, text
+from sqlalchemy import create_engine, delete, event, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from portfolio.db import models
 from portfolio.db.engine import (
     SQLITE_PRAGMAS,
     apply_sqlite_pragmas,
+    begin_migration_transaction,
     create_database_engine,
+    create_migration_engine,
     create_session_factory,
     ensure_database_directory,
+    take_transaction_control,
 )
 
 if TYPE_CHECKING:
@@ -229,3 +232,83 @@ def test_the_pragma_listener_is_registered_on_the_pool(database_url: str) -> Non
     built = create_database_engine(database_url)
 
     assert event.contains(built.sync_engine, "connect", apply_sqlite_pragmas)
+
+
+def test_the_runtime_engine_does_not_take_transaction_control(database_url: str) -> None:
+    """Transactional DDL is for migrations only; runtime behaviour must not change.
+
+    A runtime connection that silently kept a `CREATE TABLE` through a rollback is the
+    same class of bug the migration engine exists to prevent, pointed the other way.
+    """
+    runtime = create_database_engine(database_url)
+
+    assert event.contains(runtime.sync_engine, "connect", apply_sqlite_pragmas)
+    assert not event.contains(runtime.sync_engine, "connect", take_transaction_control)
+    assert not event.contains(runtime.sync_engine, "begin", begin_migration_transaction)
+
+
+def test_the_migration_engine_adds_transaction_control_on_top(database_url: str) -> None:
+    """It is the runtime engine plus two listeners, not a different engine."""
+    migration = create_migration_engine(database_url)
+
+    assert event.contains(migration.sync_engine, "connect", apply_sqlite_pragmas)
+    assert event.contains(migration.sync_engine, "connect", take_transaction_control)
+    assert event.contains(migration.sync_engine, "begin", begin_migration_transaction)
+
+
+def test_the_transaction_listeners_make_ddl_roll_back(sync_url: str) -> None:
+    """The whole point, asserted as behaviour rather than as registration.
+
+    pysqlite emits `BEGIN` before `INSERT`, `UPDATE`, `DELETE` and `REPLACE` and before
+    nothing else, so on an ordinary connection a `CREATE TABLE` survives the rollback of
+    the transaction it appeared to be inside. The contrast below is what a failed
+    migration used to leave behind: a schema change with no revision stamp, which no
+    later `upgrade head` could get past.
+    """
+    unguarded = create_engine(sync_url)
+    guarded = create_engine(sync_url)
+    event.listen(guarded, "connect", take_transaction_control)
+    event.listen(guarded, "begin", begin_migration_transaction)
+
+    try:
+        with unguarded.connect() as connection:
+            transaction = connection.begin()
+            connection.exec_driver_sql("CREATE TABLE survives_a_rollback (id INTEGER PRIMARY KEY)")
+            transaction.rollback()
+
+        with guarded.connect() as connection:
+            transaction = connection.begin()
+            connection.exec_driver_sql("CREATE TABLE undone_by_a_rollback (id INTEGER PRIMARY KEY)")
+            transaction.rollback()
+
+        tables = set(inspect(unguarded).get_table_names())
+    finally:
+        unguarded.dispose()
+        guarded.dispose()
+
+    assert "survives_a_rollback" in tables
+    assert "undone_by_a_rollback" not in tables
+
+
+def test_the_begin_listener_leaves_an_autocommit_connection_alone(sync_url: str) -> None:
+    """`disable_foreign_key_enforcement` asks for AUTOCOMMIT so its pragma is not a no-op.
+
+    Emitting `BEGIN` there would put the pragma back inside a transaction, where SQLite
+    documents it as doing nothing -- the exact failure the guard exists to avoid.
+    """
+    engine = create_engine(sync_url)
+    event.listen(engine, "connect", take_transaction_control)
+    event.listen(engine, "begin", begin_migration_transaction)
+
+    try:
+        with engine.connect() as connection:
+            autocommitting = connection.execution_options(isolation_level="AUTOCOMMIT")
+            transaction = autocommitting.begin()
+            autocommitting.exec_driver_sql("CREATE TABLE committed_anyway (id INTEGER PRIMARY KEY)")
+            transaction.rollback()
+
+        tables = set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+
+    assert "committed_anyway" in tables
