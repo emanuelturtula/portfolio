@@ -33,6 +33,7 @@ from portfolio.db.engine import create_migration_engine
 from portfolio.db.migration_guards import (
     assert_no_dangling_foreign_keys,
     disable_foreign_key_enforcement,
+    snapshot_foreign_key_violations,
 )
 from portfolio.db.models import metadata as target_metadata
 
@@ -103,6 +104,12 @@ def do_run_migrations(connection: Connection) -> None:
     disable_foreign_key_enforcement(connection)
 
     with connection.begin():
+        # Taken before anything runs. `foreign_key_check` scans the whole database, so
+        # without a baseline the check cannot tell a reference this run introduced from
+        # one that arrived in the file -- and the common startup, which applies no
+        # migrations at all, would refuse to boot on a database damaged from outside.
+        pre_existing = snapshot_foreign_key_violations(connection)
+
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
@@ -111,7 +118,7 @@ def do_run_migrations(connection: Connection) -> None:
         )
         with context.begin_transaction():
             context.run_migrations()
-        assert_no_dangling_foreign_keys(connection)
+        assert_no_dangling_foreign_keys(connection, pre_existing)
 
 
 async def run_async_migrations() -> None:
