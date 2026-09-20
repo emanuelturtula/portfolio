@@ -146,14 +146,21 @@ async def test_the_correct_password_is_also_refused_while_throttled(
 
 
 async def test_successful_login_clears_the_failure_counter(auth_client: AsyncClient) -> None:
-    """Signing in is proof of ownership, so the count starts again from zero."""
+    """Signing in is proof of ownership, so the count starts again from zero.
+
+    The top-up after the success is a **full** limit's worth of failures, and that detail
+    is the test. It previously made one further attempt and asserted a 401, on the stated
+    grounds that "without the reset, one more failure would be the sixth and would be
+    refused" -- but four failures plus one is the fifth, which is allowed either way. A
+    `clear` that did nothing at all passed it. Five more failures separate the two cases:
+    from zero they are all answered 401, and from four the second of them is refused.
+    """
     assert await fail_login(auth_client, LOGIN_FAILURE_LIMIT - 1) == [401] * (
         LOGIN_FAILURE_LIMIT - 1
     )
     await sign_in(auth_client)
 
-    # Without the reset, one more failure would be the sixth and would be refused.
-    assert await fail_login(auth_client, 1) == [401]
+    assert await fail_login(auth_client, LOGIN_FAILURE_LIMIT) == [401] * LOGIN_FAILURE_LIMIT
 
 
 def test_failures_outside_the_window_do_not_count() -> None:

@@ -1,7 +1,7 @@
 # 003 — Single-user password login with server-side sessions
 
 Issue: #3
-Status: draft
+Status: done
 
 ## Problem
 
@@ -433,3 +433,91 @@ file is the exact collision this table exists to prevent.
 - **Coverage floor is 98 and only ratchets.** This change adds a lot of branchy security
   code; the tester is responsible for the floor holding, and for raising it if the measured
   number lands materially above it.
+
+## What the spec got wrong
+
+Recorded because this spec was written before any of the code existed, and pretending it
+was right would waste the next person's time.
+
+### Two claims that were false as written
+
+- **`PORTFOLIO_ALLOWED_ORIGIN` could not be a required compose variable.** The script that
+  supplies those variables lives on the Pi, not in this repository — `remote_deploy.py` only
+  invokes it over SSH — so a `${VAR:?}` entry nothing sets would have failed every
+  deployment at `docker compose up`. Replaced with a startup refusal, which is also the
+  better failure: it fails the health check and rolls back, rather than producing a
+  container that reports healthy and rejects every write with a `403`.
+- **The Argon2id floor did not exist.** The spec said a test asserts the parameters meet the
+  OWASP floor. The test that was written inspects `Settings.model_fields[...].default` — the
+  *shipped defaults*, which no environment variable can reach — while `docs/operations.md`
+  told the operator that a value below the floor "refuses to start". An operator reading KiB
+  as MiB and setting `PORTFOLIO_ARGON2_MEMORY_COST=64` would have run production on a hash
+  a thousandfold weaker than intended, with everything green. The floor is now a startup
+  refusal, gated on `prod`.
+
+### Where the design was right but the prescription was wrong
+
+- **The dummy hash.** The spec said "a module-level dummy hash generated at import". That is
+  wrong on cost — a module constant cannot use the *configured* parameters, so its timing
+  would not match a real verification, which defeats its purpose. The implementation used a
+  lazy `cached_property` instead, which fixed that and introduced a timing oracle: the first
+  unknown-username login in a process paid `hash` **and** `verify` where a wrong password
+  paid only `verify`, a 2× signal once per process. Neither the spec's version nor the
+  implementation's was right. The answer is a third thing the spec did not consider —
+  compute it lazily, but **warm it at startup**, in the lifespan rather than in `create_app`,
+  because the image runs `create_app()` as a build-time smoke check.
+- **"A contract test walks `app.routes`."** FastAPI 0.141 stopped flattening an included
+  router into `app.routes`, so the obvious `isinstance(route, APIRoute)` walk finds only the
+  framework's own documentation endpoints — and passes, having checked nothing. The walk is
+  duck-typed, and a companion test asserts it finds every route the OpenAPI schema declares.
+
+### What the spec did not think of at all
+
+- **`create-user --replace`.** No password reset by design, plus `create-user` refusing when
+  a user exists, meant a forgotten password bricked the instance. Added as a stated scope
+  addition.
+- **`POST /api/auth/password` needed the throttle more than login did.** The spec put
+  throttling on login only. The password-change endpoint is the one where a correct guess is
+  *terminal*, since there is no reset flow — so it was the single endpoint most worth brute
+  forcing and the only one nothing counted.
+- **A per-username counter never fires against an attacker who varies the username.**
+  Twenty concurrent logins under twenty names left the throttle untripped, each paying a
+  full Argon2id verification on a `--workers 1` container. A second unkeyed counter bounds
+  it; unlike a size cap it cannot be evicted.
+- **WebSocket routes bypass the middleware entirely.** `BaseHTTPMiddleware` passes any
+  non-HTTP scope straight through, and the route walk skips anything without `methods`. Not
+  exploitable — there are no websocket routes — but `CLAUDE.md` rule 8 is written
+  unconditionally, so the contract test now fails on the existence of one.
+- **Making `/api/openapi.json` non-public broke an existing test.** The Risks section
+  worried about external tooling and missed the test in this repository.
+- **Coverage was measuring the wrong thing**, and had been since the project started using
+  async SQLAlchemy. Its asyncio layer runs inside a greenlet, so `services/auth.py` reported
+  58% while demonstrably running end to end. Naming a concurrency library then switches off
+  the thread tracing that `api/dependencies.py` needs, so both are named. Note the
+  direction: the previous numbers were **understated**, not overstated — untraced lines were
+  counted as misses — so the 98 floor was being cleared despite the handicap and is not
+  comparable to the measurement behind the 97→98 ratchet.
+
+### Test plan, as built
+
+The table above names 41 tests. The suite collects **568**, from 326 test functions of
+which **108 are new** — the gap between the two counts is parametrisation, mostly over the
+password policy and the money types.
+
+Three of the tests the plan named passed for the wrong reason, each deriving its expectation
+from the constant it was checking:
+
+- **Throttling asserted the mechanism, never the numbers.** `LOGIN_FAILURE_LIMIT` could be
+  raised from 5 to 50 — turning the throttle off — with a green suite.
+- **The 30-day ceiling was unpinned in both directions.** 30 → 3650 and 30 → 1 both passed,
+  because the ceiling tests write `expires_at` into the past by hand and never observe what
+  a login stores.
+- **The timing test could not detect the leak it names.** At the suite's deliberately cheap
+  parameters a verification is 1.68% of a request, so deleting the dummy verification
+  entirely moved the ratio from 1.04 to 1.02 — well inside the band — and left all 103 auth
+  tests green. Replaced by counting Argon2 operations directly.
+
+That is the fourth, fifth and sixth time on this milestone that mutating the implementation
+caught something review-by-reading did not. A spec that names a test is not the same as a
+spec that says what the test must assert, and the gap between those two is where this kind
+of defect lives.

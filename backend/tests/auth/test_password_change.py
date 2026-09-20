@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from httpx import ASGITransport, AsyncClient
@@ -26,6 +27,8 @@ if TYPE_CHECKING:
     import pytest
     from fastapi import FastAPI
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from portfolio.services.auth import LoginThrottle
 
 
 async def test_changing_the_password_revokes_every_session(
@@ -229,9 +232,21 @@ async def test_a_rejected_new_password_is_not_counted_as_an_attempt(
 
 
 async def test_a_successful_change_clears_the_counter(
+    auth_app: FastAPI,
     auth_client: AsyncClient,
 ) -> None:
-    """Knowing the current password is proof of ownership, exactly as a login is."""
+    """Knowing the current password is proof of ownership, exactly as a login is.
+
+    The counter is read directly at the end, and that is not laziness -- it is the only
+    vantage point left. The change has just revoked every session, so no HTTP route can
+    add another failure without signing in first, and signing in *also* clears the
+    counter, which would hide the very thing under test. Deleting the `clear` from
+    `change_password` left this test green when it ended at the sign-in instead.
+
+    The top-up is a full limit's worth for the same reason as in `test_throttling.py`:
+    from zero it stays under the limit, from four it does not.
+    """
+    throttle: LoginThrottle = auth_app.state.login_throttle
     await sign_in(auth_client)
     attempt = {"current_password": WRONG_PHRASE, "new_password": REPLACEMENT_PHRASE}
     for _ in range(LOGIN_FAILURE_LIMIT - 1):
@@ -244,6 +259,39 @@ async def test_a_successful_change_clears_the_counter(
     )
     assert changed.status_code == 204
 
-    # The change revoked every session, so signing in again is the test that the counter
-    # was cleared: without it, this login would be the sixth failure's worth of attempts.
+    now = datetime.now(UTC)
+    for _ in range(LOGIN_FAILURE_LIMIT - 1):
+        throttle.record_failure(OWNER_USERNAME, now)
+
+    assert not throttle.is_throttled(OWNER_USERNAME, now), (
+        "a successful password change must reset the counter to zero"
+    )
+    # And the account really is usable with the new password afterwards.
     await sign_in(auth_client, phrase=REPLACEMENT_PHRASE)
+
+
+async def test_failed_logins_also_throttle_the_password_change(
+    auth_client: AsyncClient,
+) -> None:
+    """The other direction of the shared counter, asserted rather than left implied.
+
+    `test_failed_password_changes_also_throttle_login` covers one way round. This is the
+    way an attacker would actually travel it: burn the login guesses, then switch to the
+    endpoint that needs a session and try there. One counter means the guesses are already
+    spent -- five at the login endpoint is five in total, not five at each.
+    """
+    await sign_in(auth_client)
+    for _ in range(LOGIN_FAILURE_LIMIT):
+        await auth_client.post(
+            LOGIN_PATH,
+            json={"username": OWNER_USERNAME, "password": WRONG_PHRASE},
+            headers=JSON_HEADERS,
+        )
+
+    refused = await auth_client.post(
+        PASSWORD_PATH,
+        json={"current_password": WRONG_PHRASE, "new_password": REPLACEMENT_PHRASE},
+        headers=JSON_HEADERS,
+    )
+
+    assert refused.status_code == 429
