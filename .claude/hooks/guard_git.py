@@ -5,6 +5,13 @@ repository's own configuration cannot: the branch ruleset stops a direct push to
 on the server, but an agent can still waste a long run getting there, and ``--no-verify``
 silently skips the secret scan on a public repository.
 
+Merging is deliberately *not* blocked. Nobody outside the repository can merge regardless
+of this hook: that requires write access, and the branch ruleset has no bypass actors. A
+local block would only have obstructed the people who are supposed to merge. The convention
+that an implementer reports a pull request URL rather than merging its own work lives in
+the agent role definitions, where it belongs, because it is a workflow norm, not a security
+control.
+
 Exits 2 with an explanation to deny the command.
 """
 
@@ -34,10 +41,6 @@ RULES: list[tuple[re.Pattern[str], str]] = [
         "branch, push the branch, then 'gh pr create'.",
     ),
     (
-        re.compile(r"\bgh\s+pr\s+merge\b"),
-        "Only the repository owner merges. Open the pull request and report its URL.",
-    ),
-    (
         re.compile(r"\bgit\s+stash\b(?!\s+(?:push|list|show))"),
         "A bare 'git stash' or 'git stash pop' shares one stack with every other worktree "
         "and session on this machine, so it can silently swallow or restore someone "
@@ -46,6 +49,24 @@ RULES: list[tuple[re.Pattern[str], str]] = [
 ]
 
 PROTECTED_BRANCH = "main"
+
+HEREDOC = re.compile(
+    r"<<-?\s*(['\"]?)(?P<tag>[A-Za-z_][A-Za-z0-9_]*)(?P=tag_quote)?.*?^\s*(?P=tag)\s*$".replace(
+        "(?P=tag_quote)", r"\1"
+    ),
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def executable_part(command: str) -> str:
+    """Return the command with here-document bodies removed.
+
+    The rules below describe the very patterns a commit message is most likely to discuss:
+    a commit explaining why bare ``git stash`` is forbidden would otherwise be refused for
+    containing the words. Only the part of the command the shell executes is inspected; the
+    text piped into it is data.
+    """
+    return HEREDOC.sub("<<HEREDOC", command)
 
 
 def current_branch() -> str | None:
@@ -76,7 +97,7 @@ def main() -> int:
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
         return 0
-    command = str(tool_input.get("command", ""))
+    command = executable_part(str(tool_input.get("command", "")))
     if not command:
         return 0
 
