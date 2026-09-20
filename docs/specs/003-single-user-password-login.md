@@ -119,7 +119,9 @@ a guessed token — is worthless against 256 bits of entropy.
 
 ### Argon2id parameters
 
-Defaults: `time_cost=3`, `memory_cost=65536` KiB (64 MiB), `parallelism=4`, overridable as
+Defaults at the time of this issue: `time_cost=3`, `memory_cost=65536` KiB (64 MiB),
+`parallelism=4` — since retuned to 144 MiB against the measurement this issue could not
+take; see `docs/operations.md`. Overridable as
 `PORTFOLIO_ARGON2_TIME_COST`, `PORTFOLIO_ARGON2_MEMORY_COST`,
 `PORTFOLIO_ARGON2_PARALLELISM`.
 
