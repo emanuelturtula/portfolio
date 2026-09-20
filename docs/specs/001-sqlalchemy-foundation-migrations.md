@@ -1,7 +1,7 @@
 # 001 — SQLAlchemy foundation, SQLite pragmas and Alembic migrations
 
 Issue: #1
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -279,3 +279,79 @@ if an implementation needs one, ask.
   future caller that forgets it will fail loudly, not silently.
 - Nothing here depends on an external API, so there is nothing to verify against vendor
   documentation.
+
+## What the implementation found that this plan did not
+
+Recorded because the plan was wrong about one thing that mattered, and the next migration
+author needs to know why the code looks the way it does.
+
+### Turning foreign keys on made batch migrations destructive
+
+The plan treated `foreign_keys=ON` as unambiguously good. It is, at runtime — but Alembic's
+batch mode rebuilds a table by `CREATE _alembic_tmp_x`, `INSERT ... SELECT`, **`DROP TABLE
+x`**, rename, and SQLite's `DROP TABLE` performs an implicit `DELETE FROM` that fires
+`ON DELETE` actions. Reproduced against this schema: a batch rebuild of `users` emptied
+`sessions`, reported success, and left the container healthy. With a `NO ACTION` reference
+it aborts the deploy instead.
+
+The fix could not live in the migration that needs it — `PRAGMA foreign_keys` is a no-op
+inside a transaction, so `op.execute("PRAGMA foreign_keys=OFF")` in a revision is a
+statement that succeeds and changes nothing. It lives in `db/migration_guards.py`, applied
+by `env.py` to the migration connection only:
+
+- enforcement is switched off under `AUTOCOMMIT`, and **read back** rather than assumed;
+- `PRAGMA foreign_key_check` gates the commit;
+- the runtime engine is untouched, which is the point of criterion 3.
+
+### The integrity check needed a baseline
+
+A whole-database `foreign_key_check` cannot tell damage this run caused from damage the
+database arrived with. Without a baseline, a restored backup containing one orphan wedged
+the deploy permanently: the container never became healthy, `deploy.py` rolled back, and
+the previous image contained the same check and died identically.
+
+`assert_no_dangling_foreign_keys` now takes a snapshot before any revision runs and fails
+only on the difference. Identity is `(child table, parent table, fk index, the child row's
+foreign key column values)` — **not rowid**, because a batch rebuild renumbers rows unless
+the primary key aliases the rowid, which would make every pre-existing orphan in a rebuilt
+table look newly introduced. The comparison is a multiset, not a total, so a run that
+repairs one orphan and introduces another is still refused. A pre-existing violation is
+logged at warning level with the table and the count, and no column value.
+
+### DDL is not transactional under pysqlite by default
+
+The first attempt at the above wrapped the run in `connection.begin()`, which does not
+bracket DDL: pysqlite emits `BEGIN` for DML only. A refused migration rolled back the
+orphan row and `alembic_version` but **left the created table**, and the next
+`upgrade head` died with "table already exists" — unrecoverable by retrying, and a
+developer running it locally has no backup. `create_migration_engine` applies SQLAlchemy's
+pysqlite recipe (`isolation_level=None`, explicit `BEGIN` on the `begin` event) to the
+migration engine alone.
+
+The two mechanisms are coupled: the foreign-key guard **must** use `AUTOCOMMIT`, and the
+`begin` listener **must not** emit `BEGIN` while it does, or the pragma lands back inside a
+transaction and silently does nothing. Both halves are documented in place.
+
+### Smaller corrections
+
+- **The drift check cannot see CHECK constraints.** Alembic's autogenerate has no
+  check-constraint comparator, so the duplicated `kind IN (...)` text was unguarded. A test
+  reflecting `ck_assets_kind`'s `sqltext` covers it, with a tripwire for the day
+  autogenerate grows one.
+- **`versions/` was invisible to `import-linter`.** grimp prunes a directory with no
+  `__init__.py`, so a data migration could have imported upward with the contract still
+  reporting "3 kept, 0 broken". Revision files were renamed `v0001_*` / `v0002_*` (revision
+  **ids** unchanged) so the directory can be a package.
+- **Coverage never measured the migration modules.** `source = ["portfolio"]` matches on a
+  module's `__name__`, and Alembic loads `env.py` and every revision script by path.
+  `source = ["src/portfolio"]` measures them; `env.py` went from a reported 0% to 100%.
+- **`compare_type=True` has been Alembic's default since 1.12.** Declaring it is still
+  right — it pins behaviour against a future flip, and a test asserts that — but the
+  original rationale overstated the case.
+
+### Test plan, as built
+
+The table above names 19 tests. The suite ships **156**, of which 88 are new under
+`backend/tests/db/`. The additions are concentrated in `test_migration_guards.py` and
+`test_migration_safety.py`, which did not exist when this plan was written because the
+hazards they cover had not been found yet.
