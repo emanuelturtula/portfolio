@@ -1,0 +1,47 @@
+# Secrets and local configuration — never commit any of these.
+.env
+.env.*
+!.env.example
+**/secrets.env
+*.pem
+*.key
+*.p12
+
+# Runtime data. The database holds wallet addresses and trade history.
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Node
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+openapi.json
+.import_linter_cache/
+
+# Claude Code local state (agent definitions and skills ARE committed)
+.claude/settings.local.json

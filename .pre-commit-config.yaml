@@ -1,0 +1,50 @@
+# Install once per clone:
+#   pre-commit install --hook-type pre-commit --hook-type pre-push
+#
+# The secret scan runs twice on purpose: cheaply on staged changes at commit time, and
+# over the full history before a push, because a secret that reached a local commit is
+# still a secret that must never reach the public remote.
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: gitleaks-staged
+        name: gitleaks (staged changes)
+        entry: python scripts/secret_scan.py --staged
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      - id: gitleaks-history
+        name: gitleaks (full history before push)
+        entry: python scripts/secret_scan.py --history
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.7
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        files: ^(backend|scripts|deploy)/
+      - id: ruff-format
+        files: ^(backend|scripts|deploy)/

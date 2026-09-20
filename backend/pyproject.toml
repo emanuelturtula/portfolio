@@ -1,0 +1,107 @@
+[project]
+name = "portfolio"
+# Placeholder only. The real version is derived from the git tag during the CI build
+# and injected into the running container through the PORTFOLIO_VERSION environment
+# variable, so this number is never bumped by hand.
+version = "0.0.0"
+description = "Backend for a self-hosted crypto investment portfolio tracker."
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings",
+    "structlog",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "httpx",
+    "mypy",
+    "ruff",
+    "import-linter",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/portfolio"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# DTZ is non-negotiable here: a portfolio is a time-ordered event log, and a naive
+# datetime silently corrupts it the moment a trade timestamp crosses a DST boundary
+# or the host runs in a different timezone than the exchange.
+# T20 keeps print() out of the code base: this process logs structured JSON to stdout,
+# and a stray print injects an unparseable line into the log stream.
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+    "N",
+    "UP",
+    "B",
+    "A",
+    "C4",
+    "DTZ",
+    "T20",
+    "SIM",
+    "TC",
+    "PTH",
+    "RUF",
+    "ASYNC",
+    "S",
+    "ERA",
+    "PT",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# assert is the point of a test.
+"tests/**" = ["S101"]
+
+[tool.ruff.lint.flake8-builtins]
+# portfolio.logging is always imported absolutely, so it cannot shadow the standard
+# library module for anyone; the name says exactly what the module configures.
+builtins-allowed-modules = ["logging"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+files = ["src", "tests"]
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["portfolio"]
+branch = true
+
+[tool.coverage.report]
+# The skeleton starts at 70 and this number only ever ratchets upward: raise it as
+# behaviour lands, never lower it to make a red build green.
+fail_under = 70
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "@overload",
+    "raise NotImplementedError",
+    "if __name__ == \"__main__\":",
+]
