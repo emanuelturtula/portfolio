@@ -118,12 +118,14 @@ branch = true
 # The skeleton starts at 70 and this number only ever ratchets upward: raise it as
 # behaviour lands, never lower it to make a red build green.
 #
-# 70 -> 85 with the database foundation (#1), measured at 87.19%. The remaining gap is
-# almost entirely `db/migrations/env.py`, which reports 0% although it demonstrably runs:
-# Alembic loads it through `spec_from_file_location` and it executes inside SQLAlchemy's
-# greenlet, and coverage records no arcs for either. 85 leaves margin for that artifact
-# without rewarding it.
-fail_under = 85
+# 70 -> 95 with the database foundation (#1), measured at 98.67%. Two lines are missed in
+# the whole backend: `engine.py`'s non-SQLite dialect guard, which would need a second
+# driver that is not a dependency, and the explicit `BEGIN` of the migration transaction,
+# which runs inside the greenlet SQLAlchemy spawns for `run_sync` and is therefore not
+# traced -- it is not dead code, and `test_a_failed_upgrade_leaves_the_earlier_revision_
+# unapplied` cannot pass without it. 95 leaves room for that blind spot without excusing
+# real gaps.
+fail_under = 95
 show_missing = true
 skip_covered = true
 exclude_also = [
