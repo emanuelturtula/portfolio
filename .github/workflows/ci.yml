@@ -107,6 +107,10 @@ jobs:
         # Plain unittest, no dependencies: these protect the path from a workflow run to a
         # production deployment, so they must run even if the backend fails to install.
         run: python3 -m unittest discover -s tests/deploy -v
+      - name: Agent hook guardrail tests
+        # Likewise dependency-free: these protect the PreToolUse guards, which fail closed
+        # and wedge a session when a hook command stops resolving.
+        run: python3 -m unittest discover -s tests/agent -v
 
   test-frontend:
     name: Frontend tests

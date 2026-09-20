@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python .claude/hooks/guard_sensitive_write.py",
+            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard_sensitive_write.py\"",
             "timeout": 15
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python .claude/hooks/guard_git.py",
+            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard_git.py\"",
             "timeout": 15
           }
         ]
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python scripts/check.py --fast --if-changed",
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/check.py\" --fast --if-changed",
             "timeout": 300
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python scripts/check.py --fast --if-changed",
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/check.py\" --fast --if-changed",
             "timeout": 300
           }
         ]
