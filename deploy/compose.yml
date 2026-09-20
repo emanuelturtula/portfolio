@@ -1,0 +1,46 @@
+# Runtime manifest for the Raspberry Pi. Uploaded by the delivery pipeline for each
+# deployment; nothing persistent lives on the host except the data volume and the
+# deployment state under the deploy root.
+#
+# The compose project name (portfolio-app-prod) is chosen by deploy.py and deliberately
+# differs from the legacy `portfolio-prod` project, so the old application keeps running
+# untouched until it is decommissioned.
+
+services:
+  app:
+    image: ${PORTFOLIO_IMAGE:?An immutable image digest is required}
+    restart: unless-stopped
+    ports:
+      - "${PORTFOLIO_PORT:?A host port is required}:8000"
+    environment:
+      PORTFOLIO_ENVIRONMENT: ${PORTFOLIO_ENVIRONMENT:?An environment name is required}
+      PORTFOLIO_DATABASE_URL: sqlite+aiosqlite:////app/data/portfolio.db
+    # Application secrets (exchange API credentials, price provider keys) live in a
+    # host-local file that deploy.py guarantees exists at mode 0600. They are written once
+    # over SSH by the operator and never pass through GitHub Actions. The /dev/null default
+    # keeps compose valid before that file has any content.
+    env_file:
+      - ${PORTFOLIO_SECRETS_ENV_FILE:-/dev/null}
+    volumes:
+      - data:/app/data
+    # Asserts both halves of the image: the API answers, and the single-page application
+    # is actually being served. A container that starts but serves no UI is not healthy.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=5)); assert d['status']=='ok'; r=urllib.request.urlopen('http://127.0.0.1:8000/',timeout=5); assert r.status==200 and b'<html' in r.read().lower()"
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 25s
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  data:

@@ -1,0 +1,163 @@
+name: Delivery
+
+# main -> full CI -> versioned arm64 image -> production on the Raspberry Pi -> git tag and
+# GitHub release.
+#
+# There is deliberately no staging environment: this project runs a single production
+# instance. The consequence is that no check proves the artifact runs on real hardware
+# before merge, so the host-side deploy script must roll back on its own, and it does.
+
+on:
+  push:
+    branches: [main]
+
+# No blanket permissions. Each job asks for exactly what it needs.
+permissions: {}
+
+concurrency:
+  group: delivery-${{ github.ref }}
+  # Never cancel a deployment in flight: a half-applied deploy is worse than a slow queue.
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  validate:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    name: Compute version
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Tags and full history are what the version is derived from.
+          fetch-depth: 0
+          persist-credentials: false
+      - id: version
+        run: python3 scripts/next_version.py --sha "$GITHUB_SHA" --github-output
+
+  build:
+    name: Build arm64 image
+    needs: version
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          # Only the immutable sha- tag here. vX.Y.Z and latest are applied after
+          # production has been verified healthy, so they always point at a working image.
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ needs.version.outputs.version }}
+          # deploy.py re-reads these labels off the pulled image and refuses a digest whose
+          # revision or version does not match what this workflow claims.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+      - id: image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          echo "image=${IMAGE_NAME}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          printf 'Version: `%s`\n\nImage: `%s@%s`\n' "$VERSION" "$IMAGE_NAME" "$DIGEST" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-prod:
+    name: Deploy production (8083)
+    needs: [version, build]
+    if: vars.DEPLOY_ENABLED == 'true'
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    uses: ./.github/workflows/remote-deploy.yml
+    with:
+      environment: prod
+      image: ${{ needs.build.outputs.image }}
+      version: ${{ needs.version.outputs.version }}
+    secrets: inherit
+
+  release:
+    name: Publish release
+    needs: [version, build, deploy-prod]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag the verified image
+        # Retags the exact digest that production is running. No rebuild, so `latest` and
+        # the running container can never diverge.
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${VERSION}" \
+            --tag "${IMAGE_NAME}:latest" \
+            "$IMAGE"
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists (this is a rerun); nothing to do."
+          else
+            gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$VERSION" --generate-notes
+          fi
+
+  deploy-disabled:
+    name: Deploy disabled
+    needs: build
+    if: vars.DEPLOY_ENABLED != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain why nothing was deployed
+        run: |
+          {
+            echo '### Deployment skipped'
+            echo
+            echo 'The image was built and pushed, but no deployment ran because the'
+            echo '`DEPLOY_ENABLED` repository variable is not set to `true`.'
+            echo
+            echo 'See docs/deployment.md to complete the one-time credential setup.'
+          } >> "$GITHUB_STEP_SUMMARY"

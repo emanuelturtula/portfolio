@@ -1,0 +1,29 @@
+# Secrets and local state must never reach the build context of a public image.
+.env
+.env.*
+**/secrets.env
+*.pem
+*.key
+data/
+*.db
+*.sqlite3
+
+# Not needed at runtime
+.git
+.github
+.claude
+**/.venv
+**/node_modules
+**/dist
+**/__pycache__
+**/.mypy_cache
+**/.pytest_cache
+**/.ruff_cache
+**/coverage
+backend/tests
+docs
+deploy
+scripts
+*.md
+.pre-commit-config.yaml
+.gitleaks.toml

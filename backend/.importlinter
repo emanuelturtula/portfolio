@@ -1,0 +1,36 @@
+# Architectural boundaries, enforced by import-linter (`uv run lint-imports`).
+#
+# The packages below are deliberately empty in the walking skeleton: the contract is
+# live from the first commit, so the first module that lands in the wrong layer fails
+# CI instead of quietly setting a precedent.
+[importlinter]
+root_package = portfolio
+include_external_packages = True
+
+[importlinter:contract:portfolio]
+name = portfolio
+type = layers
+layers =
+    portfolio.api
+    portfolio.services
+    portfolio.repositories | portfolio.providers
+    portfolio.db | portfolio.domain
+
+[importlinter:contract:thin-routers]
+name = portfolio routers stay thin
+type = forbidden
+source_modules =
+    portfolio.api.routers
+forbidden_modules =
+    sqlalchemy
+    httpx
+    portfolio.repositories
+    portfolio.providers
+
+[importlinter:contract:framework-free-services]
+name = portfolio services stay framework free
+type = forbidden
+source_modules =
+    portfolio.services
+forbidden_modules =
+    fastapi

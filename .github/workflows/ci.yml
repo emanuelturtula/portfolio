@@ -1,0 +1,188 @@
+name: CI
+
+# Every third-party action is pinned to a commit SHA with the version in a comment. A
+# floating tag is mutable, and this workflow has access to the repository contents.
+#
+# The job names below are the required status check contexts in the `main` ruleset, so
+# renaming one silently disables a merge gate. Change them together or not at all.
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets-scan:
+    name: Secrets scan
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The scan covers the whole history, not just this diff: a secret in an older
+          # commit is still published the moment the branch is pushed.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (pinned and checksum verified)
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+          echo "GITLEAKS_BIN=$RUNNER_TEMP/gitleaks" >> "$GITHUB_ENV"
+      - name: Scan the full git history
+        run: python3 scripts/secret_scan.py --history
+
+  lint:
+    name: Lint & types
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          working-directory: backend
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --locked
+      - name: ruff check
+        working-directory: backend
+        run: uv run ruff check .
+      - name: ruff format
+        working-directory: backend
+        run: uv run ruff format --check .
+      - name: mypy
+        working-directory: backend
+        run: uv run mypy
+      - name: Import layering contract
+        working-directory: backend
+        run: uv run lint-imports
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: eslint
+        working-directory: frontend
+        run: npm run lint
+      - name: prettier
+        working-directory: frontend
+        run: npm run format:check
+      - name: tsc
+        working-directory: frontend
+        run: npm run typecheck
+
+  test-backend:
+    name: Backend tests
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          working-directory: backend
+      - run: uv sync --locked
+        working-directory: backend
+      - name: pytest with coverage
+        working-directory: backend
+        run: uv run pytest --cov --cov-report=term-missing
+      - name: Deployment guardrail tests
+        # Plain unittest, no dependencies: these protect the path from a workflow run to a
+        # production deployment, so they must run even if the backend fails to install.
+        run: python3 -m unittest discover -s tests/deploy -v
+
+  test-frontend:
+    name: Frontend tests
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - name: vitest with coverage
+        working-directory: frontend
+        run: npm run test:coverage
+      - name: Build the production bundle
+        working-directory: frontend
+        run: npm run build
+
+  openapi-drift:
+    name: OpenAPI drift
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          working-directory: backend
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: uv sync --locked
+        working-directory: backend
+      - run: npm ci
+        working-directory: frontend
+      - name: Dump the OpenAPI schema
+        working-directory: backend
+        run: uv run python ../scripts/dump_openapi.py --output ../openapi.json
+      - name: Regenerate the TypeScript API types
+        working-directory: frontend
+        run: npm run gen:api
+      - name: Fail if the committed types are out of date
+        run: |
+          # --intent-to-add first: plain 'git diff' does not see untracked files, so a
+          # brand new generated file would pass this check without ever being committed.
+          git add --intent-to-add frontend/src/api/generated/
+          if ! git diff --exit-code -- frontend/src/api/generated/; then
+            echo "::error::The generated API types do not match the backend schema. Run 'uv run python ../scripts/dump_openapi.py' in backend/, then 'npm run gen:api' in frontend/, and commit the result."
+            exit 1
+          fi
+
+  docker-build:
+    name: Docker build (arm64)
+    needs: [lint, test-backend, test-frontend]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          # Native arm64 runner, so no QEMU emulation and no 20-minute builds. The target
+          # is a Raspberry Pi 5, so this is also the only architecture that matters.
+          platforms: linux/arm64
+          push: false
+          tags: portfolio:ci
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64

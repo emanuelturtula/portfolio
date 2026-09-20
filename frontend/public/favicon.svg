@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Portfolio">
+  <rect width="32" height="32" rx="7" fill="#1b1b1f" />
+  <path
+    d="M6 21.5 12.5 14l5 4.5L26 8"
+    fill="none"
+    stroke="#7cd6a0"
+    stroke-width="3"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

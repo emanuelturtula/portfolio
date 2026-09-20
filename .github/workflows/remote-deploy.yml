@@ -1,0 +1,71 @@
+name: Remote deploy
+
+# Reusable workflow: joins the tailnet as an ephemeral node, then runs the deployment over
+# SSH. Called only by delivery.yml, and scripts/remote_deploy.py independently re-checks
+# that at runtime -- a reusable workflow cannot assume its caller is well behaved.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+  # Required for the Tailscale OIDC exchange.
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Deployments are serialized by the flock in deploy/deploy.py rather than by a GitHub
+    # concurrency group, so a queued deploy waits instead of being silently discarded.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Join the tailnet (OIDC, ephemeral node)
+        # Federated identity rather than a long-lived auth key: nothing reusable is stored
+        # in this public repository's secrets.
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:portfolio-ci
+
+      - name: Deploy and verify health
+        env:
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+          DEPLOY_IMAGE: ${{ inputs.image }}
+          DEPLOY_VERSION: ${{ inputs.version }}
+          DEPLOY_REVISION: ${{ github.sha }}
+          # Host and user are secrets rather than variables purely so GitHub masks them in
+          # this public repository's logs.
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/remote_deploy.py
+
+      - name: Summary
+        env:
+          TARGET: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          printf 'Verified **%s**: `%s`\n\nImage: `%s`\n' "$TARGET" "$VERSION" "$IMAGE" \
+            >> "$GITHUB_STEP_SUMMARY"

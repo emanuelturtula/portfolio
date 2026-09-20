@@ -1,0 +1,68 @@
+# gitleaks configuration for the portfolio project.
+#
+# This repository is PUBLIC and the application handles real money, so every match here
+# must block the commit, the push and CI. Never add a broad allowlist. If a finding is a
+# genuine false positive, allowlist the exact path or a narrow regex and explain why in
+# the pull request.
+#
+# Testnet address prefixes (tb1, bcrt1, m/n/2 legacy testnet, kaspatest:) are deliberately
+# NOT matched. Test fixtures are required to use them, which is what makes the rule in
+# backend/tests/security/ enforceable.
+
+title = "portfolio secret scanning rules"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "private-ipv4-address"
+description = "Private LAN IPv4 address (infrastructure details must not be published)"
+regex = '''\b(?:10(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}|192\.168(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){2}|172\.(?:1[6-9]|2[0-9]|3[01])(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){2})\b'''
+
+[[rules]]
+id = "tailscale-cgnat-address"
+description = "Tailscale tailnet IPv4 address (CGNAT range)"
+regex = '''\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){2}\b'''
+
+[[rules]]
+id = "tailscale-key"
+description = "Tailscale auth, API or OAuth key"
+regex = '''\btskey-[a-z]+-[A-Za-z0-9-]{16,}'''
+keywords = ["tskey-"]
+
+[[rules]]
+id = "bitcoin-mainnet-bech32-address"
+description = "Bitcoin mainnet bech32/bech32m address (user data, never in the repository)"
+regex = '''\bbc1[02-9ac-hj-np-z]{11,71}\b'''
+keywords = ["bc1"]
+
+[[rules]]
+id = "bitcoin-mainnet-base58-address"
+description = "Bitcoin mainnet P2PKH/P2SH address (user data, never in the repository)"
+regex = '''(?:^|[^A-Za-z0-9])([13][a-km-zA-HJ-NP-Z1-9]{25,34})(?:[^A-Za-z0-9]|$)'''
+
+[[rules]]
+id = "kaspa-mainnet-address"
+description = "Kaspa mainnet address (user data, never in the repository)"
+regex = '''\bkaspa:[qp][a-z0-9]{59,}\b'''
+keywords = ["kaspa:"]
+
+[[rules]]
+id = "extended-public-key"
+description = "BIP32 mainnet extended public key (reveals every address of a wallet)"
+# Testnet prefixes (tpub, upub, vpub) are intentionally excluded: they control no real
+# funds, and test fixtures for the xpub feature are required to use them.
+regex = '''\b(?:xpub|ypub|zpub)[1-9A-HJ-NP-Za-km-z]{100,112}\b'''
+keywords = ["xpub", "ypub", "zpub"]
+
+[[rules]]
+id = "exchange-api-credential"
+description = "Bitget or BingX API key, secret or passphrase assigned to a variable"
+regex = '''(?i)\b(?:bitget|bingx)[_-]?(?:api[_-]?)?(?:key|secret|passphrase)\b\s*[:=]\s*['"]?([A-Za-z0-9_\-]{16,})['"]?'''
+keywords = ["bitget", "bingx"]
+
+[[rules]]
+id = "coingecko-api-key"
+description = "CoinGecko API key"
+regex = '''\bCG-[A-Za-z0-9]{20,}\b'''
+keywords = ["CG-"]

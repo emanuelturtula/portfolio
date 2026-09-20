@@ -1,0 +1,11 @@
+# This repository is developed on Windows (core.autocrlf=true) and built on Linux. Without
+# this, a fresh Windows checkout would contain CRLF and fail the LF-enforcing format check
+# on the exact commit CI accepted.
+* text=auto eol=lf
+
+# Binary files must never be normalized.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
