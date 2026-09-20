@@ -13,6 +13,12 @@ dependencies = [
     "pydantic>=2",
     "pydantic-settings",
     "structlog",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite",
+    "alembic",
+    # Already present transitively through Starlette, but the lifespan calls
+    # anyio.to_thread.run_sync directly, so it is declared directly too.
+    "anyio",
 ]
 
 [dependency-groups]
@@ -69,6 +75,15 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 # assert is the point of a test.
 "tests/**" = ["S101"]
+
+[tool.ruff.lint.flake8-type-checking]
+# SQLAlchemy resolves `Mapped[...]` annotations at runtime to build the mapper, so the
+# names inside them must be real imports. Without this, TC003 would move `datetime` into
+# an `if TYPE_CHECKING:` block and every mapped class would fail to configure.
+runtime-evaluated-base-classes = [
+    "sqlalchemy.orm.DeclarativeBase",
+    "portfolio.db.base.Base",
+]
 
 [tool.ruff.lint.flake8-builtins]
 # portfolio.logging is always imported absolutely, so it cannot shadow the standard
