@@ -28,9 +28,16 @@ if TYPE_CHECKING:
 
 # The full set of values `assets.kind` may take. `fiat` has no seeded row yet -- the
 # display currency is a later decision -- but the constraint admits it so that adding one
-# is an insert rather than a table rebuild. The text is duplicated verbatim in
-# `0001_initial_schema`, which is the copy the database is actually built from; the drift
-# check is what keeps the two honest.
+# is an insert rather than a table rebuild.
+#
+# This text is duplicated verbatim in `0001_initial_schema`, which is the copy the
+# database is actually built from, and the drift check does NOT cover the duplication:
+# Alembic's autogenerate compares tables, columns, types, server defaults, indexes,
+# unique constraints, foreign keys and comments, and has no check-constraint comparator
+# at all. Editing this string without writing the matching migration passes every gate in
+# the repository and then rejects the insert in production. What covers it is a test that
+# reflects `ck_assets_kind` back off a migrated database and compares its `sqltext`
+# against this constant.
 _ASSET_KIND_CHECK: Final = "kind IN ('crypto', 'fiat')"
 
 
