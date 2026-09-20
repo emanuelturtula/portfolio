@@ -66,6 +66,39 @@ class AppError(Exception):
         )
 
 
+class UnauthorizedError(AppError):
+    """No usable session, or credentials that did not verify.
+
+    One class for both, because the API deliberately does not distinguish "this username
+    does not exist" from "this password is wrong": the client sees the same document and
+    the same status either way.
+    """
+
+    status: ClassVar[int] = 401
+    title: ClassVar[str] = "Unauthorized"
+
+
+class ForbiddenError(AppError):
+    """A request that was rejected before it reached a route: origin or content type."""
+
+    status: ClassVar[int] = 403
+    title: ClassVar[str] = "Forbidden"
+
+
+class TooManyRequestsError(AppError):
+    """A throttled sign-in attempt, refused without verifying the password."""
+
+    status: ClassVar[int] = 429
+    title: ClassVar[str] = "Too Many Requests"
+
+
+class UnprocessableEntityError(AppError):
+    """A well-formed request whose content a rule refuses -- a password below policy."""
+
+    status: ClassVar[int] = 422
+    title: ClassVar[str] = "Unprocessable Entity"
+
+
 def problem_response(
     problem: ProblemDetail,
     extensions: Mapping[str, Any] | None = None,

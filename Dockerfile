@@ -8,7 +8,7 @@
 # ---------------------------------------------------------------------------------------
 # Stage 1 - build the single-page application
 # ---------------------------------------------------------------------------------------
-FROM node:22-alpine AS frontend
+FROM node:25-alpine AS frontend
 
 WORKDIR /build
 
@@ -67,8 +67,21 @@ COPY --from=frontend --chown=app:app /build/dist /app/src/portfolio/web/dist
 
 # Fail the build here rather than discovering at deploy time that the image serves no UI or
 # cannot import its own application.
+#
+# The second check builds the application, which constructs `Settings`, and this image
+# sets PORTFOLIO_ENVIRONMENT=prod above -- so every refusal gated on production applies
+# here, at build time, with none of the deployment's environment file present. That is
+# why the origin is supplied inline. It is a reserved `.invalid` name that can never
+# resolve, and it never reaches a running container: the real value comes from the
+# host's secrets file at deploy time.
+#
+# Anything else gated on production has to be supplied here too, or the build fails on a
+# validation error rather than a missing route.
+# `backend/tests/test_image_configuration.py` reproduces this construction, so that the
+# failure lands in the test suite instead of in a multi-architecture image build.
 RUN python -c "import pathlib, sys; p = pathlib.Path('/app/src/portfolio/web/dist/index.html'); sys.exit(0) if p.is_file() else sys.exit('The SPA bundle is missing from the image')" \
-    && python -c "from portfolio.main import create_app; assert '/api/health' in create_app().openapi()['paths'], 'The health route is missing from the OpenAPI schema'"
+    && PORTFOLIO_ALLOWED_ORIGIN=https://image-smoke-check.invalid \
+       python -c "from portfolio.main import create_app; assert '/api/health' in create_app().openapi()['paths'], 'The health route is missing from the OpenAPI schema'"
 
 USER app
 
