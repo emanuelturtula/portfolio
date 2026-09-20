@@ -5,7 +5,8 @@ green" cannot mean three different things.
 
 Usage:
     python scripts/check.py           # full gate: lint, types, layering, tests, secrets
-    python scripts/check.py --fast    # quick gate for the agent stop hook
+    python scripts/check.py --fast    # quick gate for the agent stop hooks
+    python scripts/check.py --fast --if-changed   # ... and skip entirely on a clean tree
     python scripts/check.py --backend # backend only
     python scripts/check.py --frontend
 """
@@ -90,12 +91,38 @@ def run(step: Step) -> bool:
     return result.returncode == 0
 
 
+def nothing_changed() -> bool:
+    """True when the working tree is clean, so there is nothing new to check.
+
+    The agent stop hooks run this gate on every turn. Without this, a conversation that
+    only reads code would pay ten seconds per turn to re-prove that unchanged code still
+    passes. Untracked files count as changes: a brand new file is exactly what most needs
+    checking.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=REPO_ROOT, check=True, capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False  # Fail toward running the checks rather than skipping them.
+    return not result.stdout.strip()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fast", action="store_true", help="skip the slowest checks")
+    parser.add_argument(
+        "--if-changed",
+        action="store_true",
+        help="do nothing when the working tree is clean (used by the agent stop hooks)",
+    )
     parser.add_argument("--backend", action="store_true", help="backend checks only")
     parser.add_argument("--frontend", action="store_true", help="frontend checks only")
     args = parser.parse_args(argv)
+
+    if args.if_changed and nothing_changed():
+        return 0
 
     only_backend = args.backend and not args.frontend
     only_frontend = args.frontend and not args.backend

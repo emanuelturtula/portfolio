@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python scripts/check.py --fast",
+            "command": "python scripts/check.py --fast --if-changed",
             "timeout": 300
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python scripts/check.py --fast",
+            "command": "python scripts/check.py --fast --if-changed",
             "timeout": 300
           }
         ]
