@@ -57,7 +57,8 @@ class Settings(BaseSettings):
     # Cortex-A76. Measured on the Raspberry Pi 5 with `hash-benchmark`, it came in at
     # 113.1 ms -- less than half the ~250 ms target, because the hardware is faster than
     # the estimate assumed. Argon2's cost is close to linear in `memory_cost * time_cost`,
-    # so the memory was raised by the missing factor.
+    # so the memory was raised by the missing factor, and the result was then measured on
+    # the deployed configuration rather than trusted: 271 ms, against a 250 ms target.
     #
     # Memory rather than passes: memory hardness is what makes parallel attack on a GPU
     # expensive, while an extra pass costs the defender and the attacker alike. Raising

@@ -113,16 +113,24 @@ new parameters on the next successful login.
 Every row is a `hash-benchmark` run on the host named. Add a row rather than editing one:
 the history is what tells the next person whether a slowdown is the hardware or the code.
 
-| Date | Host | memory_cost | time_cost | parallelism | Median | |
-|---|---|---|---|---|---|---|
-| 2026-09-20 | Raspberry Pi 5 | 65536 | 3 | 4 | 113.1 ms | measured |
-| 2026-09-20 | Raspberry Pi 5 | 147456 | 3 | 4 | ~254 ms | **extrapolated — confirm** |
+| Date | Host | memory_cost | Median | Notes |
+|---|---|---|---|---|
+| 2026-09-20 | Raspberry Pi 5 | 65536 | 113.1 ms | idle host |
+| 2026-09-20 | Raspberry Pi 5 | 65536 | 174.0 ms | **taken during a deployment — do not use** |
+| 2026-09-20 | Raspberry Pi 5 | **147456** | **271 ms** | the shipped default; three runs on an idle host: 271.4, 270.8, 332.6 |
 
-The second row is the shipped default, and it is **not yet a measurement**: it is the first
-row scaled by the ratio of `memory_cost`, on the assumption that Argon2's cost is linear in
-it. That assumption is good but not exact — a larger working set puts more pressure on DRAM,
-so the real figure may be somewhat higher. Run the benchmark once this deploys and replace
-that row with what it prints.
+`time_cost=3` and `parallelism=4` throughout.
+
+**Measure on an idle host, and measure more than once.** Those two 65536 rows are the same
+binary and the same parameters 54% apart, because the second was taken while two deployments
+were recreating containers. A single reading taken during a deploy is how you end up retuning
+against noise — it nearly caused exactly that here.
+
+Even idle, the third run of the shipped configuration came in 23% above the other two, which
+agreed with each other to within 0.6 ms. Treat a lone high reading as interference and repeat
+it rather than acting on it.
+
+At 271 ms against a target of roughly 250 ms, the shipped default is where it should be.
 
 ## 4. Changing the password
 
