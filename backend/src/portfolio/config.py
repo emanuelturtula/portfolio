@@ -50,12 +50,24 @@ class Settings(BaseSettings):
     allowed_origin: str = DEV_ALLOWED_ORIGIN
     session_cookie_secure: bool = True
 
-    # Argon2id cost. The defaults are OWASP's minimum configuration rounded up, and they
-    # are settings rather than constants because the number that matters -- roughly 250 ms
-    # per hash -- has to be measured on the Raspberry Pi with `hash-benchmark`, not copied
-    # from a cloud instance. `memory_cost` is in KiB, so 65536 is 64 MiB.
+    # Argon2id cost, tuned on the deployment hardware rather than copied from a cloud
+    # instance. `memory_cost` is in KiB, so 147456 is 144 MiB.
+    #
+    # The previous default of 65536 was OWASP's minimum rounded up and an estimate for a
+    # Cortex-A76. Measured on the Raspberry Pi 5 with `hash-benchmark`, it came in at
+    # 113.1 ms -- less than half the ~250 ms target, because the hardware is faster than
+    # the estimate assumed. Argon2's cost is close to linear in `memory_cost * time_cost`,
+    # so the memory was raised by the missing factor.
+    #
+    # Memory rather than passes: memory hardness is what makes parallel attack on a GPU
+    # expensive, while an extra pass costs the defender and the attacker alike. Raising
+    # this does not invalidate a stored password -- the parameters are encoded in each
+    # hash, so an old one still verifies and is re-hashed on the next successful login.
+    #
+    # These stay settings, not constants, because the number that matters is the one
+    # measured on the host. `docs/operations.md` holds the procedure and the log.
     argon2_time_cost: int = 3
-    argon2_memory_cost: int = 65536
+    argon2_memory_cost: int = 147456
     argon2_parallelism: int = 4
 
     # Two expiries, both enforced: the idle window slides with activity, the absolute one

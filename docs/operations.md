@@ -74,10 +74,10 @@ this is the one that leaves no copy of the password anywhere.
 
 ## 3. Tuning the Argon2id parameters to this hardware
 
-The defaults are an estimate for a Cortex-A76, not a measurement. Cost parameters copied
-between machines are the usual reason a password hash ends up either uselessly fast or slow
-enough to be a denial-of-service vector against the login endpoint, so take the measurement
-on the Pi itself.
+The shipped defaults are tuned to the Raspberry Pi 5 from a real measurement — see the log
+below. Cost parameters copied between machines are the usual reason a password hash ends up
+either uselessly fast or slow enough to be a denial-of-service vector against the login
+endpoint, so re-measure on any host that is not that one, and after any hardware change.
 
 ```bash
 docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio hash-benchmark
@@ -92,7 +92,7 @@ To adjust, set any of these in `secrets.env` and recreate the container as in se
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PORTFOLIO_ARGON2_MEMORY_COST` | `65536` (KiB, = 64 MiB) | The main dial. Memory is what makes the hash expensive to attack in parallel on a GPU, so raise this before anything else. |
+| `PORTFOLIO_ARGON2_MEMORY_COST` | `147456` (KiB, = 144 MiB) | The main dial. Memory is what makes the hash expensive to attack in parallel on a GPU, so raise this before anything else. |
 | `PORTFOLIO_ARGON2_TIME_COST` | `3` | Number of passes. Raise only once memory is as high as the host can spare. |
 | `PORTFOLIO_ARGON2_PARALLELISM` | `4` | Lanes. The Pi 5 has four cores; going above that buys nothing. |
 
@@ -110,12 +110,19 @@ new parameters on the next successful login.
 
 ### Measured on this instance
 
-Fill this in after running the benchmark. An empty row means nobody has measured it and the
-defaults are still a guess.
+Every row is a `hash-benchmark` run on the host named. Add a row rather than editing one:
+the history is what tells the next person whether a slowdown is the hardware or the code.
 
-| Date | Host | memory_cost | time_cost | parallelism | Median |
-|---|---|---|---|---|---|
-| | Raspberry Pi 5 | 65536 | 3 | 4 | _not yet measured_ |
+| Date | Host | memory_cost | time_cost | parallelism | Median | |
+|---|---|---|---|---|---|---|
+| 2026-09-20 | Raspberry Pi 5 | 65536 | 3 | 4 | 113.1 ms | measured |
+| 2026-09-20 | Raspberry Pi 5 | 147456 | 3 | 4 | ~254 ms | **extrapolated — confirm** |
+
+The second row is the shipped default, and it is **not yet a measurement**: it is the first
+row scaled by the ratio of `memory_cost`, on the assumption that Argon2's cost is linear in
+it. That assumption is good but not exact — a larger working set puts more pressure on DRAM,
+so the real figure may be somewhat higher. Run the benchmark once this deploys and replace
+that row with what it prints.
 
 ## 4. Changing the password
 
