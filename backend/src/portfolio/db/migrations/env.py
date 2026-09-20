@@ -8,6 +8,11 @@ Two settings here are not optional on SQLite:
 * `compare_type=True` -- autogenerate ignores type changes otherwise, which on a database
   with no declared type affinity means a column silently keeps the wrong type forever.
 
+Batch mode is also why the migration connection runs with foreign key enforcement off and
+is checked for orphaned references before it commits. `portfolio.db.migration_guards`
+explains that mechanism in full; the short version is that a batch rebuild drops the
+original table, and a `DROP TABLE` under `foreign_keys=ON` fires cascades.
+
 The URL is never read from the ini. It arrives on `Config.attributes` from
 `build_alembic_config`, and falls back to `Settings` when the developer CLI is driving.
 """
@@ -23,6 +28,10 @@ from alembic import context
 from portfolio.config import get_settings
 from portfolio.db.alembic_config import DATABASE_URL_ATTRIBUTE
 from portfolio.db.engine import create_database_engine
+from portfolio.db.migration_guards import (
+    assert_no_dangling_foreign_keys,
+    disable_foreign_key_enforcement,
+)
 from portfolio.db.models import metadata as target_metadata
 
 if TYPE_CHECKING:
@@ -46,7 +55,15 @@ def resolve_database_url() -> str:
 
 
 def run_migrations_offline() -> None:
-    """Emit SQL to stdout instead of running it, for `alembic upgrade --sql`."""
+    """Emit SQL to stdout instead of running it, for `alembic upgrade --sql`.
+
+    There is no connection here, so neither guard applies and the generated script does
+    not carry `PRAGMA foreign_keys=OFF`. That omission is deliberate: Alembic wraps the
+    script in a transaction, and the pragma is a documented no-op inside one, so emitting
+    it would produce a line that looks protective and is not. An operator applying a
+    generated script that contains a batch rebuild must set the pragma themselves, outside
+    the transaction, and run `PRAGMA foreign_key_check` before committing.
+    """
     context.configure(
         url=resolve_database_url(),
         target_metadata=target_metadata,
@@ -60,15 +77,34 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    """Run the migrations on an already-open synchronous connection."""
-    context.configure(
-        connection=connection,
-        target_metadata=target_metadata,
-        render_as_batch=True,
-        compare_type=True,
-    )
-    with context.begin_transaction():
-        context.run_migrations()
+    """Run the migrations on an already-open synchronous connection.
+
+    Order matters twice over.
+
+    Enforcement goes off first, before anything opens a transaction, because the pragma
+    does nothing once one is open.
+
+    Then the whole run is wrapped in one explicit transaction, opened *before* the context
+    is configured. Alembic's SQLite implementation declares DDL non-transactional, which
+    means its own `begin_transaction()` is a no-op at the run level and a real,
+    self-committing transaction around each individual migration -- so an integrity check
+    placed after `run_migrations()` would be inspecting a database that had already
+    committed, and raising would stamp the revision anyway. Beginning the transaction here
+    instead puts Alembic into its external-transaction mode: it stops managing commits,
+    and the check below genuinely gates the commit rather than merely reporting on it.
+    """
+    disable_foreign_key_enforcement(connection)
+
+    with connection.begin():
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            render_as_batch=True,
+            compare_type=True,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        assert_no_dangling_foreign_keys(connection)
 
 
 async def run_async_migrations() -> None:
