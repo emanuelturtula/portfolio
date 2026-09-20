@@ -13,7 +13,7 @@ question these tests answer is what is on disk, not what the migration believed 
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 from alembic import command
@@ -21,7 +21,17 @@ from alembic import context as alembic_context
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import Column, Integer, MetaData, Table, inspect, select, text
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    Integer,
+    MetaData,
+    Table,
+    Text,
+    inspect,
+    select,
+    text,
+)
 from sqlalchemy.orm import Session as SyncSession
 
 from portfolio.db.alembic_config import (
@@ -32,10 +42,13 @@ from portfolio.db.alembic_config import (
     upgrade_to_head,
 )
 from portfolio.db.base import NAMING_CONVENTION
-from portfolio.db.models import Asset, metadata
+from portfolio.db.models import _ASSET_KIND_CHECK, Asset, metadata
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sqlalchemy import Engine
+    from sqlalchemy.engine import Connection
 
 APPLICATION_TABLES = frozenset({"users", "sessions", "assets"})
 FIRST_REVISION = "0001_initial_schema"
@@ -65,6 +78,57 @@ def seed_rows(engine: Engine) -> list[tuple[str, str, int, str]]:
     with SyncSession(engine) as session:
         assets = session.scalars(select(Asset).order_by(Asset.symbol)).all()
         return [(asset.symbol, asset.name, asset.decimals, asset.kind) for asset in assets]
+
+
+# The one place the comparison options are written down. Both the drift check and the
+# test that proves the drift check can fail go through `compare_against`, because two
+# duplicated option dicts are bound together by nothing: quieting the real check with an
+# `include_object` filter would leave its companion passing and still claiming the check
+# was live.
+COMPARISON_OPTIONS: Final[dict[str, bool]] = {"compare_type": True, "render_as_batch": True}
+
+
+def compare_against(connection: Connection, target: MetaData) -> list[Any]:
+    """Diff a live database against a metadata, exactly as the drift check does."""
+    migration_context = MigrationContext.configure(connection, opts=dict(COMPARISON_OPTIONS))
+    return list(compare_metadata(migration_context, target))
+
+
+def a_copy_of_the_real_metadata() -> MetaData:
+    """The real schema, detached, so a test can bend it without touching the models."""
+    copied = MetaData(naming_convention=NAMING_CONVENTION)
+    for table in metadata.tables.values():
+        table.to_metadata(copied)
+    return copied
+
+
+def with_an_extra_table() -> MetaData:
+    drifted = a_copy_of_the_real_metadata()
+    Table("a_table_no_migration_creates", drifted, Column("id", Integer, primary_key=True))
+    return drifted
+
+
+def with_an_added_column() -> MetaData:
+    drifted = a_copy_of_the_real_metadata()
+    drifted.tables["assets"].append_column(Column("a_column_no_migration_creates", Text()))
+    return drifted
+
+
+def with_a_changed_column_type() -> MetaData:
+    """The drift `compare_type=True` exists for: same column, different type."""
+    drifted = a_copy_of_the_real_metadata()
+    drifted.tables["assets"].c.decimals.type = Text()
+    return drifted
+
+
+def normalise_sql(expression: str) -> str:
+    """Collapse runs of whitespace and nothing else.
+
+    Anything more forgiving -- stripping parentheses, folding case, ignoring quotes --
+    and the comparison stops discriminating, which is the whole point of it.
+    `test_the_check_constraint_comparison_discriminates` pins that down.
+    """
+    return " ".join(expression.split())
 
 
 def test_upgrade_head_creates_every_table(database_url: str, sync_engine: Engine) -> None:
@@ -173,46 +237,136 @@ def test_the_migrated_schema_carries_the_convention_names(
 def test_models_and_migrations_have_not_drifted(database_url: str, sync_engine: Engine) -> None:
     """Criterion 6: the migrations and the models describe the same schema.
 
-    `compare_type` and `render_as_batch` mirror `env.py` exactly. There is deliberately
-    no `include_object` filter: nothing is being excluded from the comparison, so a
-    column that only exists in one of the two places has nowhere to hide.
+    `compare_type` and `render_as_batch` mirror `env.py` exactly, and they come from
+    `COMPARISON_OPTIONS` rather than from a literal here, so the companion test below
+    cannot drift away from this one. There is deliberately no `include_object` filter:
+    nothing is excluded, so a column that exists in only one of the two has nowhere to
+    hide. Check constraints are the documented exception -- see
+    `test_the_kind_check_constraint_matches_the_model`.
     """
     upgrade_to_head(database_url)
 
     with sync_engine.connect() as connection:
-        migration_context = MigrationContext.configure(
-            connection,
-            opts={"compare_type": True, "render_as_batch": True},
-        )
-        differences = compare_metadata(migration_context, metadata)
+        differences = compare_against(connection, metadata)
 
     assert differences == []
 
 
+@pytest.mark.parametrize(
+    ("build_drift", "expected_operation", "expected_subject"),
+    [
+        (with_an_extra_table, "add_table", "a_table_no_migration_creates"),
+        (with_an_added_column, "add_column", "a_column_no_migration_creates"),
+        (with_a_changed_column_type, "modify_type", "decimals"),
+    ],
+    ids=["an extra table", "an added column", "a changed column type"],
+)
 def test_the_drift_check_detects_a_deliberate_difference(
     database_url: str,
     sync_engine: Engine,
+    build_drift: Callable[[], MetaData],
+    expected_operation: str,
+    expected_subject: str,
 ) -> None:
     """A drift check that cannot fail is worth nothing, so prove that it can.
 
-    The metadata handed to the comparison is the real one plus one table the migrations
-    never create. If this returns no differences, the test above is vacuous.
+    An extra table is the weakest possible drift -- it would be caught even with type
+    comparison switched off. The added column and the changed type are what the real
+    options actually buy, and they go through the same `compare_against` helper as the
+    test above, so the two cannot be quietly configured differently.
     """
     upgrade_to_head(database_url)
-    drifted = MetaData(naming_convention=NAMING_CONVENTION)
-    for table in metadata.tables.values():
-        table.to_metadata(drifted)
-    Table("a_table_no_migration_creates", drifted, Column("id", Integer, primary_key=True))
 
     with sync_engine.connect() as connection:
-        migration_context = MigrationContext.configure(
-            connection,
-            opts={"compare_type": True, "render_as_batch": True},
-        )
-        differences = compare_metadata(migration_context, drifted)
+        differences = compare_against(connection, build_drift())
 
     assert differences != []
-    assert any("a_table_no_migration_creates" in repr(difference) for difference in differences)
+    rendered = repr(differences)
+    assert expected_operation in rendered
+    assert expected_subject in rendered
+
+
+def test_type_comparison_is_load_bearing_not_decorative(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Turn type comparison off and a column with the wrong type becomes invisible.
+
+    `compare_type` has defaulted to `True` since Alembic 1.12, so declaring it in
+    `COMPARISON_OPTIONS` and in `env.py` is belt and braces rather than strictly
+    required. It is still worth pinning: this is what the option buys, and a future
+    Alembic that flipped the default back would otherwise silently blind the check.
+    """
+    upgrade_to_head(database_url)
+    drifted = with_a_changed_column_type()
+
+    with sync_engine.connect() as connection:
+        blind_context = MigrationContext.configure(
+            connection,
+            opts={"render_as_batch": True, "compare_type": False},
+        )
+        without_type_comparison = list(compare_metadata(blind_context, drifted))
+        with_type_comparison = compare_against(connection, drifted)
+
+    assert without_type_comparison == []
+    assert with_type_comparison != []
+    assert COMPARISON_OPTIONS["compare_type"] is True
+
+
+def test_the_kind_check_constraint_matches_the_model(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Autogenerate has no check-constraint comparator, so the drift test cannot see this.
+
+    Editing `_ASSET_KIND_CHECK` without writing the matching migration passes ruff, mypy,
+    the layering contract, every other test here *and* the drift check, and then fails in
+    production with `CHECK constraint failed: ck_assets_kind`. This is the only thing
+    looking.
+    """
+    upgrade_to_head(database_url)
+
+    reflected = {
+        str(constraint["name"]): str(constraint["sqltext"])
+        for constraint in inspect(sync_engine).get_check_constraints("assets")
+    }
+
+    assert set(reflected) == {"ck_assets_kind"}
+    assert normalise_sql(reflected["ck_assets_kind"]) == normalise_sql(_ASSET_KIND_CHECK)
+
+
+def test_the_check_constraint_comparison_discriminates() -> None:
+    """Whitespace is normalised; content is not. Without this the test above is hollow."""
+    assert normalise_sql("kind   IN\n\t('crypto', 'fiat')") == normalise_sql(_ASSET_KIND_CHECK)
+    assert normalise_sql("kind IN ('crypto')") != normalise_sql(_ASSET_KIND_CHECK)
+    assert normalise_sql("kind IN ('crypto', 'fiat', 'equity')") != normalise_sql(_ASSET_KIND_CHECK)
+    assert normalise_sql("kind IN ('CRYPTO', 'FIAT')") != normalise_sql(_ASSET_KIND_CHECK)
+
+
+def test_the_drift_check_is_blind_to_a_changed_check_constraint(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """The justification for the bespoke test above, pinned so it can expire.
+
+    If Alembic ever grows a check-constraint comparator this goes red, and at that point
+    `test_the_kind_check_constraint_matches_the_model` can be deleted in favour of the
+    drift check. Until then, deleting it would remove the only guard there is.
+    """
+    upgrade_to_head(database_url)
+    drifted = a_copy_of_the_real_metadata()
+    assets = drifted.tables["assets"]
+    for constraint in list(assets.constraints):
+        if isinstance(constraint, CheckConstraint):
+            assets.constraints.discard(constraint)
+    assets.append_constraint(CheckConstraint("kind IN ('crypto')", name="kind"))
+
+    with sync_engine.connect() as connection:
+        differences = compare_against(connection, drifted)
+
+    assert differences == [], (
+        "Alembic now compares check constraints; the bespoke sqltext test can be retired"
+    )
 
 
 def test_env_runs_with_render_as_batch(
