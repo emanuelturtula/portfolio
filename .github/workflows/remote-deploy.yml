@@ -44,6 +44,10 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           audience: ${{ secrets.TS_AUDIENCE }}
           tags: tag:portfolio-ci
+          # Tailnet peer propagation is eventually consistent: for a few seconds after the
+          # runner joins, other nodes will refuse its connections. Without this the very
+          # next step can fail an otherwise healthy deployment on a connection refused.
+          ping: ${{ secrets.DEPLOY_HOST }}
 
       - name: Deploy and verify health
         env:
