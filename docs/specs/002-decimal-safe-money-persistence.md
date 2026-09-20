@@ -199,9 +199,18 @@ Copied from the issue.
 8. `docs/architecture.md` records why `Numeric` is forbidden and why money is never
    aggregated in SQL.
 
-**Interpretation of 1.** "Exactly" means the round-tripped value satisfies both
-`==` and `str()` equality, on a column whose scale is wide enough to hold it. Testing
-`==` alone would pass for `Decimal("0.10")` against `Decimal("0.1")`.
+**Interpretation of 1.** "Exactly" means the round-tripped value satisfies both `==` and
+`str()` equality. Testing `==` alone would pass for `Decimal("0.10")` against
+`Decimal("0.1")`, which is the mistake this criterion is guarding against.
+
+The stored form is padded to the column's declared scale, so `str()` equality holds when
+the column's scale **equals** the value's own scale — `Decimal("0.000000012345678901")` has
+18 decimal places and round-trips identically through `NumericText(18)`. Through
+`NumericText(20)` it comes back as `Decimal("1.234567890100E-8")`: equal in value, padded
+in form. That is deliberate and is what `DECIMAL(p, s)` does in every other database: the
+scale is part of the column's meaning, uniform text is what makes an equality lookup or a
+unique constraint on a money column mean anything, and it is the same argument as
+normalising `-0`. The test therefore uses a column whose scale matches the value.
 
 **Interpretation of 3.** Asserted at the boundary cases ROUND_HALF_EVEN exists to
 disambiguate — `0.5` rounding to `0` and `1.5` rounding to `2` at the declared scale — not
