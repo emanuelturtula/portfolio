@@ -58,13 +58,22 @@ pre-push hooks, the `Secrets scan` CI job over full history, GitHub push protect
 ### 4. Business logic is never in a router
 
 ```
-api.routers -> services -> { repositories , providers } -> { db , domain }
-domain      -> nothing
+{ api.routers , cli } -> services -> { repositories , providers } -> db -> domain
+domain                -> nothing
 ```
 
 Routers parse, call a service, and serialize. They may not import `repositories`,
 `providers`, `sqlalchemy` or `httpx`. Services may not import `fastapi`. `domain` is pure:
 no I/O, no clock, no network, no ORM.
+
+`cli` is a sibling of `api`, not a layer above it: they are two entry points onto the same
+services, and neither imports the other. A dependency hands a router a fully built service
+rather than a database session, which is what keeps `sqlalchemy` out of `api.routers`
+without anyone having to remember the rule.
+
+`db` sits *above* `domain` rather than beside it: a column type has to round money by the
+same rule the domain defines, and two copies of a rounding rule is how they drift apart.
+The direction that matters is the one that has not changed — `domain` imports nothing.
 
 *Enforced by:* `import-linter` contracts in `backend/.importlinter`, run in CI.
 
@@ -83,6 +92,19 @@ and `fix:`/`chore:` means a patch. Direct commits to `main` are blocked.
 
 It is the one trigger that runs fork-authored code with access to repository secrets, and it
 is how public repositories get compromised. Nothing here needs it.
+
+### 8. Endpoints are authenticated unless they are on the allowlist
+
+Authentication is deny-by-default, in middleware, not a `Depends` on each router.
+Forgetting a dependency is the failure this exists to prevent, so the rule is written to be
+unforgettable rather than merely documented: any path under `/api` that is not in
+`PUBLIC_API_PATHS` requires a valid session.
+
+Adding an endpoint therefore protects it. Making one public is an edit to a named constant,
+which is a visible line in a diff and a deliberate act.
+
+*Enforced by:* a contract test that walks every registered route and asserts `401` without
+a cookie, plus a second test pinning the allowlist's exact contents.
 
 ## Running things
 
