@@ -112,6 +112,10 @@ $EDITOR ~/portfolio-app-deploy/prod/secrets.env
 recreating the container, not restarting it — `docker compose up --force-recreate app` —
 because `env_file` is read at container creation.
 
+Authentication adds two variables to this same file, one of which the application refuses
+to start without. See [Operations](operations.md), section 1 — a deployment that lands the
+authentication change before that variable is set will roll back.
+
 ### 6. Enable deployment
 
 Last, once everything above is in place:
