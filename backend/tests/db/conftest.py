@@ -16,9 +16,11 @@ when a loop is already running in the calling thread.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import pytest
+import structlog
 from anyio import to_thread
 from sqlalchemy import create_engine
 
@@ -31,6 +33,26 @@ if TYPE_CHECKING:
 
     from sqlalchemy import Engine
     from sqlalchemy.ext.asyncio import AsyncEngine
+
+
+@pytest.fixture
+def restored_logging() -> Iterator[None]:
+    """Undo anything a test does to the global logging configuration.
+
+    Two tests here reconfigure it deliberately -- one reads `alembic.ini`, whose
+    `fileConfig` section installs its own handlers, and one renders a real log record to
+    assert a value is absent from it. Leaving either installed would silently change
+    logging for every test that runs afterwards, the redaction suite included.
+    """
+    root = logging.getLogger()
+    handlers = root.handlers[:]
+    level = root.level
+    try:
+        yield
+    finally:
+        structlog.reset_defaults()
+        root.handlers[:] = handlers
+        root.setLevel(level)
 
 
 @pytest.fixture

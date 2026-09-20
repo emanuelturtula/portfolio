@@ -17,15 +17,21 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-from sqlalchemy import create_engine, event
+import structlog
+from sqlalchemy import create_engine, event, text
+from structlog.testing import capture_logs
 
+from portfolio.config import Settings
 from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import apply_sqlite_pragmas
 from portfolio.db.migration_guards import (
     MigrationIntegrityError,
     assert_no_dangling_foreign_keys,
     disable_foreign_key_enforcement,
+    foreign_key_violations,
+    snapshot_foreign_key_violations,
 )
+from portfolio.logging import configure_logging
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -33,10 +39,27 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
     from sqlalchemy.engine import Connection
 
+# Invented, unique, and asserted absent from every rendered log line. This goes into
+# `sessions.token_hash`, a real column on the table these tests damage, so a guard that
+# logged the offending row would put this exact string into the log stream.
+SENTINEL_COLUMN_VALUE = "sentinel-value-that-must-never-be-logged"
+SENTINEL_USER_ID = 424242
+INTRODUCED_USER_ID = 515151
+
 ORPHAN_SESSION = (
     "INSERT INTO sessions (user_id, token_hash, created_at, last_seen_at, expires_at) "
     "VALUES (4242, 'orphan-token', '2026-01-01', '2026-01-01', '2026-01-01')"
 )
+
+# Bound parameters rather than a formatted string: the values under test include one the
+# whole point is to track, and building SQL around it invites quoting bugs in the test
+# itself rather than in the code.
+INSERT_ORPHAN = text(
+    "INSERT INTO sessions (user_id, token_hash, created_at, last_seen_at, expires_at) "
+    "VALUES (:user_id, :token_hash, '2026-01-01', '2026-01-01', '2026-01-01')"
+)
+DELETE_BY_USER = text("DELETE FROM sessions WHERE user_id = :user_id")
+
 A_USER = (
     "INSERT INTO users (id, username, password_hash, created_at) "
     "VALUES (1, 'owner', 'x', '2026-01-01')"
@@ -45,6 +68,11 @@ A_SESSION = (
     "INSERT INTO sessions (user_id, token_hash, created_at, last_seen_at, expires_at) "
     "VALUES (1, 'valid-token', '2026-01-01', '2026-01-01', '2026-01-01')"
 )
+
+
+def insert_orphan(connection: Connection, user_id: int, token_hash: str) -> None:
+    """Add a `sessions` row whose `user_id` points at a `users` row that does not exist."""
+    connection.execute(INSERT_ORPHAN, {"user_id": user_id, "token_hash": token_hash})
 
 
 class RecordingConnection:
@@ -208,6 +236,206 @@ def test_assert_no_dangling_foreign_keys_names_every_offending_table() -> None:
 
     assert "2 dangling foreign key reference" in str(raised.value)
     assert "sessions" in str(raised.value)
+
+
+def test_a_pre_existing_orphan_does_not_block_a_migration_run(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """A damaged file must not wedge the deploy, because the rollback cannot fix it.
+
+    Every startup runs this check and the overwhelmingly common startup applies no
+    migrations at all. Without a baseline, a database that arrived broken -- a restored
+    backup, a torn WAL copy, `sqlite3` surgery on the Pi -- makes the container refuse to
+    start, `deploy.py` roll back, and the previous image refuse identically, on the only
+    copy of the trade history.
+    """
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        insert_orphan(connection, SENTINEL_USER_ID, SENTINEL_COLUMN_VALUE)
+
+    with sync_engine.connect() as connection:
+        pre_existing = snapshot_foreign_key_violations(connection)
+        assert_no_dangling_foreign_keys(connection, pre_existing)
+
+    assert sum(pre_existing.values()) == 1
+
+
+def test_the_same_orphan_without_a_baseline_is_still_refused(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Omitting the baseline means "assume the database started clean"."""
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        insert_orphan(connection, SENTINEL_USER_ID, SENTINEL_COLUMN_VALUE)
+
+    with sync_engine.connect() as connection, pytest.raises(MigrationIntegrityError):
+        assert_no_dangling_foreign_keys(connection)
+
+
+def test_a_pre_existing_orphan_is_reported_rather_than_passed_over(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Tolerated is not the same as unnoticed: the operator has to be told."""
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        insert_orphan(connection, SENTINEL_USER_ID, SENTINEL_COLUMN_VALUE)
+
+    with capture_logs() as captured, sync_engine.connect() as connection:
+        snapshot_foreign_key_violations(connection)
+
+    warnings = [event for event in captured if event["log_level"] == "warning"]
+    assert len(warnings) == 1
+    assert warnings[0]["event"] == "pre_existing_foreign_key_violations"
+    assert warnings[0]["table"] == "sessions"
+    assert warnings[0]["count"] == 1
+    # The exact key set, not merely the presence of these two: an extra field is how a
+    # column value would arrive in a log record.
+    assert set(warnings[0]) == {"event", "log_level", "table", "count", "detail"}
+
+
+def test_the_pre_existing_warning_carries_no_column_value(
+    database_url: str,
+    sync_engine: Engine,
+    restored_logging: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Rule 3: `sessions.token_hash` must not reach a log record.
+
+    The guard reads the offending row's foreign key values to build the identity it
+    compares on, so the values exist in memory a few frames from the log call. This
+    renders through the real production pipeline and asserts they did not travel.
+
+    Redaction would not save us here. It matches on the *key* name, and a value logged
+    under a field called `values` or `identity` is not a name it recognises --
+    `test_a_value_logged_under_an_innocuous_key_would_reach_stdout` proves that.
+    """
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        insert_orphan(connection, SENTINEL_USER_ID, SENTINEL_COLUMN_VALUE)
+    configure_logging(Settings(environment="prod"))
+
+    with sync_engine.connect() as connection:
+        snapshot_foreign_key_violations(connection)
+
+    written = capsys.readouterr().out
+
+    assert "pre_existing_foreign_key_violations" in written
+    assert "sessions" in written
+    assert SENTINEL_COLUMN_VALUE not in written
+    assert str(SENTINEL_USER_ID) not in written
+
+
+def test_a_value_logged_under_an_innocuous_key_would_reach_stdout(
+    restored_logging: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The discriminating half of the test above: prove the assertion can fail.
+
+    `detail` is not a name the redaction processor treats as sensitive, which is exactly
+    the point -- nothing downstream would catch a column value logged under a key like
+    this, so the guard itself has to not pass one.
+    """
+    configure_logging(Settings(environment="prod"))
+
+    structlog.get_logger("test").warning("deliberate_leak", detail=SENTINEL_COLUMN_VALUE)
+
+    assert SENTINEL_COLUMN_VALUE in capsys.readouterr().out
+
+
+def test_a_run_introduced_orphan_is_refused_even_with_a_baseline(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Tolerating what arrived broken must not tolerate what the run broke."""
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        insert_orphan(connection, SENTINEL_USER_ID, SENTINEL_COLUMN_VALUE)
+
+    with sync_engine.connect() as connection:
+        pre_existing = snapshot_foreign_key_violations(connection)
+        insert_orphan(connection, INTRODUCED_USER_ID, "introduced-value")
+
+        with pytest.raises(MigrationIntegrityError) as raised:
+            assert_no_dangling_foreign_keys(connection, pre_existing)
+
+        connection.rollback()
+
+    message = str(raised.value)
+    assert "introduced 1 dangling foreign key reference" in message
+    assert "arrived with 1 dangling" in message
+    assert "sessions" in message
+
+
+def test_repairing_one_orphan_and_introducing_another_is_refused(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """The swap: identical totals before and after, and a count comparison would commit it.
+
+    This is why the baseline is a `Counter` of whole identities rather than a number.
+    """
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        insert_orphan(connection, SENTINEL_USER_ID, SENTINEL_COLUMN_VALUE)
+
+    with sync_engine.connect() as connection:
+        pre_existing = snapshot_foreign_key_violations(connection)
+        connection.execute(DELETE_BY_USER, {"user_id": SENTINEL_USER_ID})
+        insert_orphan(connection, INTRODUCED_USER_ID, "introduced-value")
+        after = foreign_key_violations(connection)
+
+        assert sum(after.values()) == sum(pre_existing.values())
+
+        with pytest.raises(MigrationIntegrityError, match="introduced 1 dangling"):
+            assert_no_dangling_foreign_keys(connection, pre_existing)
+
+        connection.rollback()
+
+
+def test_a_violation_is_identified_by_its_values_not_by_its_rowid(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """The reason rowid is excluded, proved directly rather than inferred.
+
+    Batch mode rebuilds a table with `INSERT ... SELECT`, which renumbers rowids unless
+    the primary key aliases them. Renumbering here stands in for that rebuild: if rowid
+    were part of the identity, the same orphan would subtract to nothing and every
+    pre-existing orphan in a rebuilt table would look brand new.
+    """
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        insert_orphan(connection, SENTINEL_USER_ID, SENTINEL_COLUMN_VALUE)
+    with sync_engine.connect() as connection:
+        before = foreign_key_violations(connection)
+
+    with sync_engine.begin() as connection:
+        connection.exec_driver_sql("UPDATE sessions SET id = id + 1000")
+    with sync_engine.connect() as connection:
+        after = foreign_key_violations(connection)
+
+    assert before == after
+    assert not (after - before)
+    assert list(before) == [("sessions", "users", 0, (SENTINEL_USER_ID,))]
+
+
+def test_two_identical_orphans_are_counted_not_collapsed(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """A set would make repairing one of two identical orphans look like a clean run."""
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        insert_orphan(connection, SENTINEL_USER_ID, "first-value")
+        insert_orphan(connection, SENTINEL_USER_ID, "second-value")
+
+    with sync_engine.connect() as connection:
+        violations = foreign_key_violations(connection)
+
+    assert violations[("sessions", "users", 0, (SENTINEL_USER_ID,))] == 2
 
 
 @pytest.mark.parametrize("dialect_name", ["postgresql", "mysql"])
