@@ -26,7 +26,15 @@ division of two integer literals, `1 / 3`, which produces a float with no litera
 **Not caught: a float produced at runtime from names.** `a / b` cannot be decided
 statically -- it is a float for two ints and a `Decimal` for two `Decimal`s -- and banning
 every `/` in these layers would be unusable. `math.pi`, a float returned by a dependency,
-and `json.loads` handing back a number are all invisible here too.
+and `json.loads` handing back a number are all invisible here too. `10 ** 2 / 3` is also
+missed, because the left operand is a `BinOp` rather than a literal.
+
+**Not caught: reaching the builtin without naming it.** `getattr(builtins, "float")`,
+`__builtins__["float"]` and `int.__truediv__(1, 3)` all evade the walk, as does a
+re-export through another module. Unlike the cases above these are deliberate
+circumvention rather than accident, and chasing them in code would be an arms race against
+someone who has already decided to break the rule. They are listed so that nobody reads
+the "caught" list and concludes the set is closed.
 
 That residual is deliberate, and it is why this test is defence in depth rather than the
 whole defence. The backstop for a float that only exists at runtime is the boundary
@@ -55,6 +63,18 @@ ARCHITECTURE: Final = REPO_ROOT / "docs" / "architecture.md"
 PURE_PACKAGES: Final = ("domain", "services", "providers")
 """The three layers rule 2 names. `db/` and `api/` legitimately mention `float` to reject
 one at the boundary, which is the opposite of the thing being banned."""
+
+DOUBLE_BACKED_SQL_TYPES: Final = ("Numeric", "DECIMAL", "Float", "REAL")
+"""Every SQLAlchemy type that reaches SQLite as a C double.
+
+Rule 2 names `sqlalchemy.Numeric`, and banning only that name left three holes: `DECIMAL`,
+`Float` and `REAL` are all `Numeric` subclasses with identical behaviour, and `DECIMAL` is
+the one a developer reaching for a decimal column actually types, because it is the SQL
+spelling. Measured with the same input `docs/architecture.md` uses, `DECIMAL(38, 20)` takes
+`12345678901234567890.12345678901234567890` and returns
+`12345678901234567168.00000000000000000000` with `typeof` = `real` -- byte for byte the
+corruption the document exists to prevent.
+"""
 
 # SUM, AVG and TOTAL apply SQLite's numeric affinity, which is the `double` that
 # `NumericText` exists to keep money away from -- applied to every row at once. COUNT is
@@ -166,14 +186,18 @@ def find_float_usage(path: Path, source: str) -> list[Violation]:
 
 
 def find_numeric_usage(path: Path, source: str) -> list[Violation]:
-    """Every mention of `Numeric`, the SQLAlchemy type that round-trips through a double.
+    """Every mention of a SQLAlchemy type that round-trips money through a C double.
+
+    All four names in `DOUBLE_BACKED_SQL_TYPES`, not just the one rule 2 spells out:
+    `DECIMAL`, `Float` and `REAL` are `Numeric` subclasses and corrupt a value identically,
+    and `DECIMAL` is the spelling someone reaches for first.
 
     Aliases resolve the same way they do for `float`: this used to read
     `node.asname or node.name`, which meant `from sqlalchemy import Numeric as N` bound
     the name `N`, matched nothing, and let `N(38, 20)` through.
     """
     tree = ast.parse(source, filename=str(path))
-    bindings = _binding_names(tree, "Numeric")
+    bindings = {banned: _binding_names(tree, banned) for banned in DOUBLE_BACKED_SQL_TYPES}
     violations: list[Violation] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
@@ -184,8 +208,9 @@ def find_numeric_usage(path: Path, source: str) -> list[Violation]:
             name = node.name.split(".")[-1]
         else:
             continue
-        if name in bindings:
-            violations.append(Violation(path, node.lineno, "sqlalchemy.Numeric is forbidden"))
+        for banned, names in bindings.items():
+            if name in names:
+                violations.append(Violation(path, node.lineno, f"sqlalchemy.{banned} is forbidden"))
     return violations
 
 
@@ -491,6 +516,49 @@ def test_the_numeric_ban_catches_an_aliased_import(tmp_path: Path) -> None:
     module = tmp_path / "aliased_numeric.py"
     module.write_text(
         "from sqlalchemy import Numeric as N\n\nPRICE = N(38, 20)\n",
+        encoding="utf-8",
+    )
+
+    lines = {violation.line for violation in find_numeric_usage(module, module.read_text("utf-8"))}
+
+    assert lines == {1, 3}
+
+
+def test_the_ban_covers_exactly_the_double_backed_types() -> None:
+    """Pinned as a literal, so removing a name from the walk fails rather than shrinking it.
+
+    The same defect `PURE_PACKAGES` had: a guard that derives its expectation from the
+    thing it is guarding cannot fail.
+    """
+    assert DOUBLE_BACKED_SQL_TYPES == ("Numeric", "DECIMAL", "Float", "REAL")
+    assert len(set(DOUBLE_BACKED_SQL_TYPES)) == len(DOUBLE_BACKED_SQL_TYPES)
+
+
+@pytest.mark.parametrize("banned", DOUBLE_BACKED_SQL_TYPES)
+def test_every_double_backed_type_is_banned(banned: str, tmp_path: Path) -> None:
+    """`DECIMAL`, `Float` and `REAL` walked straight past a ban that named only `Numeric`.
+
+    All three are `Numeric` subclasses, so `DECIMAL(38, 20)` stores with `typeof` = `real`
+    and returns `12345678901234567168.00000000000000000000` for an input ending `...890`.
+    """
+    module = tmp_path / f"{banned.lower()}_column.py"
+    module.write_text(
+        f"from sqlalchemy import {banned}\n\nPRICE = {banned}(38, 20)\n",
+        encoding="utf-8",
+    )
+
+    violations = find_numeric_usage(module, module.read_text(encoding="utf-8"))
+
+    assert {violation.line for violation in violations} == {1, 3}
+    assert all(banned in violation.reason for violation in violations)
+
+
+@pytest.mark.parametrize("banned", DOUBLE_BACKED_SQL_TYPES)
+def test_every_double_backed_type_is_caught_through_an_alias(banned: str, tmp_path: Path) -> None:
+    """Renaming on import must not buy any of the four a way through."""
+    module = tmp_path / f"aliased_{banned.lower()}.py"
+    module.write_text(
+        f"from sqlalchemy import {banned} as Money\n\nPRICE = Money(38, 20)\n",
         encoding="utf-8",
     )
 

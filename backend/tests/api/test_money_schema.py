@@ -265,6 +265,34 @@ async def test_the_exponent_bound_is_walked_from_both_sides(
     assert MAX_WIRE_EXPONENT == MONEY_PRECISION
 
 
+@pytest.mark.parametrize(
+    ("sent", "id_"),
+    [
+        pytest.param("9" * 100, "wide-integer-part", id="adjusted-clause"),
+        pytest.param("0." + "9" * 100, "wide-fraction", id="exponent-clause"),
+    ],
+)
+async def test_each_half_of_the_magnitude_guard_is_load_bearing(
+    money_client: AsyncClient, sent: str, id_: str
+) -> None:
+    """Two clauses, and until these inputs existed either could be deleted silently.
+
+    The guard is `abs(exponent) > MAX or abs(adjusted()) > MAX`, and every other input in
+    this file trips both clauses at once, so deleting either one left the whole suite
+    green. These two separate them:
+
+        "9" * 100        exponent=0     adjusted=99    exponent-clause False
+        "0." + "9" * 100 exponent=-100  adjusted=-1    adjusted-clause False
+
+    A hundred nines is not a DoS on its own -- with one clause the render stays linear in
+    the request size -- so what these protect is the bound quietly widening, not the
+    out-of-memory case.
+    """
+    response = await post_raw_json(money_client, f'{{"amount": "{sent}"}}'.encode())
+
+    assert response.status_code == 422, id_
+
+
 @pytest.mark.parametrize("scale", [0, 2, 8, 18, 38])
 async def test_anything_a_money_column_accepts_also_serializes(
     money_client: AsyncClient, scale: int

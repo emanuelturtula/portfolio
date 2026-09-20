@@ -325,12 +325,20 @@ Three, in the mechanism that makes rule 2 mechanical rather than documentary:
 - `1 / 3` was not caught, and that is the accident rather than the evasion: true division of
   integer literals produces a float with no literal and no `float` name in the file.
 
-All three are closed, each with a companion proving the new rule can fail, and the walk was
-verified by planting each evasion in the real `services/` package rather than in `tmp_path`.
-The residual limit — `a / b` on names is undecidable statically — is now written into the
-module docstring, along with the point that the AST ban is defence in depth and the real
-backstop is `require_amount` / `NumericText` / `BaseUnits` / `MoneyStr` refusing a float at
-the boundary.
+All three are closed, each with a companion proving the new rule can fail, and
+`test_every_named_package_contributes_at_least_one_scanned_module` proves the walk reaches
+all three packages rather than counting to three from one directory. The residual limits —
+`a / b` on names is undecidable statically, and the `getattr(builtins, "float")` family is
+deliberate circumvention not worth an arms race — are written into the module docstring,
+along with the point that the AST ban is defence in depth and the real backstop is
+`require_amount` / `NumericText` / `BaseUnits` / `MoneyStr` refusing a float at the boundary.
+
+A fourth hole turned up in review: the ban named `Numeric` and let its three subclasses
+through. `DECIMAL(38, 20)` reproduces the corruption byte for byte —
+`12345678901234567890.12345678901234567890` in,
+`12345678901234567168.00000000000000000000` out, `typeof` = `real` — and `DECIMAL` is the
+spelling someone reaches for first, because it is the SQL one. `Float` and `REAL` likewise.
+The ban now covers all four, pinned as a literal tuple so narrowing it fails.
 
 ### Smaller corrections
 
@@ -351,8 +359,24 @@ the boundary.
   `12345678901234567168.00000000000000000000`, stored with `typeof()` = `real`, no exception
   and no warning. That is the whole argument for rule 2 in one line.
 
+### Two guards that were true only by inspection
+
+Both found by mutating the implementation rather than reading it, which is now the third
+time on this milestone that the technique caught something a careful read did not.
+
+- **`_MONEY_CONTEXT`'s rounding mode was dead code.** `Decimal.quantize`'s explicit
+  `rounding=` argument takes precedence over the context's, so the mode was spelled twice
+  one line apart with the second copy never evaluated — and a later refactor dropping the
+  argument "because the context already says so" would have been trusting a value no test
+  had ever read. The argument is gone; the context is the single source. Flipping
+  `MONEY_ROUNDING` now fails thirteen tests instead of none.
+- **Half the wire magnitude guard was unproven.** It reads
+  `abs(exponent) > MAX or abs(adjusted()) > MAX`, and every input in the suite tripped both
+  clauses at once, so deleting either left everything green. `"9" * 100` and
+  `"0." + "9" * 100` separate them, and each now kills exactly one test.
+
 ### Test plan, as built
 
-The table above names 21 tests. The suite ships **401**, of which 245 are new. The
+The table above names 21 tests. The suite ships **413**, of which 257 are new. The
 difference is almost entirely failure paths: every guard above has a test, and every test
 that asserts a ban has a companion proving the ban can fail.

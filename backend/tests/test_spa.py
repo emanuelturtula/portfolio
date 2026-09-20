@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 INDEX_BODY = "<!doctype html><title>portfolio</title><div id='root'></div>"
 ASSET_BODY = "export const version = 1;"
+FAVICON_BODY = "<svg xmlns='http://www.w3.org/2000/svg'/>"
 
 
 @pytest.fixture
@@ -30,6 +31,7 @@ def dist_dir(tmp_path: Path) -> Path:
     assets.mkdir()
     (tmp_path / "index.html").write_text(INDEX_BODY, encoding="utf-8")
     (assets / "app-abc123.js").write_text(ASSET_BODY, encoding="utf-8")
+    (tmp_path / "favicon.svg").write_text(FAVICON_BODY, encoding="utf-8")
     return tmp_path
 
 
@@ -76,3 +78,24 @@ def test_missing_bundle_is_skipped_instead_of_crashing(tmp_path: Path) -> None:
 def test_default_dist_dir_sits_inside_the_package() -> None:
     assert default_dist_dir().name == "dist"
     assert default_dist_dir().parent.name == "web"
+
+
+async def test_a_root_file_that_is_not_the_entry_point_gets_no_cache_header(
+    spa_client: AsyncClient,
+) -> None:
+    """The third arm of the cache-header branch: served, but neither hashed nor the entry.
+
+    A file sitting at the root of `dist/` is not under `assets/` so it gets no immutable
+    header, and it is not `index.html` so it gets no no-cache header either -- it falls
+    through with whatever Starlette set. `favicon.svg` is the real instance: Vite copies
+    `public/` to the root of the bundle unhashed.
+
+    Worth a test of its own because the coverage note in `pyproject.toml` claimed this
+    branch was unreachable. It is reached by one request.
+    """
+    response = await spa_client.get("/favicon.svg")
+
+    assert response.status_code == 200
+    assert response.text == FAVICON_BODY
+    assert response.headers.get("cache-control") != IMMUTABLE_CACHE_CONTROL
+    assert response.headers.get("cache-control") != NO_CACHE_CONTROL

@@ -120,7 +120,13 @@ def quantize(value: Decimal, scale: int) -> Decimal:
     happens to say, because the context is passed explicitly. A caller inside a
     `decimal.localcontext()` gets the same answer as one outside it.
     """
-    return value.quantize(_exponent(scale), rounding=MONEY_ROUNDING, context=_MONEY_CONTEXT)
+    # No `rounding=` argument here. An explicit one takes precedence over the context's,
+    # which left the mode spelled twice one line apart with the context's copy never
+    # evaluated -- so a later refactor dropping the argument "because the context already
+    # says so" would have been trusting a value no test had ever read. `_MONEY_CONTEXT` is
+    # now the single source for both precision and rounding, and changing `MONEY_ROUNDING`
+    # fails thirteen tests rather than none.
+    return value.quantize(_exponent(scale), context=_MONEY_CONTEXT)
 
 
 def to_base_units(amount: Decimal, decimals: int) -> int:

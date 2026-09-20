@@ -89,10 +89,14 @@ select = [
 # at class-creation time. Without it, the first response model with a `MoneyStr` field trips
 # TC001, and ruff's suggested fix -- move the import into `if TYPE_CHECKING:` -- breaks the
 # model at runtime. An autofix that is confidently wrong is worse than a missing rule.
+# `pydantic_settings.BaseSettings` is the same case and does not bite today only because
+# `config.py` has no `from __future__ import annotations`, which is house style everywhere
+# else. Adding that one line to it would be enough.
 runtime-evaluated-base-classes = [
     "sqlalchemy.orm.DeclarativeBase",
     "portfolio.db.base.Base",
     "pydantic.BaseModel",
+    "pydantic_settings.BaseSettings",
 ]
 
 [tool.ruff.lint.flake8-builtins]
@@ -129,13 +133,18 @@ branch = true
 # behaviour lands, never lower it to make a red build green.
 #
 # 70 -> 97 with the database foundation (#1). 97 -> 98 with money persistence (#2),
-# measured at 99.27%.
+# measured at 99.42%.
 #
-# 99.27 is the ceiling with the current dependency set, not headroom. The misses are the
-# same three they were in #1 and none of them is reachable: `web/spa.py:52`, and the two
-# `if dialect.name == "sqlite"` branches in the engine factories, which need a non-SQLite
-# async driver that is not a dependency and should not become one. A floor of 99 would
-# leave essentially nothing and turn every refactor into a threshold argument.
+# Exactly what is uncovered, because the note written here at the 98 ratchet said "the
+# same three misses, none of them reachable" and that was wrong on both counts. There are
+# three, and one of them was reachable by a single request -- `spa.py`'s third cache-header
+# arm, now covered by a test for a root file that is neither hashed nor the entry point.
+#
+# What is left: one statement, `web/spa.py:52` (the re-raise of a non-404), and two
+# branches, the `if dialect.name == "sqlite"` guards in the two engine factories. Those
+# genuinely need a non-SQLite async driver that is not a dependency and should not become
+# one. A floor of 99 would leave 0.4 points, which is inside the noise a single refactor
+# makes in branch coverage.
 fail_under = 98
 show_missing = true
 skip_covered = true
