@@ -10,11 +10,19 @@ include_external_packages = True
 [importlinter:contract:portfolio]
 name = portfolio
 type = layers
+# Items on one line are independent: siblings may not import each other. `portfolio.db`
+# and `portfolio.domain` were on one line, which made `db -> domain` a violation -- and
+# that is the import the money types need, so that `NumericText` rounds by the rule
+# `domain.money` defines instead of carrying a second copy of it. `db` therefore sits
+# above `domain`. `domain` still imports nothing from the application, which is the
+# property that actually matters; persistence depending on the domain vocabulary is the
+# right direction, and the reverse would not be.
 layers =
     portfolio.api
     portfolio.services
     portfolio.repositories | portfolio.providers
-    portfolio.db | portfolio.domain
+    portfolio.db
+    portfolio.domain
 
 [importlinter:contract:thin-routers]
 name = portfolio routers stay thin
