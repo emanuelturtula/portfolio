@@ -8,12 +8,8 @@ from typing import Final
 import pytest
 
 from portfolio.config import Settings
-from portfolio.services.password_hasher import (
-    HASH_LENGTH,
-    OWASP_MINIMUM_MEMORY_COST,
-    OWASP_MINIMUM_TIME_COST,
-    PasswordHasher,
-)
+from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_TIME_COST
+from portfolio.services.password_hasher import HASH_LENGTH, PasswordHasher
 from tests.auth.conftest import OWNER_PHRASE, WRONG_PHRASE
 
 # The PHC string format Argon2 encodes into: algorithm, version, parameters, salt, digest.

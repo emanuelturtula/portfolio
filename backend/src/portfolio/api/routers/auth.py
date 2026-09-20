@@ -171,6 +171,11 @@ async def change_password(
     """Change the password. Every session dies, the caller's included, so the cookie goes."""
     try:
         await service.change_password(principal, body.current_password, body.new_password)
+    except TooManyAttemptsError as exc:
+        # The same counter login uses, on the same username. A guessed current password is
+        # a permanent takeover of an application with no reset flow, so this is the path
+        # that most needs a limit, not the one that least needs one.
+        raise TooManyRequestsError(str(exc)) from exc
     except PasswordPolicyError as exc:
         raise UnprocessableEntityError(str(exc)) from exc
     except InvalidCredentialsError as exc:

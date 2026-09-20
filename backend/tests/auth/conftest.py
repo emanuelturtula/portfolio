@@ -58,8 +58,10 @@ LOGIN_PATH: Final = "/api/auth/login"
 LOGOUT_PATH: Final = "/api/auth/logout"
 SESSION_PATH: Final = "/api/auth/session"
 
-# and a constant called `..._PATH` holding "/api/auth/password" is exactly the false
-# positive it cannot distinguish -- which is a good trade for the times it is right.
+# The `noqa` below is for a URL, not a credential. Ruff's S105 decides by name -- anything
+# containing "pass", "pwd", "secret" or "token" assigned a string literal -- and a constant
+# called `..._PATH` holding "/api/auth/password" is exactly the false positive it cannot
+# distinguish, which is a good trade for the times it is right.
 PASSWORD_PATH: Final = "/api/auth/password"  # noqa: S105
 
 

@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from portfolio.config import Settings
+    from portfolio.services.password_hasher import PasswordHasher
 
 _logger = structlog.get_logger(__name__)
 
@@ -56,9 +57,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db_sessionmaker = create_session_factory(engine)
     try:
         await bootstrap_owner(app, settings)
+        await warm_password_hasher(app)
         yield
     finally:
         await engine.dispose()
+
+
+async def warm_password_hasher(app: FastAPI) -> None:
+    """Compute the dummy hash now, so that no request is the first to pay for it.
+
+    `PasswordHasher.dummy_hash` is what a login against an unknown username verifies
+    against, and it is a cached property: whoever touches it first pays to build it. Left
+    to the request path, that first toucher is the first login for a username that does
+    not exist -- which then costs two Argon2id operations against one for a wrong
+    password, roughly 500 ms against 250 ms on the Pi. That is a clean "no such user"
+    signal, once per process, in the one place the design says there must not be one.
+
+    Here rather than in `create_app`, deliberately: the image's build-time smoke check
+    calls `create_app()`, so warming there would run a 64 MiB hash during `docker build`
+    and would break the invariant that building the application has no side effects. A
+    lifespan has already run the migrations by this point and is the right place to spend
+    a quarter of a second.
+
+    In a worker thread for the same reason the migration is: it is a CPU-bound call, and
+    the event loop is the one thing in this process that must not be blocked.
+    """
+    hasher: PasswordHasher = app.state.password_hasher
+    await to_thread.run_sync(lambda: hasher.dummy_hash)
 
 
 async def bootstrap_owner(app: FastAPI, settings: Settings) -> None:

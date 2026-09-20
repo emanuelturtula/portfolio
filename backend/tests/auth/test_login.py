@@ -193,6 +193,65 @@ async def test_both_login_failures_perform_exactly_one_password_verification(
     assert seen["wrong"] != [dummy], "the present branch must verify against the stored hash"
 
 
+async def test_the_first_unknown_user_login_performs_exactly_one_argon2_operation(
+    auth_app: FastAPI,
+    auth_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Criterion 8, on the request the previous test warms away: the very first one.
+
+    `dummy_hash` is a cached property, so whoever touches it first pays to build it. The
+    test above warms it by hand, which is right for what it measures and wrong as a claim
+    about production: left to the request path, the first toucher is the first login for a
+    username that does not exist, and it then costs a `hash` *and* a `verify` -- two
+    Argon2id operations against one for a wrong password, roughly 500 ms against 250 ms at
+    the shipped parameters. Once per process, a clean "no such user" signal.
+
+    So the lifespan warms it, and this test is the one that would fail if that were ever
+    removed: nothing here touches `dummy_hash`, and the count still has to be one.
+
+    Both `hash` and `verify` are counted. Counting only verifications is exactly how the
+    hole survived the first round of tests.
+    """
+    hasher: PasswordHasher = auth_app.state.password_hasher
+    operations: list[str] = []
+    real_hash, real_verify = hasher.hash, hasher.verify
+
+    def counting_hash(password: str) -> str:
+        operations.append("hash")
+        return real_hash(password)
+
+    def counting_verify(encoded_hash: str, password: str) -> bool:
+        operations.append("verify")
+        return real_verify(encoded_hash, password)
+
+    monkeypatch.setattr(hasher, "hash", counting_hash)
+    monkeypatch.setattr(hasher, "verify", counting_verify)
+
+    response = await auth_client.post(
+        LOGIN_PATH,
+        json={"username": "nobody", "password": OWNER_PHRASE},
+        headers=JSON_HEADERS,
+    )
+
+    assert response.status_code == 401
+    assert operations == ["verify"], (
+        "the first login for an absent username must cost one Argon2id operation, not two"
+    )
+
+
+async def test_the_lifespan_warms_the_dummy_hash(auth_app: FastAPI) -> None:
+    """The mechanism behind the test above, asserted directly so a failure says why.
+
+    A cached property stores itself in the instance dictionary, so its presence there is
+    the question "has anything computed this yet" -- and after startup the answer must be
+    yes, with no request having been made.
+    """
+    hasher: PasswordHasher = auth_app.state.password_hasher
+
+    assert "dummy_hash" in hasher.__dict__
+
+
 async def test_unknown_user_and_wrong_password_take_similar_time(
     auth_app: FastAPI,
     auth_client: AsyncClient,

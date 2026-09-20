@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from portfolio import cli
-from portfolio.services.password_hasher import OWASP_MINIMUM_MEMORY_COST
+from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST
 
 if TYPE_CHECKING:
     from pathlib import Path

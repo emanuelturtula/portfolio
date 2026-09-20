@@ -10,6 +10,14 @@ include_external_packages = True
 [importlinter:contract:portfolio]
 name = portfolio
 type = layers
+# `portfolio.config` is a layer rather than a module nothing constrains. It reads the
+# environment, and it sits directly above `portfolio.domain` so that the one direction that
+# matters is impossible: a `domain` module doing `from portfolio.config import get_settings`
+# would put an environment read inside the layer whose entire property is that it has none.
+# Every existing edge is downward and stays legal -- `api`, `cli` and `db.migrations.env`
+# read settings, and `config` reads the password policy from `domain` so that the bootstrap
+# password is measured against the same rule as every other password.
+#
 # `portfolio.cli` sits beside `portfolio.api` rather than above it: they are two entry
 # points onto the same services, and neither may import the other. A CLI that reached into
 # the API layer would drag FastAPI into an operator command, and an API that reached into
@@ -27,6 +35,7 @@ layers =
     portfolio.services
     portfolio.repositories | portfolio.providers
     portfolio.db
+    portfolio.config
     portfolio.domain
 
 [importlinter:contract:thin-routers]

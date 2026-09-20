@@ -5,7 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final
 
-from portfolio.services.auth import LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW, LoginThrottle
+from portfolio.services.auth import (
+    LOGIN_FAILURE_LIMIT,
+    LOGIN_FAILURE_WINDOW,
+    TOTAL_FAILURE_LIMIT,
+    LoginThrottle,
+)
 from tests.auth.conftest import (
     JSON_HEADERS,
     LOGIN_PATH,
@@ -34,6 +39,11 @@ WRONG_CREDENTIALS = {"username": OWNER_USERNAME, "password": WRONG_PHRASE}
 # the numbers, so the numbers are pinned here.
 SPEC_FAILURE_LIMIT: Final = 5
 SPEC_FAILURE_WINDOW: Final = timedelta(minutes=15)
+
+# Not from the criterion: the total counter is an addition, and this is the number the
+# design settled on. Pinned for the same reason -- a limit read from the module it is
+# checking can only prove the module agrees with itself.
+SPEC_TOTAL_FAILURE_LIMIT: Final = 50
 
 
 async def fail_login(client: AsyncClient, times: int) -> list[int]:
@@ -178,3 +188,115 @@ def test_clearing_a_username_that_never_failed_is_harmless() -> None:
     throttle.clear("nobody")
 
     assert not throttle.is_throttled("nobody", datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+
+
+# --------------------------------------------------------------------------------------
+# The total counter: what stops an attacker simply varying the username.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_total_limit_is_the_one_the_design_names() -> None:
+    """Pinned against a literal, for the reason the two constants above are."""
+    assert TOTAL_FAILURE_LIMIT == SPEC_TOTAL_FAILURE_LIMIT
+    # An owner fumbling one password must never be able to reach the total on their own.
+    assert TOTAL_FAILURE_LIMIT > SPEC_FAILURE_LIMIT
+
+
+def test_varying_the_username_trips_the_total_counter() -> None:
+    """The hole the per-username counter has, and the counter that closes it.
+
+    Keying on the submitted username means an attacker who never repeats one is never
+    throttled: measured on the running application before this existed, twenty logins with
+    twenty distinct usernames left every key at a single failure and every one of them paid
+    for a full Argon2id verification. Fifty is where that stops.
+    """
+    throttle = LoginThrottle()
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    for index in range(SPEC_TOTAL_FAILURE_LIMIT):
+        username = f"nobody-{index}"
+        assert not throttle.is_throttled(username, now), index
+        throttle.record_failure(username, now)
+
+    # Every key holds one failure, far below the per-username limit, and yet:
+    assert throttle.is_throttled("nobody-fresh", now)
+    assert throttle.is_throttled(OWNER_USERNAME, now)
+
+
+def test_the_total_counter_slides_with_the_same_window() -> None:
+    """It expires like the per-username one; a lockout is fifteen minutes, not forever."""
+    throttle = LoginThrottle()
+    started = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    for index in range(SPEC_TOTAL_FAILURE_LIMIT):
+        throttle.record_failure(f"nobody-{index}", started)
+
+    assert throttle.is_throttled(OWNER_USERNAME, started + timedelta(minutes=14, seconds=59))
+    assert not throttle.is_throttled(OWNER_USERNAME, started + timedelta(minutes=15, seconds=1))
+
+
+def test_a_successful_login_does_not_reset_the_total() -> None:
+    """Proving you own one account says nothing about the failures naming other usernames.
+
+    If `clear` reset the total, an attacker who knew any working credential -- or who could
+    make the owner sign in -- would hold the reset button for the limit that exists
+    precisely because the per-username one can be side-stepped.
+    """
+    throttle = LoginThrottle()
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    for index in range(SPEC_TOTAL_FAILURE_LIMIT):
+        throttle.record_failure(f"nobody-{index}", now)
+
+    throttle.clear(OWNER_USERNAME)
+
+    assert throttle.is_throttled(OWNER_USERNAME, now)
+
+
+def test_the_counters_stop_growing_once_the_total_is_reached() -> None:
+    """The memory bound, which is the other half of why the total exists.
+
+    Nothing caps the size of the per-username dictionary, deliberately -- an attacker who
+    could overflow a cap could use the overflow to evict the one entry that matters. The
+    total bounds it instead: a refused attempt is never recorded, so neither structure
+    grows past the limit however many usernames are tried afterwards.
+    """
+    throttle = LoginThrottle()
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    for index in range(SPEC_TOTAL_FAILURE_LIMIT):
+        throttle.record_failure(f"nobody-{index}", now)
+
+    tracked = throttle.tracked_usernames()
+
+    # Every one of these is refused before verification, so the service never records it,
+    # and neither structure grows. Asserted rather than assumed: a limiter that kept
+    # counting refused attempts would keep allocating for as long as the flood lasted.
+    for index in range(SPEC_TOTAL_FAILURE_LIMIT * 4):
+        assert throttle.is_throttled(f"flood-{index}", now)
+
+    assert throttle.tracked_usernames() == tracked
+    assert tracked == SPEC_TOTAL_FAILURE_LIMIT
+
+
+async def test_the_total_counter_refuses_a_login_over_http(
+    auth_app: FastAPI,
+    auth_client: AsyncClient,
+) -> None:
+    """End to end: fifty failures across fifty usernames, and the next login is a 429.
+
+    Driven through the real application rather than the class, because the property that
+    matters is that the request path consults it -- a counter nothing calls is not a limit.
+    """
+    throttle: LoginThrottle = auth_app.state.login_throttle
+    now = datetime.now(UTC)
+    # The spec literal, not the constant: a neighbouring test pins the two together, so
+    # looping on the live value would only make a raised limit hang the suite instead of
+    # failing it.
+    for index in range(SPEC_TOTAL_FAILURE_LIMIT):
+        throttle.record_failure(f"nobody-{index}", now)
+
+    response = await auth_client.post(
+        LOGIN_PATH,
+        json={"username": OWNER_USERNAME, "password": OWNER_PHRASE},
+        headers=JSON_HEADERS,
+    )
+
+    assert response.status_code == 429

@@ -10,9 +10,11 @@ cost parameters are settings, not constants, because the only number that matter
 one measured on the machine this runs on -- a Raspberry Pi 5, not a CI runner and not a
 laptop. `python -m portfolio hash-benchmark` is how that measurement is taken.
 
-The OWASP floor (`memory_cost >= 19456` KiB, `time_cost >= 2`) is named here and asserted
-by a test against the shipped defaults, so that a future "logging in feels slow" change
-cannot quietly lower the parameters to the library's minimum.
+The OWASP floor (`memory_cost >= 19456` KiB, `time_cost >= 2`) lives in
+`domain.passwords` with the rest of the password policy. A production process refuses to
+start below it, and a test pins the shipped defaults against it, so that a future
+"logging in feels slow" change cannot quietly drop the parameters to the library's
+minimum.
 """
 
 from __future__ import annotations
@@ -24,10 +26,6 @@ from typing import Final
 from argon2 import PasswordHasher as Argon2PasswordHasher
 from argon2 import Type
 from argon2.exceptions import InvalidHashError, VerificationError
-
-# OWASP's minimum configuration for Argon2id, at the parallelism this application uses.
-OWASP_MINIMUM_MEMORY_COST: Final = 19456
-OWASP_MINIMUM_TIME_COST: Final = 2
 
 # Argon2id defaults that argon2-cffi does not expose as constants. Named so that a hash
 # written today can be read back by a version that changes its own defaults.

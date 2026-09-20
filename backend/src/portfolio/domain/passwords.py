@@ -22,6 +22,16 @@ from typing import Final
 MINIMUM_LENGTH: Final = 12
 """Characters, counted after nothing is stripped: a trailing space is part of the secret."""
 
+# OWASP's minimum configuration for Argon2id, at the parallelism this application uses.
+#
+# Here rather than beside the hasher because it is policy, not mechanism: the settings
+# validator refuses to start a production process below it, and a validator that had to
+# import the service layer to learn the number would be reaching upward through every
+# boundary this code base has. `services/password_hasher.py` reads them from here too, so
+# the floor is one number in one place.
+OWASP_MINIMUM_MEMORY_COST: Final = 19456
+OWASP_MINIMUM_TIME_COST: Final = 2
+
 DENY_LIST: Final[frozenset[str]] = frozenset(
     {
         "changeme",

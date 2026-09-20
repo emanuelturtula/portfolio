@@ -10,10 +10,12 @@ Three decisions worth keeping in view while reading it:
 * **Failure is uniform.** An unknown username and a wrong password raise the same
   exception and perform the same Argon2id verification, the second against a hash of a
   random password. Anything cheaper leaks which usernames exist, through the clock.
-* **The throttle is in process.** A dict, pruned to a fifteen minute window. For a
-  single-user application in a container that runs one worker this is exact, and the
-  alternative -- a table -- would add the only migration in this change plus a cleanup job.
-  The cost is that a restart clears the window; an attacker cannot cause a restart.
+* **The throttle is in process.** A dict and a list, both pruned to a fifteen minute
+  window, counting failures per username and in total. For a single-user application in a
+  container that runs one worker this is exact, and the alternative -- a table -- would add
+  the only migration in this change plus a cleanup job. The cost is that a restart clears
+  the window; an attacker cannot cause a restart. Both login and the password change are
+  counted, because the password change is the request worth brute forcing.
 * **The token is the only thing the client ever sees.** Its SHA-256 is what is stored, so
   the database cannot hand a reader a working cookie.
 """
@@ -43,12 +45,19 @@ if TYPE_CHECKING:
 # and two messages are how a client learns which usernames exist.
 INVALID_CREDENTIALS_DETAIL: Final = "The username or password is incorrect."
 SESSION_REQUIRED_DETAIL: Final = "Authentication is required."
+TOO_MANY_ATTEMPTS_DETAIL: Final = "Too many failed attempts. Try again later."
 
 # Five failures inside the window are tolerated, so the sixth attempt is refused. Keyed on
 # the submitted username rather than on the client address: there is one real username, and
 # an address key lets anyone on the same network rotate their way around the limit.
 LOGIN_FAILURE_LIMIT: Final = 5
 LOGIN_FAILURE_WINDOW: Final = timedelta(minutes=15)
+
+# The same window, counted across every username at once. Ten times the per-username limit
+# so that an owner fumbling one password can never reach it, and low enough that varying
+# the username -- which defeats the per-username count entirely -- buys fifty verifications
+# rather than an unbounded number.
+TOTAL_FAILURE_LIMIT: Final = 50
 
 
 def utc_now() -> datetime:
@@ -65,7 +74,7 @@ class InvalidCredentialsError(AuthError):
 
 
 class TooManyAttemptsError(AuthError):
-    """Too many recent failures for this username; the attempt was refused unverified."""
+    """Too many recent failures, for this username or in total. Refused unverified."""
 
 
 class SessionInvalidError(AuthError):
@@ -95,22 +104,37 @@ class IssuedSession:
 
 @dataclass
 class LoginThrottle:
-    """Recent failed logins per username, pruned to a sliding window.
+    """Recent failed credential checks, counted per username and in total.
 
     Deliberately mutable process state. One instance is built per application and shared
     by every request, which is the only way an in-process counter can mean anything.
 
-    It grows with the number of distinct usernames tried, and nothing caps that. The bound
-    that makes it acceptable is not in this class: every failed attempt pays for a full
-    Argon2id verification first, so filling this dictionary costs the attacker roughly a
-    quarter of a second per entry on the hardware this runs on, and the process is
-    restarted by every deployment. A cap would be the wrong fix anyway -- an attacker who
-    could overflow it could then use the overflow to evict the real username's counter.
+    **Two counters, because one of them is trivially avoidable.** The per-username count
+    is what stops a password being guessed. It is keyed on the submitted username, so an
+    attacker who varies the username never trips it -- measured on the running
+    application, twenty logins with twenty distinct usernames left every key at one
+    failure, and every one of them paid for a full Argon2id verification first. The total
+    count is what stops that: fifty failures in the window and every attempt is refused,
+    whatever username it names.
+
+    The total also bounds the memory. `_failures` grows with the number of distinct
+    usernames tried and nothing caps its size, because a cap is the wrong instrument --
+    an attacker who could overflow a cap could then use the overflow to evict the real
+    username's counter, which is the one entry that matters. The total limit is not
+    evictable: once it is reached nothing further is recorded, because an attempt refused
+    before verification is never counted, so both the list and the dictionary stop growing
+    at that point.
+
+    The cost is that fifty failures lock the owner out for fifteen minutes. That exposure
+    is not new -- anyone who knows the one real username could already do it in five
+    attempts -- and it is the trade the per-username counter already made.
     """
 
     limit: int = LOGIN_FAILURE_LIMIT
+    total_limit: int = TOTAL_FAILURE_LIMIT
     window: timedelta = LOGIN_FAILURE_WINDOW
     _failures: dict[str, list[datetime]] = field(default_factory=dict, repr=False)
+    _total: list[datetime] = field(default_factory=list, repr=False)
 
     @staticmethod
     def _key(username: str) -> str:
@@ -127,17 +151,43 @@ class LoginThrottle:
             self._failures.pop(key, None)
         return recent
 
+    def _recent_total(self, now: datetime) -> list[datetime]:
+        """Every failure still inside the window, whatever username it named."""
+        self._total = [at for at in self._total if now - at < self.window]
+        return self._total
+
     def is_throttled(self, username: str, now: datetime) -> bool:
-        """Whether the next attempt for this username must be refused without verifying."""
-        return len(self._recent(username, now)) >= self.limit
+        """Whether the next attempt must be refused without verifying a password.
+
+        Both counters are consulted, and both are pruned on the way past, so a window that
+        has emptied itself costs nothing to keep.
+        """
+        over_total = len(self._recent_total(now)) >= self.total_limit
+        over_username = len(self._recent(username, now)) >= self.limit
+        return over_total or over_username
 
     def record_failure(self, username: str, now: datetime) -> None:
-        """Count one failed attempt."""
+        """Count one failed attempt, against this username and against the total."""
         recent = self._recent(username, now)
         self._failures[self._key(username)] = [*recent, now]
+        self._total = [*self._recent_total(now), now]
+
+    def tracked_usernames(self) -> int:
+        """How many usernames currently hold a failure inside the window.
+
+        The memory this class holds, as a number, so that the bound the total limit
+        provides can be asserted without a test reaching into a private attribute -- a
+        coupling that would outlive the test that introduced it.
+        """
+        return len(self._failures)
 
     def clear(self, username: str) -> None:
-        """Forget every failure for a username. A successful login is proof of ownership."""
+        """Forget every failure for a username. A successful login is proof of ownership.
+
+        The total is deliberately left alone: proving you own *this* account says nothing
+        about the forty-nine failures that named other usernames, and letting one success
+        reset the total would hand an attacker the reset button along with it.
+        """
         self._failures.pop(self._key(username), None)
 
 
@@ -172,8 +222,7 @@ class AuthService:
         """Verify a password and issue a session, or raise without saying which half failed."""
         now = self._clock()
         if self._throttle.is_throttled(username, now):
-            message = "Too many failed sign-in attempts. Try again later."
-            raise TooManyAttemptsError(message)
+            raise TooManyAttemptsError(TOO_MANY_ATTEMPTS_DETAIL)
 
         user = await self._users.get_by_username(username)
         # The absent user is verified against a hash of a random password so that both
@@ -248,14 +297,31 @@ class AuthService:
         Revoking everything is the product's whole session-management story: there is no
         session list and no "sign out other devices", because changing the password is the
         one revocation a single-user application needs.
+
+        Throttled through the same counter as login, keyed on the same username. The
+        current-password check is the only thing between a borrowed browser -- or script
+        running with the cookie -- and a permanent takeover, and unlike a failed login a
+        success here is terminal: this product has no reset flow, so an attacker who
+        guesses it owns the instance. Leaving this path unlimited would have meant the one
+        endpoint worth brute forcing was the one nothing counted.
+
+        The order is deliberate. The throttle refuses before any work is done; the policy
+        check is arithmetic on the *new* password and is not an attempt at the old one, so
+        it does not count as a failure; only a wrong current password does.
         """
+        now = self._clock()
+        if self._throttle.is_throttled(principal.username, now):
+            raise TooManyAttemptsError(TOO_MANY_ATTEMPTS_DETAIL)
+
         ensure_meets_policy(new_password)
         user = await self._users.get_by_id(principal.user_id)
         stored = user.password_hash if user is not None else self._hasher.dummy_hash
         verified = self._hasher.verify(stored, current_password)
         if user is None or not verified:
+            self._throttle.record_failure(principal.username, now)
             raise InvalidCredentialsError(INVALID_CREDENTIALS_DETAIL)
 
+        self._throttle.clear(principal.username)
         await self._users.set_password_hash(user, self._hasher.hash(new_password))
         await self._sessions.delete_for_user(user.id)
         await self._session.commit()

@@ -34,13 +34,13 @@ from portfolio.db.engine import (
     ensure_database_directory,
 )
 from portfolio.domain.auth import SessionLifetime
-from portfolio.domain.passwords import PasswordPolicyError
-from portfolio.services.auth import AuthError, LoginThrottle, build_auth_service
-from portfolio.services.password_hasher import (
+from portfolio.domain.passwords import (
     OWASP_MINIMUM_MEMORY_COST,
     OWASP_MINIMUM_TIME_COST,
-    PasswordHasher,
+    PasswordPolicyError,
 )
+from portfolio.services.auth import AuthError, LoginThrottle, build_auth_service
+from portfolio.services.password_hasher import PasswordHasher
 
 if TYPE_CHECKING:
     from portfolio.config import Settings

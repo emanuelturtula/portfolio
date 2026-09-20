@@ -16,14 +16,18 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 from starlette.requests import Request
+from starlette.routing import Mount, WebSocketRoute
 
 from portfolio.api.dependencies import get_principal
 from portfolio.api.errors import UnauthorizedError
 from portfolio.api.middleware import PUBLIC_API_PATHS, is_api_path
+from portfolio.main import create_app
+from portfolio.web.spa import mount_spa
 from tests.auth.conftest import JSON_HEADERS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from pathlib import Path
 
     from fastapi import FastAPI
     from httpx import AsyncClient
@@ -182,3 +186,72 @@ def test_the_principal_dependency_refuses_a_request_the_middleware_never_saw() -
 
     with pytest.raises(UnauthorizedError):
         get_principal(request)
+
+
+# --------------------------------------------------------------------------------------
+# What the walk above cannot see, and what the middleware cannot cover.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_application_registers_no_websocket_route(auth_app: FastAPI) -> None:
+    """A websocket would be authenticated by nothing, and `walk_routes` cannot see it.
+
+    Two blind spots line up exactly. `BaseHTTPMiddleware.__call__` passes any scope whose
+    type is not `http` straight through to the application, so the origin check and the
+    session check never run for a websocket; and `walk_routes` keeps only routes that
+    carry `methods`, which a `WebSocketRoute` does not, so the contract test above would
+    stay green while the connection was accepted with no cookie at all. Driven with a real
+    cookieless scope by review, a handler added at `/api/live` accepted and sent data.
+
+    Nothing here uses websockets, so the honest guardrail is to fail the build on the
+    route's existence rather than to extend the middleware to a shape the application does
+    not have -- untested security code being worse than an explicit "not supported".
+
+    If this ever fails, the fix is not to delete the assertion: it is to authenticate
+    websockets in pure ASGI middleware, before the route is reached, and to teach
+    `walk_routes` about them.
+    """
+    websockets = [route for route in auth_app.routes if isinstance(route, WebSocketRoute)]
+
+    assert websockets == [], "websockets bypass the request guard; see this test's docstring"
+
+
+def test_every_mount_is_the_single_page_application(
+    auth_environment: Path,
+    tmp_path: Path,
+) -> None:
+    """A mount is the other shape `walk_routes` cannot see into.
+
+    A sub-application mounted under `/api` would answer requests the walk never enumerated.
+    The SPA is the one mount this application has, it serves static files and no data, and
+    it has to be reachable before a session exists -- so it is named, and anything else
+    fails.
+
+    Built with a real bundle directory, because in the test environment `web/dist` does not
+    exist and the mount is skipped: without this the assertion would pass by having nothing
+    to check.
+    """
+    del auth_environment  # Ordering only: settings are read while the app is built.
+    bundle = tmp_path / "dist"
+    bundle.mkdir()
+    (bundle / "index.html").write_text("<!doctype html>", encoding="utf-8")
+
+    app = create_app()
+    before = [route for route in app.routes if isinstance(route, Mount)]
+    assert mount_spa(app, bundle) is True
+
+    mounts = [route for route in app.routes if isinstance(route, Mount)]
+
+    # Counted rather than compared against a literal: a checkout that happens to have a
+    # built bundle under `web/dist` already carries the real mount, and this test is about
+    # what a mount may be, not about how many times this one was added.
+    assert len(mounts) == len(before) + 1
+    assert {mount.name for mount in mounts} == {"spa"}
+    assert mounts[-1].path == "", "the SPA is mounted at the root, below every API route"
+
+
+def test_the_shipped_application_mounts_nothing_unexpected(auth_app: FastAPI) -> None:
+    """The same rule on the real application, where the bundle may or may not be present."""
+    mounts = [route for route in auth_app.routes if isinstance(route, Mount)]
+
+    assert {mount.name for mount in mounts} <= {"spa"}

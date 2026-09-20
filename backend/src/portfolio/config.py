@@ -11,7 +11,11 @@ from typing import Final, Literal, Self
 from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from portfolio.domain.passwords import policy_violation
+from portfolio.domain.passwords import (
+    OWASP_MINIMUM_MEMORY_COST,
+    OWASP_MINIMUM_TIME_COST,
+    policy_violation,
+)
 
 # The Vite dev server. Harmless in development and wrong everywhere else, which is why
 # `prod` refuses to start while it is still the configured value.
@@ -88,10 +92,20 @@ class Settings(BaseSettings):
           prefix, and with it the guarantee that no other host on the domain set it;
         * `prod` still carrying the development origin rejects every write with a 403
           while the health check stays green -- "login works, nothing else does", a
-          symptom that does not name its cause.
+          symptom that does not name its cause;
+        * `prod` below the OWASP cost floor hashes passwords fast enough to be worth
+          cracking, and says nothing about it at all. The realistic way to arrive there is
+          not malice: `memory_cost` is in KiB, so an operator tuning after a
+          `hash-benchmark` run and reading the number as MiB sets 64 and drops the cost by
+          a factor of a thousand.
 
-        Refusing to start turns all three into a container that fails its health check,
+        Refusing to start turns all four into a container that fails its health check,
         which is a failure the deployment pipeline already knows how to roll back.
+
+        The cost floor is the one check gated on `prod` for a reason beyond symmetry: the
+        test suite runs the real application at `memory_cost=64` so that it can hash
+        several hundred times in a few seconds, and a floor that applied in `dev` would
+        make that impossible rather than merely slow.
         """
         if self.bootstrap_password is not None:
             reason = policy_violation(self.bootstrap_password.get_secret_value())
@@ -108,6 +122,19 @@ class Settings(BaseSettings):
             message = (
                 "PORTFOLIO_ALLOWED_ORIGIN must be set to the deployed origin in "
                 "production; it is still the development default."
+            )
+            raise ValueError(message)
+        if self.environment == "prod" and self.argon2_memory_cost < OWASP_MINIMUM_MEMORY_COST:
+            message = (
+                f"PORTFOLIO_ARGON2_MEMORY_COST is {self.argon2_memory_cost}, below the "
+                f"OWASP minimum of {OWASP_MINIMUM_MEMORY_COST}. The unit is KiB, not MiB: "
+                f"{OWASP_MINIMUM_MEMORY_COST} KiB is 19 MiB."
+            )
+            raise ValueError(message)
+        if self.environment == "prod" and self.argon2_time_cost < OWASP_MINIMUM_TIME_COST:
+            message = (
+                f"PORTFOLIO_ARGON2_TIME_COST is {self.argon2_time_cost}, below the OWASP "
+                f"minimum of {OWASP_MINIMUM_TIME_COST}."
             )
             raise ValueError(message)
         return self

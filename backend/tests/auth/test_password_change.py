@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from portfolio.db.models import Session
+from portfolio.services.auth import LOGIN_FAILURE_LIMIT
 from tests.auth.conftest import (
     BASE_URL,
     JSON_HEADERS,
@@ -22,6 +23,7 @@ from tests.auth.conftest import (
 )
 
 if TYPE_CHECKING:
+    import pytest
     from fastapi import FastAPI
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -128,3 +130,120 @@ async def test_a_password_change_needs_a_session(auth_client: AsyncClient) -> No
     )
 
     assert response.status_code == 401
+
+
+# --------------------------------------------------------------------------------------
+# The password change is throttled by the same counter as login.
+# --------------------------------------------------------------------------------------
+
+
+async def test_repeated_wrong_current_passwords_are_throttled(
+    signed_in_client: AsyncClient,
+) -> None:
+    """The endpoint worth brute forcing is the one that was not counted.
+
+    A hit here is terminal in a way a guessed login is not: this product has no password
+    reset flow, so whoever changes the password owns the instance. The attacker already
+    holds a session -- a borrowed browser, a script with the cookie -- and the current
+    password is the only thing left in their way, so an unlimited number of guesses at it
+    is the weakest point in the design.
+
+    Five wrong guesses are answered 401 and the sixth is refused, exactly as login is,
+    because it is the same counter keyed on the same username.
+    """
+    attempt = {"current_password": WRONG_PHRASE, "new_password": REPLACEMENT_PHRASE}
+    statuses = [
+        (await signed_in_client.post(PASSWORD_PATH, json=attempt, headers=JSON_HEADERS)).status_code
+        for _ in range(6)
+    ]
+
+    assert statuses == [401, 401, 401, 401, 401, 429]
+
+
+async def test_a_throttled_password_change_does_not_verify_the_password(
+    auth_app: FastAPI,
+    signed_in_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refused before the hash, so the guesses cost the attacker rather than the Pi."""
+    attempt = {"current_password": WRONG_PHRASE, "new_password": REPLACEMENT_PHRASE}
+    for _ in range(LOGIN_FAILURE_LIMIT):
+        await signed_in_client.post(PASSWORD_PATH, json=attempt, headers=JSON_HEADERS)
+
+    def refuse_to_verify(encoded_hash: str, password: str) -> bool:
+        del encoded_hash, password
+        message = "a throttled password change must not reach the password hasher"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(auth_app.state.password_hasher, "verify", refuse_to_verify)
+    response = await signed_in_client.post(PASSWORD_PATH, json=attempt, headers=JSON_HEADERS)
+
+    assert response.status_code == 429
+
+
+async def test_failed_password_changes_also_throttle_login(
+    auth_client: AsyncClient,
+) -> None:
+    """One counter, one username: guesses spent here are not free at the login endpoint.
+
+    Two separate counters would let an attacker take five guesses at each, and would let
+    the password endpoint be used to keep the login counter empty.
+    """
+    await sign_in(auth_client)
+    attempt = {"current_password": WRONG_PHRASE, "new_password": REPLACEMENT_PHRASE}
+    for _ in range(LOGIN_FAILURE_LIMIT):
+        await auth_client.post(PASSWORD_PATH, json=attempt, headers=JSON_HEADERS)
+
+    refused = await auth_client.post(
+        LOGIN_PATH,
+        json={"username": OWNER_USERNAME, "password": OWNER_PHRASE},
+        headers=JSON_HEADERS,
+    )
+
+    assert refused.status_code == 429
+
+
+async def test_a_rejected_new_password_is_not_counted_as_an_attempt(
+    signed_in_client: AsyncClient,
+) -> None:
+    """A new password below policy is arithmetic, not a guess at the old one.
+
+    Counting it would let a typo in the *new* password lock the owner out of the endpoint
+    they are trying to use, and would tell an attacker nothing either way.
+    """
+    for _ in range(LOGIN_FAILURE_LIMIT + 1):
+        response = await signed_in_client.post(
+            PASSWORD_PATH,
+            json={"current_password": OWNER_PHRASE, "new_password": "short"},
+            headers=JSON_HEADERS,
+        )
+        assert response.status_code == 422
+
+    changed = await signed_in_client.post(
+        PASSWORD_PATH,
+        json={"current_password": OWNER_PHRASE, "new_password": REPLACEMENT_PHRASE},
+        headers=JSON_HEADERS,
+    )
+
+    assert changed.status_code == 204
+
+
+async def test_a_successful_change_clears_the_counter(
+    auth_client: AsyncClient,
+) -> None:
+    """Knowing the current password is proof of ownership, exactly as a login is."""
+    await sign_in(auth_client)
+    attempt = {"current_password": WRONG_PHRASE, "new_password": REPLACEMENT_PHRASE}
+    for _ in range(LOGIN_FAILURE_LIMIT - 1):
+        await auth_client.post(PASSWORD_PATH, json=attempt, headers=JSON_HEADERS)
+
+    changed = await auth_client.post(
+        PASSWORD_PATH,
+        json={"current_password": OWNER_PHRASE, "new_password": REPLACEMENT_PHRASE},
+        headers=JSON_HEADERS,
+    )
+    assert changed.status_code == 204
+
+    # The change revoked every session, so signing in again is the test that the counter
+    # was cleared: without it, this login would be the sixth failure's worth of attempts.
+    await sign_in(auth_client, phrase=REPLACEMENT_PHRASE)

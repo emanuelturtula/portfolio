@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from portfolio.config import DEV_ALLOWED_ORIGIN, Settings, get_settings
 from portfolio.db.models import User
+from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_TIME_COST
 from portfolio.main import create_app
 from tests.auth.conftest import OWNER_PHRASE, OWNER_USERNAME, apply_auth_environment
 
@@ -106,6 +107,57 @@ def test_prod_refuses_the_development_allowed_origin() -> None:
     """
     with pytest.raises(ValidationError, match="PORTFOLIO_ALLOWED_ORIGIN"):
         Settings(environment="prod", allowed_origin=DEV_ALLOWED_ORIGIN)
+
+
+def test_prod_refuses_argon2_parameters_below_the_owasp_floor() -> None:
+    """The floor is enforced, not merely documented and asserted against the defaults.
+
+    `test_password_hasher.py` pins the shipped defaults, which no environment variable can
+    reach -- so before this existed, `PORTFOLIO_ARGON2_MEMORY_COST=8` started a production
+    container that hashed at `$argon2id$v=19$m=8,t=1,p=1$` and said nothing.
+
+    The realistic way to get there is not malice. `memory_cost` is in KiB, so an operator
+    tuning after a `hash-benchmark` run and reading 64 as MiB sets 64, and divides the cost
+    by a thousand. The message says the unit for that reason.
+    """
+    with pytest.raises(ValidationError, match="PORTFOLIO_ARGON2_MEMORY_COST"):
+        Settings(
+            environment="prod",
+            allowed_origin=PRODUCTION_ORIGIN,
+            argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST - 1,
+        )
+
+    with pytest.raises(ValidationError, match="PORTFOLIO_ARGON2_TIME_COST"):
+        Settings(
+            environment="prod",
+            allowed_origin=PRODUCTION_ORIGIN,
+            argon2_time_cost=OWASP_MINIMUM_TIME_COST - 1,
+        )
+
+
+def test_prod_accepts_parameters_exactly_at_the_floor() -> None:
+    """The boundary, in the direction a `>` typo would break: at the floor is acceptable."""
+    settings = Settings(
+        environment="prod",
+        allowed_origin=PRODUCTION_ORIGIN,
+        argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
+        argon2_time_cost=OWASP_MINIMUM_TIME_COST,
+    )
+
+    assert settings.argon2_memory_cost == OWASP_MINIMUM_MEMORY_COST
+
+
+def test_dev_may_run_below_the_floor() -> None:
+    """Gated on `prod`, and this is the reason.
+
+    This suite runs the real application at `memory_cost=64` so that it can hash several
+    hundred times in a few seconds. A floor that applied in `dev` would not make the tests
+    slow, it would make them impossible -- and the pressure would then be to weaken the
+    floor rather than to keep the tests.
+    """
+    settings = Settings(environment="dev", argon2_memory_cost=64, argon2_time_cost=1)
+
+    assert settings.argon2_memory_cost == 64
 
 
 def test_prod_accepts_a_deployed_origin_and_a_secure_cookie() -> None:
