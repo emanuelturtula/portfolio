@@ -6,13 +6,36 @@ is an AST walk that fails the build and names the file and the line.
 
 Two things make the difference between this and a test that passes forever:
 
-* it asserts it actually **found** the modules it claims to have scanned, because a ban
-  pointed at a directory that no longer exists is green and worthless;
+* it asserts it actually **found** the modules it claims to have scanned, against the
+  literal tuple of package names, because a guard written in terms of `PURE_PACKAGES`
+  shrinks along with `PURE_PACKAGES` and cannot fail;
 * it is proven able to **fail**, by being fed a synthetic module containing every banned
   form and asserting each one comes back with its file and its line.
 
 There is no allowlist, deliberately. A genuine exception should be argued in a pull request,
 not added to a list that grows one quiet entry at a time.
+
+## What this catches, and what it does not
+
+Caught: a float literal; the name `float` in any position, so `float(x)`, `x: float`,
+`-> float` and `isinstance(x, float)` all fail; `builtins.float`; an aliased import, so
+`from builtins import float as f` fails at the import *and* at every use of `f`; and true
+division of two integer literals, `1 / 3`, which produces a float with no literal and no
+`float` anywhere in the file.
+
+**Not caught: a float produced at runtime from names.** `a / b` cannot be decided
+statically -- it is a float for two ints and a `Decimal` for two `Decimal`s -- and banning
+every `/` in these layers would be unusable. `math.pi`, a float returned by a dependency,
+and `json.loads` handing back a number are all invisible here too.
+
+That residual is deliberate, and it is why this test is defence in depth rather than the
+whole defence. The backstop for a float that only exists at runtime is the boundary
+refusing it: `require_amount` rejects a non-`Decimal` before any conversion can hide the
+damage, `NumericText` and `BaseUnits` reject one on the way into the database and
+`BaseUnits` rejects one on the way back out, and `MoneyStr` rejects a JSON number. This
+test stops a float being *written*; those stop one being *stored or served*. A reader who
+assumes this file is the only thing standing between the codebase and a float will
+eventually be wrong in an expensive way.
 """
 
 from __future__ import annotations
@@ -71,42 +94,98 @@ def _docstring_constants(tree: ast.Module) -> set[int]:
     return holders
 
 
-def find_float_usage(path: Path, source: str) -> list[Violation]:
-    """Every float literal and every reference to the builtin `float` in one module.
+def _binding_names(tree: ast.Module, target: str) -> set[str]:
+    """Every local name in this module that refers to `target`.
 
-    A reference is reported as well as a call, so `float(x)`, `x: float` and
-    `isinstance(x, float)` are all caught. `float` has no legitimate use in these three
-    layers in any of those positions, and narrowing this to `ast.Call` would let an
-    annotation declare a money field as a float while the ban stayed green.
+    Always contains `target` itself. `from builtins import float as f` adds `f`, so a
+    module cannot rename its way past a ban -- the import is reported, and so is every
+    later use of the new name, which is what points at the line that does the damage.
+    """
+    names = {target}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Import | ast.ImportFrom):
+            continue
+        for alias in node.names:
+            if alias.name.split(".")[-1] == target:
+                names.add(alias.asname or alias.name)
+    return names
+
+
+def _is_integer_literal(node: ast.expr) -> bool:
+    """True for `1` and for `-1`, false for `True`, a name, or anything computed."""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd | ast.USub):
+        node = node.operand
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, int)
+        and not isinstance(node.value, bool)
+    )
+
+
+def find_float_usage(path: Path, source: str) -> list[Violation]:
+    """Every statically decidable way this module produces or names a float.
+
+    Four forms, and the module docstring says which fifth form is out of reach:
+
+    * a float literal;
+    * the name `float` in any position, so `float(x)`, `x: float` and
+      `isinstance(x, float)` all count -- narrowing this to `ast.Call` would let an
+      annotation declare a money field as a float while the ban stayed green;
+    * an import that binds the builtin under another name, reported at the import and at
+      every use of the alias;
+    * `1 / 3`, true division of two integer literals. This is the accident rather than the
+      evasion: a share computed that way is a float with no literal and no `float` name
+      anywhere in the file. Only literals, because `a / b` on two `Decimal`s is correct and
+      indistinguishable from here.
     """
     tree = ast.parse(source, filename=str(path))
+    bindings = _binding_names(tree, "float")
     violations: list[Violation] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, float):
             violations.append(Violation(path, node.lineno, f"float literal {node.value!r}"))
-        elif isinstance(node, ast.Name) and node.id == "float":
+        elif isinstance(node, ast.Name) and node.id in bindings:
             violations.append(Violation(path, node.lineno, "reference to the builtin float"))
         elif isinstance(node, ast.Attribute) and node.attr == "float":
             violations.append(Violation(path, node.lineno, f"attribute access .{node.attr}"))
+        elif isinstance(node, ast.alias) and node.name.split(".")[-1] == "float":
+            binding = node.asname or node.name
+            violations.append(
+                Violation(path, node.lineno, f"import of the builtin float as {binding}")
+            )
+        elif (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Div)
+            and _is_integer_literal(node.left)
+            and _is_integer_literal(node.right)
+        ):
+            violations.append(
+                Violation(path, node.lineno, "true division of integer literals yields a float")
+            )
     return violations
 
 
 def find_numeric_usage(path: Path, source: str) -> list[Violation]:
-    """Every mention of `Numeric`, the SQLAlchemy type that round-trips through a double."""
+    """Every mention of `Numeric`, the SQLAlchemy type that round-trips through a double.
+
+    Aliases resolve the same way they do for `float`: this used to read
+    `node.asname or node.name`, which meant `from sqlalchemy import Numeric as N` bound
+    the name `N`, matched nothing, and let `N(38, 20)` through.
+    """
     tree = ast.parse(source, filename=str(path))
+    bindings = _binding_names(tree, "Numeric")
     violations: list[Violation] = []
     for node in ast.walk(tree):
-        name = None
         if isinstance(node, ast.Name):
             name = node.id
         elif isinstance(node, ast.Attribute):
             name = node.attr
         elif isinstance(node, ast.alias):
-            name = node.asname or node.name
-        if name == "Numeric":
-            violations.append(
-                Violation(path, getattr(node, "lineno", 0), "sqlalchemy.Numeric is forbidden")
-            )
+            name = node.name.split(".")[-1]
+        else:
+            continue
+        if name in bindings:
+            violations.append(Violation(path, node.lineno, "sqlalchemy.Numeric is forbidden"))
     return violations
 
 
@@ -133,11 +212,15 @@ def find_sql_money_aggregates(path: Path, source: str) -> list[Violation]:
     return violations
 
 
-def pure_layer_modules() -> list[Path]:
-    """Every Python module under `domain/`, `services/` and `providers/`."""
+def pure_layer_modules(packages: tuple[str, ...] = PURE_PACKAGES) -> list[Path]:
+    """Every Python module under `domain/`, `services/` and `providers/`.
+
+    `packages` is an argument only so a test can call the walk with a deliberately wrong
+    tuple and show what that loses. Production callers pass nothing.
+    """
     return sorted(
         path
-        for package in PURE_PACKAGES
+        for package in packages
         for path in (SOURCE_ROOT / package).rglob("*.py")
         if "__pycache__" not in path.parts
     )
@@ -153,21 +236,51 @@ def all_source_modules() -> list[Path]:
 # --------------------------------------------------------------------------------------
 
 
-def test_the_scan_actually_finds_the_modules_it_claims_to_check() -> None:
-    """A ban walking the wrong directory is green and proves nothing.
+def test_the_scan_covers_exactly_the_three_layers_rule_2_names() -> None:
+    """Pinned against the literal names, because the previous version could not fail.
 
-    Pinned by name rather than by count, so adding a module does not fail this, and
-    renaming a package away from the ban does.
+    It asserted `len(modules) >= len(PURE_PACKAGES)` and looped over `PURE_PACKAGES` to
+    check each entry was a directory. Both sides shrank together: with
+    `PURE_PACKAGES = ("domain",)` it passed, and so did `("domain", "domain")`. The ban
+    could have stopped scanning `services/` and `providers/` entirely without one test
+    going red -- and since both currently hold nothing but an empty `__init__.py`, not a
+    single assertion elsewhere would have noticed either.
     """
+    assert PURE_PACKAGES == ("domain", "services", "providers")
+    assert len(set(PURE_PACKAGES)) == len(PURE_PACKAGES)
     assert SOURCE_ROOT.is_dir(), SOURCE_ROOT
-    for package in PURE_PACKAGES:
-        assert (SOURCE_ROOT / package).is_dir(), f"{package} is not where the ban looks"
 
-    modules = pure_layer_modules()
-    names = {path.relative_to(SOURCE_ROOT).as_posix() for path in modules}
 
-    assert "domain/money.py" in names
-    assert len(modules) >= len(PURE_PACKAGES)
+def test_every_named_package_contributes_at_least_one_scanned_module() -> None:
+    """Each layer is reached, checked per package rather than by a total count.
+
+    A total count is satisfied by three modules from one package. This is not.
+    """
+    scanned: dict[str, set[str]] = {package: set() for package in PURE_PACKAGES}
+    for path in pure_layer_modules():
+        relative = path.relative_to(SOURCE_ROOT)
+        scanned[relative.parts[0]].add(relative.as_posix())
+
+    for package, modules in scanned.items():
+        assert modules, f"{package} contributed no module to the float ban"
+    assert "domain/money.py" in scanned["domain"]
+
+
+def test_dropping_a_package_from_the_walk_is_visible() -> None:
+    """The control. Without it the two tests above are claims about themselves.
+
+    Calling the walk with the tuple the reviewer used shows exactly what it stops
+    reaching, which is what the per-package assertion is there to catch.
+    """
+    wrong_tuple = ("domain",)
+    shrunken = pure_layer_modules(wrong_tuple)
+    reached = {path.relative_to(SOURCE_ROOT).parts[0] for path in shrunken}
+
+    assert reached == {"domain"}
+    assert set(PURE_PACKAGES) - reached == {"services", "providers"}
+    # The old assertion, evaluated against the tuple it was written in terms of: still
+    # true, which is precisely why it never caught this.
+    assert len(shrunken) >= len(wrong_tuple)
 
 
 def test_no_float_in_the_pure_layers() -> None:
@@ -241,6 +354,104 @@ def test_an_integer_literal_is_not_a_float(tmp_path: Path) -> None:
     assert find_float_usage(module, module.read_text(encoding="utf-8")) == []
 
 
+def test_the_float_ban_catches_an_aliased_import(tmp_path: Path) -> None:
+    """`from builtins import float as f` renamed its way straight past the old ban.
+
+    Reported twice on purpose: at the import, which is the line to delete, and at the use,
+    which is the line that produces the float.
+    """
+    module = tmp_path / "aliased.py"
+    module.write_text(
+        "\n".join(
+            [
+                "from builtins import float as f",  # 1: the import
+                "",  # 2
+                "",  # 3
+                "def convert(value: str) -> object:",  # 4
+                "    return f(value)",  # 5: the use, under the new name
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    violations = find_float_usage(module, module.read_text(encoding="utf-8"))
+    located = {(violation.line, violation.reason) for violation in violations}
+
+    assert (1, "import of the builtin float as f") in located
+    assert (5, "reference to the builtin float") in located
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        pytest.param("from builtins import float", id="plain"),
+        pytest.param("from builtins import float as f", id="renamed"),
+        pytest.param("import builtins.float as f", id="dotted"),
+    ],
+)
+def test_every_import_spelling_of_the_builtin_is_caught(tmp_path: Path, spelling: str) -> None:
+    module = tmp_path / "imports.py"
+    module.write_text(f"{spelling}\n", encoding="utf-8")
+
+    assert find_float_usage(module, module.read_text(encoding="utf-8")) != []
+
+
+def test_the_float_ban_catches_dividing_two_integer_literals(tmp_path: Path) -> None:
+    """`1 / 3` is a float with no literal and no `float` anywhere in the file.
+
+    The accident rather than the evasion: a future `services/allocation.py` computing a
+    share this way would have passed the old ban and produced `0.3333333333333333`.
+    """
+    module = tmp_path / "division.py"
+    module.write_text(
+        "\n".join(
+            [
+                "RATE = 1 / 3",  # 1: the plain case
+                "NEGATIVE = -1 / 3",  # 2: a unary minus in front of the literal
+                "FLOOR = 1 // 3",  # 3: an int, and not a violation
+                "WHOLE = 4 / 2",  # 4: still a float, 2.0
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    lines = {
+        violation.line for violation in find_float_usage(module, module.read_text(encoding="utf-8"))
+    }
+
+    assert lines == {1, 2, 4}
+
+
+def test_the_division_rule_does_not_fire_on_values_it_cannot_decide(tmp_path: Path) -> None:
+    """The documented limit, asserted so it is a decision and not an oversight.
+
+    `a / b` is a float for two ints and a `Decimal` for two `Decimal`s, and nothing in the
+    AST says which. Flagging it would ban correct `Decimal` arithmetic in the one package
+    that exists to do `Decimal` arithmetic, so the ban stops here and the boundary guards
+    take over. If this test ever starts failing because the rule got broader, read the
+    module docstring before widening it further.
+    """
+    module = tmp_path / "undecidable.py"
+    module.write_text(
+        "\n".join(
+            [
+                "from decimal import Decimal",
+                "",
+                "",
+                "def share(part: Decimal, whole: Decimal) -> Decimal:",
+                "    return part / whole",
+                "",
+                "",
+                "def ratio(part: int, whole: int) -> object:",
+                "    return part / whole",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert find_float_usage(module, module.read_text(encoding="utf-8")) == []
+
+
 # --------------------------------------------------------------------------------------
 # The other two halves of rule 2: no `Numeric`, no aggregation in SQL.
 # --------------------------------------------------------------------------------------
@@ -268,6 +479,24 @@ def test_the_numeric_ban_reports_a_synthetic_violation(tmp_path: Path) -> None:
     lines = {violation.line for violation in find_numeric_usage(module, module.read_text("utf-8"))}
 
     assert lines == {2, 4}
+
+
+def test_the_numeric_ban_catches_an_aliased_import(tmp_path: Path) -> None:
+    """The same hole the float ban had, in the sibling that was supposed to be the model.
+
+    `find_numeric_usage` resolved an alias as `node.asname or node.name`, so
+    `from sqlalchemy import Numeric as N` bound the name `N`, matched nothing, and let
+    `N(38, 20)` build a column that round-trips money through a C double.
+    """
+    module = tmp_path / "aliased_numeric.py"
+    module.write_text(
+        "from sqlalchemy import Numeric as N\n\nPRICE = N(38, 20)\n",
+        encoding="utf-8",
+    )
+
+    lines = {violation.line for violation in find_numeric_usage(module, module.read_text("utf-8"))}
+
+    assert lines == {1, 3}
 
 
 def test_money_is_not_aggregated_in_sql() -> None:
