@@ -13,6 +13,12 @@ dependencies = [
     "pydantic>=2",
     "pydantic-settings",
     "structlog",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite",
+    "alembic",
+    # Already present transitively through Starlette, but the lifespan calls
+    # anyio.to_thread.run_sync directly, so it is declared directly too.
+    "anyio",
 ]
 
 [dependency-groups]
@@ -70,6 +76,15 @@ select = [
 # assert is the point of a test.
 "tests/**" = ["S101"]
 
+[tool.ruff.lint.flake8-type-checking]
+# SQLAlchemy resolves `Mapped[...]` annotations at runtime to build the mapper, so the
+# names inside them must be real imports. Without this, TC003 would move `datetime` into
+# an `if TYPE_CHECKING:` block and every mapped class would fail to configure.
+runtime-evaluated-base-classes = [
+    "sqlalchemy.orm.DeclarativeBase",
+    "portfolio.db.base.Base",
+]
+
 [tool.ruff.lint.flake8-builtins]
 # portfolio.logging is always imported absolutely, so it cannot shadow the standard
 # library module for anyone; the name says exactly what the module configures.
@@ -90,13 +105,28 @@ asyncio_mode = "auto"
 pythonpath = ["src"]
 
 [tool.coverage.run]
-source = ["portfolio"]
+# A directory, not the package name. Coverage matches a package source against the
+# module's `__name__`, and Alembic loads `env.py` and every revision script by path, so
+# they arrive named `env` and `v0001_initial_schema` rather than `portfolio.db....`.
+# Under `source = ["portfolio"]` they were silently never traced -- reported at 0% while
+# demonstrably running every migration in the suite. Matching on the directory measures
+# what actually executes.
+source = ["src/portfolio"]
 branch = true
 
 [tool.coverage.report]
 # The skeleton starts at 70 and this number only ever ratchets upward: raise it as
 # behaviour lands, never lower it to make a red build green.
-fail_under = 70
+#
+# 70 -> 97 with the database foundation (#1), measured at 99.03%. That is the ceiling with
+# the current dependencies, not a plateau to relax on: exactly one statement in the whole
+# backend is missed -- `web/spa.py:52`, which predates this change -- and the only missed
+# branches are the two `if dialect.name == "sqlite"` guards in the engine factories, which
+# need a non-SQLite async driver that is not a dependency and should not become one.
+#
+# The 2 points of headroom mirror what the previous ratchet left. Do not read a green gate
+# at 97 as permission to add fifteen untested statements.
+fail_under = 97
 show_missing = true
 skip_covered = true
 exclude_also = [

@@ -24,7 +24,11 @@ class Settings(BaseSettings):
 
     environment: Literal["dev", "prod"] = "dev"
     log_level: str = "INFO"
-    database_url: str = "sqlite:///./data/portfolio.db"
+    # The async driver is explicit in the URL: the engine, the session factory and
+    # Alembic's environment are all async, and a bare `sqlite://` URL would build a
+    # synchronous engine that fails the moment it is awaited. Production already sets
+    # `sqlite+aiosqlite:////app/data/portfolio.db`, so only the default was out of step.
+    database_url: str = "sqlite+aiosqlite:///./data/portfolio.db"
     allowed_origin: str = "http://localhost:5173"
     session_cookie_secure: bool = True
 
