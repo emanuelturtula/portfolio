@@ -105,7 +105,13 @@ asyncio_mode = "auto"
 pythonpath = ["src"]
 
 [tool.coverage.run]
-source = ["portfolio"]
+# A directory, not the package name. Coverage matches a package source against the
+# module's `__name__`, and Alembic loads `env.py` and every revision script by path, so
+# they arrive named `env` and `v0001_initial_schema` rather than `portfolio.db....`.
+# Under `source = ["portfolio"]` they were silently never traced -- reported at 0% while
+# demonstrably running every migration in the suite. Matching on the directory measures
+# what actually executes.
+source = ["src/portfolio"]
 branch = true
 
 [tool.coverage.report]
