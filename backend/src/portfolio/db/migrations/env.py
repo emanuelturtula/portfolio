@@ -57,15 +57,31 @@ def resolve_database_url() -> str:
     return get_settings().database_url
 
 
+# Emitted into the generated script itself, not merely documented here. The artifact an
+# operator reads is the SQL on stdout, and a script containing a batch rebuild deletes
+# referencing rows if it is applied under enforcement -- the exact failure this whole
+# change exists to prevent.
+#
+# The pragma is deliberately not emitted as a statement. Alembic wraps the script in a
+# transaction and `PRAGMA foreign_keys` is a no-op inside one, so an emitted line would
+# look protective while doing nothing. It has to be the operator's step, outside.
+OFFLINE_PREAMBLE = """\
+-- Apply this script with foreign key enforcement OFF, or a table rebuild inside it will
+-- delete every row referencing the rebuilt table. SQLite performs an implicit DELETE FROM
+-- when it drops a table, which fires ON DELETE actions.
+--
+--   PRAGMA foreign_keys=OFF;   -- outside any transaction; inside one it is a no-op
+--   <this script>
+--   PRAGMA foreign_key_check;  -- must return no rows
+--   COMMIT;                    -- only if it returned none; otherwise ROLLBACK
+"""
+
+
 def run_migrations_offline() -> None:
     """Emit SQL to stdout instead of running it, for `alembic upgrade --sql`.
 
-    There is no connection here, so neither guard applies and the generated script does
-    not carry `PRAGMA foreign_keys=OFF`. That omission is deliberate: Alembic wraps the
-    script in a transaction, and the pragma is a documented no-op inside one, so emitting
-    it would produce a line that looks protective and is not. An operator applying a
-    generated script that contains a batch rebuild must set the pragma themselves, outside
-    the transaction, and run `PRAGMA foreign_key_check` before committing.
+    There is no connection here, so neither guard can run: the script carries the
+    instructions for the operator to apply them by hand instead.
     """
     context.configure(
         url=resolve_database_url(),
@@ -75,6 +91,8 @@ def run_migrations_offline() -> None:
         render_as_batch=True,
         compare_type=True,
     )
+    # Before `begin_transaction`, so the instructions sit above the script's own BEGIN.
+    context.get_context().impl.static_output(OFFLINE_PREAMBLE)
     with context.begin_transaction():
         context.run_migrations()
 
