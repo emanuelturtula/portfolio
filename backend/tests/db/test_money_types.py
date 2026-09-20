@@ -27,6 +27,7 @@ from sqlalchemy.types import TypeDecorator
 
 from portfolio.db import models
 from portfolio.db.types import BaseUnits, NumericText
+from portfolio.domain.money import MONEY_PRECISION
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -303,6 +304,122 @@ def test_numeric_text_requires_a_scale() -> None:
         NumericText()  # type: ignore[call-arg]
 
 
+# --------------------------------------------------------------------------------------
+# The declared scale is validated at construction, not at bind time.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "scale",
+    [
+        pytest.param(2.0, id="float"),
+        pytest.param(True, id="bool"),
+        pytest.param(Decimal("2"), id="decimal"),
+        pytest.param("2", id="str"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_numeric_text_rejects_a_scale_that_is_not_an_int(scale: object) -> None:
+    """A float scale, in the type whose reason for existing is banning floats.
+
+    It used to construct fine and die at bind time with `exponent must be an integer`,
+    which names no column and sends the reader to the value rather than to the schema.
+    """
+    with pytest.raises(TypeError, match="NumericText requires an int scale"):
+        NumericText(scale)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("scale", [-1, -2, 39, 100])
+def test_numeric_text_rejects_a_scale_outside_the_representable_range(scale: int) -> None:
+    """`NumericText(-2)`, a plausible typo for `NumericText(2)`, was silent money loss.
+
+    It bound `Decimal("12345.67")` to the string `"12300"` -- a legal-looking amount,
+    quietly missing 45.67 and rounded to the nearest hundred. Nothing raised, nothing
+    logged, and the column looked fine in a diff.
+    """
+    with pytest.raises(ValueError, match="requires a scale between 0 and 38"):
+        NumericText(scale)
+
+
+@pytest.mark.parametrize("scale", [0, 1, 2, 8, 18, 37, 38])
+def test_numeric_text_accepts_every_scale_in_range(scale: int) -> None:
+    """Both endpoints included: 0 is an integer column, 38 is the whole precision."""
+    assert NumericText(scale).scale == scale
+
+
+def test_a_bad_scale_fails_at_construction_not_at_insert() -> None:
+    """Which makes it an import-time error, before any row exists to be wrong.
+
+    A column definition is evaluated when its module is imported, so a typo'd scale stops
+    the application from starting rather than corrupting the first write.
+    """
+    with pytest.raises(ValueError, match="requires a scale between 0 and 38"):
+        Table(
+            "never_created",
+            MetaData(),
+            Column("id", Integer, primary_key=True),
+            Column("amount", NumericText(-2)),
+        )
+
+
+# --------------------------------------------------------------------------------------
+# An amount too large for the digits the scale leaves in front of the point.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("scale", [0, 2, 8, 18, 38])
+def test_the_usable_integer_range_is_precision_minus_scale(scale: int) -> None:
+    """The boundary, walked from both sides, at every scale that matters.
+
+    A column's integer part gets `MONEY_PRECISION - scale` digits. One more digit than
+    that is the first value it cannot hold, and it has to say so rather than raise a bare
+    `InvalidOperation`.
+    """
+    integer_digits = MONEY_PRECISION - scale
+    column = NumericText(scale)
+    widest = Decimal("9" * integer_digits) if integer_digits else Decimal(0)
+    one_too_wide = Decimal("9" * (integer_digits + 1))
+
+    assert column.process_bind_param(widest, DIALECT) is not None
+    with pytest.raises(ValueError, match="cannot store"):
+        column.process_bind_param(one_too_wide, DIALECT)
+
+
+def test_an_over_magnitude_value_names_the_value_the_scale_and_the_ceiling() -> None:
+    """The old failure was `decimal.InvalidOperation: [<class 'decimal.InvalidOperation'>]`.
+
+    That message contains no value, no column and no number, and SQLAlchemy wraps it in a
+    `StatementError` at INSERT time, so the person reading the traceback learns only that
+    a decimal operation somewhere was invalid.
+    """
+    with pytest.raises(ValueError, match="NumericText cannot store") as caught:
+        NumericText(2).process_bind_param(Decimal(10**36), DIALECT)
+
+    message = str(caught.value)
+    assert "1000000000000000000000000000000000000" in message
+    assert "a scale of 2" in message
+    assert "36 digits before the decimal point" in message
+    assert str(MONEY_PRECISION) in message
+
+
+def test_a_scale_of_38_leaves_no_room_in_front_of_the_point() -> None:
+    """Conflating the precision with the scale builds a column that cannot hold `1.5`."""
+    column = NumericText(MONEY_PRECISION)
+
+    assert column.process_bind_param(Decimal("0.5"), DIALECT) == "0." + "5" + "0" * 37
+    with pytest.raises(ValueError, match="leaves 0 digits before the decimal point"):
+        column.process_bind_param(Decimal("1.5"), DIALECT)
+
+
+async def test_an_over_magnitude_insert_reports_the_column_not_a_bare_decimal_error(
+    money_engine: AsyncEngine,
+) -> None:
+    """Through a real INSERT, which is where this failure is actually met."""
+    async with money_engine.begin() as connection:
+        with pytest.raises(StatementError, match="NumericText cannot store"):
+            await connection.execute(amounts.insert().values(id=1, fiat=Decimal(10**36)))
+
+
 def test_two_scales_do_not_share_a_cache_key() -> None:
     """A shared cache entry would round a value to another column's scale, silently.
 
@@ -431,6 +548,70 @@ async def test_base_units_round_trips_through_a_real_column(money_engine: AsyncE
     assert restored == KASPA_SUPPLY_IN_SOMPI
     assert isinstance(restored, int)
     assert affinity == "integer"
+
+
+# --------------------------------------------------------------------------------------
+# `BaseUnits` guards the read path too, because SQLite does not enforce a column type.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param(1.5, id="real"),
+        pytest.param(1.0, id="whole-real"),
+        pytest.param(True, id="bool"),
+        pytest.param("7", id="text"),
+    ],
+)
+def test_base_units_refuses_a_stored_value_that_is_not_an_integer(stored: object) -> None:
+    """Guarding the bind side alone assumes every row arrived through the ORM."""
+    with pytest.raises(TypeError, match="which is not an integer quantity"):
+        UNITS.process_result_value(stored, DIALECT)
+
+
+@pytest.mark.parametrize("stored", [0, 1, -1, INT64_MAX, None])
+def test_base_units_passes_through_a_stored_integer(stored: int | None) -> None:
+    assert UNITS.process_result_value(stored, DIALECT) == stored
+
+
+async def test_a_raw_real_row_is_refused_rather_than_read_back_as_a_float(
+    money_engine: AsyncEngine,
+) -> None:
+    """The path that defeats the AST ban entirely, because no Python code writes it.
+
+    An Alembic `op.execute` backfill or `sqlite3` on the Pi can write `1.5` into a column
+    declared `BIGINT`: SQLite has no type enforcement, the row is stored with `typeof` =
+    `real`, and before this guard it came back as a Python `float` from an attribute
+    annotated `Mapped[int]`. Nothing downstream would have noticed.
+    """
+    async with money_engine.begin() as connection:
+        await connection.execute(text("INSERT INTO amounts (id, units) VALUES (1, 1.5)"))
+
+    async with money_engine.connect() as connection:
+        # The premise: SQLite really did store a real in a BIGINT column.
+        assert await connection.scalar(text("SELECT typeof(units) FROM amounts WHERE id = 1")) == (
+            "real"
+        )
+        with pytest.raises(TypeError, match="which is not an integer quantity"):
+            await connection.scalar(select(amounts.c.units).where(amounts.c.id == 1))
+
+
+async def test_the_refusal_names_the_value_and_says_where_it_came_from(
+    money_engine: AsyncEngine,
+) -> None:
+    """A read-side failure has no INSERT to blame, so the message has to carry the cause."""
+    async with money_engine.begin() as connection:
+        await connection.execute(text("INSERT INTO amounts (id, units) VALUES (1, 2.5)"))
+
+    async with money_engine.connect() as connection:
+        with pytest.raises(TypeError) as caught:
+            await connection.scalar(select(amounts.c.units).where(amounts.c.id == 1))
+
+    message = str(caught.value)
+    assert "2.5" in message
+    assert "float" in message
+    assert "not written through this type" in message
 
 
 # --------------------------------------------------------------------------------------
