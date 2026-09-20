@@ -133,8 +133,8 @@ Two hashes, for two different threats:
 
 - **Argon2id** over the password, because a password is low entropy and guessable, so the
   hash has to be slow and memory-hard. The cost parameters are settings, floored at the
-  OWASP minimum, and measured on the deployment hardware rather than copied — see
-  `docs/operations.md`.
+  OWASP minimum in production, and measured on the deployment hardware rather than
+  copied — see `docs/operations.md`.
 - **SHA-256** over the session token, because the token is 32 bytes from
   `secrets.token_urlsafe` and no amount of offline work recovers 256 bits of entropy. The
   hash only has to be preimage resistant. Running Argon2id per request would add a quarter

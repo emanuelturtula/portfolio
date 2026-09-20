@@ -56,12 +56,18 @@ If you would rather not put the password in a file at all, leave
 container:
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio create-user
+docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio create-user --username <name>
 ```
 
-It prompts for the username and then for the password twice, with no echo. The password is
-never accepted as a command-line argument and never read from the environment — a shell
-argument lands in the shell history and in `ps` output for every user on the host.
+It prompts for the password twice, with no echo, and for nothing else. The account name is
+**not** prompted for: it comes from `--username`, or from `PORTFOLIO_BOOTSTRAP_USERNAME`, or
+from `owner` if neither is set. Pass `--username` explicitly unless you want `owner` — an
+account silently created under a name you did not choose is a confusing way to fail to sign
+in.
+
+The password is never accepted as a command-line argument and never read from the
+environment: a shell argument lands in the shell history and in `ps` output for every user
+on the host.
 
 This is the recommended route. The bootstrap variable exists for an unattended first boot;
 this is the one that leaves no copy of the password anywhere.
@@ -90,8 +96,13 @@ To adjust, set any of these in `secrets.env` and recreate the container as in se
 | `PORTFOLIO_ARGON2_TIME_COST` | `3` | Number of passes. Raise only once memory is as high as the host can spare. |
 | `PORTFOLIO_ARGON2_PARALLELISM` | `4` | Lanes. The Pi 5 has four cores; going above that buys nothing. |
 
-Floors are enforced in code (`memory_cost >= 19456` KiB, `time_cost >= 2`, the OWASP
-minimum). A value below them refuses to start rather than quietly weakening the hash.
+In `prod`, both are floored in code at the OWASP minimum — `memory_cost >= 19456` KiB and
+`time_cost >= 2` — and a value below either refuses to start rather than quietly weakening
+the hash. The check is gated on `PORTFOLIO_ENVIRONMENT=prod`, which the image sets at build
+time, because the test suite deliberately runs far below the floor to keep 500 tests fast.
+
+Misreading KiB as MiB is the mistake this catches: `PORTFOLIO_ARGON2_MEMORY_COST=64` looks
+like 64 MiB and is 64 KiB, a thousandfold weaker than intended.
 
 Changing these does **not** invalidate the existing password: the parameters are encoded in
 each stored hash, so an old hash still verifies, and it is transparently re-hashed with the
@@ -144,7 +155,21 @@ year; a cleanup job would be more moving parts than the problem deserves.
 Sessions live in the database, so restarting or recreating the container does not end them.
 Changing the password is the only way to revoke every session at once.
 
-## 6. Login throttling
+## 6. The API documentation requires a session
+
+`/api/docs` and `/api/openapi.json` are **not** public. Opening either in a browser that
+has not signed in returns `401` with a problem document, not a login redirect, so it looks
+broken rather than protected.
+
+Sign in to the application first, in the same browser and on the same origin. The cookie
+goes with the request and Swagger UI loads normally.
+
+This is deliberate: the documentation enumerates the entire API surface, and there is no
+reason an unauthenticated scan should get it for free. A command-line client fetching the
+schema needs a session cookie; nothing in this repository does that, because the OpenAPI
+drift check in CI generates the document in process rather than over HTTP.
+
+## 7. Login throttling
 
 Five failed attempts for a username inside 15 minutes; the sixth is rejected with `429`
 before the password is even verified. A successful login clears the counter.
@@ -163,7 +188,8 @@ If you lock yourself out, wait 15 minutes or recreate the container.
 | Container refuses to start, log names the bootstrap password | It is blank, under 12 characters, or a deny-listed default |
 | Login returns 204 but the app still shows the login page | The cookie was dropped. `__Host-` requires `Secure`, which requires HTTPS — check the origin is not plain HTTP on a non-`localhost` host |
 | Reads work, every write returns 403 | `PORTFOLIO_ALLOWED_ORIGIN` does not match the address bar exactly |
-| Login returns 429 | Throttled — section 6 |
+| `/api/docs` returns 401 in the browser | Working as intended — sign in first, section 6 |
+| Login returns 429 | Throttled — section 7 |
 | Logged out roughly weekly | Working as intended: the 7-day idle window |
 | Logged out roughly monthly despite daily use | Working as intended: the 30-day absolute ceiling, which activity does not extend |
 | Edited `secrets.env`, nothing changed | `env_file` is read at container creation — recreate, do not restart |

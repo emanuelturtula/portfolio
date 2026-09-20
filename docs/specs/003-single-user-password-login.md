@@ -47,8 +47,8 @@ the runtime image to go in by hand.
 delete cascades to that user's sessions through the `ondelete="CASCADE"` already on
 `sessions.user_id`, so it revokes everything as a side effect. It still prompts and still
 confirms — the flag replaces the account, never the prompt — and it requires an explicit
-typed confirmation naming the account being destroyed, refusing outright when stdin is not
-a TTY.
+typed confirmation, either the name of the account being destroyed or `y`, refusing outright
+when stdin is not a TTY.
 
 One flag, against an instance that otherwise cannot be recovered.
 
@@ -130,9 +130,16 @@ the parameters being lowered into uselessness:
 
 - `python -m portfolio hash-benchmark` hashes with the configured parameters and reports the
   median wall time, to be run on the Pi over SSH after deployment.
-- A test asserts the configured parameters meet the OWASP floor
-  (`memory_cost >= 19456` KiB, `time_cost >= 2`), so a future "it feels slow" commit cannot
-  quietly drop them to argon2-cffi's minimum.
+- In `prod`, a settings validator refuses to start below the OWASP floor
+  (`memory_cost >= 19456` KiB, `time_cost >= 2`), so a future "it feels slow" commit — or an
+  operator reading KiB as MiB — cannot quietly drop them to argon2-cffi's minimum. Gated on
+  `prod` because the test suite runs far below the floor deliberately, to stay fast.
+  A separate test asserts the *shipped defaults* meet the floor too.
+
+  Added after review. The spec originally claimed a floor that only a test on the defaults
+  enforced, which no environment variable could reach: `PORTFOLIO_ARGON2_MEMORY_COST=64`
+  would have started happily in production with a hash a thousandfold weaker than intended,
+  while `docs/operations.md` told the operator that could not happen.
 - `docs/operations.md` records the procedure and has a table for the measured value.
 
 Flagged in Risks. The alternative — writing a number into the spec and calling it measured —
@@ -295,6 +302,14 @@ problem documents through the existing `AppError` machinery.
 
 `POST /api/auth/password` revokes the caller's own session too. The frontend treats the
 `204` as a logout; that is #4's problem, and the spec for it will say so.
+
+**A requirement #4 must know about, found in review.** `Content-Type: application/json` is
+required on *every* non-GET request, including `POST /api/auth/logout`, which has an empty
+body. A `fetch` with no body sends no `Content-Type` and gets a `403`, and the generated
+client declares `requestBody?: never` for that operation — so the natural call fails. The
+middleware is deliberately *not* relaxed for bodyless requests: exempting them would reopen
+the gap the content-type rule exists to close, for convenience. #4 sends the header
+explicitly on logout.
 
 ## Data model
 
