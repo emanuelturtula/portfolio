@@ -17,13 +17,13 @@ after the conversion there is nothing left to see.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import BigInteger, DateTime, Text
 from sqlalchemy.types import TypeDecorator
 
-from portfolio.domain.money import quantize, require_amount
+from portfolio.domain.money import MONEY_PRECISION, quantize, require_amount
 
 if TYPE_CHECKING:
     from sqlalchemy.engine.interfaces import Dialect
@@ -76,9 +76,22 @@ class NumericText(TypeDecorator[Decimal]):
     comparable by eye and in a diff, and it is why `format(value, "f")` is used rather
     than `str(value)` -- `str(Decimal("1E+2"))` is `"1E+2"`.
 
-    `scale` is required and has no default. A money column without a declared scale has
-    no defined rounding, and a default would let one be omitted by accident rather than
-    by decision.
+    `scale` is required, has no default, and is validated at construction. A money column
+    without a declared scale has no defined rounding, and a default would let one be
+    omitted by accident rather than by decision.
+
+    A column holds `MONEY_PRECISION - scale` digits before the decimal point: at
+    `scale=20` the largest storable amount is just under 10**18. Beyond that, binding
+    raises rather than storing a rounded amount, because the digits that would be lost
+    are the ones in front.
+
+    **The two over-precision rules here are deliberately different, and a reader meets
+    them side by side.** Too many digits *after* the point is rounded away, because that
+    is what declaring a scale means and what `DECIMAL(p, s)` does everywhere else. Too
+    many digits *before* it is refused, because there is no rounding that preserves the
+    amount. `domain.money.to_base_units` refuses in both directions instead -- a chain
+    balance is exact and rounding one would report a holding the chain disagrees with --
+    so the same value can be legal in a column and rejected by a conversion.
 
     Text does not sort or sum numerically, and that is a feature, not a limitation to
     work around: `SUM()`, `ORDER BY` and `<` on this column would coerce it to a float in
@@ -96,8 +109,29 @@ class NumericText(TypeDecorator[Decimal]):
     cache_ok = True
 
     def __init__(self, scale: int) -> None:
-        """Declare the number of decimal places this column rounds to and stores."""
+        """Declare the number of decimal places this column rounds to and stores.
+
+        Validated here so a bad scale is an error when the module is imported, rather
+        than a column that quietly stores the wrong number. `NumericText(-2)`, a
+        plausible typo for `NumericText(2)`, otherwise binds `Decimal("12345.67")` to
+        `"12300"` -- a legal-looking amount, silently missing 45.67 -- and
+        `NumericText(38)`, conflating the precision with the scale, builds a column that
+        accepts `Decimal("0.5")` and then raises on `Decimal("1.5")`.
+
+        Raises:
+            TypeError: `scale` is not an `int`, or is a `bool`.
+            ValueError: `scale` is negative or exceeds `MONEY_PRECISION`.
+        """
         super().__init__()
+        if isinstance(scale, bool) or not isinstance(scale, int):
+            # A float scale, in the type whose reason for existing is banning floats,
+            # otherwise constructs fine and dies at bind time with `exponent must be an
+            # integer` and no mention of the column.
+            message = f"NumericText requires an int scale, got {type(scale).__name__}"
+            raise TypeError(message)
+        if not 0 <= scale <= MONEY_PRECISION:
+            message = f"NumericText requires a scale between 0 and {MONEY_PRECISION}, got {scale}"
+            raise ValueError(message)
         self.scale = scale
 
     # `object` rather than `Decimal | None`: refusing a value that is not a Decimal
@@ -115,7 +149,21 @@ class NumericText(TypeDecorator[Decimal]):
             # Exact by construction: an `int` has nothing after the decimal point to
             # lose. This is the one non-Decimal input worth accepting.
             value = Decimal(value)
-        amount = quantize(require_amount(value, subject="NumericText"), self.scale)
+        try:
+            amount = quantize(require_amount(value, subject="NumericText"), self.scale)
+        except InvalidOperation:
+            # The bare `decimal.InvalidOperation: [<class 'decimal.InvalidOperation'>]`
+            # names no value, no column and no reason, and SQLAlchemy wraps it in a
+            # StatementError at INSERT time. This is the failure a money column actually
+            # hits -- an amount too large for the digits the scale leaves in front of the
+            # point -- so it says which value, which scale and what the ceiling is.
+            integer_digits = MONEY_PRECISION - self.scale
+            message = (
+                f"NumericText cannot store {value}: a scale of {self.scale} leaves "
+                f"{integer_digits} digits before the decimal point, out of the "
+                f"{MONEY_PRECISION} this application represents"
+            )
+            raise ValueError(message) from None
         if amount.is_zero():
             # Otherwise a column holds two spellings of the same amount: `-0.00` and
             # `0.00` are equal as Decimals and different as the text SQLite compares.
@@ -160,4 +208,28 @@ class BaseUnits(TypeDecorator[int]):
         if not _INT64_MIN <= value <= _INT64_MAX:
             message = f"BaseUnits cannot store {value}: outside the signed 64-bit range"
             raise ValueError(message)
+        return value
+
+    def process_result_value(self, value: object, dialect: Dialect) -> int | None:
+        """Refuse a stored value that is not an integer, rather than returning a float.
+
+        Guarding the bind side only assumes every row got here through the ORM. SQLite
+        has no column type enforcement: a row written by an Alembic `op.execute` backfill
+        or by `sqlite3` on the Pi as `1.5` is stored with `typeof` = `real` and comes back
+        as a Python `float` from an attribute annotated `Mapped[int]`. Nothing downstream
+        would notice, and the float ban would have been defeated by the one path that
+        never passes through the code the AST test reads.
+
+        `NumericText` needs no equivalent guard only because TEXT affinity coerces the
+        value on the way in -- that protection is SQLite's, not this module's, so it is
+        not one to rely on here.
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            message = (
+                f"BaseUnits read {value!r} ({type(value).__name__}) from the database, "
+                f"which is not an integer quantity: the row was not written through this type"
+            )
+            raise TypeError(message)
         return value
