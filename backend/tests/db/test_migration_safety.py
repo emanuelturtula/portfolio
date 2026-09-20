@@ -131,6 +131,59 @@ def downgrade() -> None:
 '''
 
 
+ORPHAN_SESSION = (
+    "INSERT INTO sessions (user_id, token_hash, created_at, last_seen_at, expires_at) "
+    "VALUES (4242, 'orphan-token', '2026-01-01', '2026-01-01', '2026-01-01')"
+)
+
+REBUILD_SESSIONS = '''"""Rebuild the table that holds the dangling reference."""
+
+from __future__ import annotations
+
+import sqlalchemy as sa
+from alembic import op
+
+revision = "0003_rebuild_sessions"
+down_revision = "0002_seed_assets"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    with op.batch_alter_table("sessions", recreate="always") as batch_op:
+        batch_op.alter_column("token_hash", existing_type=sa.Text(), nullable=False)
+
+
+def downgrade() -> None:
+    pass
+'''
+
+DROP_THEN_BREAK = '''"""Succeed on the way up; drop a table and then fail on the way down."""
+
+from __future__ import annotations
+
+import sqlalchemy as sa
+from alembic import op
+
+revision = "0003_drop_then_break"
+down_revision = "0002_seed_assets"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table("dropped_on_the_way_down", sa.Column("id", sa.Integer(), primary_key=True))
+
+
+def downgrade() -> None:
+    op.drop_table("dropped_on_the_way_down")
+    op.execute(
+        "INSERT INTO sessions (user_id, token_hash, created_at, last_seen_at, expires_at) "
+        "VALUES (4242, 'orphan-token', '2026-01-01', '2026-01-01', '2026-01-01')"
+    )
+'''
+
+
 @pytest.fixture
 def migrations_copy(tmp_path: Path) -> Path:
     """The packaged migrations, copied so a test can add a revision to them safely."""
@@ -258,6 +311,60 @@ def test_a_failed_upgrade_leaves_the_earlier_revision_unapplied(
         "connection.begin() does not bracket CREATE TABLE. alembic_version is back at "
         "0002 while the schema is at 0003, and every later `upgrade head` now dies with "
         "'table already exists'."
+    )
+
+
+def test_a_pre_existing_orphan_survives_a_rebuild_as_pre_existing(
+    database_url: str,
+    sync_engine: Engine,
+    migrations_copy: Path,
+) -> None:
+    """A damaged row in the very table the migration rebuilds must not read as new.
+
+    This is the scenario the rebuild-stable identity exists for, end to end: the orphan
+    is in `sessions`, and the revision rebuilds `sessions`. If the identity carried the
+    rowid, the copy would look like a reference this run introduced and the deploy would
+    be refused for damage it did not cause.
+
+    `test_migration_guards.py::test_a_violation_is_identified_by_its_values_not_by_its_rowid`
+    is the discriminating half: `sessions.id` is an `INTEGER PRIMARY KEY` and therefore
+    aliases the rowid, so this particular rebuild happens to preserve it. The guard must
+    not depend on that being true.
+    """
+    add_revision(migrations_copy, "v0003_rebuild_sessions.py", REBUILD_SESSIONS)
+    command.upgrade(config_for(migrations_copy, database_url), SEED_REVISION)
+    with sync_engine.begin() as connection:
+        connection.exec_driver_sql(ORPHAN_SESSION)
+
+    command.upgrade(config_for(migrations_copy, database_url), "head")
+
+    assert stamped_revision(sync_engine) == "0003_rebuild_sessions"
+    assert count(sync_engine, "SELECT COUNT(*) FROM sessions") == 1
+
+
+def test_a_downgrade_is_atomic_too(
+    database_url: str,
+    sync_engine: Engine,
+    migrations_copy: Path,
+) -> None:
+    """Downgrade goes through the same bracket, so a refused one must undo its DDL.
+
+    `do_run_migrations` does not know which direction it is running in, but that is an
+    argument for pinning the behaviour rather than assuming it: a downgrade that dropped
+    a table and then failed would leave the same unmigratable database an upgrade used
+    to leave.
+    """
+    add_revision(migrations_copy, "v0003_drop_then_break.py", DROP_THEN_BREAK)
+    command.upgrade(config_for(migrations_copy, database_url), "head")
+    assert "dropped_on_the_way_down" in set(inspect(sync_engine).get_table_names())
+
+    with pytest.raises(MigrationIntegrityError, match="dangling foreign key"):
+        command.downgrade(config_for(migrations_copy, database_url), SEED_REVISION)
+
+    assert stamped_revision(sync_engine) == "0003_drop_then_break"
+    assert "dropped_on_the_way_down" in set(inspect(sync_engine).get_table_names())
+    assert (
+        count(sync_engine, "SELECT COUNT(*) FROM sessions WHERE token_hash = 'orphan-token'") == 0
     )
 
 
