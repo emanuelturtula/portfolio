@@ -25,13 +25,20 @@ import pytest
 from fastapi import APIRouter, FastAPI
 from httpx import ASGITransport, AsyncClient, Response
 from pydantic import BaseModel
+from sqlalchemy.dialects.sqlite import dialect as sqlite_dialect
 
-from portfolio.api.schemas.money import MoneyStr
+from portfolio.api.schemas.money import MAX_WIRE_EXPONENT, MoneyStr
+from portfolio.db.types import NumericText
+from portfolio.domain.money import MONEY_PRECISION
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
 BASE_URL: Final = "http://moneytest"
+
+# Only needed so the column type can be asked what it would have stored; the tests that
+# use it are about the wire, not about the database.
+DIALECT: Final = sqlite_dialect()
 
 # 20 integer digits and 20 decimal ones: far past what an IEEE-754 double can carry, so a
 # response that survives this intact cannot have gone through a float on the way out.
@@ -213,6 +220,114 @@ async def test_a_malformed_string_is_an_ordinary_422(money_client: AsyncClient) 
 
     assert response.status_code == 422
     assert "must arrive as a JSON string" not in response.text
+
+
+# --------------------------------------------------------------------------------------
+# The exponent is bounded, because rendering is linear in it and the client picks it.
+# --------------------------------------------------------------------------------------
+
+
+async def test_an_enormous_exponent_is_refused_without_rendering_it(
+    money_client: AsyncClient,
+) -> None:
+    """A 15-byte field used to cost a gigabyte of output. On a Pi that is an OOM kill.
+
+    `format(value, "f")` writes every position between the digits and the point, so its
+    cost is linear in the exponent while the request body stays tiny: `"1E+1000000"` used
+    to render a 1,000,014-character string. The amplifier is the renderer, not the parser,
+    and the client chooses the exponent and does not pay for it.
+    """
+    response = await post_raw_json(money_client, b'{"amount": "1E+1000000"}')
+
+    assert response.status_code == 422
+    assert "exponent within" in response.text
+    # The refusal did not render the value on its way to being refused.
+    assert len(response.text) < 2_000
+
+
+@pytest.mark.parametrize(
+    ("sent", "accepted"),
+    [
+        pytest.param("1E+38", True, id="max-positive-exponent"),
+        pytest.param("1E+39", False, id="one-past-positive"),
+        pytest.param("1E-38", True, id="max-negative-exponent"),
+        pytest.param("1E-39", False, id="one-past-negative"),
+        pytest.param("1E+1000000000", False, id="absurd"),
+    ],
+)
+async def test_the_exponent_bound_is_walked_from_both_sides(
+    money_client: AsyncClient, sent: str, accepted: bool
+) -> None:
+    """The bound is `MONEY_PRECISION` in either direction, and it is exactly that."""
+    response = await post_raw_json(money_client, f'{{"amount": "{sent}"}}'.encode())
+
+    assert (response.status_code == 200) is accepted
+    assert MAX_WIRE_EXPONENT == MONEY_PRECISION
+
+
+@pytest.mark.parametrize("scale", [0, 2, 8, 18, 38])
+async def test_anything_a_money_column_accepts_also_serializes(
+    money_client: AsyncClient, scale: int
+) -> None:
+    """The reason the bound is derived from `MONEY_PRECISION` rather than picked.
+
+    A separate number would eventually differ, and the difference would show up as a value
+    that persists fine and then fails to serialize -- a row in the database that no
+    endpoint can return. This walks the widest value each scale admits, stores it through
+    `NumericText`, and sends the same value over the wire.
+    """
+    integer_digits = MONEY_PRECISION - scale
+    widest = Decimal(f"{'9' * integer_digits}.{'9' * scale}" if scale else "9" * integer_digits)
+    stored = NumericText(scale).process_bind_param(widest, DIALECT)
+
+    response = await post_raw_json(money_client, f'{{"amount": "{widest}"}}'.encode())
+
+    assert stored is not None
+    assert response.status_code == 200
+    assert json.loads(response.text) == {"amount": stored}
+
+
+# --------------------------------------------------------------------------------------
+# Negative zero, so the wire and the column agree.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        pytest.param("-0.00", "0.00", id="two-places"),
+        pytest.param("-0", "0", id="bare"),
+        pytest.param("-0.000", "0.000", id="three-places"),
+        pytest.param("0.00", "0.00", id="already-positive"),
+    ],
+)
+async def test_negative_zero_is_normalised_on_the_wire(
+    money_client: AsyncClient, sent: str, expected: str
+) -> None:
+    """A computed loss of four tenths of a cent rendered as `-0.00` in the UI.
+
+    The scale is preserved and only the sign is dropped, which is what keeps this
+    agreeing with `NumericText`: the column stores `0.00` for the same amount, and before
+    this the two layers disagreed about how to spell it.
+    """
+    response = await post_raw_json(money_client, f'{{"amount": "{sent}"}}'.encode())
+
+    assert response.status_code == 200
+    assert json.loads(response.text) == {"amount": expected}
+    assert "-0" not in response.text
+
+
+def test_the_wire_and_the_column_spell_zero_the_same_way() -> None:
+    """Asserted against `NumericText` directly, so the two cannot drift apart."""
+    on_the_wire = Amount(amount=Decimal("-0.00")).model_dump()["amount"]
+    in_the_column = NumericText(2).process_bind_param(Decimal("-0.00"), DIALECT)
+
+    assert on_the_wire == in_the_column == "0.00"
+
+
+def test_a_negative_amount_that_is_not_zero_keeps_its_sign() -> None:
+    """The normalisation is for zero only; `-0.01` is a real loss and must show as one."""
+    assert Amount(amount=Decimal("-0.01")).model_dump()["amount"] == "-0.01"
 
 
 # --------------------------------------------------------------------------------------
