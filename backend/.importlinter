@@ -10,6 +10,11 @@ include_external_packages = True
 [importlinter:contract:portfolio]
 name = portfolio
 type = layers
+# `portfolio.cli` sits beside `portfolio.api` rather than above it: they are two entry
+# points onto the same services, and neither may import the other. A CLI that reached into
+# the API layer would drag FastAPI into an operator command, and an API that reached into
+# the CLI would inherit its `getpass` prompt.
+#
 # Items on one line are independent: siblings may not import each other. `portfolio.db`
 # and `portfolio.domain` were on one line, which made `db -> domain` a violation -- and
 # that is the import the money types need, so that `NumericText` rounds by the rule
@@ -18,7 +23,7 @@ type = layers
 # property that actually matters; persistence depending on the domain vocabulary is the
 # right direction, and the reverse would not be.
 layers =
-    portfolio.api
+    portfolio.cli | portfolio.api
     portfolio.services
     portfolio.repositories | portfolio.providers
     portfolio.db
@@ -27,6 +32,13 @@ layers =
 [importlinter:contract:thin-routers]
 name = portfolio routers stay thin
 type = forbidden
+# Direct imports only. Rule 4 is "a router may not import a repository, a provider,
+# sqlalchemy or httpx" -- it is about what a router reaches for, not about what its
+# service reaches for on its way to the database. Without this flag the contract also
+# reports the chain `router -> service -> repository`, which is the layering working
+# exactly as intended, and it would fail for the first router that ever called a service.
+# The layers contract above is what keeps the chain pointing downward.
+allow_indirect_imports = True
 source_modules =
     portfolio.api.routers
 forbidden_modules =

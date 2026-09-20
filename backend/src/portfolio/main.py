@@ -8,12 +8,15 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
+import structlog
 from anyio import to_thread
 from fastapi import FastAPI
 
 from portfolio import __version__
+from portfolio.api.dependencies import auth_service_for, install_auth_runtime
 from portfolio.api.errors import register_exception_handlers
-from portfolio.api.routers import health
+from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware
+from portfolio.api.routers import auth, health
 from portfolio.config import get_settings
 from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import (
@@ -27,7 +30,9 @@ from portfolio.web.spa import mount_spa
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-API_PREFIX = "/api"
+    from portfolio.config import Settings
+
+_logger = structlog.get_logger(__name__)
 
 
 @asynccontextmanager
@@ -50,9 +55,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db_engine = engine
     app.state.db_sessionmaker = create_session_factory(engine)
     try:
+        await bootstrap_owner(app, settings)
         yield
     finally:
         await engine.dispose()
+
+
+async def bootstrap_owner(app: FastAPI, settings: Settings) -> None:
+    """Create the owner account from the bootstrap password, if there is not one already.
+
+    This is how a fresh deployment becomes usable without an interactive shell: the
+    variable is set once in the host's environment file, the first start creates the
+    account, and every start after that finds one and leaves it alone. Leaving the
+    variable in place therefore does not reset the password on the next deploy, which is
+    the failure this would otherwise cause on every single release.
+
+    The password itself never reaches this function as a `str`: it is a `SecretStr`
+    unwrapped at the call into the service, so it cannot be carried into a log record or
+    a traceback frame by accident.
+    """
+    if settings.bootstrap_password is None:
+        return
+    sessionmaker = app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        service = auth_service_for(app, session)
+        created = await service.bootstrap_user(
+            settings.bootstrap_username,
+            settings.bootstrap_password.get_secret_value(),
+        )
+    _logger.info(
+        "bootstrap_user_created" if created else "bootstrap_user_already_exists",
+        username=settings.bootstrap_username,
+    )
 
 
 def create_app() -> FastAPI:
@@ -76,7 +110,15 @@ def create_app() -> FastAPI:
     )
 
     register_exception_handlers(app)
+    install_auth_runtime(app, settings)
+
+    # Middleware runs before routing, which is the whole point: the SPA is mounted at the
+    # root and matches every path, so a check that ran after routing would see an API
+    # request only when a route happened to exist for it.
+    app.add_middleware(RequestGuardMiddleware, settings=settings)
+
     app.include_router(health.router, prefix=API_PREFIX)
+    app.include_router(auth.router, prefix=API_PREFIX)
 
     # Mounted last and at the root: it matches every path, so any route registered
     # after it would be unreachable.

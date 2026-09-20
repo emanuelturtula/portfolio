@@ -10,6 +10,10 @@ license = "MIT"
 dependencies = [
     "fastapi",
     "uvicorn[standard]",
+    # Argon2id is the password hash: memory hard, so a GPU farm buys far less than it does
+    # against PBKDF2 or bcrypt. The cost parameters are settings rather than constants
+    # because the number that matters is the one measured on the Raspberry Pi.
+    "argon2-cffi",
     "pydantic>=2",
     "pydantic-settings",
     "structlog",
@@ -127,6 +131,14 @@ pythonpath = ["src"]
 # what actually executes.
 source = ["src/portfolio"]
 branch = true
+# Both, and neither is optional. SQLAlchemy's asyncio layer runs its work inside a
+# greenlet, so without "greenlet" every line of an `async def` after its first `await` on
+# a session goes untraced -- `services/auth.py` reported 58% while demonstrably running
+# end to end. FastAPI runs a *synchronous* dependency in a worker thread, and naming a
+# concurrency library turns off the thread tracing coverage does by default, so dropping
+# "thread" hides `api/dependencies.py` instead. Measuring one of the two is worse than
+# measuring neither, because the number looks plausible.
+concurrency = ["thread", "greenlet"]
 
 [tool.coverage.report]
 # The skeleton starts at 70 and this number only ever ratchets upward: raise it as
