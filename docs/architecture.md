@@ -90,8 +90,8 @@ than leaving it visibly broken.
 ## Layering
 
 ```
-api.routers -> services -> { repositories , providers } -> db -> domain
-domain      -> nothing
+{ api.routers , cli } -> services -> { repositories , providers } -> db -> domain
+domain                -> nothing
 ```
 
 Enforced by `import-linter` contracts in `backend/.importlinter`, run in CI and by
@@ -100,6 +100,16 @@ Enforced by `import-linter` contracts in `backend/.importlinter`, run in CI and 
 - **`api.routers`** parse a request, call a service, serialize the result. They may not
   import `repositories`, `providers`, `sqlalchemy` or `httpx`; a separate `forbidden`
   contract says so by name, because "thin" is otherwise a matter of opinion.
+
+  What makes that hold in practice is that a router is never handed a database session.
+  `api.dependencies` opens the session, builds the service around it and yields the
+  service; the router's signature mentions neither `AsyncSession` nor a repository, so
+  the contract has nothing to catch because there is nothing to write.
+- **`cli`** is a sibling of `api`, not a layer above it. Both are entry points onto the
+  same services, and neither imports the other. `python -m portfolio create-user` and the
+  login endpoint reach the same password policy and the same hasher, which is the point:
+  an account created from the command line and one created by the bootstrap path cannot
+  end up under different rules.
 - **`services`** hold the business logic and may not import `fastapi`. A service that
   raises `HTTPException` has put an HTTP concern in the only layer that should be
   testable without one.
@@ -113,7 +123,44 @@ Enforced by `import-linter` contracts in `backend/.importlinter`, run in CI and 
   ORM. The current time is passed in as an argument. That is what makes a domain
   calculation reproducible from its inputs alone, in a test and in an incident.
 
+## Authentication
+
+Single user, one password, opaque server-side sessions. No JWT and no refresh tokens: a
+stateless token cannot be revoked, and revocation is the only session behaviour this
+product actually needs.
+
+Two hashes, for two different threats:
+
+- **Argon2id** over the password, because a password is low entropy and guessable, so the
+  hash has to be slow and memory-hard. The cost parameters are settings, floored at the
+  OWASP minimum, and measured on the deployment hardware rather than copied — see
+  `docs/operations.md`.
+- **SHA-256** over the session token, because the token is 32 bytes from
+  `secrets.token_urlsafe` and no amount of offline work recovers 256 bits of entropy. The
+  hash only has to be preimage resistant. Running Argon2id per request would add a quarter
+  of a second to every page load for no gain.
+
+Only the hash is stored, so a leaked database file yields no usable session.
+
+Two expiries apply at once: a sliding 7-day idle window and a hard 30-day ceiling that
+activity never extends. Whichever comes first ends the session.
+
+Authorization is **deny-by-default, in middleware**. Any path under `/api` outside
+`PUBLIC_API_PATHS` requires a session. A `Depends` on each router would be the more
+conventional shape and is the wrong one here: forgetting it on one endpoint is the exact
+failure mode, and a rule that can be forgotten is a rule that eventually is. A contract
+test walks every registered route and asserts `401` without a cookie.
+
+The same middleware enforces, on every non-GET request, a matching `Origin` and a
+`Content-Type` of `application/json`. The second is the one that does the work: a
+form-encoded POST is the shape an HTML form can send cross-site without a preflight, so
+refusing it closes CSRF without a token round-trip. `SameSite=Lax` on the cookie is the
+belt to that pair of braces.
+
+See `docs/specs/003-single-user-password-login.md` for the decisions and what they cost.
+
 ## Related documents
 
 - `CLAUDE.md` — the working agreement, and the enforcement behind each rule.
+- `docs/operations.md` — running the instance: the account, the password hash, sessions.
 - `docs/specs/` — the per-issue implementation specs.

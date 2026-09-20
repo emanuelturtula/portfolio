@@ -19,6 +19,22 @@ services:
     # host-local file that deploy.py guarantees exists at mode 0600. They are written once
     # over SSH by the operator and never pass through GitHub Actions. The /dev/null default
     # keeps compose valid before that file has any content.
+    #
+    # Two authentication variables live in that same file rather than here, because one is
+    # a host name and the other is a credential, and neither may enter the repository:
+    #
+    #   PORTFOLIO_ALLOWED_ORIGIN     the scheme and host the browser shows, e.g.
+    #                                https://portfolio.example -- required in prod, and
+    #                                the application refuses to start without it, so the
+    #                                first deployment after authentication lands will roll
+    #                                back until it is set. docs/operations.md section 1.
+    #   PORTFOLIO_BOOTSTRAP_PASSWORD optional; creates the account on first start and is
+    #                                ignored once one exists. Prefer `create-user`, which
+    #                                prompts and leaves no copy on disk.
+    #
+    # They are NOT declared as required compose variables: the script that supplies those
+    # lives on the host, not in this repository, so a `${VAR:?}` entry nothing sets would
+    # fail every deployment at `docker compose up`.
     env_file:
       - ${PORTFOLIO_SECRETS_ENV_FILE:-/dev/null}
     volumes:

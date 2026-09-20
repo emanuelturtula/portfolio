@@ -16,7 +16,8 @@ The wallet registry (#5) is blocked on this, and the login page (#4) has nothing
 ## Scope
 
 - Argon2id password hashing, with cost parameters read from settings rather than hardcoded.
-- `python -m portfolio create-user`, prompting for the password on a TTY.
+- `python -m portfolio create-user`, prompting for the password on a TTY, with a
+  `--replace` flag (added after the spec was first committed — see Scope additions).
 - `python -m portfolio hash-benchmark`, which measures the configured parameters on the
   host it runs on. This is what makes "tuned on the Pi" an action rather than a wish.
 - Opaque session tokens, stored as a SHA-256 hash, with a sliding idle expiry and a hard
@@ -28,6 +29,28 @@ The wallet registry (#5) is blocked on this, and the login page (#4) has nothing
 - `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/session`,
   `POST /api/auth/password`.
 - Bootstrap-password validation that refuses to start the application.
+
+## Scope additions
+
+Recorded here rather than folded in silently, so the pull request review can see what grew
+and why.
+
+### `create-user --replace`
+
+Writing `docs/operations.md` surfaced a hole this spec left open. There is deliberately no
+password reset flow — no email, no recovery question, nothing to attack — and `create-user`
+deliberately refuses when a user already exists. Together those mean a forgotten password
+bricks the instance: no reset, no way to re-create the account, and no `sqlite3` binary in
+the runtime image to go in by hand.
+
+`--replace` deletes the existing user and creates the new one in one transaction. The
+delete cascades to that user's sessions through the `ondelete="CASCADE"` already on
+`sessions.user_id`, so it revokes everything as a side effect. It still prompts and still
+confirms — the flag replaces the account, never the prompt — and it requires an explicit
+typed confirmation naming the account being destroyed, refusing outright when stdin is not
+a TTY.
+
+One flag, against an instance that otherwise cannot be recovered.
 
 ## Non-goals
 
@@ -151,9 +174,23 @@ Rule 2 is the one that matters: a form-encoded POST is the shape an HTML form ca
 cross-origin without a CORS preflight. Both rejections are `403`.
 
 In production the SPA is served from the same origin as the API, so
-`PORTFOLIO_ALLOWED_ORIGIN` must be set to the deployed origin. It is added to
-`deploy/compose.yml` as a required variable — the value is infrastructure and stays out of
-the repository (rule 3).
+`PORTFOLIO_ALLOWED_ORIGIN` must be set to the deployed origin.
+
+**Corrected after the spec was first committed.** The original plan was to make it a
+required variable in `deploy/compose.yml`. That is wrong: the host-side script that supplies
+those compose variables lives on the Pi, not in this repository — `scripts/remote_deploy.py`
+only invokes it over SSH — so a `${VAR:?}` entry nothing sets would fail every deployment at
+`docker compose up`.
+
+Instead, `Settings` refuses to start when `environment` is `prod` and `allowed_origin` is
+still the development default. The value itself is a hostname, so by rule 3 it lives in the
+host-local secrets env file compose already loads through `PORTFOLIO_SECRETS_ENV_FILE`,
+alongside `PORTFOLIO_BOOTSTRAP_PASSWORD`.
+
+Refusing to start is also the better failure: an unset origin otherwise yields a container
+that reports healthy and then rejects every write with `403`, and the symptom — login works,
+nothing else does — does not name its cause. A refusal fails the deployment's health check
+and rolls back, which is a path the pipeline already handles and tests.
 
 ### Deny-by-default authentication
 
@@ -304,6 +341,9 @@ Verbatim from the issue, numbered.
 | 2 | Confirmation must match | `tests/cli/test_create_user.py::test_create_user_rejects_a_mismatched_confirmation` |
 | 2 | Policy applies | `tests/cli/test_create_user.py::test_create_user_rejects_a_password_below_policy` |
 | 2 | Refuses a second user | `tests/cli/test_create_user.py::test_create_user_refuses_when_a_user_exists` |
+| — | `--replace` cascades to sessions | `tests/cli/test_create_user.py::test_create_user_replace_deletes_the_existing_user_and_its_sessions` |
+| — | `--replace` still prompts | `tests/cli/test_create_user.py::test_create_user_replace_still_prompts_for_the_password` |
+| — | `--replace` needs confirmation | `tests/cli/test_create_user.py::test_create_user_replace_aborts_when_the_confirmation_does_not_match` |
 | 3 | Token shape and entropy | `tests/auth/test_sessions.py::test_issued_token_is_url_safe_and_32_bytes` |
 | 3 | Plaintext is never stored | `tests/auth/test_sessions.py::test_database_never_contains_the_plaintext_token` |
 | 4 | Idle expiry rejects | `tests/auth/test_sessions.py::test_session_expires_after_the_idle_window` |
@@ -313,6 +353,7 @@ Verbatim from the issue, numbered.
 | 5 | Every cookie attribute | `tests/auth/test_login.py::test_cookie_carries_every_required_attribute` |
 | 5 | Name degrades when insecure | `tests/auth/test_login.py::test_cookie_name_drops_the_host_prefix_when_insecure` |
 | 5 | `prod` refuses insecure | `tests/auth/test_startup.py::test_prod_refuses_an_insecure_session_cookie` |
+| 6 | `prod` refuses the dev origin | `tests/auth/test_startup.py::test_prod_refuses_the_development_allowed_origin` |
 | 6 | Cross-origin POST | `tests/auth/test_request_guards.py::test_cross_origin_post_is_rejected` |
 | 6 | Missing Origin | `tests/auth/test_request_guards.py::test_post_without_an_origin_is_rejected` |
 | 6 | Form-encoded POST | `tests/auth/test_request_guards.py::test_form_encoded_post_is_rejected` |
@@ -362,10 +403,12 @@ file is the exact collision this table exists to prevent.
   comes in far from 250 ms, the fix is an environment variable and a restart, not a code
   change — which is why the parameters are settings.
 - **The throttle window does not survive a restart.** See Design. A deployment clears it.
-- **`PORTFOLIO_ALLOWED_ORIGIN` becomes required in production.** It currently defaults to
-  the Vite dev server, so a deployment that does not set it rejects every write with `403`,
-  and the symptom — login works, nothing else does — does not name its cause. Mitigated by
-  making it required in `deploy/compose.yml` rather than defaulted.
+- **`PORTFOLIO_ALLOWED_ORIGIN` becomes required in production.** It defaults to the Vite dev
+  server, so a deployment that does not set it would reject every write with `403`.
+  Mitigated by refusing to start instead — see the correction in Design. The first
+  deployment after this merges **will** fail and roll back unless the operator adds the
+  variable to the host's secrets env file first; `docs/operations.md` carries that step, and
+  it is the one manual action this change requires.
 - **Making `/api/openapi.json` non-public** could break a tool that fetches it
   unauthenticated. Nothing in this repository does: the drift job dumps the schema in
   process.
