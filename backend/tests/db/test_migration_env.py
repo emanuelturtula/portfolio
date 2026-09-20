@@ -12,7 +12,6 @@ paths are therefore driven through Alembic itself.
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import pytest
@@ -34,24 +33,6 @@ APPLICATION_TABLES = frozenset({"users", "sessions", "assets"})
 # `backend/alembic.ini`, resolved from the package rather than from the test's working
 # directory, because pytest's rootdir is not necessarily `backend/`.
 ALEMBIC_INI = MIGRATIONS_DIR.parents[3] / "alembic.ini"
-
-
-@pytest.fixture
-def restored_logging() -> Iterator[None]:
-    """Undo whatever `fileConfig` does to the root logger.
-
-    The ini carries a logging configuration, and reading it is the point of one of the
-    tests below -- but leaving it installed would silently reconfigure logging for every
-    test that runs afterwards, including the redaction tests.
-    """
-    root = logging.getLogger()
-    handlers = root.handlers[:]
-    level = root.level
-    try:
-        yield
-    finally:
-        root.handlers[:] = handlers
-        root.setLevel(level)
 
 
 @pytest.fixture
@@ -152,6 +133,58 @@ def test_env_offline_mode_renders_the_check_constraint(
 
     assert "ck_assets_kind" in emitted
     assert "fk_sessions_user_id_users" in emitted
+
+
+def test_the_offline_script_carries_the_safety_preamble_first(
+    database_url: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The artifact an operator reads is the SQL, so the warning has to be in the SQL.
+
+    A generated script containing a batch rebuild deletes every referencing row if it is
+    applied under enforcement. The instructions must therefore sit above the first
+    statement, not in a docstring nobody applying the script will read.
+
+    SQLite declares DDL non-transactional, so Alembic emits no `BEGIN` of its own here:
+    the anchor is the first statement in the script rather than a `BEGIN` line.
+    """
+    command.upgrade(build_offline_config(database_url), "head", sql=True)
+
+    emitted = capsys.readouterr().out
+
+    assert "PRAGMA foreign_keys=OFF" in emitted
+    assert "PRAGMA foreign_key_check" in emitted
+    assert "ROLLBACK" in emitted
+    # Every preamble line is a comment, and all of them precede the first statement.
+    first_statement = emitted.index("CREATE TABLE alembic_version")
+    preamble = emitted[:first_statement]
+    assert preamble.index("-- Apply this script") < first_statement
+    assert "PRAGMA foreign_keys=OFF" in preamble
+    assert "PRAGMA foreign_key_check" in preamble
+    assert all(line.startswith("--") for line in preamble.splitlines() if line.strip()), (
+        "the preamble must be comments only, or the script will not parse"
+    )
+
+
+def test_the_offline_preamble_does_not_emit_the_pragma_as_a_statement(
+    database_url: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An emitted `PRAGMA foreign_keys=OFF` would look protective and do nothing.
+
+    Alembic wraps the script in a transaction and the pragma is a documented no-op
+    inside one, so it has to stay an instruction to the operator.
+    """
+    command.upgrade(build_offline_config(database_url), "head", sql=True)
+
+    emitted = capsys.readouterr().out
+
+    executable = [
+        line
+        for line in emitted.splitlines()
+        if "PRAGMA" in line and not line.strip().startswith("--")
+    ]
+    assert executable == []
 
 
 def test_the_developer_ini_drives_a_real_migration(
