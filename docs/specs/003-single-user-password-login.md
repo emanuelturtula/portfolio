@@ -488,6 +488,16 @@ was right would waste the next person's time.
   non-HTTP scope straight through, and the route walk skips anything without `methods`. Not
   exploitable — there are no websocket routes — but `CLAUDE.md` rule 8 is written
   unconditionally, so the contract test now fails on the existence of one.
+- **A production-gated startup refusal breaks the image build.** The Dockerfile sets
+  `PORTFOLIO_ENVIRONMENT=prod` and then imports `create_app()` as its last build step, to
+  prove the image can serve what it ships — so every refusal gated on production is
+  evaluated during `docker build`, with none of the deployment environment present. The
+  `PORTFOLIO_ALLOWED_ORIGIN` refusal therefore failed the arm64 build while all twelve
+  local checks were green, because the whole suite runs at `environment="dev"`. The smoke
+  check now supplies a reserved `.invalid` origin inline, and
+  `backend/tests/test_image_configuration.py` parses the Dockerfile and reproduces the
+  construction, so the next one fails in milliseconds instead of after a
+  multi-architecture build.
 - **Making `/api/openapi.json` non-public broke an existing test.** The Risks section
   worried about external tooling and missed the test in this repository.
 - **Coverage was measuring the wrong thing**, and had been since the project started using
