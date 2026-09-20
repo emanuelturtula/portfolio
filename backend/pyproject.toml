@@ -30,6 +30,10 @@ dev = [
     "mypy",
     "ruff",
     "import-linter",
+    # Base-unit conversion is the kind of arithmetic where the failing input is one
+    # nobody thinks to write down by hand, so the round trip is asserted over generated
+    # decimals rather than over a handful of examples.
+    "hypothesis",
 ]
 
 [build-system]
