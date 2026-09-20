@@ -84,9 +84,15 @@ select = [
 # SQLAlchemy resolves `Mapped[...]` annotations at runtime to build the mapper, so the
 # names inside them must be real imports. Without this, TC003 would move `datetime` into
 # an `if TYPE_CHECKING:` block and every mapped class would fail to configure.
+#
+# `pydantic.BaseModel` is here for the same reason: Pydantic resolves a model's annotations
+# at class-creation time. Without it, the first response model with a `MoneyStr` field trips
+# TC001, and ruff's suggested fix -- move the import into `if TYPE_CHECKING:` -- breaks the
+# model at runtime. An autofix that is confidently wrong is worse than a missing rule.
 runtime-evaluated-base-classes = [
     "sqlalchemy.orm.DeclarativeBase",
     "portfolio.db.base.Base",
+    "pydantic.BaseModel",
 ]
 
 [tool.ruff.lint.flake8-builtins]
@@ -122,15 +128,15 @@ branch = true
 # The skeleton starts at 70 and this number only ever ratchets upward: raise it as
 # behaviour lands, never lower it to make a red build green.
 #
-# 70 -> 97 with the database foundation (#1), measured at 99.03%. That is the ceiling with
-# the current dependencies, not a plateau to relax on: exactly one statement in the whole
-# backend is missed -- `web/spa.py:52`, which predates this change -- and the only missed
-# branches are the two `if dialect.name == "sqlite"` guards in the engine factories, which
-# need a non-SQLite async driver that is not a dependency and should not become one.
+# 70 -> 97 with the database foundation (#1). 97 -> 98 with money persistence (#2),
+# measured at 99.27%.
 #
-# The 2 points of headroom mirror what the previous ratchet left. Do not read a green gate
-# at 97 as permission to add fifteen untested statements.
-fail_under = 97
+# 99.27 is the ceiling with the current dependency set, not headroom. The misses are the
+# same three they were in #1 and none of them is reachable: `web/spa.py:52`, and the two
+# `if dialect.name == "sqlite"` branches in the engine factories, which need a non-SQLite
+# async driver that is not a dependency and should not become one. A floor of 99 would
+# leave essentially nothing and turn every refactor into a threshold argument.
+fail_under = 98
 show_missing = true
 skip_covered = true
 exclude_also = [

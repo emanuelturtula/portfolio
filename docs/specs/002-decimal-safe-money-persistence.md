@@ -1,7 +1,7 @@
 # 002 — Decimal-safe money persistence and domain money helpers
 
 Issue: #2
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -286,3 +286,73 @@ needs to move.
   here. If it finds one that implies a design change rather than a bug fix, stop and say so.
 - Nothing here depends on an external API, so there is nothing to verify against vendor
   documentation.
+
+## What the implementation found that this plan did not
+
+### The guard that guards money lost money
+
+`NumericText.__init__` validated nothing. `NumericText(-2)` — a plausible typo for
+`NumericText(2)` — was accepted, and bound `Decimal("12345.67")` to the string `'12300'`:
+silent loss, no error, no warning, and a stored form that looks like a legitimate amount.
+In the file whose entire purpose is preventing exactly that. The scale is now validated at
+construction, so all three degenerate cases (`-2`, a `float` scale, `38`) are import-time
+errors or produce a message that diagnoses the mistake.
+
+Found by mutation, not by reading. This plan did not think to specify it, and no test
+written against the plan would have caught it.
+
+### `quantize` depended on ambient state, in the module that exists to avoid ambient state
+
+`domain/money.py` grew an `_exponent` helper specifically so that "nothing about money
+depends on ambient state that a caller can change" — and then rounded through the thread's
+ambient decimal context one line later. Inside a `localcontext(prec=9)` the same function
+gave a different answer. It now takes an explicit
+`Context(prec=MONEY_PRECISION, rounding=MONEY_ROUNDING)`.
+
+That also demotes the import-time `DefaultContext` mutation from something this module's
+correctness rests on to a convenience for other code, which is a better place to be.
+
+### The float ban had holes, and its own self-guard could not fail
+
+Three, in the mechanism that makes rule 2 mechanical rather than documentary:
+
+- The test asserting the walk covers the right packages iterated `PURE_PACKAGES` to check
+  `PURE_PACKAGES`. Narrowing the tuple to `("domain",)` kept it green. Since `services/` and
+  `providers/` held nothing but an empty `__init__.py`, the ban had never in fact scanned a
+  line outside `domain/money.py`.
+- `from builtins import float as f` was not caught. The same hole existed in the sibling
+  `Numeric` ban — `from sqlalchemy import Numeric as N` sailed through.
+- `1 / 3` was not caught, and that is the accident rather than the evasion: true division of
+  integer literals produces a float with no literal and no `float` name in the file.
+
+All three are closed, each with a companion proving the new rule can fail, and the walk was
+verified by planting each evasion in the real `services/` package rather than in `tmp_path`.
+The residual limit — `a / b` on names is undecidable statically — is now written into the
+module docstring, along with the point that the AST ban is defence in depth and the real
+backstop is `require_amount` / `NumericText` / `BaseUnits` / `MoneyStr` refusing a float at
+the boundary.
+
+### Smaller corrections
+
+- **`MoneyStr` had no magnitude bound.** `{"amount": "1E+1000000"}` validated and rendered a
+  1,000,014-character string; linear in the exponent, so a 15-byte field meant roughly a
+  gigabyte and an OOM on the Pi. Bounded at `MONEY_PRECISION`, derived rather than picked,
+  so the wire cannot reject a value a column stores happily.
+- **`BaseUnits` guarded bind but not result.** A row written by raw SQL as `1.5` came back
+  through the ORM as a Python `float` from a column typed `Mapped[int]`.
+- **`-0.00` was normalised in the database and not on the wire**, so a computed P/L of minus
+  four tenths of a cent rendered as `-0.00`.
+- **The over-magnitude failure reported `decimal.InvalidOperation: [<class
+  'decimal.InvalidOperation'>]`** — no value, no scale, no reason. It now names all three,
+  and the `MONEY_PRECISION - scale` ceiling is documented.
+- **SQLAlchemy does not warn about `Numeric` on SQLite.** An earlier draft of
+  `docs/architecture.md` asserted it did. The claim was replaced with a measured round trip:
+  `Numeric(38, 20)` takes `12345678901234567890.12345678901234567890` and returns
+  `12345678901234567168.00000000000000000000`, stored with `typeof()` = `real`, no exception
+  and no warning. That is the whole argument for rule 2 in one line.
+
+### Test plan, as built
+
+The table above names 21 tests. The suite ships **401**, of which 245 are new. The
+difference is almost entirely failure paths: every guard above has a test, and every test
+that asserts a ban has a companion proving the ban can fail.
