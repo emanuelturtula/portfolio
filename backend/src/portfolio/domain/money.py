@@ -34,19 +34,39 @@ MONEY_ROUNDING: Final[str] = ROUND_HALF_EVEN
 upward -- which, over thousands of fills, is a portfolio that reports more than it holds.
 """
 
-# `getcontext()` returns the *calling thread's* context, so setting it alone configures
-# whichever thread imported this module and nothing else. That is not a theoretical
-# concern here: `main.py` runs the Alembic migrations through `anyio.to_thread.run_sync`,
-# and Starlette runs every non-async route handler in a worker thread too. A thread
-# builds its context by copying `DefaultContext` the first time it calls `getcontext()`,
-# so setting only one of the two leaves half the process quantizing at 28 digits without
-# an error to show for it. Measured: with `getcontext()` alone a worker thread reports
-# 28; with `DefaultContext` also set it reports 38. A thread that had already
-# materialised its own context before this module was imported would keep the old
-# precision, which in practice cannot happen -- the import completes while the
-# application is still being built, before any worker thread exists.
-decimal.getcontext().prec = MONEY_PRECISION
-decimal.DefaultContext.prec = MONEY_PRECISION
+
+def configure_decimal_context() -> None:
+    """Raise the decimal precision to `MONEY_PRECISION`, for this thread and new ones.
+
+    `getcontext()` returns the *calling thread's* context, so setting it alone configures
+    whichever thread called this and nothing else. That is not a theoretical concern
+    here: `main.py` runs the Alembic migrations through `anyio.to_thread.run_sync`, and
+    Starlette runs every non-async route handler in a worker thread too. A thread builds
+    its context by copying `DefaultContext` the first time it calls `getcontext()`, so
+    setting only one of the two leaves half the process quantizing at 28 digits with no
+    error to show for it. Measured: with `getcontext()` alone a worker thread reports 28;
+    with `DefaultContext` also set it reports 38.
+
+    Two consequences worth stating rather than discovering. A thread that materialised
+    its own context *before* this ran keeps the old precision -- which is why this is
+    called at import below, while the application is still being built and no worker
+    thread exists yet. And `DefaultContext` is the `decimal` module's own global, so this
+    changes the default precision for everything in the process, not only for this
+    package. That is the point -- a guarantee that only covers the code that remembered
+    to ask for it is not a guarantee -- but it is a real side effect of importing a
+    library module, and the honest place to record it is here.
+    """
+    decimal.getcontext().prec = MONEY_PRECISION
+    decimal.DefaultContext.prec = MONEY_PRECISION
+
+
+# Called at import, deliberately. The alternative -- threading a `decimal.Context`
+# through every call, or requiring an explicit setup call -- fails open the first time a
+# caller forgets, and a rounding that is silently wrong is the failure mode this whole
+# module exists to prevent. Naming the operation rather than running two bare assignments
+# here means the entry point can also call it explicitly, and that moving to
+# explicit-only configuration would be a one-line change rather than a redesign.
+configure_decimal_context()
 
 
 def require_amount(value: object, *, subject: str) -> Decimal:
