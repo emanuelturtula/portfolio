@@ -15,6 +15,28 @@ dict or a list. Keys are matched case-insensitively on a substring, so `api_key`
 
 This is defence in depth, not the primary control: credentials belong in `SecretStr`
 fields so they never reach a log statement in the first place.
+
+## The second control, and why the first one cannot do its job alone
+
+`redact_sensitive` is a **structlog processor**, so it only ever sees records that went
+through structlog's chain. A third-party library logging through the standard library does
+not: its record goes to the root handler `configure_logging` installs, renders through
+`"%(message)s"`, and reaches stdout without passing a single processor. Matching on key
+names would not have helped even if it had -- the record carries one preformatted string.
+
+That is not hypothetical. `httpx` logs every request it makes at **INFO**, with the full
+URL, from `logger.info("HTTP Request: %s %s ...")` in `httpx/_client.py`. At production
+defaults that put an owner's wallet address on stdout on every balance read, and would
+have put an exchange's query-string signature there too -- the two disclosures rule 3
+exists to prevent, arriving through a door the redaction processor does not watch.
+`providers/http.py` scrubs what *it* logs and is powerless here, because
+`AsyncClient.send` sits above the transport.
+
+`URL_LOGGING_LIBRARIES` closes it, and the honest description of it is written here rather
+than discovered later: **it is a named list, not a mechanism.** Any library that logs a URL
+through the standard library bypasses `redact_sensitive` entirely, and silencing two
+loggers closes today's leak without closing that hole. The general case is a separate
+issue.
 """
 
 from __future__ import annotations
@@ -58,6 +80,42 @@ SENSITIVE_KEY_FRAGMENTS: Final[tuple[str, ...]] = (
 # whole derivation tree, so a field named after one is redacted wholesale.
 EXTENDED_KEY_PREFIXES: Final[tuple[str, ...]] = ("xpub", "ypub", "zpub")
 
+URL_LOGGING_LIBRARIES: Final[tuple[str, ...]] = ("httpx", "httpcore")
+"""Standard-library loggers that render a URL, silenced below `VENDOR_LOG_FLOOR`.
+
+`httpx` is the measured leak. Its `AsyncClient.send` calls
+`logger.info('HTTP Request: %s %s "%s %d %s"', request.method, request.url, ...)`, which at
+production defaults writes the path -- and therefore the wallet address, since both target
+chains put it there -- and the query string -- and therefore an exchange signature -- onto
+stdout for every request. Verified in httpx 0.28.1: those are the only two `logger` calls
+in the package, both at INFO, so a WARNING floor removes the leak entirely.
+
+`httpcore` is precautionary and I could not exercise it, which is worth saying plainly
+rather than implying a test that does not exist: it logs only through `Trace`, only at
+DEBUG, and `httpx.MockTransport` bypasses httpcore altogether, so nothing in the suite
+reaches that code. It is listed because a connection-level logger is one we never want on
+stdout, and because `Trace.__init__` asks `isEnabledFor(DEBUG)` before formatting anything,
+so the floor also spares the work.
+
+Naming the parent is enough for `httpcore.connection`, `httpcore.http11` and their three
+siblings: none of them sets its own level, so each inherits its effective level from this
+one. That would stop being true if httpcore ever called `setLevel` on a child.
+"""
+
+VENDOR_LOG_FLOOR: Final = logging.WARNING
+"""An absolute floor for those loggers, not a maximum against `settings.log_level`.
+
+Deliberately not `max(level, WARNING)`. Turning the application's own logging up to DEBUG
+to investigate a provider must not be the act that puts every wallet address on stdout --
+which is exactly when someone would be tailing it, and exactly when a copy would end up
+pasted into an issue.
+
+WARNING rather than silencing the loggers outright, because `httpx` has no URL-bearing call
+above INFO and a genuine warning from it is worth hearing. Our own transport already logs
+an attempt, a status and a scrubbed target for every request, so nothing diagnostic is
+lost by dropping its INFO line.
+"""
+
 
 def is_sensitive_key(key: str) -> bool:
     """Return whether a log field name must never have its value rendered."""
@@ -93,10 +151,32 @@ def redact_sensitive(
     return {key: _redact_item(key, value) for key, value in event_dict.items()}
 
 
+def silence_vendor_url_logging() -> None:
+    """Raise every logger in `URL_LOGGING_LIBRARIES` to `VENDOR_LOG_FLOOR`.
+
+    Called from `configure_logging`, which is the one place that decides what may reach
+    stdout, so the rule applies to the whole process rather than to whichever factory
+    remembered to ask for it. A named function rather than two lines inline so that the
+    reasoning has somewhere to live and an entry point can call it on its own.
+
+    Sets the level on the logger rather than adding a filter to the handler: a filter on
+    the root handler would be removed by the next `logging.basicConfig(force=True)`, and
+    fixing the leak with something a later call silently undoes is worse than not fixing
+    it, because the gate would stay green.
+    """
+    for library in URL_LOGGING_LIBRARIES:
+        logging.getLogger(library).setLevel(VENDOR_LOG_FLOOR)
+
+
 def configure_logging(settings: Settings) -> None:
     """Configure structlog: JSON on one line in production, readable console in dev."""
     level = logging.getLevelNamesMapping().get(settings.log_level.upper(), logging.INFO)
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level, force=True)
+    # After `basicConfig`, which installs the root handler these records would otherwise
+    # propagate to. `force=True` resets the root logger's handlers and does not touch a
+    # named logger's level, so the order is not load-bearing -- but reading it in the
+    # order the records travel is.
+    silence_vendor_url_logging()
 
     renderer: Processor = (
         structlog.processors.JSONRenderer()
