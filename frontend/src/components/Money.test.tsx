@@ -51,4 +51,43 @@ describe('Money', () => {
     // Never exponent notation, whatever the grouping and truncation rules are.
     expect(element.textContent).not.toMatch(/e[+-]/i);
   });
+
+  // The `value` attribute alone proves nothing about formatting: it is the
+  // input string echoed straight back, and every assertion on it would still
+  // pass with `decimal.js` removed from this component's path entirely. These
+  // pin the visible text, which is the part a person actually reads.
+  it('renders the formatted text, grouped', () => {
+    const { container } = render(<Money value={money('1234567.89')} />);
+
+    expect(dataElement(container).textContent).toBe('1,234,567.89');
+  });
+
+  it('keeps the sign in the visible text, not only in the attribute', () => {
+    const { container } = render(<Money value={money('-1234.5')} />);
+
+    const element = dataElement(container);
+    expect(element.textContent).toBe('-1,234.5');
+    expect(element.getAttribute('value')).toBe('-1234.5');
+  });
+
+  it('passes formatting options through to formatMoney', () => {
+    const { container } = render(
+      <Money value={money('1234.5')} options={{ minimumFractionDigits: 2 }} />,
+    );
+
+    const element = dataElement(container);
+    expect(element.textContent).toBe('1,234.50');
+    // Formatting is display only. The attribute still carries the exact input.
+    expect(element.getAttribute('value')).toBe('1234.5');
+  });
+
+  it('respects a reduced maximum precision without losing the exact value', () => {
+    const { container } = render(
+      <Money value={money('1.2345')} options={{ maximumFractionDigits: 2 }} />,
+    );
+
+    const element = dataElement(container);
+    expect(element.textContent).toBe('1.23');
+    expect(element.getAttribute('value')).toBe('1.2345');
+  });
 });

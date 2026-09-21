@@ -1,7 +1,7 @@
 # 004 — Login page and authenticated application shell
 
 Issue: #4
-Status: draft
+Status: done
 
 ## Problem
 
@@ -306,3 +306,174 @@ the test that proves it fires belongs to the tester.
 - **`react-router-dom` v7 with `StrictMode`** double-invokes effects in development. Anything
   written as an effect-driven redirect will fire twice; the guard is therefore declarative
   (`<Navigate>`), not an effect.
+
+## What the spec got wrong
+
+### The one that matters: a named test is not a specified assertion
+
+The test plan named `LoginPage.test.tsx::returns to the route that triggered the redirect`
+for criterion 2. That test was written, was green, and the feature was **broken in the running
+application** — signing in from `/health` landed on `/`.
+
+Two redirects raced in `LoginPage`. `onSuccess` awaited `invalidateQueries`, which refetched
+the session; by the time it resolved `session.data` was truthy, React re-rendered, and the
+already-signed-in branch returned a hardcoded `<Navigate to="/" replace />` that beat the
+imperative `navigate(resolveReturnPath(...))`. The fix was to delete the imperative navigate
+and let the single declarative redirect carry the resolved path.
+
+The test did not catch it because of how it was repaired earlier in the same cycle. The
+original assertion checked the final location; under a `MemoryRouter`, `navigate('//evil.example')`
+goes nowhere and `<Navigate to="/">` then lands on `/` anyway, so the open-redirect mutation
+did not bite. The repair moved the assertion from the **outcome** to the **request** — what
+the page asks `navigate` for. That made the open-redirect mutations discriminate correctly and
+simultaneously blinded the test to the outcome being wrong. The page does ask for `/health`;
+it just also renders a redirect that wins.
+
+This is #3's lesson arrived at from the opposite direction. There, five tests derived their
+expectation from the constant they were checking. Here, one test derived its expectation from
+the call the implementation makes rather than the result the user gets. The rule this issue
+adds: **when an assertion has to change to make a mutation bite, establish what the old
+assertion was covering before dropping it, and prefer keeping both.**
+
+### jsdom and a real browser resolve this race in opposite directions
+
+Measured, not assumed. With the dual-redirect race restored, the tester recorded the
+navigation trajectory under jsdom:
+
+```
+FIXED   (single declarative redirect)  ["/health","/login","/health"]  final=/health
+MUTATED (dual-redirect race)           ["/health","/login","/health"]  final=/health
+```
+
+Identical. jsdom happens to resolve the ordering the safe way; the real browser resolves it
+the other way, which is why a hand-run sign-in found the bug and a suite at 100% coverage
+could not. **No DOM assertion can catch this defect** — settled, trailed or otherwise.
+
+Two consequences, both of which outlive this issue:
+
+1. The test that pins it is deliberately white-box: it asserts that no imperative `navigate`
+   occurs during a sign-in. The property the spec mandates — declarative, not an effect — is
+   observable; its symptom is not. When that is the situation, pin the property. The test
+   carries a comment recording this measurement so that nobody later "simplifies" it into a
+   behavioural test that cannot fail.
+2. **The suite is not evidence on anything redirect-shaped.** `App.test.tsx::signs out and
+   returns to the login page` passes with or without the same race in `AccountControls`.
+
+A second, weaker assertion pattern was found in the same pass: `waitFor(() =>
+expect(currentPath()).toBe('/health'))` is satisfied the instant that path first appears, so
+it passed against an implementation that reached `/health` and was overridden a tick later.
+The rule is **assert the settled state, not the first state that matches** — which is a
+sharper statement than the "keep both assertions" one above, and supersedes it. The render
+harness now exposes a `visitedPaths()` trail, so a later bounce is visible rather than
+invisible.
+
+### The risk list was right, and not for the reason it gave
+
+The spec flagged that MSW cannot reproduce the backend's `Origin`/`Content-Type` guard and
+that the end-to-end proof is a manual sign-in "which the verification step must actually
+perform rather than assume". It was performed, and it did catch something — but not the guard.
+It caught the redirect bug above, which has nothing to do with MSW's limits and everything to
+do with jsdom not being a browser with real history. The manual step earns its place for a
+broader reason than the one written down.
+
+What the manual run did confirm about the guard is worse than recorded. A bodyless logout
+without `Content-Type` does not merely fail:
+
+```
+POST /api/auth/logout  (no Content-Type)  -> 403, and GET /api/auth/session still returns 200
+POST /api/auth/logout  (Content-Type set) -> 204, and GET /api/auth/session returns 401
+```
+
+Without the transport fix the user clicks "Sign out", the UI signs them out locally, and
+**the server-side session remains valid**. #3 recorded this as a `403`; the security-relevant
+half — that the session survives — was not written down.
+
+### `addMoney` was not in the test plan at all
+
+The plan covered `money()` and `<Money>` and omitted arithmetic. `addMoney` returned
+exponential notation, because `decimal.js` switches to it below an exponent of -7: adding two
+18-decimal on-chain amounts produced `"1e-18"`, a string branded `Money` that `money()` itself
+rejects. Found by review, not by the suite, and it would have surfaced as a rendering bug on
+the first balance the dashboard displayed.
+
+The deeper fault was the `as Money` cast. A brand that can be applied to an unvalidated string
+is a brand that will eventually be wrong; `addMoney` now returns through `money()`.
+
+### The file-ownership table had a hole
+
+`frontend/tsconfig.app.json` belonged to nobody, and the change needed it: test files require
+Node types and the application must not have them. Neither implementer would edit it, correctly,
+and both reported it up. Resolved with a third project, `tsconfig.test.json`, rather than by
+adding `"node"` to the app project — which would let a component `import "node:fs"` and still
+typecheck, surfacing as a broken browser bundle instead of a type error.
+
+That in turn had its own hole: the include globs covered `src/test/**/*.ts` but not `.tsx`, so
+the shared render harness belonged to no project. `tsc -b` passed anyway, because the test
+files pull it in transitively, while ESLint's project service — which resolves by path — could
+not lint it. A file that typechecks and cannot be linted is a silent gap.
+
+**The rule for next time:** the ownership table must cover every file the change will touch,
+including configuration. A file owned by nobody stalls two agents and gets decided by whoever
+notices first.
+
+### What the spec got right
+
+- The `401 → null` session query. It collapsed four states into one `data` check and every
+  downstream component stayed simple. Nothing argued with it during implementation.
+- Fixing the `Content-Type` at the transport rather than the call site. Proven at the wire.
+- Naming the mutation checks up front. Nine of ten were specified in advance; two escaped on
+  the first pass and both escapes were themselves defects in the tests.
+- Refusing the open redirect. Two spellings were found — `//evil.example` in the plan,
+  `/\evil.example` in review.
+
+### Numbers
+
+Frontend coverage thresholds ratcheted **60 → 100** on all four metrics, measured, not padded:
+every branch is reached by a real render or a real intercepted request, including four
+defensive ones that only ever run in production — a problem document with `detail` absent, a
+`200` whose body is not JSON, a response with no reason phrase, and a partial problem document.
+Ten mutations, ten caught.
+
+## Deferred deliberately
+
+Found by adversarial review, judged not worth holding the pull request for. Each is recorded
+so that the next person meets a decision rather than a surprise.
+
+- **`addMoney` rounds past 40 significant digits instead of refusing.**
+  `addMoney('10000000000000000000000.000000000000000001', '0')` drops the entire fractional
+  tail, silently, and the result still validates as `Money`. Unreachable at realistic
+  magnitudes — wei-denominated ETH supply is 27 digits — so this is headroom, not a live bug.
+  A module whose contract is "no precision loss" should nonetheless refuse rather than round;
+  revisit when a chain with more than 18 decimals appears.
+- **The route guard drops `location.hash`.** It captures `${pathname}${search}` only. No route
+  uses a hash today, so a deep link to an anchor would silently lose it after sign-in.
+- **`src/lib/queryClient.ts` imports `src/api/session.ts`.** `money.ts` is a pure leaf;
+  `queryClient.ts` is not, because it reaches into `api/session` for the query key. `lib` now
+  holds two files with opposite dependency rules, and the day `api/session.ts` wants the
+  client back, that is a cycle. The frontend has no `import-linter` equivalent, so nothing
+  enforces this; #39 is the place to decide whether it should.
+- **`sessionQueryKey` is unnamespaced.** `['session']` collides with nothing today, but a
+  future `['session', ...]` key would be swept by the prefix match in `invalidateQueries`.
+
+### An equivalent mutant, recorded so it is not mistaken for a test gap
+
+Nineteen of twenty mutations were caught. The twentieth could not be, and the reason is worth
+keeping: in `formatMoney`, `const negative = fixed.startsWith('-') && !rounded.isZero()` had a
+second conjunct that no test could kill, because `decimal.js` normalises the sign away in
+`toFixed` — so `fixed.startsWith('-')` is already false whenever `rounded.isZero()`:
+
+```
+-0                    reaches the line: true   fixed: "0.00000000"   roundedZero: true
+-0.000000000000000001 reaches the line: false  (the sentinel branch returned first)
+-1.5                  reaches the line: true   fixed: "-1.50000000"  roundedZero: false
+```
+
+The conjunct was removed rather than kept. Not for tidiness: its comment claimed that line was
+what stopped `-0` reaching a screen, and it was not — the library is. A guard that looks
+load-bearing and is not will mislead whoever next edits the function, and it is a branch no
+test can defend. The guarantee now lives where it can fail: a test asserting
+`formatMoney(money('-0'))` renders `0`.
+
+**The general rule:** when a mutation survives, establish whether it is a gap in the tests or
+an equivalent mutant before writing a test for it. A test written to kill an equivalent mutant
+pins an implementation detail and will obstruct the next refactor.

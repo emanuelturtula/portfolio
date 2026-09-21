@@ -1,10 +1,13 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { type SubmitEvent, useState } from 'react';
-import { Navigate, useLocation, useNavigate } from 'react-router-dom';
+import { Navigate, useLocation } from 'react-router-dom';
 
-import { ApiError } from '@/api/client';
+import { describeApiError } from '@/api/client';
 import { login, sessionQueryKey, useSession } from '@/api/session';
 import { ErrorState } from '@/components/ErrorState';
+
+const SESSION_UNREACHABLE_MESSAGE =
+  'The backend could not be reached. Check that the API is running, then reload the page.';
 
 /**
  * `POST /api/auth/login` form.
@@ -21,7 +24,6 @@ import { ErrorState } from '@/components/ErrorState';
  */
 export function LoginPage() {
   const location = useLocation();
-  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const session = useSession();
 
@@ -31,13 +33,39 @@ export function LoginPage() {
   const mutation = useMutation({
     mutationFn: () => login({ username, password }),
     onSuccess: async () => {
+      // Only invalidate here - do not also navigate imperatively. The
+      // resolved session flips `session.data` truthy, which re-renders this
+      // component into the declarative branch below. An imperative
+      // `navigate(resolveReturnPath(...))` racing that re-render is what
+      // caused a real sign-in to land on `/` instead of the attempted route:
+      // the guard's own redirect (previously hardcoded to `/`) could win the
+      // race. One redirect, declarative, reading the same `location.state`,
+      // removes the race instead of tuning it.
       await queryClient.invalidateQueries({ queryKey: sessionQueryKey });
-      void navigate(resolveReturnPath(location.state), { replace: true });
     },
   });
 
   if (session.data) {
-    return <Navigate to="/" replace />;
+    return <Navigate to={resolveReturnPath(location.state)} replace />;
+  }
+
+  // The credentials were accepted - `mutation` succeeded - but the read that
+  // confirms *who* now holds the cookie failed. Without this branch the user
+  // is stranded on a login form while already signed in: `session.data` is
+  // `undefined`, not `null`, so the redirect above never fires, and nothing
+  // said why. `RequireSession` would have shown exactly this after the old,
+  // now-removed imperative `navigate()` sent them off this page; this is that
+  // same recovery, kept on the page a failed confirmation actually happened.
+  if (mutation.isSuccess && session.isError) {
+    return (
+      <ErrorState
+        title="Signed in, but we could not confirm it"
+        description={describeApiError(session.error, SESSION_UNREACHABLE_MESSAGE)}
+        onRetry={() => {
+          void session.refetch();
+        }}
+      />
+    );
   }
 
   function handleSubmit(event: SubmitEvent<HTMLFormElement>) {
@@ -85,7 +113,13 @@ export function LoginPage() {
         )}
 
         {mutation.isError && (
-          <ErrorState title="Sign-in failed" description={describeLoginError(mutation.error)} />
+          <ErrorState
+            title="Sign-in failed"
+            description={describeApiError(
+              mutation.error,
+              'The server could not be reached. Check your connection and try again.',
+            )}
+          />
         )}
 
         <button type="submit" disabled={mutation.isPending}>
@@ -94,23 +128,6 @@ export function LoginPage() {
       </form>
     </section>
   );
-}
-
-/**
- * Turns a failed login attempt into one sentence a user can read.
- *
- * The backend already writes the sentence a person should see - "the
- * username or password is incorrect", "too many failed attempts" - into the
- * problem document's `detail`. Inventing a second wording here would fork the
- * message from the one source of truth for it, so an `ApiError` is always
- * shown as the server wrote it.
- */
-function describeLoginError(error: unknown): string {
-  if (error instanceof ApiError) {
-    return error.problem.detail ?? error.problem.title;
-  }
-
-  return 'The server could not be reached. Check your connection and try again.';
 }
 
 /**

@@ -1,7 +1,7 @@
 import { http, HttpResponse } from 'msw';
 import { describe, expect, it, vi } from 'vitest';
 
-import { ApiError, apiFetch, apiSend } from '@/api/client';
+import { ApiError, apiFetch, apiSend, describeApiError } from '@/api/client';
 import { LOGIN_PATH, LOGOUT_PATH, server } from '@/test/server';
 
 /** Runs a request that is expected to reject and hands back the rejection. */
@@ -235,5 +235,99 @@ describe('apiSend', () => {
 
     expect(rejection).toBeInstanceOf(ApiError);
     expect((rejection as ApiError).status).toBe(401);
+  });
+});
+
+/**
+ * Which sentence the user is shown for a failed request.
+ *
+ * Found by stopping the real backend and pressing "Sign out": the alert read
+ * "Bad Gateway", not the sentence the caller passed. Vite's proxy answers with
+ * an HTML `502`, `readProblem` cannot parse it and synthesises a document whose
+ * `title` is the HTTP reason phrase, and that synthesised machine phrase then
+ * beat the caller's fallback. Every fallback in the application was unreachable
+ * for precisely the failure it was written for.
+ *
+ * The fix has two halves and both need pinning, because the second is the one a
+ * careless edit removes: a synthesised document must lose to the caller's
+ * sentence, and a real one must still win. This project prefers the backend's
+ * own wording over an invented string wherever the backend actually sent one.
+ */
+describe('describeApiError', () => {
+  const FALLBACK = 'Could not reach the server. Your session may still be active.';
+
+  /** Produces a genuine ApiError by failing a real request. */
+  async function errorFrom(resolver: Parameters<typeof http.get>[1]): Promise<unknown> {
+    server.use(http.get('/api/health', resolver));
+    return captureRejection(apiFetch('/api/health'));
+  }
+
+  it('prefers the caller sentence when the problem document was synthesised', async () => {
+    const error = await errorFrom(
+      () =>
+        new HttpResponse('<html><body>502 Bad Gateway</body></html>', {
+          status: 502,
+          statusText: 'Bad Gateway',
+          headers: { 'content-type': 'text/html' },
+        }),
+    );
+
+    expect(describeApiError(error, FALLBACK)).toBe(FALLBACK);
+    // The reason phrase is a machine word. It must not reach a person.
+    expect(describeApiError(error, FALLBACK)).not.toMatch(/bad gateway/i);
+  });
+
+  it('shows the server title when the problem document is real but has no detail', async () => {
+    const error = await errorFrom(() =>
+      HttpResponse.json(
+        // No `detail`: the backend serialises with `exclude_none=True`, so this
+        // is what a real problem document without a specific message looks like.
+        { type: 'about:blank', title: 'Service Unavailable', status: 503 },
+        { status: 503, headers: { 'content-type': 'application/problem+json' } },
+      ),
+    );
+
+    // The assertion that stops the fix overshooting into "always use the
+    // fallback". The backend said something; discarding it would replace a
+    // specific, true sentence with a generic guess.
+    expect(describeApiError(error, FALLBACK)).toBe('Service Unavailable');
+  });
+
+  it('shows the server detail when the problem document carries one', async () => {
+    const error = await errorFrom(() =>
+      HttpResponse.json(
+        {
+          type: 'about:blank',
+          title: 'Service Unavailable',
+          status: 503,
+          detail: 'The database is not reachable.',
+        },
+        { status: 503, headers: { 'content-type': 'application/problem+json' } },
+      ),
+    );
+
+    expect(describeApiError(error, FALLBACK)).toBe('The database is not reachable.');
+  });
+
+  it('prefers the caller sentence when the response has no reason phrase either', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('nope', { status: 500, statusText: '' }));
+
+    try {
+      const error = await captureRejection(apiFetch('/api/health'));
+
+      // "Request failed" is this module's own placeholder, not the server's
+      // wording, so it loses to the caller's sentence for the same reason.
+      expect(describeApiError(error, FALLBACK)).toBe(FALLBACK);
+      expect(describeApiError(error, FALLBACK)).not.toMatch(/request failed/i);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('uses the caller sentence for a failure that is not an ApiError at all', () => {
+    expect(describeApiError(new TypeError('Failed to fetch'), FALLBACK)).toBe(FALLBACK);
+    expect(describeApiError(undefined, FALLBACK)).toBe(FALLBACK);
   });
 });

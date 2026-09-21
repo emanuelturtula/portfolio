@@ -65,6 +65,31 @@ describe('HealthPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Bad Gateway');
   });
 
+  it('tells the user the backend is unreachable when a proxy answers for it', async () => {
+    server.use(
+      http.get(
+        '/api/health',
+        () =>
+          new HttpResponse('<html><body>502 Bad Gateway</body></html>', {
+            status: 502,
+            statusText: 'Bad Gateway',
+            headers: { 'content-type': 'text/html' },
+          }),
+      ),
+    );
+
+    renderHealthPage();
+
+    // This page kept a fourth private copy of the "which sentence do we show"
+    // logic, and was the last place still showing the bare HTTP reason phrase
+    // after `client.ts` was fixed. Folding it onto `describeApiError` is what
+    // makes one mutation of that function fail tests on every page at once -
+    // which is the property that proves no fifth copy is hiding somewhere.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/could not be reached/i);
+    expect(alert).not.toHaveTextContent(/bad gateway/i);
+  });
+
   it('shows an unreachable-backend message when the request fails outright', async () => {
     server.use(http.get('/api/health', () => HttpResponse.error()));
 

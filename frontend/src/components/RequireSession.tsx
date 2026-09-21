@@ -1,7 +1,7 @@
 import type { ReactElement } from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
 
-import { ApiError } from '@/api/client';
+import { describeApiError } from '@/api/client';
 import { useSession } from '@/api/session';
 import { ErrorState } from '@/components/ErrorState';
 import { Skeleton } from '@/components/Skeleton';
@@ -32,7 +32,10 @@ export function RequireSession({ children }: RequireSessionProps) {
     return (
       <ErrorState
         title="We could not check your session"
-        description={describeSessionError(error)}
+        description={describeApiError(
+          error,
+          'The backend could not be reached. Check that the API is running, then reload the page.',
+        )}
         onRetry={() => {
           void refetch();
         }}
@@ -47,13 +50,4 @@ export function RequireSession({ children }: RequireSessionProps) {
   }
 
   return children;
-}
-
-/** Turns whatever the session read failed with into one sentence a user can read. */
-function describeSessionError(error: Error): string {
-  if (error instanceof ApiError) {
-    return error.problem.detail ?? error.problem.title;
-  }
-
-  return 'The backend could not be reached. Check that the API is running, then reload the page.';
 }

@@ -57,22 +57,62 @@ export interface FormatMoneyOptions {
 
 /**
  * Renders a {@link Money} value for display: grouped thousands, rounded to at
- * most `maximumFractionDigits` fractional digits.
+ * most `maximumFractionDigits` fractional digits, padded to at least
+ * `minimumFractionDigits`.
  *
  * This is display formatting only - it may round. The exact, unrounded value
  * is what {@link Money} (the component) also carries in a `<data value>`
  * attribute, which is what makes "no precision loss" a property of the DOM
- * rather than a claim about this function.
+ * rather than a claim about this function. Rounding for display is still
+ * bound by two rules a portfolio balance cannot bend:
+ *
+ * 1. A non-zero amount that rounds away to nothing at the requested precision
+ *    is never shown as `0` - a wei-scale balance and an empty one are a
+ *    different answer to "do I have anything here", and collapsing them is
+ *    exactly the fabricated-zero failure this module exists to prevent. Such
+ *    a value renders as a boundary instead, e.g. `< 0.00000001`.
+ * 2. A genuine zero is never shown as `-0`. `decimal.js` itself normalises the
+ *    sign away in `toFixed` once the rounded magnitude is exactly zero - it
+ *    only keeps a sign on a zero-magnitude result when rounding *reached*
+ *    zero from a non-zero value, which is precisely the case rule 1 already
+ *    intercepts above. This function does not re-guard it; the guarantee
+ *    lives in the test asserting `formatMoney(money('-0'))` renders `'0'` -
+ *    if a future `decimal.js` ever stops normalising it, that test is what
+ *    fails.
+ *
+ * `minimumFractionDigits` must not exceed `maximumFractionDigits` - the same
+ * invariant `Intl.NumberFormat` enforces - because the alternative is padding
+ * that silently never happens.
  *
  * Built entirely from `decimal.js` string output and manual string
  * manipulation, never `Number()`, so the module that exists to keep money out
  * of floating point does not reach for one itself.
+ *
+ * @throws {RangeError} When `minimumFractionDigits` exceeds `maximumFractionDigits`.
  */
 export function formatMoney(value: Money, options: FormatMoneyOptions = {}): string {
   const maximumFractionDigits = options.maximumFractionDigits ?? 8;
   const minimumFractionDigits = options.minimumFractionDigits ?? 0;
 
-  const fixed = new Decimal(value).toFixed(maximumFractionDigits);
+  if (minimumFractionDigits > maximumFractionDigits) {
+    throw new RangeError(
+      `minimumFractionDigits (${String(minimumFractionDigits)}) must not be greater than ` +
+        `maximumFractionDigits (${String(maximumFractionDigits)}).`,
+    );
+  }
+
+  const decimal = new Decimal(value);
+  const rounded = decimal.toDecimalPlaces(maximumFractionDigits);
+
+  if (rounded.isZero() && !decimal.isZero()) {
+    const threshold = smallestUnit(maximumFractionDigits);
+    return decimal.isNegative() ? `> -${threshold}` : `< ${threshold}`;
+  }
+
+  const fixed = rounded.toFixed(maximumFractionDigits);
+  // `fixed` never starts with `-` when `rounded` is exactly zero - see rule 2
+  // above - so reading the sign straight off `fixed` already excludes `-0`
+  // without this function re-checking `rounded.isZero()` itself.
   const negative = fixed.startsWith('-');
   const unsigned = negative ? fixed.slice(1) : fixed;
   const [wholePart = '0', fractionPart = ''] = unsigned.split('.');
@@ -82,6 +122,15 @@ export function formatMoney(value: Money, options: FormatMoneyOptions = {}): str
   const formatted = fraction.length > 0 ? `${groupedWhole}.${fraction}` : groupedWhole;
 
   return negative ? `-${formatted}` : formatted;
+}
+
+/** The smallest positive amount representable at `maximumFractionDigits`, e.g. `0.01` for 2. */
+function smallestUnit(maximumFractionDigits: number): string {
+  if (maximumFractionDigits === 0) {
+    return '1';
+  }
+
+  return `0.${'0'.repeat(maximumFractionDigits - 1)}1`;
 }
 
 /**

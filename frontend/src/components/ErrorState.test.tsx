@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -18,6 +18,10 @@ describe('ErrorState', () => {
     const alert = screen.getByRole('alert');
     expect(alert).toHaveTextContent('The backend is unreachable');
     expect(alert).toHaveTextContent('Check that the API is running.');
+    // The summary is a heading, not another paragraph. That is what every
+    // caller inherits by using this instead of writing its own alert, and it
+    // is what `LoginPage.test.tsx` keys on to prove it uses the shared one.
+    expect(within(alert).getByRole('heading')).toHaveTextContent('The backend is unreachable');
   });
 
   it('renders without a retry button when there is nothing to retry', () => {

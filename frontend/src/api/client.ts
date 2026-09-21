@@ -52,12 +52,52 @@ export class ApiError extends Error {
 
   readonly status: number;
 
-  constructor(problem: ProblemDetails) {
+  /**
+   * Whether `problem` is a real RFC 9457 document the server sent, or one
+   * synthesised here because the body was not one - an HTML proxy
+   * interstitial for a `502`, an empty body, anything not
+   * `application/problem+json`. A synthesised `problem.title` is borrowed
+   * from `response.statusText` (`"Bad Gateway"`, `"Request failed"`), not
+   * written for a person to read, so {@link describeApiError} must not treat
+   * it the way it treats a title the backend actually wrote.
+   */
+  readonly hasProblemDocument: boolean;
+
+  constructor(problem: ProblemDetails, hasProblemDocument: boolean) {
     super(problem.detail ?? problem.title);
     this.name = 'ApiError';
     this.problem = problem;
     this.status = problem.status;
+    this.hasProblemDocument = hasProblemDocument;
   }
+}
+
+/**
+ * Turns any error a query or mutation can fail with into one sentence a user
+ * can read: the server's own `problem.detail`, or `problem.title` when that
+ * title was actually written by the server, for an {@link ApiError}; the
+ * given `fallback` otherwise - a network failure, an unreachable backend, or
+ * an `ApiError` whose problem document was synthesised from a non-JSON
+ * response rather than sent by the backend (see {@link ApiError.hasProblemDocument}).
+ *
+ * That last case is why the fallback cannot simply lose to `problem.title`
+ * unconditionally: with the backend unreachable, a proxy's own `502` page is
+ * not JSON, `title` becomes its HTTP reason phrase, and every caller's
+ * carefully written fallback - "your session may still be active" and
+ * similar - would otherwise be silently unreachable for exactly the failures
+ * it exists to describe.
+ *
+ * The backend already writes the sentence a person should see into a real
+ * problem document. Every call site that showed its own wording for an
+ * `ApiError` was a second copy of that sentence waiting to drift from the
+ * first, so this is the one place that reads it.
+ */
+export function describeApiError(error: unknown, fallback: string): string {
+  if (!(error instanceof ApiError)) {
+    return fallback;
+  }
+
+  return error.problem.detail ?? (error.hasProblemDocument ? error.problem.title : fallback);
 }
 
 export interface ApiRequestOptions {
@@ -85,12 +125,15 @@ export async function apiFetch<T>(path: string, options: ApiRequestOptions = {})
   const payload = await readJson(response);
 
   if (payload === undefined) {
-    throw new ApiError({
-      type: 'about:blank',
-      title: 'Malformed response',
-      status: response.status,
-      detail: 'The server answered with a successful status but the body was not valid JSON.',
-    });
+    throw new ApiError(
+      {
+        type: 'about:blank',
+        title: 'Malformed response',
+        status: response.status,
+        detail: 'The server answered with a successful status but the body was not valid JSON.',
+      },
+      false,
+    );
   }
 
   return payload as T;
@@ -141,7 +184,8 @@ async function request(path: string, options: ApiRequestOptions): Promise<Respon
   const response = await fetch(resolveUrl(path), init);
 
   if (!response.ok) {
-    throw new ApiError(await readProblem(response));
+    const { problem, hasProblemDocument } = await readProblem(response);
+    throw new ApiError(problem, hasProblemDocument);
   }
 
   return response;
@@ -165,22 +209,35 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
+/** {@link readProblem}'s result: the details, and whether the server actually sent them. */
+interface ReadProblemResult {
+  readonly problem: ProblemDetails;
+  /** `false` when `problem` was synthesised because the body was not a real problem document. */
+  readonly hasProblemDocument: boolean;
+}
+
 /** Maps a failed response onto problem details, whatever the body looks like. */
-async function readProblem(response: Response): Promise<ProblemDetails> {
+async function readProblem(response: Response): Promise<ReadProblemResult> {
   const fallbackTitle = response.statusText === '' ? FALLBACK_TITLE : response.statusText;
   const body = await readJson(response);
 
   if (!isRecord(body)) {
-    return { type: 'about:blank', title: fallbackTitle, status: response.status };
+    return {
+      problem: { type: 'about:blank', title: fallbackTitle, status: response.status },
+      hasProblemDocument: false,
+    };
   }
 
   const status = body.status;
 
   return {
-    type: readString(body, 'type') ?? 'about:blank',
-    title: readString(body, 'title') ?? fallbackTitle,
-    status: typeof status === 'number' ? status : response.status,
-    detail: readString(body, 'detail'),
+    problem: {
+      type: readString(body, 'type') ?? 'about:blank',
+      title: readString(body, 'title') ?? fallbackTitle,
+      status: typeof status === 'number' ? status : response.status,
+      detail: readString(body, 'detail'),
+    },
+    hasProblemDocument: true,
   };
 }
 

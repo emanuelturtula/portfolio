@@ -13,14 +13,23 @@ import tseslint from 'typescript-eslint';
  * to prevent, and `parseInt` additionally truncates everything after the
  * decimal point.
  *
- * The ban is scoped to the directories where money is actually handled -
- * feature code (`src/features/**`), shared domain helpers (`src/lib/**`), the
- * shared components (`src/components/**`) and the pages that render balances
- * (`src/pages/**`) - so that legitimate non-monetary parsing elsewhere
- * (reading a pixel offset, a page number from a query string) does not have
- * to fight the rule. `src/lib/money.ts` and `<Money>` are what these files
- * use instead. Test files are exempt: a test proving the rule fires has to be
- * able to write the violation.
+ * The ban is deny-by-default across all of `src/**`, not an allowlist of the
+ * directories money happens to live in today. An allowlist makes every
+ * directory not yet named safe by omission: a future `src/hooks/`,
+ * `src/utils/` or `src/store/` would be free to `parseFloat` a balance and
+ * nothing would fail, and the diagnosis would arrive downstream in a wrong
+ * number rather than at review time in a lint error. CLAUDE.md rule 8 makes
+ * the identical choice for endpoints - deny-by-default, in middleware, so
+ * that forgetting to opt in is what fails - and this rule now matches it:
+ * adding a directory is automatically covered, and only *removing* protection
+ * from one is a visible line in this file.
+ *
+ * `ignores` below is the deliberate, narrow exemption: `src/api/**` and
+ * `src/test/**` are where legitimate non-monetary parsing lives (HTTP status
+ * codes, response plumbing, test fixtures), and test files everywhere are
+ * exempt because a test proving the rule fires has to be able to write the
+ * violation. `src/lib/money.ts` and `<Money>` are what everywhere else uses
+ * instead.
  */
 const noNumberCoercionMessage =
   'Monetary values arrive from the API as strings and must never be coerced into a JavaScript number: IEEE-754 doubles cannot represent them exactly. Use the decimal helpers instead of parseFloat, parseInt, Number() or unary +.';
@@ -55,13 +64,8 @@ export default tseslint.config(
   },
   {
     // See the comment above `noNumberCoercionMessage`.
-    files: [
-      'src/features/**/*.{ts,tsx}',
-      'src/lib/**/*.{ts,tsx}',
-      'src/components/**/*.{ts,tsx}',
-      'src/pages/**/*.{ts,tsx}',
-    ],
-    ignores: ['**/*.test.{ts,tsx}'],
+    files: ['src/**/*.{ts,tsx}'],
+    ignores: ['src/api/**', 'src/test/**', '**/*.test.{ts,tsx}'],
     rules: {
       'no-restricted-globals': [
         'error',

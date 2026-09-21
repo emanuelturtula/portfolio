@@ -111,6 +111,30 @@ describe('RequireSession', () => {
     expect(screen.queryByText(LOGIN_TEXT)).not.toBeInTheDocument();
   });
 
+  it('tells the user the backend is unreachable when a proxy answers for it', async () => {
+    server.use(
+      http.get(
+        SESSION_PATH,
+        () =>
+          new HttpResponse('<html><body>502 Bad Gateway</body></html>', {
+            status: 502,
+            statusText: 'Bad Gateway',
+            headers: { 'content-type': 'text/html' },
+          }),
+      ),
+    );
+
+    renderGuard();
+
+    // The guard has the same shape of bug as the sign-out alert did: a
+    // synthesised problem document whose title is the HTTP reason phrase would
+    // otherwise beat the sentence written for exactly this failure.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/could not be reached/i);
+    expect(alert).not.toHaveTextContent(/bad gateway/i);
+    expect(screen.queryByText(LOGIN_TEXT)).not.toBeInTheDocument();
+  });
+
   it('falls back to the problem title when the server sends no detail', async () => {
     // The backend serialises its problem documents with `exclude_none=True`, so
     // `detail` really is absent whenever an error carries no specific message.

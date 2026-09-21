@@ -1,10 +1,17 @@
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { http } from 'msw';
+import { http, HttpResponse } from 'msw';
 import { describe, expect, it } from 'vitest';
 
-import { currentPath, renderApp } from '@/test/render';
-import { fakeSession, HEALTH_PATH, server, TEST_USERNAME, unauthorized } from '@/test/server';
+import { currentPath, renderApp, settle, visitedPaths } from '@/test/render';
+import {
+  fakeSession,
+  HEALTH_PATH,
+  LOGOUT_PATH,
+  server,
+  TEST_USERNAME,
+  unauthorized,
+} from '@/test/server';
 
 /** True while the login form is on screen. */
 function loginFormIsShown(): boolean {
@@ -74,8 +81,14 @@ describe('App', () => {
     renderApp(['/health']);
 
     await waitFor(() => {
-      expect(currentPath()).toBe('/login');
+      expect(loginFormIsShown()).toBe(true);
     });
+    await settle();
+
+    // The settled location. A bare waitFor on the path is satisfied by the
+    // first instant it matches, which is how the sign-in race stayed hidden.
+    expect(currentPath()).toBe('/login');
+    expect(visitedPaths().at(-1)).toBe('/login');
     // Not a crash and not a blank screen: a usable form.
     expect(loginFormIsShown()).toBe(true);
     expect(screen.getByRole('button', { name: /sign in/i })).toBeInTheDocument();
@@ -91,9 +104,12 @@ describe('App', () => {
     await user.click(await screen.findByRole('button', { name: /sign out/i }));
 
     await waitFor(() => {
-      expect(currentPath()).toBe('/login');
+      expect(loginFormIsShown()).toBe(true);
     });
-    expect(loginFormIsShown()).toBe(true);
+    await settle();
+
+    expect(currentPath()).toBe('/login');
+    expect(visitedPaths().at(-1)).toBe('/login');
     expect(fake.currentUser()).toBeNull();
 
     // `POST /api/auth/logout` carries no body. The backend's write guard still
@@ -102,6 +118,127 @@ describe('App', () => {
     // so setting the header only when there is a body fails right here.
     expect(fake.logouts).toHaveLength(1);
     expect(fake.logouts[0]?.contentType).toBe('application/json');
+  });
+
+  it('warns that the session may still be active when the sign-out cannot be sent', async () => {
+    const user = userEvent.setup();
+    const fake = fakeSession({ initialUser: TEST_USERNAME });
+    server.use(...fake.handlers);
+    server.use(http.post(LOGOUT_PATH, () => HttpResponse.error()));
+
+    renderApp(['/']);
+    await user.click(await screen.findByRole('button', { name: /sign out/i }));
+
+    const alert = await screen.findByRole('alert');
+    // A network failure carries no problem document, so this is the one case
+    // where the page supplies the sentence - and the sentence has to say the
+    // session may still be live, because it is.
+    expect(alert).toHaveTextContent(/could not reach the server to sign you out/i);
+    expect(alert).toHaveTextContent(/session may still be active/i);
+    expect(alert).not.toHaveTextContent(/failed to fetch/i);
+  });
+
+  it('says the session may still be active when a proxy answers instead of the backend', async () => {
+    const user = userEvent.setup();
+    const fake = fakeSession({ initialUser: TEST_USERNAME });
+    server.use(...fake.handlers);
+    // The live-run case: the backend is down, Vite's proxy answers the write
+    // with an HTML 502, and the reason phrase "Bad Gateway" reached the user
+    // instead of the sentence this branch exists to show.
+    server.use(
+      http.post(
+        LOGOUT_PATH,
+        () =>
+          new HttpResponse('<html><body>502 Bad Gateway</body></html>', {
+            status: 502,
+            statusText: 'Bad Gateway',
+            headers: { 'content-type': 'text/html' },
+          }),
+      ),
+    );
+
+    renderApp(['/']);
+    await user.click(await screen.findByRole('button', { name: /sign out/i }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/could not reach the server to sign you out/i);
+    expect(alert).toHaveTextContent(/session may still be active/i);
+    expect(alert).not.toHaveTextContent(/bad gateway/i);
+    // And the warning is true: the cookie really is still live.
+    expect(fake.currentUser()).toBe(TEST_USERNAME);
+  });
+
+  it("shows the server's own message when the sign-out is refused", async () => {
+    const user = userEvent.setup();
+    const fake = fakeSession({ initialUser: TEST_USERNAME });
+    server.use(...fake.handlers);
+    server.use(
+      http.post(LOGOUT_PATH, () =>
+        HttpResponse.json(
+          {
+            type: 'about:blank',
+            title: 'Internal Server Error',
+            status: 500,
+            detail: 'The server encountered an unexpected condition.',
+          },
+          { status: 500, headers: { 'content-type': 'application/problem+json' } },
+        ),
+      ),
+    );
+
+    renderApp(['/']);
+    await user.click(await screen.findByRole('button', { name: /sign out/i }));
+
+    // When the backend did answer, its sentence wins over the local fallback -
+    // the same rule the login page and the health page follow.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('The server encountered an unexpected condition.');
+  });
+
+  it('keeps the user signed in when the sign-out fails', async () => {
+    const user = userEvent.setup();
+    const fake = fakeSession({ initialUser: TEST_USERNAME });
+    server.use(...fake.handlers);
+    server.use(http.post(LOGOUT_PATH, () => HttpResponse.error()));
+
+    renderApp(['/']);
+    await user.click(await screen.findByRole('button', { name: /sign out/i }));
+    await screen.findByRole('alert');
+    await settle();
+
+    // The session cookie is still valid on the server, so the honest thing is
+    // to stay put. Redirecting to `/login` would tell the user they had signed
+    // out while the session that matters carried on living - the one failure
+    // mode worse than showing an error.
+    expect(fake.currentUser()).toBe(TEST_USERNAME);
+    expect(currentPath()).toBe('/');
+    expect(visitedPaths().at(-1)).toBe('/');
+    expect(loginFormIsShown()).toBe(false);
+    expect(screen.getByText(TEST_USERNAME)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /sign out/i })).toBeInTheDocument();
+  });
+
+  it('signs out on a second attempt after a failed one', async () => {
+    const user = userEvent.setup();
+    const fake = fakeSession({ initialUser: TEST_USERNAME });
+    server.use(...fake.handlers);
+    server.use(http.post(LOGOUT_PATH, () => HttpResponse.error()));
+
+    renderApp(['/']);
+    await user.click(await screen.findByRole('button', { name: /sign out/i }));
+    await screen.findByRole('alert');
+
+    // The button has to stay usable: a failed sign-out the user cannot retry
+    // is a session they cannot end.
+    server.use(...fake.handlers);
+    await user.click(screen.getByRole('button', { name: /sign out/i }));
+
+    await waitFor(() => {
+      expect(loginFormIsShown()).toBe(true);
+    });
+    await settle();
+    expect(currentPath()).toBe('/login');
+    expect(fake.currentUser()).toBeNull();
   });
 
   it('offers no sign-out control while signed out', async () => {

@@ -117,11 +117,35 @@ describe('the money coercion lint rule', () => {
     expect(await moneyErrors('export const amount = +"1.10";', filePath)).toHaveLength(1);
   });
 
+  it.each([
+    'src/hooks/useBalance.ts',
+    'src/state/portfolio.ts',
+    'src/widgets/nested/deep/Total.tsx',
+  ])('covers %s, a directory that does not exist yet', async (filePath) => {
+    // This is the entire point of banning by default and naming the
+    // exemptions, rather than listing the directories that are covered. An
+    // allowlist protects the directories somebody remembered; the next
+    // feature invents a directory nobody listed, and the rule silently stops
+    // applying exactly where new money-handling code is being written.
+    //
+    // These paths are deliberately fictional. If someone flips the config back
+    // to an allowlist, this is the case that fails.
+    expect(await moneyErrors('export const amount = Number("1.10");', filePath)).toHaveLength(1);
+    expect(await moneyErrors('export const amount = +"1.10";', filePath)).toHaveLength(1);
+  });
+
   it.each(['src/api/client.ts', 'src/test/server.ts'])(
-    'leaves %s outside the ban, where non-monetary parsing belongs',
+    'exempts %s, which is named in the ignore list on purpose',
     async (filePath) => {
-      // Reading a status code, a pixel offset or a page number is legitimate.
-      // A ban everywhere is a ban people route around.
+      // Not "this directory happens to be outside the ban" - that reading is
+      // what let the ban miss every directory nobody had thought of. These two
+      // are deliberate, enumerated exemptions: the transport layer reads
+      // status codes and the test scaffolding builds fixtures, and neither
+      // touches a monetary value.
+      //
+      // Narrowing this list is a safe change. Widening it is the one that
+      // needs an argument, and it will show up as an edit to a named constant
+      // in a diff rather than as a directory quietly falling outside a glob.
       expect(await moneyErrors('export const page = Number("2");', filePath)).toHaveLength(0);
     },
   );
