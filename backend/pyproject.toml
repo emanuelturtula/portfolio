@@ -23,6 +23,12 @@ dependencies = [
     # Already present transitively through Starlette, but the lifespan calls
     # anyio.to_thread.run_sync directly, so it is declared directly too.
     "anyio",
+    # Runtime rather than dev since #6: `providers/http.py` is the shared client every
+    # chain provider makes its calls through, and it ships in the image. It was already
+    # installed everywhere as a test dependency -- `httpx.ASGITransport` is what drives
+    # the API tests -- so nothing new is downloaded; what changes is that the arm64 image
+    # now depends on it being there, which is the build that would notice if it were not.
+    "httpx",
 ]
 
 [dependency-groups]
@@ -30,7 +36,6 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
-    "httpx",
     "mypy",
     "ruff",
     "import-linter",
