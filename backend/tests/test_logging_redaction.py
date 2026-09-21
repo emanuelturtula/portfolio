@@ -80,7 +80,13 @@ def test_sensitive_keys_are_redacted(key: str) -> None:
 
 @pytest.mark.parametrize(
     "key",
-    ["event", "user_id", "symbol", "quantity", "path", "status", "public_address_count"],
+    # `public_address_count` used to be on this list. It is not any more: #5 added
+    # `address` to the fragments, the match is a substring, and so a key with `address`
+    # in its name is now redacted whatever else it says. That breadth is deliberate --
+    # see `SENSITIVE_KEY_FRAGMENTS` and `tests/security/test_address_logging.py` -- and
+    # the honest replacement is a key that makes the same point without the collision,
+    # not a narrower rule.
+    ["event", "user_id", "symbol", "quantity", "path", "status", "wallet_count"],
 )
 def test_ordinary_keys_are_left_alone(key: str) -> None:
     assert not is_sensitive_key(key)

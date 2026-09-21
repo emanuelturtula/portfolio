@@ -192,8 +192,18 @@ this problem and already has the test that covers it: a test reflects the constr
 migrated database and compares its `sqltext` to the constant. `ck_wallets_chain_key` gets
 the same treatment.
 
-Migrations run with foreign keys off, gated by the `foreign_key_check` baseline diff. That
-baseline has to be updated for the new table; do not turn foreign keys back on.
+Migrations run with foreign keys off, gated by the `foreign_key_check` baseline diff. Do not
+turn foreign keys back on.
+
+**Correction — this spec was wrong when written.** It said the baseline "has to be updated for
+the new table". There is nothing to update: the baseline is computed at run time by
+`snapshot_foreign_key_violations` and is a `Counter` of live violations, not a list of tables.
+
+What actually has to be updated is `APPLICATION_TABLES` in `backend/tests/db/test_migration_env.py`
+and `test_migrations.py`, and `EXPECTED_NAMES` in `test_base.py` — and those are compared with
+`>=` and by key, so they **pass silently** while a new table is missing from them. They cover
+less than they claim, and nothing fails to say so. Adding `wallets` to them is part of this
+issue; making them exact rather than `>=` is worth doing while the reason is fresh.
 
 ## Acceptance criteria
 

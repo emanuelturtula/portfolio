@@ -28,7 +28,15 @@ if TYPE_CHECKING:
 
     from sqlalchemy import Engine
 
-APPLICATION_TABLES = frozenset({"users", "sessions", "assets"})
+APPLICATION_TABLES = frozenset({"users", "sessions", "assets", "wallets"})
+"""Every table the application owns, compared **exactly** rather than with `>=`.
+
+Under `>=` a table nobody added here satisfied every assertion below, so the list could
+fall silently behind the schema. `alembic_version` is Alembic's own bookkeeping and is
+added at each comparison rather than listed as though the application owned it.
+"""
+
+STAMP_TABLE = "alembic_version"
 
 # `backend/alembic.ini`, resolved from the package rather than from the test's working
 # directory, because pytest's rootdir is not necessarily `backend/`.
@@ -81,7 +89,7 @@ def test_env_falls_back_to_settings_when_the_config_carries_no_url(
     command.upgrade(config, "head")
 
     assert settings_database.is_file()
-    assert table_names_in(settings_database) >= APPLICATION_TABLES
+    assert table_names_in(settings_database) == APPLICATION_TABLES | {STAMP_TABLE}
 
 
 def test_the_config_attribute_wins_over_settings(
@@ -95,7 +103,7 @@ def test_the_config_attribute_wins_over_settings(
 
     command.upgrade(config, "head")
 
-    assert table_names_in(database_path) >= APPLICATION_TABLES
+    assert table_names_in(database_path) == APPLICATION_TABLES | {STAMP_TABLE}
     assert not settings_database.exists()
 
 
@@ -203,7 +211,7 @@ def test_the_developer_ini_drives_a_real_migration(
 
     command.upgrade(config, "head")
 
-    assert set(inspect(sync_engine).get_table_names()) >= APPLICATION_TABLES
+    assert set(inspect(sync_engine).get_table_names()) == APPLICATION_TABLES | {STAMP_TABLE}
 
 
 def test_the_ini_carries_no_database_url() -> None:

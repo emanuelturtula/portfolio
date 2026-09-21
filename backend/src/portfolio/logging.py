@@ -43,6 +43,15 @@ SENSITIVE_KEY_FRAGMENTS: Final[tuple[str, ...]] = (
     "authorization",
     "signature",
     "password",
+    # A wallet address is the owner's holdings in one string: anyone who has it can read
+    # every balance and every transaction that address has ever been part of, forever.
+    # Because the match is on a substring, this one entry also covers `address_canonical`,
+    # `address_display` and `wallet_address` -- and, deliberately, `email_address`.
+    #
+    # This is the backstop, not the control. Nothing in the wallet registry logs an
+    # address in the first place; a test walks the code to keep it that way. The fragment
+    # is here for the log statement somebody adds in a hurry two years from now.
+    "address",
 )
 
 # Matched as a case-insensitive prefix of the key: an extended public key leaks the

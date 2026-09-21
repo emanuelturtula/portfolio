@@ -90,6 +90,13 @@ def test_the_walk_actually_finds_the_routes(auth_app: FastAPI) -> None:
     assert ("POST", "/api/auth/login") in routes
     assert ("GET", "/api/auth/session") in routes
     assert ("POST", "/api/auth/password") in routes
+    # The wallet registry, named here so that criterion 9 of #5 is visibly covered by the
+    # walk rather than merely covered in principle. A route that stopped being registered
+    # would fail here instead of silently dropping out of the 401 sweep below.
+    assert ("GET", "/api/wallets") in routes
+    assert ("POST", "/api/wallets") in routes
+    assert ("PATCH", "/api/wallets/{wallet_id}") in routes
+    assert ("DELETE", "/api/wallets/{wallet_id}") in routes
     # FastAPI's own documentation endpoints are routes like any other, and are covered.
     assert ("GET", "/api/openapi.json") in routes
     assert ("GET", "/api/docs") in routes

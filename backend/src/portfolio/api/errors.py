@@ -85,6 +85,30 @@ class ForbiddenError(AppError):
     title: ClassVar[str] = "Forbidden"
 
 
+class NotFoundError(AppError):
+    """A resource the caller named does not exist, or is not theirs.
+
+    Deliberately one class for both. A 403 for somebody else's row would confirm that the
+    row exists, which is the one fact a caller who does not own it has no business
+    learning.
+    """
+
+    status: ClassVar[int] = 404
+    title: ClassVar[str] = "Not Found"
+
+
+class ConflictError(AppError):
+    """A well-formed request that the current state of the data refuses.
+
+    Registering an address that is already registered is the case this exists for. The
+    detail says whether the row holding the slot is archived, because that is what tells
+    the caller whether to restore it or to look at what they already have.
+    """
+
+    status: ClassVar[int] = 409
+    title: ClassVar[str] = "Conflict"
+
+
 class TooManyRequestsError(AppError):
     """A throttled sign-in attempt, refused without verifying the password."""
 

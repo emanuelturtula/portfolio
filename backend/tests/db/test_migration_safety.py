@@ -11,11 +11,12 @@ failing for reasons that have nothing to do with the code.
 from __future__ import annotations
 
 import shutil
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 
 from portfolio.db.alembic_config import DATABASE_URL_ATTRIBUTE, MIGRATIONS_DIR
@@ -26,7 +27,27 @@ if TYPE_CHECKING:
 
     from sqlalchemy import Engine
 
-SEED_REVISION = "0002_seed_assets"
+_PACKAGED_HEAD = ScriptDirectory(str(MIGRATIONS_DIR)).get_current_head()
+if _PACKAGED_HEAD is None:  # pragma: no cover - only if the package shipped no migrations
+    message = "the packaged migrations have no head revision"
+    raise RuntimeError(message)
+
+PACKAGED_HEAD: Final[str] = _PACKAGED_HEAD
+"""The revision the packaged migrations currently end at, read rather than written down.
+
+Every synthetic revision below hangs off this one, through the `@HEAD@` placeholder that
+`add_revision` substitutes. Hard-coding the id here instead -- which this file did until
+`0003_wallets` landed -- forks the history the moment a real migration is added: the copied
+tree then has two heads, `upgrade head` refuses to choose between them, and six tests that
+have nothing to do with the new migration fail with `Multiple head revisions are present`.
+"""
+
+HEAD_PLACEHOLDER = "@HEAD@"
+
+PACKAGED_REVISIONS = frozenset(
+    script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+)
+"""Every revision the application actually ships, so `add_revision` can refuse to pin to one."""
 
 A_USER = (
     "INSERT INTO users (id, username, password_hash, created_at) "
@@ -46,7 +67,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0003_rebuild_users"
-down_revision = "0002_seed_assets"
+down_revision = "@HEAD@"
 branch_labels = None
 depends_on = None
 
@@ -67,7 +88,7 @@ from __future__ import annotations
 from alembic import op
 
 revision = "0003_leave_an_orphan"
-down_revision = "0002_seed_assets"
+down_revision = "@HEAD@"
 branch_labels = None
 depends_on = None
 
@@ -91,7 +112,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0003_create_a_table"
-down_revision = "0002_seed_assets"
+down_revision = "@HEAD@"
 branch_labels = None
 depends_on = None
 
@@ -144,7 +165,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0003_rebuild_sessions"
-down_revision = "0002_seed_assets"
+down_revision = "@HEAD@"
 branch_labels = None
 depends_on = None
 
@@ -166,7 +187,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0003_drop_then_break"
-down_revision = "0002_seed_assets"
+down_revision = "@HEAD@"
 branch_labels = None
 depends_on = None
 
@@ -193,8 +214,23 @@ def migrations_copy(tmp_path: Path) -> Path:
 
 
 def add_revision(migrations: Path, filename: str, source: str) -> None:
-    """Drop a revision script into the copied tree."""
-    (migrations / "versions" / filename).write_text(source, encoding="utf-8")
+    """Drop a revision script into the copied tree, hung off the real current head.
+
+    A template may name another *synthetic* revision as its parent -- one test needs two
+    of them in sequence -- but naming a **packaged** revision is refused. That is the
+    mistake that forked the history when `0003_wallets` landed: a template pinned to the
+    revision that used to be the head became its sibling instead of its child, and six
+    tests started failing with "Multiple head revisions are present" for a reason nothing
+    in this file made visible.
+    """
+    named_packaged = sorted(revision for revision in PACKAGED_REVISIONS if revision in source)
+    assert named_packaged == [], (
+        f"{filename} names the packaged revision(s) {named_packaged} literally; "
+        f"use {HEAD_PLACEHOLDER} so the synthetic revision follows whatever the head is"
+    )
+    (migrations / "versions" / filename).write_text(
+        source.replace(HEAD_PLACEHOLDER, PACKAGED_HEAD), encoding="utf-8"
+    )
 
 
 def config_for(migrations: Path, database_url: str) -> Config:
@@ -228,7 +264,7 @@ def test_a_batch_rebuild_preserves_rows_in_a_referencing_table(
     `DELETE FROM`, which fires `ON DELETE CASCADE` on every referencing row.
     """
     add_revision(migrations_copy, "v0003_rebuild_users.py", REBUILD_USERS)
-    command.upgrade(config_for(migrations_copy, database_url), SEED_REVISION)
+    command.upgrade(config_for(migrations_copy, database_url), PACKAGED_HEAD)
     with sync_engine.begin() as connection:
         connection.exec_driver_sql(A_USER)
         connection.exec_driver_sql(A_SESSION)
@@ -275,12 +311,12 @@ def test_a_migration_that_leaves_an_orphan_is_refused(
 ) -> None:
     """Enforcement is off for the run, so the deferred check is the only thing looking."""
     add_revision(migrations_copy, "v0003_leave_an_orphan.py", LEAVE_AN_ORPHAN)
-    command.upgrade(config_for(migrations_copy, database_url), SEED_REVISION)
+    command.upgrade(config_for(migrations_copy, database_url), PACKAGED_HEAD)
 
     with pytest.raises(MigrationIntegrityError, match="dangling foreign key"):
         command.upgrade(config_for(migrations_copy, database_url), "head")
 
-    assert stamped_revision(sync_engine) == SEED_REVISION
+    assert stamped_revision(sync_engine) == PACKAGED_HEAD
     assert (
         count(sync_engine, "SELECT COUNT(*) FROM sessions WHERE token_hash = 'orphan-token'") == 0
     )
@@ -298,12 +334,12 @@ def test_a_failed_upgrade_leaves_the_earlier_revision_unapplied(
     """
     add_revision(migrations_copy, "v0003_create_a_table.py", CREATE_A_TABLE)
     add_revision(migrations_copy, "v0004_then_leave_an_orphan.py", THEN_LEAVE_AN_ORPHAN)
-    command.upgrade(config_for(migrations_copy, database_url), SEED_REVISION)
+    command.upgrade(config_for(migrations_copy, database_url), PACKAGED_HEAD)
 
     with pytest.raises(MigrationIntegrityError, match="dangling foreign key"):
         command.upgrade(config_for(migrations_copy, database_url), "head")
 
-    assert stamped_revision(sync_engine) == SEED_REVISION
+    assert stamped_revision(sync_engine) == PACKAGED_HEAD
     tables = set(inspect(sync_engine).get_table_names())
     assert "only_if_the_whole_run_commits" not in tables, (
         "0003 created the table and 0004 failed, but the table survived the rollback. "
@@ -332,7 +368,7 @@ def test_a_pre_existing_orphan_survives_a_rebuild_as_pre_existing(
     not depend on that being true.
     """
     add_revision(migrations_copy, "v0003_rebuild_sessions.py", REBUILD_SESSIONS)
-    command.upgrade(config_for(migrations_copy, database_url), SEED_REVISION)
+    command.upgrade(config_for(migrations_copy, database_url), PACKAGED_HEAD)
     with sync_engine.begin() as connection:
         connection.exec_driver_sql(ORPHAN_SESSION)
 
@@ -359,7 +395,7 @@ def test_a_downgrade_is_atomic_too(
     assert "dropped_on_the_way_down" in set(inspect(sync_engine).get_table_names())
 
     with pytest.raises(MigrationIntegrityError, match="dangling foreign key"):
-        command.downgrade(config_for(migrations_copy, database_url), SEED_REVISION)
+        command.downgrade(config_for(migrations_copy, database_url), PACKAGED_HEAD)
 
     assert stamped_revision(sync_engine) == "0003_drop_then_break"
     assert "dropped_on_the_way_down" in set(inspect(sync_engine).get_table_names())
@@ -376,7 +412,7 @@ def test_the_database_can_still_be_upgraded_after_a_refused_run(
     """A refusal must leave a database the next deploy can still migrate."""
     add_revision(migrations_copy, "v0003_create_a_table.py", CREATE_A_TABLE)
     add_revision(migrations_copy, "v0004_then_leave_an_orphan.py", THEN_LEAVE_AN_ORPHAN)
-    command.upgrade(config_for(migrations_copy, database_url), SEED_REVISION)
+    command.upgrade(config_for(migrations_copy, database_url), PACKAGED_HEAD)
     with pytest.raises(MigrationIntegrityError):
         command.upgrade(config_for(migrations_copy, database_url), "head")
 

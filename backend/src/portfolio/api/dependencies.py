@@ -32,6 +32,7 @@ from portfolio.services.auth import (
     build_auth_service,
 )
 from portfolio.services.password_hasher import PasswordHasher
+from portfolio.services.wallets import WalletService, build_wallet_service
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -84,6 +85,21 @@ async def get_auth_service(request: Request) -> AsyncIterator[AuthService]:
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
     async with sessionmaker() as session:
         yield auth_service_for(request.app, session)
+
+
+async def get_wallet_service(request: Request) -> AsyncIterator[WalletService]:
+    """Open a session for this request, hand the router a service, then close it.
+
+    The same shape as `get_auth_service`, and for the same reason: the router asks for a
+    `WalletService` and never names a session, which is what keeps `sqlalchemy` out of
+    `api.routers` without anyone having to remember the rule.
+
+    Nothing process-wide is needed here -- no hasher, no throttle -- so the service is
+    built from the session alone rather than from `app.state`.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_wallet_service(session)
 
 
 def get_principal(request: Request) -> Principal:
