@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 
-import { ApiError, apiFetch } from '@/api/client';
+import { apiFetch, describeApiError } from '@/api/client';
 
 /** Response body of `GET /api/health`. */
 interface HealthStatus {
@@ -37,7 +37,12 @@ export function HealthPage() {
     return (
       <div className="state state-error" role="alert">
         <h2>The backend health check failed</h2>
-        <p>{describeError(error)}</p>
+        <p>
+          {describeApiError(
+            error,
+            'The backend could not be reached. Check that the API is running, then reload the page.',
+          )}
+        </p>
       </div>
     );
   }
@@ -55,13 +60,4 @@ export function HealthPage() {
       </dl>
     </section>
   );
-}
-
-/** Turns whatever the query failed with into one sentence a user can read. */
-function describeError(error: Error): string {
-  if (error instanceof ApiError) {
-    return error.problem.detail ?? error.problem.title;
-  }
-
-  return 'The backend could not be reached. Check that the API is running, then reload the page.';
 }

@@ -34,5 +34,8 @@
       "@/*": ["src/*"]
     }
   },
-  "include": ["src"]
+  /* Tests are excluded and typechecked by `tsconfig.test.json` instead, which is
+     what keeps Node's types out of the application's reach. */
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test"]
 }

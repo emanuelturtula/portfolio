@@ -1,0 +1,54 @@
+{
+  /* Tests are a third project rather than part of `tsconfig.app.json`, for one
+     reason: the test suite legitimately needs Node types (a lint test runs
+     ESLint in process, which reads the filesystem) and the application code
+     legitimately must not have them. Adding "node" to the app project would let
+     a component `import "node:fs"` and still typecheck, and the failure would
+     surface as a broken browser bundle rather than as a type error.
+
+     Everything below mirrors `tsconfig.app.json` except `types` and the file
+     globs. The two must be kept in step: a type-safety option relaxed here and
+     not there is a hole that only test code falls through. */
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.test.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "esnext",
+    "types": ["node", "vite/client", "vitest/globals", "@testing-library/jest-dom"],
+    "allowArbitraryExtensions": true,
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Type safety */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+
+    /* Path aliases - mirrored in vite.config.ts */
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  },
+  /* `src/test` needs the `.tsx` glob as well as the `.ts` one: the shared render
+     harness is JSX. `tsc -b` would pass without it, because the test files
+     import the harness and TypeScript pulls it into the program transitively,
+     but ESLint's project service resolves each file by path and reports it as
+     belonging to no project. A file that typechecks and cannot be linted is the
+     failure this glob exists to prevent. */
+  "include": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test/**/*.ts", "src/test/**/*.tsx"]
+}
