@@ -11,12 +11,27 @@
  *
  * All requests are same-origin: the Vite dev server proxies `/api` to the
  * backend, and in production both are served from the same origin.
+ *
+ * Two entry points share one internal {@link request} so they cannot drift:
+ * {@link apiFetch} for endpoints that answer with a JSON body, and
+ * {@link apiSend} for the `204 No Content` responses the auth endpoints use,
+ * which must not be parsed as JSON at all.
  */
 
 const JSON_MEDIA_TYPE = 'application/json';
 
 /** Fallback title used when the server gives us nothing better to show. */
 const FALLBACK_TITLE = 'Request failed';
+
+/**
+ * Methods for which a body - and therefore a `Content-Type` - would be
+ * unusual. Every other method gets `Content-Type: application/json` even when
+ * it carries no body, because the backend's write guard requires that header
+ * on every non-safe method and does not relax it for a bodyless request (see
+ * `POST /api/auth/logout`). Setting it at the call site instead would leave
+ * every future write one forgotten header away from a `403`.
+ */
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 /**
  * The subset of RFC 9457 problem details this application relies on.
@@ -47,7 +62,11 @@ export class ApiError extends Error {
 
 export interface ApiRequestOptions {
   readonly method?: string;
-  /** Serialised as JSON; its presence is what sets the `Content-Type` header. */
+  /**
+   * Serialised as JSON when present. `Content-Type` is set independently of
+   * this - see {@link SAFE_METHODS} - so a bodyless write still declares the
+   * media type the backend's write guard requires.
+   */
   readonly body?: unknown;
   readonly signal?: AbortSignal;
 }
@@ -62,9 +81,49 @@ export interface ApiRequestOptions {
  * a successful response does not contain valid JSON.
  */
 export async function apiFetch<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+  const response = await request(path, options);
+  const payload = await readJson(response);
+
+  if (payload === undefined) {
+    throw new ApiError({
+      type: 'about:blank',
+      title: 'Malformed response',
+      status: response.status,
+      detail: 'The server answered with a successful status but the body was not valid JSON.',
+    });
+  }
+
+  return payload as T;
+}
+
+/**
+ * Performs a request against an endpoint that answers `204 No Content` on
+ * success - every auth endpoint except the session read. The body is never
+ * read: a `204` has none, and reading it as JSON is exactly what makes
+ * {@link apiFetch} unusable against these endpoints.
+ *
+ * @throws {ApiError} When the response status is not in the 2xx range.
+ */
+export async function apiSend(path: string, options: ApiRequestOptions = {}): Promise<void> {
+  await request(path, options);
+}
+
+/**
+ * Shared request plumbing for {@link apiFetch} and {@link apiSend}: builds the
+ * headers, serialises the body, sends the request and turns a non-OK response
+ * into an {@link ApiError}. Neither caller reads the body here - that is each
+ * one's own concern - so this returns the raw {@link Response}.
+ */
+async function request(path: string, options: ApiRequestOptions): Promise<Response> {
+  const method = options.method ?? 'GET';
   const headers = new Headers({ Accept: JSON_MEDIA_TYPE });
+
+  if (!SAFE_METHODS.has(method.toUpperCase())) {
+    headers.set('Content-Type', JSON_MEDIA_TYPE);
+  }
+
   const init: RequestInit = {
-    method: options.method ?? 'GET',
+    method,
     // The backend authenticates with a session cookie, so every call must carry
     // credentials - including the proxied ones in development.
     credentials: 'include',
@@ -72,7 +131,6 @@ export async function apiFetch<T>(path: string, options: ApiRequestOptions = {})
   };
 
   if (options.body !== undefined) {
-    headers.set('Content-Type', JSON_MEDIA_TYPE);
     init.body = JSON.stringify(options.body);
   }
 
@@ -86,18 +144,7 @@ export async function apiFetch<T>(path: string, options: ApiRequestOptions = {})
     throw new ApiError(await readProblem(response));
   }
 
-  const payload = await readJson(response);
-
-  if (payload === undefined) {
-    throw new ApiError({
-      type: 'about:blank',
-      title: 'Malformed response',
-      status: response.status,
-      detail: 'The server answered with a successful status but the body was not valid JSON.',
-    });
-  }
-
-  return payload as T;
+  return response;
 }
 
 /** Resolves an API path against the current origin, which `fetch` requires. */

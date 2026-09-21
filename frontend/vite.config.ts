@@ -45,15 +45,22 @@ export default defineConfig({
         'src/test/**',
         '**/*.config.{ts,js}',
       ],
-      // These thresholds are deliberately low: this is a walking skeleton with
-      // a single page, so a high bar here would measure nothing. The rule for
-      // this project is that they only ever ratchet upward - never lower a
-      // threshold to make a build green.
+      // Set to the value measured on #4, which is what the project rule asks
+      // for: thresholds only ever ratchet upward, and never come down to make
+      // a build green. Lowering one needs an explicit justification in the
+      // pull request description.
+      //
+      // Every branch of the shipped frontend is exercised, including the ones
+      // that only a misbehaving backend reaches - a problem document with no
+      // `detail`, a 200 whose body is not JSON, a response with no reason
+      // phrase. Those are the branches that never run in development and
+      // always run on the Pi at 3am, so 100 here is a statement that they are
+      // deliberate rather than an accident of what was easy to test.
       thresholds: {
-        lines: 60,
-        branches: 60,
-        functions: 60,
-        statements: 60,
+        lines: 100,
+        branches: 100,
+        functions: 100,
+        statements: 100,
       },
     },
   },
