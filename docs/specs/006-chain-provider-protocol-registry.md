@@ -221,8 +221,9 @@ provider will later sign its requests there, so the signature and the key that p
 would otherwise ride along in any URL that reaches a log.
 
 **It is not sufficient for a chain provider, and the issue does not say so.** Esplora's
-endpoint is `/api/address/{address}/utxo` and Kaspa's is
-`/addresses/{address}/balance`: the address is in the *path*. Stripping the query does
+endpoint is `GET /address/:address` -- `/api/address/...` on a deployment that mounts the
+API under a prefix -- and Kaspa's is `GET /addresses/{address}/balance`. Both put the
+address in the *path*, confirmed against their published APIs. Stripping the query does
 nothing for either, and an address in a log is the disclosure `SENSITIVE_KEY_FRAGMENTS`,
 `hide_parameters=True` and the whole of #5 exist to prevent.
 
@@ -400,12 +401,37 @@ answer is missing tests, not a smaller number.
   `uv.lock` changes and the arm64 image build is the place that would notice. The #3 lesson
   applies: the suite runs at `environment="dev"` and the image builds at `prod`, so a green
   local gate is not evidence about the container.
-- **Neither target API has been exercised yet.** Esplora's and Kaspa's real rate limits,
-  their `Retry-After` behaviour and their batch ceiling are assumptions in this change,
-  confirmed against nothing. The design keeps all three as declarations -- a policy object
-  and a capability integer -- so #7 and #8 correct them by changing a value rather than by
-  changing this seam. If either turns out to need a materially different retry shape, that
-  is a finding against this spec and belongs in its closing section.
+- **The target APIs' shapes are confirmed; their limits are not.** Checked against primary
+  sources while this was being implemented, so the table below is fact rather than
+  recollection:
+
+  | | Bitcoin (Esplora) | Kaspa (kaspa-rest-server) |
+  |---|---|---|
+  | single address | `GET /address/:address` | `GET /addresses/{address}/balance` |
+  | batch | **none documented** | `POST /addresses/balances`, body `{"addresses": [...]}` |
+  | response | `chain_stats` and `mempool_stats`, each with `funded_txo_sum` and `spent_txo_sum` | `[{"address": ..., "balance": ...}]` |
+  | units | satoshis | sompi, 1 KAS = 1e8 |
+
+  Three design decisions in this spec are load-bearing on that table and all three hold.
+  The address is in the *path* on both, so criterion 4b is necessary rather than
+  defensive. One batches and one does not, so `max_addresses_per_call` is an integer and
+  not a boolean. Kaspa's batch is a read expressed as a `POST`, so the `retry_methods`
+  opt-in has a real caller rather than a hypothetical one. The batch response being a list
+  of `{address, balance}` is also why `align_balances` refuses an unrequested address: a
+  list correlated by content is exactly the shape that can come back short or reordered.
+
+  **Still unconfirmed:** neither API documents a rate limit, a `Retry-After` behaviour or a
+  cap on the batch size. Esplora's documentation mentions none at all and points at
+  self-hosting instead, which is a reason to have a client-side limiter rather than a
+  reason not to -- there is no server contract to lean on. #7 and #8 correct these by
+  changing a policy value or a capability integer, not this seam.
+
+- **Esplora reports a confirmed balance as a derivation, not a number.**
+  `funded_txo_sum - spent_txo_sum` from `chain_stats`. That belongs in #7, but it is worth
+  recording here because it is also the evidence for this spec's "no `pending` field"
+  decision: Esplora *does* expose `mempool_stats` and Kaspa exposes nothing of the kind, so
+  the asymmetry the decision assumed is real and a shared field would be zero on one chain
+  for two different reasons.
 - **The `Retry-After` HTTP-date path needs a clock.** `parse_retry_after` takes `now` as an
   argument rather than reading one, which keeps it pure, but `email.utils.parsedate_to_datetime`
   can return a naive datetime for some inputs and ruff's DTZ rules will not catch a
