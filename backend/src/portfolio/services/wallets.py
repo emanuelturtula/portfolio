@@ -29,7 +29,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Final
 
 from portfolio.domain.chains import validate_address
-from portfolio.repositories.wallets import WalletRepository
+from portfolio.repositories.wallets import WalletConstraintError, WalletRepository
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -215,14 +215,39 @@ class WalletService:
         if existing is not None:
             raise WalletAlreadyExistsError(archived=existing.archived_at is not None)
 
-        wallet = await self._wallets.add(
-            user_id=principal.user_id,
-            chain_key=chain_key,
-            address_canonical=validated.canonical,
-            address_display=validated.display,
-            label=clean_label,
-            created_at=self._clock(),
-        )
+        try:
+            wallet = await self._wallets.add(
+                user_id=principal.user_id,
+                chain_key=chain_key,
+                address_canonical=validated.canonical,
+                address_display=validated.display,
+                label=clean_label,
+                created_at=self._clock(),
+            )
+        except WalletConstraintError:
+            # **The lookup above is an optimisation. This is the authority.** Nothing
+            # holds a lock between a `find_by_canonical` that found nothing and this
+            # insert, so two requests for the same address -- a double-clicked button, or
+            # a client retrying a response it never received -- both pass the check and
+            # the second meets `uq_wallets_user_chain_address`. Before this existed that
+            # was a 500 whose traceback carried the row into the log.
+            #
+            # The reason is established by looking, not by parsing the driver's message.
+            # `wallets` carries three constraints and only one of them means "duplicate":
+            # if a row now holds the slot, that is what happened; if none does, the
+            # foreign key or the chain check refused the insert, which is a bug in this
+            # process rather than a race and has no business being reported as a conflict.
+            # The rollback is what makes the second query legal at all -- a failed flush
+            # leaves the session unusable until its transaction is abandoned.
+            await self._session.rollback()
+            conflicting = await self._wallets.find_by_canonical(
+                user_id=principal.user_id,
+                chain_key=chain_key,
+                address_canonical=validated.canonical,
+            )
+            if conflicting is None:
+                raise
+            raise WalletAlreadyExistsError(archived=conflicting.archived_at is not None) from None
         view = view_of(wallet)
         await self._session.commit()
         return view
@@ -252,7 +277,7 @@ class WalletService:
         if not isinstance(label, Unset):
             await self._wallets.set_label(wallet, normalise_label(label), now)
         if not isinstance(archived, Unset):
-            await self._wallets.set_archived_at(wallet, now if archived else None, now)
+            await self._set_archived(wallet, archived=archived, now=now)
 
         view = view_of(wallet)
         await self._session.commit()
@@ -269,11 +294,35 @@ class WalletService:
             WalletNotFoundError: no wallet with that id belongs to the caller.
         """
         wallet = await self._require_wallet(principal, wallet_id)
-        if wallet.archived_at is not None:
-            return
-        now = self._clock()
-        await self._wallets.set_archived_at(wallet, now, now)
+        await self._set_archived(wallet, archived=True, now=self._clock())
         await self._session.commit()
+
+    async def _set_archived(self, wallet: Wallet, *, archived: bool, now: datetime) -> None:
+        """Move a wallet to the requested archive state, writing nothing if it is there.
+
+        **Both ways of archiving a wallet go through this, and that is the point.**
+        `DELETE /api/wallets/{id}` and `PATCH {"archived": true}` are one logical
+        operation, and they used to disagree: `DELETE` returned early on an
+        already-archived row while `PATCH` set `archived_at` unconditionally, so
+        repeating the first changed nothing and repeating the second silently moved the
+        retirement date. Two answers to one question, decided by which endpoint the
+        caller happened to reach for.
+
+        The surviving behaviour is the one `archive_wallet` argued for. `archived_at` is
+        not a flag spelled as a timestamp -- it records *when* an address stopped being
+        watched, and the balance history is going to ask it that. A request that asks for
+        no change must therefore write nothing at all, including `updated_at`: bumping
+        that would make a no-op edit look like an edit to anything ordering by it.
+
+        `label` deliberately does not get the same treatment. Re-sending an identical
+        label does move `updated_at`, because a label carries no history -- there is no
+        second column recording when it was set -- so "you asked, it was applied" is a
+        complete account of that request. The asymmetry is between a column that is
+        history and a column that is a value, not an inconsistency.
+        """
+        if archived == (wallet.archived_at is not None):
+            return
+        await self._wallets.set_archived_at(wallet, now if archived else None, now)
 
     async def _require_wallet(self, principal: Principal, wallet_id: int) -> Wallet:
         """Fetch a wallet the caller owns, or raise.

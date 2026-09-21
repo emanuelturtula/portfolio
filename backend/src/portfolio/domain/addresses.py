@@ -137,9 +137,27 @@ def _normalise_case(raw: str) -> str:
     computed over, so allowing a mixed-case string through would mean two different strings
     verifying as the same address.
 
+    **Non-ASCII is refused first, and the ASCII check is load bearing rather than
+    defensive.** The mixed-case test below asks whether `raw` equals its own lower or upper
+    form, and Unicode has characters for which that question gives the wrong answer.
+    U+212A KELVIN SIGN lowercases to `k` but uppercases to itself, so an otherwise
+    uppercase string containing one satisfies `raw.upper() == raw`, sails past the
+    mixed-case guard, and then folds to a perfectly valid address. The checksum verifies,
+    because it is computed over the folded form -- and `display`, which is the form
+    `GET /api/wallets` returns and the owner copies, keeps the Kelvin sign. That string is
+    not an address on any network. Uniqueness and provider calls key off `canonical` and
+    were never at risk, so this was never a double-counted balance; it was an address the
+    product would have shown back to its owner as if it were theirs.
+
+    An address in every encoding here is ASCII by construction, so nothing legitimate is
+    refused by this.
+
     Raises:
-        AddressInvalidError: the string contains both uppercase and lowercase letters.
+        AddressInvalidError: the string contains a non-ASCII character, or both uppercase
+            and lowercase letters.
     """
+    if not raw.isascii():
+        raise AddressInvalidError(AddressRejection.INVALID_CHARACTER)
     if raw.lower() != raw and raw.upper() != raw:
         raise AddressInvalidError(AddressRejection.MIXED_CASE)
     return raw.lower()

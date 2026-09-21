@@ -28,9 +28,15 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 import pytest
 import structlog
+from httpx import ASGITransport, AsyncClient
 from structlog.testing import capture_logs
 
+from portfolio.api.errors import PROBLEM_CONTENT_TYPE
 from portfolio.config import Settings
+from portfolio.domain.passwords import (
+    OWASP_MINIMUM_MEMORY_COST,
+    OWASP_MINIMUM_TIME_COST,
+)
 from portfolio.logging import (
     REDACTED,
     SENSITIVE_KEY_FRAGMENTS,
@@ -38,18 +44,23 @@ from portfolio.logging import (
     is_sensitive_key,
     redact_sensitive,
 )
+from portfolio.repositories.wallets import WalletRepository
 from tests.address_vectors import (
     BIP173_TESTNET_P2WPKH,
     BIP173_TESTNET_P2WPKH_UPPERCASE,
     KASPA_TESTNET_V1_KEY,
     NAMED_CORRUPTIONS,
 )
+from tests.auth.conftest import BASE_URL as SECURE_BASE_URL
 from tests.auth.conftest import JSON_HEADERS
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from datetime import datetime
 
-    from httpx import AsyncClient
+    from fastapi import FastAPI
+
+    from portfolio.db.models import Wallet
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[3]
 SOURCE_ROOT: Final = REPO_ROOT / "backend" / "src" / "portfolio"
@@ -119,8 +130,26 @@ def test_an_ordinary_wallet_field_is_still_readable() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# Criterion 7, part two: a real request, and every record it produced
+# Criterion 7, part two: a real request, and every line it actually printed
 # --------------------------------------------------------------------------------------
+#
+# **These tests read stdout, not `structlog.testing.capture_logs`.** That is the whole
+# point of this section and it was learned the hard way: the version of it that shipped
+# used `capture_logs`, whose docstring claimed it caught an address "bound as a field,
+# formatted into an event name, or carried inside an exception". It could not catch the
+# third. `capture_logs` swaps the entire processor chain out for a `LogCapture`, so
+# `format_exc_info` never runs, the traceback is never rendered to a string, and the
+# captured entry holds `exc_info: True` and nothing else. An address inside an exception
+# message was invisible to the assertion -- and one was: a concurrent duplicate `POST`
+# raised `IntegrityError`, whose text carried SQLAlchemy's bound parameters, both address
+# columns among them, straight into the production JSON log.
+#
+# The general form of the mistake is worth naming, because it has now appeared three times
+# in this issue: a verifier that shares state with the thing it verifies can only confirm
+# its own account. `capture_logs` replaces the pipeline and then reports on the pipeline.
+# So these tests install the **production** pipeline, drive real requests through it, and
+# read the bytes that reach stdout -- which is the artifact that actually gets copied,
+# tailed and pasted into an issue.
 
 
 def rendered(entries: Sequence[Mapping[str, Any]]) -> str:
@@ -128,103 +157,33 @@ def rendered(entries: Sequence[Mapping[str, Any]]) -> str:
     return json.dumps(entries, default=repr)
 
 
-async def test_no_log_event_contains_an_address(signed_in_api_client: AsyncClient) -> None:
-    """Criterion 7, against the running code rather than against the helper.
+def forbidden_forms(*addresses: str) -> list[str]:
+    """Each address and the spellings of it a log could plausibly carry instead."""
+    forms: list[str] = []
+    for address in addresses:
+        forms.extend((address, address.lower(), address.upper()))
+        # A twenty-character run is as good as the whole address to whoever reads it.
+        forms.extend((address[:20], address[-20:]))
+    return forms
 
-    Every request the registry serves is driven here -- create, list, patch, archive, and
-    the three failure paths -- with every log record structlog emits captured. The
-    assertion is on the *rendered* records, so an address is caught whether it was bound
-    as a field, formatted into an event name, or carried inside an exception.
 
-    A test that only checked the redaction helper would pass while the service logged the
-    address under `wallet=` or `target=`. This is the test that would not.
+def assert_absent(written: str, *addresses: str) -> None:
+    """Fail naming the address **and the line it reached**, not merely that it matched.
+
+    A bare `assert form not in written` says a leak happened. Saying which spelling
+    appeared and quoting the log line says *how*, which is the difference between an hour
+    of bisecting and reading the answer off the failure.
     """
-    corrupted = NAMED_CORRUPTIONS[0][2]
-
-    with capture_logs() as entries:
-        created = await signed_in_api_client.post(
-            WALLETS,
-            json={
-                "chain_key": "bitcoin",
-                "address": BIP173_TESTNET_P2WPKH_UPPERCASE,
-                "label": "Cold storage",
-            },
-            headers=JSON_HEADERS,
-        )
-        assert created.status_code == 201, created.text
-        wallet_id = created.json()["id"]
-
-        await signed_in_api_client.get(WALLETS)
-        await signed_in_api_client.get(WALLETS, params={"include_archived": "true"})
-        await signed_in_api_client.patch(
-            f"{WALLETS}/{wallet_id}", json={"label": "Renamed"}, headers=JSON_HEADERS
-        )
-        # The failure paths, which are where an error message is most likely to quote the
-        # input it refused.
-        duplicate = await signed_in_api_client.post(
-            WALLETS,
-            json={"chain_key": "bitcoin", "address": BIP173_TESTNET_P2WPKH},
-            headers=JSON_HEADERS,
-        )
-        assert duplicate.status_code == 409, duplicate.text
-        invalid = await signed_in_api_client.post(
-            WALLETS,
-            json={"chain_key": "bitcoin", "address": corrupted},
-            headers=JSON_HEADERS,
-        )
-        assert invalid.status_code == 422, invalid.text
-        missing = await signed_in_api_client.delete(f"{WALLETS}/999999", headers=JSON_HEADERS)
-        assert missing.status_code == 404
-        await signed_in_api_client.delete(f"{WALLETS}/{wallet_id}", headers=JSON_HEADERS)
-
-    assert entries, "nothing was logged at all, so this test proves nothing"
-    written = rendered(entries)
-
-    for forbidden in (
-        BIP173_TESTNET_P2WPKH,
-        BIP173_TESTNET_P2WPKH_UPPERCASE,
-        BIP173_TESTNET_P2WPKH.lower(),
-        corrupted,
-    ):
-        assert forbidden not in written
-        # A prefix is as good as the whole address to whoever reads the log.
-        assert forbidden[:20] not in written
-        assert forbidden[-20:] not in written
-
-
-async def test_the_log_capture_really_captures(signed_in_api_client: AsyncClient) -> None:
-    """The guard on the test above: an empty capture would pass it without checking.
-
-    `test_no_log_event_contains_an_address` already asserts the capture is non-empty, but
-    "non-empty" could be one unrelated record. This proves the request path being driven
-    is one that logs, by making it log a refusal on purpose.
-    """
-    with capture_logs() as entries:
-        response = await signed_in_api_client.delete(f"{WALLETS}/424242", headers=JSON_HEADERS)
-
-    assert response.status_code == 404
-    assert any(entry.get("event") == "request_failed" for entry in entries), entries
-
-
-async def test_an_address_is_absent_from_a_log_of_an_unauthenticated_attempt(
-    api_client: AsyncClient,
-) -> None:
-    """The middleware logs every refusal, and a refused request still carries a body."""
-    with capture_logs() as entries:
-        response = await api_client.post(
-            WALLETS,
-            json={"chain_key": "bitcoin", "address": KASPA_TESTNET_V1_KEY},
-            headers=JSON_HEADERS,
-        )
-
-    assert response.status_code == 401
-    assert entries
-    assert KASPA_TESTNET_V1_KEY not in rendered(entries)
+    for form in forbidden_forms(*addresses):
+        if form in written:
+            line = next((one for one in written.splitlines() if form in one), "<no line>")
+            message = f"an address reached the log as {form[:24]!r}... on this line: {line[:400]}"
+            raise AssertionError(message)
 
 
 @pytest.fixture
 def restored_logging() -> Iterator[None]:
-    """Undo the global logging configuration the test below installs."""
+    """Undo the global logging configuration these tests install."""
     root = logging.getLogger()
     handlers = root.handlers[:]
     level = root.level
@@ -239,6 +198,390 @@ def restored_logging() -> Iterator[None]:
 #: A fictional origin, never a real hostname (rule 3). `Settings` refuses to build with
 #: `environment="prod"` while `allowed_origin` is still the development default.
 PRODUCTION_ORIGIN: Final = "https://portfolio.example"
+
+
+@pytest.fixture
+def production_logging(restored_logging: None) -> Callable[[], None]:
+    """Hand back an installer the test calls; **do not install here**.
+
+    `configure_logging` goes through `logging.basicConfig`, which binds whatever object
+    `sys.stdout` names at the moment it is called. pytest swaps that object between the
+    setup and call phases and throws the setup phase's buffer away, so a pipeline
+    installed in fixture setup writes into a buffer `capsys.readouterr()` never returns --
+    and every assertion of the form "the address is not in the output" then passes against
+    an empty string. That is the vacuous-pass failure this module has now hit twice, so
+    the ordering requirement is expressed as a callable the test has to invoke rather than
+    as a convention somebody has to remember.
+
+    `environment="prod"` because the JSON renderer is what the Raspberry Pi emits and
+    rendering is exactly what is under test. The Argon2 parameters are passed explicitly
+    to clear the production floor: the suite's environment sets them deliberately cheap,
+    and `Settings` is right to refuse those values in production.
+    """
+    del restored_logging  # The fixture's value is its teardown.
+
+    def install() -> None:
+        configure_logging(
+            Settings(
+                environment="prod",
+                allowed_origin=PRODUCTION_ORIGIN,
+                argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
+                argon2_time_cost=OWASP_MINIMUM_TIME_COST,
+            )
+        )
+
+    return install
+
+
+async def test_no_log_line_contains_an_address(
+    signed_in_api_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[[], None],
+) -> None:
+    """Criterion 7, against the bytes the process actually writes.
+
+    Every request the registry serves is driven here -- create, list, patch, archive, the
+    three ordinary failure paths, **and a duplicate that loses the race**, which is the
+    only one that reaches the unhandled-exception handler. The assertion is on rendered
+    stdout, so an address is caught whether it was bound as a field, formatted into an
+    event name, or carried inside an exception's text.
+
+    The race is simulated rather than waited for. `find_by_canonical` is made to answer
+    `None`, which is exactly what it answers when the competing transaction has not yet
+    committed at the moment this request's pre-check runs. Everything after that point --
+    the insert, the constraint, the exception, the handler, the renderer -- is the real
+    code path, and the rendered `IntegrityError` is what carried both address columns into
+    production's JSON log.
+    """
+    production_logging()
+    corrupted = NAMED_CORRUPTIONS[0][2]
+
+    created = await signed_in_api_client.post(
+        WALLETS,
+        json={
+            "chain_key": "bitcoin",
+            "address": BIP173_TESTNET_P2WPKH_UPPERCASE,
+            "label": "Cold storage",
+        },
+        headers=JSON_HEADERS,
+    )
+    assert created.status_code == 201, created.text
+    wallet_id = created.json()["id"]
+
+    await signed_in_api_client.get(WALLETS)
+    await signed_in_api_client.get(WALLETS, params={"include_archived": "true"})
+    await signed_in_api_client.patch(
+        f"{WALLETS}/{wallet_id}", json={"label": "Renamed"}, headers=JSON_HEADERS
+    )
+    # The failure paths, where an error message is most likely to quote what it refused.
+    duplicate = await signed_in_api_client.post(
+        WALLETS,
+        json={"chain_key": "bitcoin", "address": BIP173_TESTNET_P2WPKH},
+        headers=JSON_HEADERS,
+    )
+    assert duplicate.status_code == 409, duplicate.text
+    invalid = await signed_in_api_client.post(
+        WALLETS,
+        json={"chain_key": "bitcoin", "address": corrupted},
+        headers=JSON_HEADERS,
+    )
+    assert invalid.status_code == 422, invalid.text
+    missing = await signed_in_api_client.delete(f"{WALLETS}/999999", headers=JSON_HEADERS)
+    assert missing.status_code == 404
+
+    lose_the_race(monkeypatch)
+    raced = await signed_in_api_client.post(
+        WALLETS,
+        json={"chain_key": "bitcoin", "address": BIP173_TESTNET_P2WPKH, "label": "Raced"},
+        headers=JSON_HEADERS,
+    )
+    assert raced.status_code in {409, 500}, raced.text
+
+    written = capsys.readouterr().out
+
+    assert written.strip(), "nothing was written to stdout, so this test proves nothing"
+    assert "wallet" in written or "request" in written, (
+        "stdout carried no request log at all; the pipeline is not the one under test"
+    )
+    assert_absent(written, BIP173_TESTNET_P2WPKH, BIP173_TESTNET_P2WPKH_UPPERCASE, corrupted)
+
+
+def lose_the_race(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the duplicate pre-check miss **once**, then behave normally again.
+
+    That single call is the whole race. Two requests arrive together, both run
+    `find_by_canonical` before either has committed, both find nothing, both insert, and
+    the second meets `uq_wallets_user_chain_address`. By the time the service looks again
+    to establish *why* the insert was refused, the competing row is committed and visible
+    -- so the recovery lookup must see it.
+
+    Patching the method to answer `None` unconditionally, which is what this helper did
+    first, models something else entirely: a database that has lost the row. The service
+    correctly refuses to call that a conflict, re-raises, and the test then measures the
+    handling of a bug rather than the handling of a race. A simulation that is wrong in
+    that direction is worse than none, because it fails and looks like a real defect.
+    """
+    real = WalletRepository.find_by_canonical
+    missed = False
+
+    async def absent_once(
+        self: WalletRepository,
+        *,
+        user_id: int,
+        chain_key: str,
+        address_canonical: str,
+    ) -> Wallet | None:
+        nonlocal missed
+        if not missed:
+            missed = True
+            return None
+        return await real(
+            self,
+            user_id=user_id,
+            chain_key=chain_key,
+            address_canonical=address_canonical,
+        )
+
+    monkeypatch.setattr(WalletRepository, "find_by_canonical", absent_once)
+
+
+async def test_a_duplicate_that_loses_the_race_is_409_and_logs_no_address(
+    signed_in_api_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[[], None],
+) -> None:
+    """The defect criterion 7's original test could not see, pinned from both sides.
+
+    Before the fix this answered `500` and printed SQLAlchemy's bound parameters --
+    `address_canonical` and `address_display`, verbatim -- into the production log. Two
+    separate things were wrong and each needs its own assertion, because fixing one
+    without the other still leaves a bug:
+
+    * the constraint firing is a **conflict**, not an internal error. The caller asked for
+      something the current state of the data refuses, which is exactly 409, and a 500
+      tells them to retry something that will never succeed;
+    * a driver exception must not carry column values into a log. No amount of care in
+      this repository's own code prevents that, because the string is built inside
+      SQLAlchemy -- only `hide_parameters` does.
+    """
+    production_logging()
+    first = await signed_in_api_client.post(
+        WALLETS,
+        json={"chain_key": "bitcoin", "address": BIP173_TESTNET_P2WPKH, "label": "First"},
+        headers=JSON_HEADERS,
+    )
+    assert first.status_code == 201, first.text
+
+    lose_the_race(monkeypatch)
+    response = await signed_in_api_client.post(
+        WALLETS,
+        json={"chain_key": "bitcoin", "address": BIP173_TESTNET_P2WPKH, "label": "Second"},
+        headers=JSON_HEADERS,
+    )
+
+    written = capsys.readouterr().out
+
+    assert response.status_code == 409, (
+        f"a lost race must be a conflict, not an internal error: {response.text}"
+    )
+    assert response.headers["content-type"].startswith(PROBLEM_CONTENT_TYPE)
+    assert BIP173_TESTNET_P2WPKH not in response.text
+    assert written.strip(), "nothing was written to stdout, so this test proves nothing"
+    assert_absent(written, BIP173_TESTNET_P2WPKH)
+
+
+async def test_a_constraint_refusal_that_is_not_a_duplicate_logs_no_address(
+    api_app: FastAPI,
+    signed_in_api_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[[], None],
+) -> None:
+    """The path where `hide_parameters` is the *only* thing standing between the row and
+    the log.
+
+    `wallets` carries three constraints and only one of them means "duplicate". A foreign
+    key or chain-check refusal is a bug in this process rather than a race, so the service
+    deliberately re-raises it: it becomes a 500, and `handle_unexpected_error` calls
+    `logger.exception`, which renders the chained driver error in full.
+
+    On the duplicate path that never happens -- the conflict is translated to a 409 and
+    nothing is logged at all -- so reverting `hide_parameters` alone leaves
+    `test_a_duplicate_that_loses_the_race_is_409_and_logs_no_address` green. **This is the
+    test that goes red for that mutation**, and without it the flag would be held in place
+    only by the repository-level tests, which do not exercise the handler that does the
+    rendering.
+
+    Driven by pointing the insert at an account that does not exist, which is a real
+    foreign key violation from a real driver, rather than by raising a stand-in.
+    """
+    production_logging()
+    real_add = WalletRepository.add
+
+    async def add_for_a_missing_account(
+        self: WalletRepository,
+        *,
+        user_id: int,
+        chain_key: str,
+        address_canonical: str,
+        address_display: str,
+        label: str | None,
+        created_at: datetime,
+    ) -> Wallet:
+        del user_id
+        return await real_add(
+            self,
+            user_id=999_999,
+            chain_key=chain_key,
+            address_canonical=address_canonical,
+            address_display=address_display,
+            label=label,
+            created_at=created_at,
+        )
+
+    monkeypatch.setattr(WalletRepository, "add", add_for_a_missing_account)
+
+    # A client that does **not** re-raise the application's exception, because uvicorn
+    # does not either: in production `handle_unexpected_error` renders a 500 problem
+    # document and the server keeps going. `ASGITransport` defaults to re-raising, which
+    # is convenient for most tests and wrong for this one -- the response is half the
+    # claim being made.
+    transport = ASGITransport(app=api_app, raise_app_exceptions=False)
+    async with AsyncClient(
+        transport=transport,
+        base_url=SECURE_BASE_URL,
+        cookies=signed_in_api_client.cookies,
+    ) as client:
+        response = await client.post(
+            WALLETS,
+            json={
+                "chain_key": "bitcoin",
+                "address": BIP173_TESTNET_P2WPKH,
+                "label": "Cold storage",
+            },
+            headers=JSON_HEADERS,
+        )
+    written = capsys.readouterr().out
+
+    # Not a conflict: nothing holds the slot, so reporting 409 would send the owner
+    # hunting for a duplicate that does not exist.
+    assert response.status_code == 500, response.text
+    assert BIP173_TESTNET_P2WPKH not in response.text
+    assert "unhandled_exception" in written, written[:400]
+    assert_absent(written, BIP173_TESTNET_P2WPKH)
+    assert "Cold storage" not in written
+
+
+async def test_the_stdout_capture_really_captures(
+    signed_in_api_client: AsyncClient,
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[[], None],
+) -> None:
+    """The guard on the two tests above: an empty capture would pass them silently.
+
+    This is the failure mode that let the redaction test pass for a while without ever
+    logging anything, so it is now asserted for the stdout path as well -- positively, on
+    a request that is guaranteed to log a refusal.
+    """
+    production_logging()
+    response = await signed_in_api_client.delete(f"{WALLETS}/424242", headers=JSON_HEADERS)
+    written = capsys.readouterr().out
+
+    assert response.status_code == 404
+    assert "request_failed" in written, written[:400]
+    assert '"status": 404' in written or '"status":404' in written, written[:400]
+
+
+async def test_an_address_is_absent_from_a_log_of_an_unauthenticated_attempt(
+    api_client: AsyncClient,
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[[], None],
+) -> None:
+    """The middleware logs every refusal, and a refused request still carries a body."""
+    production_logging()
+    response = await api_client.post(
+        WALLETS,
+        json={"chain_key": "kaspa", "address": KASPA_TESTNET_V1_KEY},
+        headers=JSON_HEADERS,
+    )
+    written = capsys.readouterr().out
+
+    assert response.status_code == 401
+    assert "request_refused" in written, written[:400]
+    assert_absent(written, KASPA_TESTNET_V1_KEY)
+
+
+def test_the_pipeline_does_not_redact_an_exception_message(
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[[], None],
+) -> None:
+    """The residual, asserted rather than assumed, because assuming it is what went wrong.
+
+    Redaction works on **key names**. An exception's rendered traceback arrives as the
+    value of `exception`, which is not a sensitive name and whose text no processor
+    inspects, so anything inside an exception message is printed in full. That is not a
+    bug to be fixed here -- a redactor that scanned every string for anything
+    address-shaped would be slow, would mangle tracebacks, and would still miss a
+    truncated address.
+
+    It is the reason the two rules that *do* protect this path have to hold: nothing in
+    this repository may put an address into an exception message, and the database driver
+    must not either. This test exists so that nobody reads the redaction processor and
+    concludes the pipeline is a safety net for exception text. It is a statement of what
+    is **not** covered, in the same spirit as the residual documented in
+    `tests/security/test_no_float.py`.
+    """
+    production_logging()
+    sentinel = "sentinel-value-carried-inside-an-exception"
+
+    try:
+        message = f"failing row contained {sentinel}"
+        raise ValueError(message)
+    except ValueError:
+        structlog.get_logger("test").exception("unhandled_exception", path="/api/wallets")
+
+    written = capsys.readouterr().out
+
+    assert "unhandled_exception" in written
+    assert sentinel in written, (
+        "the pipeline now redacts exception text; if that is deliberate, this test should "
+        "be replaced by one asserting the redaction rather than deleted"
+    )
+
+
+def test_capture_logs_would_not_have_seen_that(
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[[], None],
+) -> None:
+    """Why this whole section reads stdout instead of `structlog.testing.capture_logs`.
+
+    Pinned as a test rather than left in a comment, because the comment was there and the
+    blind spot shipped anyway. `capture_logs` replaces the processor chain, so
+    `format_exc_info` never runs: the captured entry carries `exc_info: True` and no
+    rendered traceback at all. Every assertion written against it is therefore blind to
+    anything an exception carries.
+
+    If a future structlog renders the exception into the captured entry, this goes red --
+    and at that point `capture_logs` becomes safe for this purpose again and the stdout
+    plumbing above could be simplified. Until then, deleting this test would remove the
+    only record of why the plumbing is there.
+    """
+    production_logging()
+    sentinel = "sentinel-value-carried-inside-an-exception"
+
+    with capture_logs() as entries:
+        try:
+            message = f"failing row contained {sentinel}"
+            raise ValueError(message)
+        except ValueError:
+            structlog.get_logger("test").exception("unhandled_exception")
+
+    assert entries, "capture_logs recorded nothing, so this comparison proves nothing"
+    assert sentinel not in rendered(entries), (
+        "capture_logs now renders exception text, so it is no longer blind here"
+    )
 
 
 @pytest.mark.parametrize("environment", ["prod", "dev"])
@@ -288,6 +631,12 @@ def test_the_configured_pipeline_redacts_an_address_it_is_handed(
 #: The modules that handle an address. A log call in one of these that bound an address
 #: under a name the fragment list does not match would be redacted by nothing.
 ADDRESS_HANDLING_MODULES: Final = (
+    # Not a wallet module, and it is on this list because of a real leak. The unhandled
+    # exception handler logs on a path every wallet request can reach, and the exception
+    # it is handed is the one object in the process most likely to be carrying an address
+    # -- a driver error quoting its bound parameters is exactly that. Binding any part of
+    # it as a log field would put one in the log.
+    SOURCE_ROOT / "api" / "errors.py",
     SOURCE_ROOT / "domain" / "addresses.py",
     SOURCE_ROOT / "domain" / "chains.py",
     SOURCE_ROOT / "repositories" / "wallets.py",

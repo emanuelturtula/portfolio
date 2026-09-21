@@ -62,8 +62,27 @@ def apply_sqlite_pragmas(
 
 
 def create_database_engine(database_url: str) -> AsyncEngine:
-    """Build the async engine for a URL, with the SQLite pragmas wired to its pool."""
-    engine = create_async_engine(database_url)
+    """Build the async engine for a URL, with the SQLite pragmas wired to its pool.
+
+    **`hide_parameters=True` is a disclosure control, not a tuning knob.** By default
+    SQLAlchemy renders the bound parameters into the text of a `StatementError`, so the
+    values of the row being written become part of the exception message -- and from
+    there part of any traceback that is logged. `redact_sensitive` cannot save us: it
+    matches on *key names*, and the field carrying the traceback is called `exception`,
+    which contains no sensitive fragment. The whole statement goes out verbatim.
+
+    That is not hypothetical here. Two concurrent `POST /api/wallets` for the same
+    address raced past the service's duplicate pre-check and reached the unique
+    constraint; the `IntegrityError` that came back carried both `address_canonical` and
+    `address_display` in cleartext into a production log line. `OperationalError:
+    database is locked` renders the same way and needs no duplicate at all. This flag is
+    the half of the fix that protects every future table rather than just `wallets` --
+    trade executions and balances are no more loggable than an address is.
+
+    The statement text and the driver's own message are untouched, so a failure is still
+    diagnosable; only the values are replaced.
+    """
+    engine = create_async_engine(database_url, hide_parameters=True)
     if engine.dialect.name == "sqlite":
         # Registered on the sync engine: the `connect` event is a DBAPI-level event, and
         # the async engine is a wrapper around the sync one rather than a separate pool.

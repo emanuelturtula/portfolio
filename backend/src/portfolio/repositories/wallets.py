@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from portfolio.db.models import Wallet
 
@@ -26,6 +27,26 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from sqlalchemy.ext.asyncio import AsyncSession
+
+
+class WalletConstraintError(Exception):
+    """An insert the database refused, re-raised without the driver's exception.
+
+    The point of this class is what it does **not** carry. SQLAlchemy renders the bound
+    parameters into a `StatementError`'s message, so letting an `IntegrityError` travel
+    upward means the row being written travels with it -- into a traceback, and from there
+    into a log line that `redact_sensitive` cannot help with, because that processor
+    matches key names and the field is called `exception`.
+
+    Re-raising a bare exception here is what keeps `sqlalchemy` out of the service layer
+    as well: a caller can tell "the database refused this" from "something else went
+    wrong" without importing the driver to name its error type.
+
+    Deliberately not called `DuplicateWalletError`. It means only that a constraint
+    rejected the insert, and `wallets` has three -- a unique constraint, a foreign key and
+    a check. Deciding it was a duplicate is the service's job, and the service decides it
+    by looking, not by parsing a message.
+    """
 
 
 class WalletRepository:
@@ -92,6 +113,11 @@ class WalletRepository:
         `updated_at` starts equal to `created_at`: a row that has never been edited has
         been "updated" exactly once, when it was created, and a null here would make every
         reader handle a case that lasts until the first `PATCH`.
+
+        Raises:
+            WalletConstraintError: the database refused the insert. The driver's exception
+                is chained but is not allowed to propagate on its own, because its message
+                contains the bound row -- both address columns included.
         """
         wallet = Wallet(
             user_id=user_id,
@@ -104,7 +130,14 @@ class WalletRepository:
             updated_at=created_at,
         )
         self._session.add(wallet)
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as exc:
+            # `from exc` keeps the chain for a debugger and for `logger.exception`, and it
+            # is safe to keep *because* the engine is built with `hide_parameters=True`.
+            # The two are one control: this translation alone would still let the
+            # parameters through in the `__cause__`'s rendering.
+            raise WalletConstraintError from exc
         return wallet
 
     async def set_label(self, wallet: Wallet, label: str | None, updated_at: datetime) -> None:

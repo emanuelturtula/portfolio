@@ -13,13 +13,16 @@ only ever reads itself back cannot tell a soft archive from a hard delete: both 
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from itertools import count
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 from sqlalchemy import text
 
+from portfolio.api import dependencies
 from portfolio.api.errors import PROBLEM_CONTENT_TYPE
+from portfolio.services.wallets import WalletService, build_wallet_service
 from tests.address_vectors import (
     BIP173_MIXED_CASE,
     BIP173_TESTNET_P2WPKH,
@@ -32,6 +35,7 @@ from tests.address_vectors import (
     CORE_TESTNET4_P2SH,
     CORE_UNKNOWN_VERSION_BYTE,
     DERIVED_V1_WITH_BECH32,
+    HOMOGLYPH_KELVIN,
     KASPA_NAMED_CORRUPTIONS,
     KASPA_TESTNET_V0,
     KASPA_TESTNET_V1_KEY,
@@ -184,6 +188,203 @@ async def test_delete_twice_returns_204_both_times(signed_in_api_client: AsyncCl
     second = await signed_in_api_client.delete(path, headers=JSON_HEADERS)
 
     assert (first.status_code, second.status_code) == (204, 204)
+
+
+@pytest.fixture
+def stepping_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give the wallet service a clock that never returns the same instant twice.
+
+    The archive tests below assert that a request which changes nothing **writes**
+    nothing, by reading the timestamps before and after. With the real clock that
+    assertion is only as good as the gap between two `datetime.now` calls: on a fast
+    machine, or one whose clock has coarse resolution, a write can land on the same value
+    it replaced and "unchanged" then means "changed, indistinguishably".
+
+    That is not hypothetical. Under the mutation that removes the no-op guard, one of
+    these tests passed in a batched run and failed when run alone -- the mutant survived
+    because two wall-clock reads happened to agree. A test whose verdict depends on how
+    fast the host is has no verdict.
+
+    Stepping a whole second per call removes the coincidence entirely: every write moves
+    every timestamp, visibly, so "unchanged" can only mean "not written".
+
+    Patched at the composition root rather than inside the service: `build_wallet_service`
+    binds `utc_now` as a default argument at definition time, so replacing the module
+    attribute would do nothing at all -- quietly, which is the worst way for a test double
+    to fail.
+    """
+    ticks = count()
+    base = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+
+    def clock() -> datetime:
+        return base + timedelta(seconds=next(ticks))
+
+    def build(session: AsyncSession) -> WalletService:
+        return build_wallet_service(session, clock=clock)
+
+    monkeypatch.setattr(dependencies, "build_wallet_service", build)
+
+
+def test_the_stepping_clock_really_steps() -> None:
+    """The double's own guard: a clock that returned one value would prove nothing."""
+    ticks = count()
+    base = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    readings = [base + timedelta(seconds=next(ticks)) for _ in range(3)]
+
+    assert len(set(readings)) == 3
+    assert readings[1] - readings[0] == timedelta(seconds=1)
+
+
+async def archive_columns(
+    sessionmaker: async_sessionmaker[AsyncSession], wallet_id: int
+) -> tuple[Any, Any]:
+    """`(archived_at, updated_at)`, read outside the request that wrote them.
+
+    Both, because they fail independently. An implementation can leave `archived_at`
+    alone and still stamp `updated_at` on a request that changed nothing, and #10 will
+    order its polling decisions off these columns.
+    """
+    session: AsyncSession
+    async with sessionmaker() as session:
+        result = await session.execute(
+            text("SELECT archived_at, updated_at FROM wallets WHERE id = :id"),
+            {"id": wallet_id},
+        )
+        archived_at, updated_at = result.one()
+        return archived_at, updated_at
+
+
+async def archived_at_of(sessionmaker: async_sessionmaker[AsyncSession], wallet_id: int) -> Any:
+    """Just the archive timestamp, for the assertions that only care about it."""
+    return (await archive_columns(sessionmaker, wallet_id))[0]
+
+
+async def test_delete_twice_leaves_the_archive_timestamp_unchanged(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+    stepping_clock: None,
+) -> None:
+    """Idempotent means the *state* is unchanged, not merely that the status code is 204.
+
+    `test_delete_twice_returns_204_both_times` is satisfied by an implementation that
+    re-stamps `archived_at` on every call, which is not idempotent -- it rewrites when the
+    wallet was retired, on a request that asked for no change. A retry after a dropped
+    response would silently move the date, and once #10 stores balance snapshots that date
+    is the boundary the history is read against.
+    """
+    created = await create_ok(signed_in_api_client)
+    path = f"{WALLETS}/{created['id']}"
+
+    await signed_in_api_client.delete(path, headers=JSON_HEADERS)
+    first = await archived_at_of(api_sessionmaker, created["id"])
+    await signed_in_api_client.delete(path, headers=JSON_HEADERS)
+    second = await archived_at_of(api_sessionmaker, created["id"])
+
+    assert first is not None
+    assert second == first, "the second DELETE rewrote when the wallet was retired"
+
+
+async def test_patch_archiving_an_already_archived_wallet_leaves_the_timestamp_unchanged(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+    stepping_clock: None,
+) -> None:
+    """The same rule through the other door, which is the one that had no test.
+
+    `DELETE` and `PATCH {"archived": true}` ask for the same end state, so they have to
+    reach the same one. Pinned separately because they are separate code paths: whichever
+    of the two was wrong could have been "fixed" to match the other, in either direction,
+    without a single test noticing which way it went.
+    """
+    created = await create_ok(signed_in_api_client)
+    await signed_in_api_client.delete(f"{WALLETS}/{created['id']}", headers=JSON_HEADERS)
+    before = await archived_at_of(api_sessionmaker, created["id"])
+
+    response = await signed_in_api_client.patch(
+        f"{WALLETS}/{created['id']}", json={"archived": True}, headers=JSON_HEADERS
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["archived"] is True
+    after = await archived_at_of(api_sessionmaker, created["id"])
+    assert before is not None
+    assert after == before, "PATCH re-stamped a wallet that was already archived"
+
+
+async def test_unarchiving_then_archiving_again_does_move_the_timestamp(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+    stepping_clock: None,
+) -> None:
+    """The other half, without which "never move it" would be an equally passing rule.
+
+    Restoring a wallet and retiring it again is a genuinely new retirement, so the
+    timestamp must move. A test suite that only pinned "unchanged" would be satisfied by
+    an implementation that stamped `archived_at` once and never again.
+    """
+    created = await create_ok(signed_in_api_client)
+    path = f"{WALLETS}/{created['id']}"
+    await signed_in_api_client.delete(path, headers=JSON_HEADERS)
+    first = await archived_at_of(api_sessionmaker, created["id"])
+
+    await signed_in_api_client.patch(path, json={"archived": False}, headers=JSON_HEADERS)
+    assert await archived_at_of(api_sessionmaker, created["id"]) is None
+    await signed_in_api_client.patch(path, json={"archived": True}, headers=JSON_HEADERS)
+
+    assert await archived_at_of(api_sessionmaker, created["id"]) != first
+
+
+@pytest.mark.parametrize("archived", [True, False], ids=["archive", "unarchive"])
+async def test_patch_that_asks_for_the_state_the_wallet_is_already_in_writes_nothing(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+    stepping_clock: None,
+    archived: bool,
+) -> None:
+    """All four combinations of the archive setter, not the three that come to mind.
+
+    Archiving an archived wallet is the obvious no-op. **Unarchiving an already-active one
+    is the one that hides**, because the wallet is unarchived before and after either way:
+    the only visible difference is `updated_at`, which nothing else asserts. An
+    unconditional write there would be invisible to every other test in this file.
+
+    `updated_at` is asserted as well as `archived_at` for the same reason -- a request
+    that changed nothing must leave no trace, or "when did this row last change" stops
+    meaning anything.
+    """
+    created = await create_ok(signed_in_api_client)
+    path = f"{WALLETS}/{created['id']}"
+    if archived:
+        await signed_in_api_client.delete(path, headers=JSON_HEADERS)
+    before = await archive_columns(api_sessionmaker, created["id"])
+
+    response = await signed_in_api_client.patch(
+        path, json={"archived": archived}, headers=JSON_HEADERS
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["archived"] is archived
+    assert await archive_columns(api_sessionmaker, created["id"]) == before, (
+        "a PATCH asking for the state the wallet was already in wrote to the row"
+    )
+
+
+async def test_a_unicode_homoglyph_address_is_refused(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A string that folds to a valid address but is not one, refused at the boundary.
+
+    It matters here and not only in the domain because `display` is what this endpoint
+    hands back. Stored, the owner would be shown a string carrying a Kelvin sign, copy it,
+    and find that nothing accepts it.
+    """
+    response = await create(signed_in_api_client, HOMOGLYPH_KELVIN)
+
+    assert response.status_code == 422, response.text
+    assert [error for error in response.json()["errors"] if error["loc"][-1] == "address"]
+    assert HOMOGLYPH_KELVIN not in response.text
+    assert await rows(api_sessionmaker) == []
 
 
 async def test_list_excludes_archived_unless_asked(signed_in_api_client: AsyncClient) -> None:

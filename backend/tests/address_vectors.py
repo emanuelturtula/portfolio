@@ -205,6 +205,24 @@ DERIVED_OVER_BECH32_LENGTH_LIMIT: Final = (
     "jjhllyrqe7uru4tj5dzxvguvyzd0e"
 )
 
+#: U+212A KELVIN SIGN, which lowercases to `k` and uppercases to **itself**.
+KELVIN_SIGN: Final = "K"  # noqa: RUF001 - the ambiguity is the subject here
+
+#: `BIP173_TESTNET_P2WPKH_UPPERCASE` with its one `K` replaced by a Kelvin sign.
+#:
+#: This is not a corruption in the ordinary sense: the checksum *verifies*. The usual
+#: mixed-case guard asks whether a string equals its own lower or upper form, and this one
+#: equals its upper form, because U+212A is already uppercase. It therefore sails past the
+#: guard, folds to a perfectly valid address, and passes every checksum test in the suite.
+#:
+#: What it breaks is the **display** column. `canonical` is the folded form, so uniqueness
+#: and provider calls were never at risk; `display` keeps the Kelvin sign, and that string
+#: is not an address on any network. The owner would be shown it, copy it, and paste it
+#: somewhere that rejects it -- or worse, not notice. Refusing non-ASCII outright is the
+#: only tractable answer, because every encoding here is ASCII by construction and Unicode
+#: has more than one character with this property.
+HOMOGLYPH_KELVIN: Final = BIP173_TESTNET_P2WPKH_UPPERCASE.replace("K", KELVIN_SIGN, 1)
+
 #: BIP-350, "Invalid addresses": mixed case.
 BIP350_MIXED_CASE: Final = "tb1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq47Zagq"
 

@@ -14,11 +14,12 @@ guard is the only one there is.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import pytest
 
 from portfolio.db.models import Wallet
+from portfolio.services import auth, wallets
 from portfolio.services.wallets import (
     DUPLICATE_ARCHIVED_DETAIL,
     DUPLICATE_DETAIL,
@@ -33,6 +34,9 @@ from portfolio.services.wallets import (
     view_of,
 )
 from tests.address_vectors import BIP173_TESTNET_P2WPKH, BIP173_TESTNET_P2WPKH_UPPERCASE
+
+if TYPE_CHECKING:
+    from types import ModuleType
 
 CREATED_AT: Final = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
 UPDATED_AT: Final = datetime(2026, 9, 22, 8, 30, tzinfo=UTC)
@@ -242,3 +246,61 @@ def test_the_default_clock_is_timezone_aware_and_utc() -> None:
     assert now.tzinfo is not None
     assert now.utcoffset() == datetime.now(UTC).utcoffset()
     assert now.utcoffset() is not None
+
+
+# --------------------------------------------------------------------------------------
+# A latent trap in both services, pinned so it stays discoverable
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("module", "builder"),
+    [(wallets, wallets.build_wallet_service), (auth, auth.build_auth_service)],
+    ids=["wallets", "auth"],
+)
+def test_reassigning_the_module_clock_does_not_reach_the_built_service(
+    monkeypatch: pytest.MonkeyPatch,
+    module: ModuleType,
+    builder: object,
+) -> None:
+    """`clock=utc_now` is captured at definition time, so monkeypatching it does nothing.
+
+    Both service builders take the clock as a keyword argument defaulting to their
+    module's `utc_now`. Python evaluates that default **once, when the function is
+    defined**, and stores the resulting function object in `__kwdefaults__`. Reassigning
+    `module.utc_now` afterwards replaces a name the builder no longer consults.
+
+    The failure mode is the dangerous kind rather than the loud kind. `monkeypatch.setattr`
+    succeeds, the test reads as though it has fixed the clock, and the service goes on
+    calling the real one -- so a test written to assert something about a chosen instant
+    silently asserts it about wall-clock time instead. That is the same shape as every
+    other defect this issue turned up: a double whose acceptance is taken as evidence that
+    it took effect.
+
+    **No test in this suite currently falls into it.** The archive tests inject the clock
+    through `build_wallet_service` at the composition root instead, which substitutes the
+    object actually wired rather than a name the wiring copied. This test is here so the
+    next person writing one finds the trap before losing an afternoon to it, and so that
+    the trap cannot be quietly removed from one service and left in the other.
+
+    **If this goes red, the trap is gone and that is good news.** Delete this test rather
+    than working around it -- and check that its sibling parametrisation went red too,
+    because fixing one service and not the other is the outcome that leaves the next
+    reader worse off than a consistent trap does.
+    """
+    defaults = builder.__kwdefaults__  # type: ignore[attr-defined]
+    captured = defaults["clock"]
+    assert captured is module.utc_now, (
+        "the builder no longer captures the module's clock; if the default was changed "
+        "deliberately, this test has expired and should be deleted"
+    )
+
+    def a_different_clock() -> datetime:
+        return datetime(1999, 12, 31, 23, 59, tzinfo=UTC)
+
+    monkeypatch.setattr(module, "utc_now", a_different_clock)
+
+    # The reassignment succeeded, and reached nothing.
+    assert module.utc_now is a_different_clock
+    assert defaults["clock"] is captured
+    assert defaults["clock"] is not a_different_clock

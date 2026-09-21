@@ -64,6 +64,7 @@ from tests.address_vectors import (
     DERIVED_PROGRAM_TOO_SHORT,
     DERIVED_V0_WRONG_PROGRAM_LENGTH,
     DERIVED_V1_WITH_BECH32,
+    HOMOGLYPH_KELVIN,
     KASPA_DATA_TOO_SHORT,
     KASPA_MIXED_CASE,
     KASPA_NAMED_CORRUPTIONS,
@@ -79,6 +80,7 @@ from tests.address_vectors import (
     KASPA_VECTORS,
     KASPA_WRONG_NETWORK_PREFIX,
     KASPA_WRONG_PAYLOAD_LENGTH,
+    KELVIN_SIGN,
     NAMED_CORRUPTIONS,
     SYNTHETIC_TPUB,
     TWO_HUNDRED_CHARACTERS,
@@ -345,6 +347,39 @@ def test_witness_version_two_with_a_bech32_checksum_is_rejected() -> None:
 def test_mixed_case_bech32_is_rejected(address: str) -> None:
     """Bech32 is case insensitive but not case *mixing*: the checksum is defined on one."""
     assert reject(address).reason is AddressRejection.MIXED_CASE
+
+
+def test_a_unicode_homoglyph_is_rejected() -> None:
+    """The case-folding trap the mixed-case guard cannot see.
+
+    U+212A KELVIN SIGN lowercases to `k` and uppercases to itself, so a string containing
+    one satisfies `raw.upper() == raw` and is not "mixed case" by any test written in
+    terms of that question. It then folds to a valid address and the checksum verifies --
+    so every other assertion in this module passes on it.
+
+    What it corrupts is the form the owner is shown. `canonical` is the folded ASCII
+    address, so uniqueness and provider calls were never at risk; `display` keeps the
+    Kelvin sign, and `GET /api/wallets` hands the owner a string that is not an address on
+    any network. Refusing non-ASCII outright is the tractable fix, because every encoding
+    here is ASCII by construction and Unicode has more than one character with this
+    property -- enumerating them would be an arms race.
+    """
+    # The properties that make this vector pathological, asserted so the test cannot
+    # quietly stop being about a homoglyph if the constant is ever edited.
+    assert HOMOGLYPH_KELVIN.upper() == HOMOGLYPH_KELVIN
+    assert HOMOGLYPH_KELVIN.lower() == BIP173_TESTNET_P2WPKH
+    assert not HOMOGLYPH_KELVIN.isascii()
+    assert len(HOMOGLYPH_KELVIN) == len(BIP173_TESTNET_P2WPKH_UPPERCASE)
+
+    assert reject(HOMOGLYPH_KELVIN).reason is AddressRejection.INVALID_CHARACTER
+
+
+def test_a_homoglyph_in_a_kaspa_address_is_rejected() -> None:
+    """The same trap on the other chain, which folds case in the same way."""
+    homoglyph = KASPA_TESTNET_V0.upper().replace("K", KELVIN_SIGN, 1)
+    assert not homoglyph.isascii()
+
+    assert reject(homoglyph, KASPA).reason is AddressRejection.INVALID_CHARACTER
 
 
 def test_a_case_flip_of_a_valid_bech32_address_is_rejected() -> None:

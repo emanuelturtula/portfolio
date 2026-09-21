@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from portfolio.db.engine import create_session_factory
 from portfolio.db.models import _WALLET_CHAIN_KEY_CHECK, Wallet
 from portfolio.domain.chains import ChainKey
-from portfolio.repositories.wallets import WalletRepository
+from portfolio.repositories.wallets import WalletConstraintError, WalletRepository
 from tests.address_vectors import (
     BIP173_TESTNET_P2WPKH,
     BIP173_TESTNET_P2WPKH_UPPERCASE,
@@ -233,6 +233,44 @@ async def test_the_constraint_holds_for_an_archived_row_too(
             )
 
 
+async def test_a_refused_insert_does_not_carry_the_row_in_its_exception(
+    wallets_engine: AsyncEngine,
+) -> None:
+    """The disclosure control on the engine, asserted by behaviour rather than by flag.
+
+    SQLAlchemy renders the bound parameters into a `StatementError`'s message by default,
+    so an `IntegrityError` from a duplicate insert carries the whole row -- both address
+    columns -- in its text. That text reaches a log the moment anything calls
+    `logger.exception`, and `redact_sensitive` cannot help: it matches key names, and the
+    field is called `exception`.
+
+    Asserted on the rendered exception rather than on `engine.hide_parameters`, because
+    the flag is the current mechanism and the absence of the row is the requirement. A
+    future SQLAlchemy that spelled the option differently should not need this test edited.
+    """
+    row = {
+        "user_id": OWNER_ID,
+        "chain_key": ChainKey.BITCOIN.value,
+        "canonical": BIP173_TESTNET_P2WPKH,
+        "display": BIP173_TESTNET_P2WPKH_UPPERCASE,
+        "label": "Cold storage",
+        "archived_at": None,
+    }
+    async with wallets_engine.begin() as connection:
+        await connection.execute(INSERT_WALLET, row)
+
+    with pytest.raises(IntegrityError) as caught:
+        async with wallets_engine.begin() as connection:
+            await connection.execute(INSERT_WALLET, row)
+
+    rendered = f"{caught.value}{caught.value!r}"
+
+    # The failure is still legible -- this is a disclosure control, not a gag.
+    assert "UNIQUE" in rendered.upper()
+    for secret in (BIP173_TESTNET_P2WPKH, BIP173_TESTNET_P2WPKH_UPPERCASE, "Cold storage"):
+        assert secret not in rendered, f"the driver's exception carried {secret[:20]!r}"
+
+
 async def test_the_same_address_is_allowed_on_another_chain(
     wallets_engine: AsyncEngine,
 ) -> None:
@@ -263,12 +301,29 @@ async def test_the_repository_also_hits_the_constraint(
     repository: WalletRepository,
     session: AsyncSession,
 ) -> None:
-    """The realistic path: the same refusal arrives through the code the service uses."""
+    """The realistic path, and the boundary where the driver's exception is stopped.
+
+    The repository translates `IntegrityError` into `WalletConstraintError` and does not
+    let the original propagate on its own. That is a disclosure boundary rather than a
+    tidying-up: SQLAlchemy renders the bound row into the message it raises, so an
+    `IntegrityError` escaping this method carries both address columns wherever it lands --
+    including into `logger.exception`, where nothing can redact it.
+
+    The `__cause__` is deliberately kept, and is safe to keep only because the engine also
+    sets `hide_parameters`. Both halves are asserted here, because either one alone still
+    leaks: without the translation the message is rendered by whoever catches it, and
+    without `hide_parameters` the chained cause renders it anyway.
+    """
     await add_wallet(repository)
     await session.commit()
 
-    with pytest.raises(IntegrityError):
+    with pytest.raises(WalletConstraintError) as caught:
         await add_wallet(repository, label="again")
+
+    assert isinstance(caught.value.__cause__, IntegrityError)
+    rendered = f"{caught.value}{caught.value!r}{caught.value.__cause__}"
+    assert BIP173_TESTNET_P2WPKH not in rendered
+    assert "Cold storage" not in rendered
 
 
 async def test_two_different_addresses_coexist_for_one_user(

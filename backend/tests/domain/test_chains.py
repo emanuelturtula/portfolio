@@ -71,14 +71,27 @@ IMPURE_IMPORTS: Final = frozenset(
 
 
 def imported_modules(path: Path) -> set[str]:
-    """Every top-level module name a file imports, however it spells the import."""
+    """Every module name a file imports, however it spells the import.
+
+    **A relative import is reported as `.`-prefixed rather than skipped.** The first
+    version of this filtered on `node.level == 0`, which silently dropped
+    `from .something import ...` -- so a relative import inside `domain/` was invisible to
+    both assertions below, and the scan quietly covered less than its docstring claimed.
+    Nothing in `domain/` uses one today; the point is that the scan would not have said so
+    if something did, and a guard that cannot see a whole syntactic form is not a guard.
+
+    A relative name can never be in `PURE_IMPORTS_ALLOWED`, which is spelled in absolute
+    names, so any relative import fails the containment check by construction. That is the
+    right answer twice over: house style here is absolute imports, and a relative one
+    inside `domain/` could reach a sibling this list was never able to vet.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
-            found.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            found.add("." * node.level + (node.module or ""))
     return found
 
 
@@ -171,7 +184,25 @@ def test_the_address_modules_import_nothing_that_could_block_or_drift(module: st
     assert imported <= PURE_IMPORTS_ALLOWED, imported - PURE_IMPORTS_ALLOWED
 
 
-def test_the_purity_scan_can_actually_fail() -> None:
-    """A scan that found no imports would pass the test above without checking anything."""
+def test_the_purity_scan_can_actually_fail(tmp_path: Path) -> None:
+    """A scan that found no imports would pass the test above without checking anything.
+
+    The relative-import case is driven against a planted file rather than asserted in the
+    abstract, because that is the form the scan used to be blind to and an assertion about
+    the fix has to exercise the fix.
+    """
     assert imported_modules(Path(__file__)) & {"ast", "pathlib"} == {"ast", "pathlib"}
     assert IMPURE_IMPORTS.isdisjoint(PURE_IMPORTS_ALLOWED)
+
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "import socket\nfrom . import sibling\nfrom .deeper.thing import name\n",
+        encoding="utf-8",
+    )
+
+    found = imported_modules(planted)
+
+    assert found == {"socket", ".", ".deeper.thing"}
+    # Both assertions in the test above have to reject this file, not just one of them.
+    assert {name.split(".")[0] for name in found} & IMPURE_IMPORTS == {"socket"}
+    assert not found <= PURE_IMPORTS_ALLOWED
