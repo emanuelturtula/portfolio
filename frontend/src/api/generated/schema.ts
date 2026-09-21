@@ -104,10 +104,81 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/wallets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the wallets balances are read from
+         * @description Return the caller's wallets, oldest first, archived ones hidden by default.
+         */
+        get: operations["listWallets"];
+        put?: never;
+        /**
+         * Register an address to read balances from
+         * @description Register an address after verifying its checksum, offline.
+         *
+         *     A duplicate is a 409 whether or not the row holding the slot is archived, and the
+         *     problem detail says which -- because "you already have this" and "you archived this"
+         *     call for different next steps from the owner.
+         */
+        post: operations["createWallet"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/wallets/{wallet_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Archive a wallet, keeping its history
+         * @description Archive rather than delete, and succeed again if it is already archived.
+         *
+         *     Nothing is removed, because the balance snapshots that will reference `wallets.id`
+         *     need the row to outlive the owner's interest in the address. Repeating the request is
+         *     a 204 rather than a 404: the end state the caller asked for is the end state they get,
+         *     so a retry after a dropped response is not an error.
+         */
+        delete: operations["archiveWallet"];
+        options?: never;
+        head?: never;
+        /**
+         * Rename a wallet, archive it, or restore it
+         * @description Apply only the fields the request actually sent.
+         *
+         *     `model_fields_set` is what separates "the label was omitted" from `"label": null`; the
+         *     first leaves the label alone and the second clears it. Without that distinction,
+         *     archiving a wallet would silently erase its name.
+         */
+        patch: operations["updateWallet"];
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * ChainKey
+         * @description Every chain balances can be read from.
+         *
+         *     A `StrEnum` so that the value stored in `wallets.chain_key`, the value the `CHECK`
+         *     constraint admits and the value that crosses the API are one string rather than three
+         *     that have to be kept in step. Adding a member is therefore also a migration.
+         * @enum {string}
+         */
+        ChainKey: "bitcoin" | "kaspa";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -171,6 +242,71 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /**
+         * WalletCreateRequest
+         * @description A new wallet: which chain, which address, and optionally what to call it.
+         */
+        WalletCreateRequest: {
+            /** Address */
+            address: string;
+            chain_key: components["schemas"]["ChainKey"];
+            /** Label */
+            label?: string | null;
+        };
+        /**
+         * WalletListResponse
+         * @description The wallet collection, wrapped in an object rather than returned as a bare array.
+         *
+         *     A top-level array has nowhere to grow: adding a count or a cursor later would break
+         *     every client, and an object costs one key now.
+         */
+        WalletListResponse: {
+            /** Wallets */
+            wallets: components["schemas"]["WalletResponse"][];
+        };
+        /**
+         * WalletResponse
+         * @description One wallet, as the API publishes it.
+         */
+        WalletResponse: {
+            /** Address */
+            address: string;
+            /** Archived */
+            archived: boolean;
+            /** Chain Key */
+            chain_key: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Id */
+            id: number;
+            /** Label */
+            label: string | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /**
+         * WalletUpdateRequest
+         * @description A change to a wallet. Both fields are optional, and absent is not the same as null.
+         *
+         *     Omitting `label` leaves the label alone; sending `"label": null` clears it. The router
+         *     tells the two apart through `model_fields_set`, which is the only reason this is not
+         *     simply a nullable field with a default.
+         *
+         *     `archived` is the simpler case: omitted and null both mean "leave it as it is", because
+         *     a three-valued boolean has no third meaning worth having.
+         */
+        WalletUpdateRequest: {
+            /** Archived */
+            archived?: boolean | null;
+            /** Label */
+            label?: string | null;
         };
     };
     responses: never;
@@ -297,6 +433,135 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+        };
+    };
+    listWallets: {
+        parameters: {
+            query?: {
+                /** @description Include wallets that have been archived. */
+                include_archived?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WalletListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    createWallet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WalletCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WalletResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    archiveWallet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                wallet_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    updateWallet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                wallet_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WalletUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WalletResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

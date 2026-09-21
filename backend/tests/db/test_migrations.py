@@ -50,7 +50,19 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
     from sqlalchemy.engine import Connection
 
-APPLICATION_TABLES = frozenset({"users", "sessions", "assets"})
+APPLICATION_TABLES = frozenset({"users", "sessions", "assets", "wallets"})
+"""Every table the application owns, compared **exactly** rather than with `>=`.
+
+`>=` was the original spelling and it covered less than it looked like it did: a table a
+migration created but nobody listed here satisfied it, so the list could fall behind the
+schema without a single test noticing. Exact comparison means the next migration either
+updates this set or fails, which is what the set was presumably always meant to guarantee.
+
+`alembic_version` is Alembic's own bookkeeping and is added where a live schema is
+compared, rather than being listed here as though the application owned it.
+"""
+
+STAMP_TABLE = "alembic_version"
 FIRST_REVISION = "0001_initial_schema"
 
 EXPECTED_SEED_ROWS = [
@@ -65,6 +77,12 @@ EXPECTED_CONSTRAINT_NAMES = {
     "users": {"pk_users", "uq_users_username"},
     "assets": {"pk_assets", "uq_assets_symbol", "ck_assets_kind"},
     "sessions": {"pk_sessions", "uq_sessions_token_hash", "fk_sessions_user_id_users"},
+    "wallets": {
+        "pk_wallets",
+        "uq_wallets_user_chain_address",
+        "ck_wallets_chain_key",
+        "fk_wallets_user_id_users",
+    },
 }
 
 
@@ -137,8 +155,7 @@ def test_upgrade_head_creates_every_table(database_url: str, sync_engine: Engine
 
     names = table_names(sync_engine)
 
-    assert names >= APPLICATION_TABLES
-    assert "alembic_version" in names
+    assert names == APPLICATION_TABLES | {STAMP_TABLE}
 
 
 def test_upgrade_head_stamps_the_latest_revision(database_url: str, sync_engine: Engine) -> None:
@@ -161,7 +178,10 @@ def test_downgrade_base_leaves_no_application_tables(
 
     downgrade_to_base(database_url)
 
-    assert table_names(sync_engine) & APPLICATION_TABLES == set()
+    # Exactly the stamp table and nothing else: a downgrade that left one table behind
+    # would satisfy "none of the application's tables remain" only until the next release
+    # added a table it also forgot to drop.
+    assert table_names(sync_engine) == {STAMP_TABLE}
 
 
 def test_upgrade_downgrade_upgrade_round_trip(database_url: str, sync_engine: Engine) -> None:
@@ -170,7 +190,7 @@ def test_upgrade_downgrade_upgrade_round_trip(database_url: str, sync_engine: En
     downgrade_to_base(database_url)
     upgrade_to_head(database_url)
 
-    assert table_names(sync_engine) >= APPLICATION_TABLES
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
 
@@ -224,6 +244,10 @@ def test_the_migrated_schema_carries_the_convention_names(
     upgrade_to_head(database_url)
     inspector = inspect(sync_engine)
 
+    # Exact, for the same reason `APPLICATION_TABLES` is: a table missing from this map
+    # is a table whose constraint names nothing checks.
+    assert set(EXPECTED_CONSTRAINT_NAMES) == APPLICATION_TABLES
+
     for table, expected in EXPECTED_CONSTRAINT_NAMES.items():
         found = {inspector.get_pk_constraint(table)["name"]}
         found |= {unique["name"] for unique in inspector.get_unique_constraints(table)}
@@ -232,6 +256,7 @@ def test_the_migrated_schema_carries_the_convention_names(
         assert found == expected, table
 
     assert {index["name"] for index in inspector.get_indexes("sessions")} == {"ix_sessions_user_id"}
+    assert {index["name"] for index in inspector.get_indexes("wallets")} == {"ix_wallets_user_id"}
 
 
 def test_models_and_migrations_have_not_drifted(database_url: str, sync_engine: Engine) -> None:

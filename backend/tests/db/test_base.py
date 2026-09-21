@@ -23,6 +23,16 @@ EXPECTED_NAMES = {
         "fk_sessions_user_id_users",
         "ix_sessions_user_id",
     },
+    # `uq_wallets_user_chain_address` is named explicitly on the model rather than left to
+    # the convention, which would render `uq_wallets_user_id_chain_key_address_canonical`
+    # -- accurate, and too long for any error message quoting it to be readable.
+    "wallets": {
+        "pk_wallets",
+        "uq_wallets_user_chain_address",
+        "ck_wallets_chain_key",
+        "fk_wallets_user_id_users",
+        "ix_wallets_user_id",
+    },
 }
 
 
@@ -37,7 +47,15 @@ def test_the_convention_covers_every_constraint_kind() -> None:
 
 
 def test_constraints_are_named_by_the_convention() -> None:
-    """Every constraint and index on every mapped table has its conventional name."""
+    """Every constraint and index on every mapped table has its conventional name.
+
+    The table set is compared **exactly**. Iterating `EXPECTED_NAMES` alone -- which is
+    what this did until #5 -- means a newly mapped table that nobody added here is checked
+    by nothing at all, while the test goes on reporting success over the tables it does
+    know about.
+    """
+    assert set(EXPECTED_NAMES) == set(metadata.tables)
+
     for table_name, expected in EXPECTED_NAMES.items():
         table = metadata.tables[table_name]
         found = {constraint.name for constraint in table.constraints}

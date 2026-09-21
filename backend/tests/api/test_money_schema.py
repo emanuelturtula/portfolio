@@ -380,5 +380,10 @@ def test_the_shipped_application_gained_no_money_operation(app: FastAPI) -> None
         "/api/auth/logout",
         "/api/auth/session",
         "/api/auth/password",
+        # The wallet registry (#5). It records which addresses to read balances from and
+        # carries no monetary field of any kind -- reading a balance is #6 to #8, and that
+        # is the change that will have to introduce `Amount` and argue for it here.
+        "/api/wallets",
+        "/api/wallets/{wallet_id}",
     }
     assert "Amount" not in schema.get("components", {}).get("schemas", {})
