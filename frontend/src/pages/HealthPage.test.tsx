@@ -48,6 +48,60 @@ describe('HealthPage', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
+  it('falls back to the problem title when the server sends no detail', async () => {
+    server.use(
+      http.get('/api/health', () =>
+        HttpResponse.json(
+          { type: 'about:blank', title: 'Bad Gateway', status: 502 },
+          { status: 502, headers: { 'content-type': 'application/problem+json' } },
+        ),
+      ),
+    );
+
+    renderHealthPage();
+
+    // The backend serialises with `exclude_none=True`, so `detail` really is
+    // absent whenever an error carries no specific message.
+    expect(await screen.findByRole('alert')).toHaveTextContent('Bad Gateway');
+  });
+
+  it('tells the user the backend is unreachable when a proxy answers for it', async () => {
+    server.use(
+      http.get(
+        '/api/health',
+        () =>
+          new HttpResponse('<html><body>502 Bad Gateway</body></html>', {
+            status: 502,
+            statusText: 'Bad Gateway',
+            headers: { 'content-type': 'text/html' },
+          }),
+      ),
+    );
+
+    renderHealthPage();
+
+    // This page kept a fourth private copy of the "which sentence do we show"
+    // logic, and was the last place still showing the bare HTTP reason phrase
+    // after `client.ts` was fixed. Folding it onto `describeApiError` is what
+    // makes one mutation of that function fail tests on every page at once -
+    // which is the property that proves no fifth copy is hiding somewhere.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/could not be reached/i);
+    expect(alert).not.toHaveTextContent(/bad gateway/i);
+  });
+
+  it('shows an unreachable-backend message when the request fails outright', async () => {
+    server.use(http.get('/api/health', () => HttpResponse.error()));
+
+    renderHealthPage();
+
+    const alert = await screen.findByRole('alert');
+    // A `TypeError` from `fetch` carries no problem document, so the page needs
+    // a sentence of its own. "Failed to fetch" is not one.
+    expect(alert).toHaveTextContent(/could not be reached/i);
+    expect(alert).not.toHaveTextContent(/failed to fetch/i);
+  });
+
   it('shows an accessible error message when the backend reports a problem', async () => {
     server.use(
       http.get('/api/health', () =>
