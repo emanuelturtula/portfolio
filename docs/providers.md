@@ -77,10 +77,16 @@ four cases:
 |---|---|
 | a requested address is missing from the response | zero balance |
 | the response carries an address nobody requested | `ProviderResponseError` |
+| a count that is not a whole number of base units | `ProviderResponseError` |
 | a negative base-unit count | `ProviderResponseError` |
 | the same address requested twice | `ValueError` |
 
-The third row is the one worth internalising. A batch API answering about something we did
+The third row is not paranoia about types. `json.loads` returns whatever the vendor sent,
+so a balance rendered as `1.0e8` arrives as a `float`, and `100000000.0 < 0` is `False`.
+`align_balances` refuses it; the AST float ban cannot, because that float has no literal
+and no `float` anywhere in your source.
+
+The second row is the one worth internalising. A batch API answering about something we did
 not ask about is a correlation bug, and dropping the entry silently would hide it behind a
 total that still looks plausible.
 
@@ -137,12 +143,35 @@ out of `services/`:
 ```python
 try:
     response = await self._client.get(url, extensions={"endpoint": "address_balance"})
-    response.raise_for_status()
 except httpx.TransportError as error:
+    # Nobody answered. Transient by assumption: keep the last known balance.
     raise ProviderUnavailableError("the chain did not answer") from error
-except httpx.HTTPStatusError as error:
-    raise ProviderUnavailableError("the chain returned an error") from error
+
+status = response.status_code
+if status == HTTPStatus.TOO_MANY_REQUESTS:
+    # We asked too often. The remedy is a longer HostRateLimiter interval for this
+    # vendor, not patience -- so it must not arrive as a generic outage.
+    raise ProviderRateLimitedError("the chain is throttling us")
+if status >= HTTPStatus.INTERNAL_SERVER_ERROR:
+    # The vendor is broken, not us. Retrying later is the right response.
+    raise ProviderUnavailableError("the chain failed to answer")
+if status >= HTTPStatus.BAD_REQUEST:
+    # The vendor understood and refused: 400, 401, 403, 404. Retrying changes
+    # nothing, and reporting it as an outage buries the only useful fact.
+    raise ProviderResponseError(f"the chain refused the request with {status}")
 ```
+
+**All three branches matter, and collapsing them is the mistake this hierarchy exists to
+prevent.** Concretely: a self-hosted Esplora put behind an auth proxy starts returning 401.
+Mapped to `ProviderUnavailableError`, every sync reports "chain temporarily unavailable"
+forever, the operator waits for a vendor to recover that was never down, and nothing ever
+says the credential is the problem. Mapped to `ProviderResponseError` it is a failure that
+does not retry and does demand a person, which is what it is.
+
+`ProviderRateLimitedError` is the one most easily forgotten, because a 429 is also
+"try later" and a generic outage error is not obviously wrong. It is separate because the
+remedy is different: a 429 that survived the transport's retries means our interval for
+that vendor is too short, and that is a configuration change, not something waiting fixes.
 
 Do not raise a `ProviderError` from a transport or from a shared helper. The transport
 implements `httpx.AsyncBaseTransport` and owes that interface its own exception types, and
@@ -177,7 +206,7 @@ will use, because one exchange signs its requests in the query string. It is not
 for a chain provider: reaching for it to log a chain request would meet the letter of the
 rule and leak the address anyway.
 
-Three further rules, none of them optional:
+Four further rules, none of them optional:
 
 - **Never log a response body.** An error body from a public index can echo the request,
   which is to say the address.

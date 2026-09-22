@@ -75,6 +75,7 @@ them by changing a value. `docs/providers.md` records the same split.
 
 from __future__ import annotations
 
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -93,12 +94,15 @@ __all__ = [
     "DEFAULT_RETRY_POLICY",
     "DEFAULT_TIMEOUT",
     "ENDPOINT_EXTENSION",
+    "ENDPOINT_LABEL",
+    "HTTP_ERROR_FLOOR",
     "RETRYABLE_STATUSES",
     "UNLABELLED",
     "HostRateLimiter",
     "RetryPolicy",
     "RetryingTransport",
     "build_http_client",
+    "host_key",
     "monotonic_ms",
     "parse_retry_after",
     "request_target",
@@ -127,17 +131,38 @@ an endpoint internally is nobody else's business.
 """
 
 UNLABELLED: Final = "<unlabelled>"
-"""What a request that set no endpoint label is logged as.
+"""What a request with no usable endpoint label is logged as.
 
 The default discloses nothing. Labelling a request is an opt-in to saying more about it,
-so a provider added without one is quiet rather than leaky.
+so a provider added without one is quiet rather than leaky -- and so is one whose label
+does not match `ENDPOINT_LABEL`.
 """
 
-# All four explicit, none left to the library. `httpx`'s default is five seconds on
-# everything and no total ceiling, and the failure that matters is not a refused
-# connection -- it is a public API that accepts the connection and then stalls, which
-# would hold a sync open indefinitely. `read` is the generous one because a chain index
-# answering a batch legitimately takes longer than a handshake.
+ENDPOINT_LABEL: Final = re.compile(r"[a-z][a-z0-9_]{0,31}")
+"""The only shape an endpoint label may take: lower snake case, at most 32 characters.
+
+A constant the provider author writes down, not a value derived from the request. The
+pattern is what makes `request_target`'s promise structural instead of conventional: no
+string containing a slash, a dot, a colon, a percent-escape, whitespace or an upper-case
+character can reach a log through it, so `extensions={"endpoint": request.url.path}` --
+the helpful thing a provider author reaches for when they cannot see their request --
+renders as `UNLABELLED` rather than as the owner's address.
+
+See `request_target` for what this does not cover.
+"""
+
+# All four explicit, none left to the library: `httpx`'s default is five seconds on
+# everything. `read` is the generous one because a chain index answering a batch
+# legitimately takes longer than a handshake.
+#
+# **These are four per-operation timeouts and they do not add up to a deadline.** `read`
+# bounds the wait for *each* chunk, so a server trickling one byte every 19 seconds never
+# trips a 20-second read and holds the connection indefinitely -- which is the failure
+# these were originally described as preventing, and they do not. A whole-request deadline
+# is a real design decision with a scheduler behind it: how long one address may take,
+# what a partial sync means, whether a slow chain blocks a fast one. It belongs with #10,
+# which has the caller, and a `fail_after` dropped in here would be a number invented
+# without one. Recorded rather than fixed, deliberately.
 #
 # A test pins `READ_TIMEOUT_MS > CONNECT_TIMEOUT_MS` -- the *relationship* the sentence
 # above claims -- rather than either number. All four are guesses awaiting a measurement,
@@ -155,6 +180,9 @@ DEFAULT_TIMEOUT: Final = httpx.Timeout(
     write=WRITE_TIMEOUT_MS / MILLISECONDS_PER_SECOND,
     pool=POOL_TIMEOUT_MS / MILLISECONDS_PER_SECOND,
 )
+
+HTTP_ERROR_FLOOR: Final = 400
+"""The status at and above which a response is a failure worth logging at error."""
 
 RETRYABLE_STATUSES: Final = frozenset({429, *range(500, 600)})
 """429 and every 5xx, and nothing else.
@@ -228,6 +256,26 @@ def strip_query(url: httpx.URL | str) -> httpx.URL:
     return httpx.URL(url).copy_with(query=None, fragment=None, userinfo=b"")
 
 
+def host_key(url: httpx.URL) -> str:
+    """What the rate limiter treats as one peer: host and port.
+
+    Host alone was wrong for the deployment this product actually has. A Raspberry Pi
+    running a self-hosted Esplora on one port and a Kaspa REST server on another gives
+    both the same hostname, so they would have shared a single 250 ms budget -- halving
+    the throughput of each because the other exists, while `HostRateLimiter`'s docstring
+    promised the opposite.
+
+    `httpx` normalises a default port away, so `https://x.test` and `https://x.test:443`
+    remain one key and are one server. `:8443` is its own key, which is the case that
+    matters.
+
+    The scheme is not in the key. The same host and port over http and https is the same
+    listener being addressed two ways, not two vendors, and pacing it twice as fast would
+    be the original bug wearing a different hat.
+    """
+    return url.netloc.decode("ascii")
+
+
 def request_target(request: httpx.Request) -> str:
     """What a request is allowed to be called in a log: scheme, host, and a label.
 
@@ -237,14 +285,46 @@ def request_target(request: httpx.Request) -> str:
 
     The label comes from `request.extensions["endpoint"]` -- a constant the provider
     chooses, such as `"address_balance"`, which says what kind of call it was without
-    saying what it was about. Anything that is not a string, including a missing label,
-    renders as `UNLABELLED`: the default says nothing, and saying more is an opt-in.
+    saying what it was about.
+
+    **The label is validated against `ENDPOINT_LABEL`, not merely checked for being a
+    string, and that is the difference between a convention and a guarantee.** Until it
+    was, this function's promise held only for labels we had thought of. Measured on this
+    branch, with a well-behaved label the security tests stayed green throughout:
+
+        'address_balance'              -> https://api.example/address_balance
+        'address/tb1qw508d6q...'       -> https://api.example/address/tb1qw508d6q...
+        '/address/tb1q.../utxo'        -> https://api.example//address/tb1q.../utxo
+        'address_balance/tb1qw508d6qe' -> https://api.example/address_balance/tb1qw508d6qe
+
+    The third line is the realistic one, and the cause is helpfulness rather than malice:
+    a provider author who wants more detail in the log writes
+    `extensions={"endpoint": request.url.path}`, or appends an address prefix to
+    correlate two lines, and every retry and failure line carries it -- out of a function
+    whose docstring says it cannot. Anything not matching the pattern now renders as
+    `UNLABELLED`, empty string included.
+
+    **The residual, stated so nobody reads more into the pattern than it says.** A label
+    that *is* a short address still passes: a bech32 address is lowercase alphanumeric and
+    `"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".isidentifier()` is `True`. What the
+    pattern makes structurally impossible is the *accidental* case -- anything carrying a
+    slash, a dot, a colon, a percent-escape, whitespace or an upper-case character cannot
+    get through. Deliberately naming a label after an address is still possible and is no
+    longer something anyone does by accident. The honest completion of this is an
+    allowlist of known labels, the same shape as `PUBLIC_API_PATHS`; it is not here
+    because there are no providers yet and an empty allowlist would render every real
+    request `<unlabelled>`. It belongs with #7.
+
+    The length cap is hygiene, not the control -- it bounds a log line, and it happens to
+    reject a full 42-character bech32 address while doing nothing at all about a truncated
+    one. A truncated address is still an address, which is why the shape and not the
+    length is what this rests on.
 
     The port is left out too. It identifies a deployment, not a call, and it is one more
     thing a reader might mistake for part of the target.
     """
     label = request.extensions.get(ENDPOINT_EXTENSION)
-    endpoint = label if isinstance(label, str) else UNLABELLED
+    endpoint = label if isinstance(label, str) and ENDPOINT_LABEL.fullmatch(label) else UNLABELLED
     return f"{request.url.scheme}://{request.url.host}/{endpoint}"
 
 
@@ -294,7 +374,18 @@ def parse_retry_after(
 
     Returns:
         Milliseconds to wait, at least zero, or `None` if the header said nothing usable.
+
+    Raises:
+        ValueError: `now` is naive. Checked here, before either arm, rather than being
+            left to the subtraction in `_http_date_ms`. A naive clock is a caller's bug
+            in every case, but only the HTTP-date arm would notice it -- so
+            `parse_retry_after("5", naive_now)` used to succeed and the defect waited for
+            the first server that answered with a date, which is to say for an outage.
+            A refusal at the boundary turns a latent crash into an immediate, obvious one.
     """
+    if now.tzinfo is None:
+        message = "parse_retry_after requires a timezone-aware `now`; got a naive datetime"
+        raise ValueError(message)
     if value is None:
         return None
     candidate = value.strip()
@@ -408,8 +499,10 @@ class HostRateLimiter:
     of addresses on a schedule and has no burst to allow for. If a measurement ever asks
     for one, adding it is a change to this class and to nothing else.
 
-    Per host, keyed on the hostname, because being throttled by one vendor is no reason to
-    slow down calls to another.
+    Per host, because being throttled by one vendor is no reason to slow down calls to
+    another. Keyed on host **and port** -- see `host_key` -- because on a Raspberry Pi
+    running two self-hosted indexes the hostname is the same for both, and keying on it
+    alone would make them share one budget while this docstring claimed they did not.
 
     The clock is monotonic and integer -- see `monotonic_ms` -- so a wall-clock step
     backwards cannot stall it and a step forwards cannot make it stop limiting.
@@ -434,6 +527,10 @@ class HostRateLimiter:
 
     async def acquire(self, host: str) -> None:
         """Wait, if necessary, until this host may be called again.
+
+        `host` is whatever string identifies a peer; the transport passes `host_key(url)`,
+        which is host and port. A caller may pass a bare hostname and get per-hostname
+        pacing, which is what a test usually wants.
 
         The bookkeeping happens under a lock and the sleeping happens outside it. That
         ordering is the whole design: each waiter claims its slot the moment it arrives,
@@ -544,7 +641,7 @@ class RetryingTransport(httpx.AsyncBaseTransport):
         while True:
             attempt += 1
             final = attempt >= self._policy.max_attempts
-            await self._limiter.acquire(request.url.host)
+            await self._limiter.acquire(host_key(request.url))
             try:
                 response = await self._next.handle_async_request(request)
             except httpx.TransportError as error:
@@ -564,21 +661,8 @@ class RetryingTransport(httpx.AsyncBaseTransport):
                 )
                 continue
 
-            if not retryable or response.status_code not in self._policy.retry_statuses:
-                _logger.debug(
-                    "provider_request",
-                    target=target,
-                    attempt=attempt,
-                    status=response.status_code,
-                )
-                return response
-            if final:
-                _logger.error(
-                    "provider_request_failed",
-                    target=target,
-                    attempt=attempt,
-                    status=response.status_code,
-                )
+            if final or not retryable or response.status_code not in self._policy.retry_statuses:
+                self._log_outcome(target=target, attempt=attempt, status=response.status_code)
                 return response
 
             delay_ms = self._response_delay_ms(response, attempt)
@@ -596,6 +680,27 @@ class RetryingTransport(httpx.AsyncBaseTransport):
     async def aclose(self) -> None:
         """Close the wrapped transport, so `AsyncClient.aclose()` still frees the pool."""
         await self._next.aclose()
+
+    def _log_outcome(self, *, target: str, attempt: int, status: int) -> None:
+        """Log the response this transport is about to return, at a level its status earns.
+
+        **Any failing status logs at error, whether or not it was retried**, and that is
+        the correction to a real hole rather than a tidy-up. The two return paths used to
+        log differently: an exhausted retry logged at error, while a response the policy
+        never retried logged at debug -- invisible at every production log level. A 400, a
+        401, a 404 all took that path, and so did a 503 on a `POST`, since `retry_methods`
+        defaults to `{"GET", "HEAD"}` and Kaspa's batch balance call is a `POST`. So the
+        most likely failing request in the system was also the quietest one, and because
+        `docs/providers.md` tells a provider not to log its own URL, there would have been
+        no record of the sync failing anywhere at all.
+
+        One method rather than a level chosen at each `return`, so the two paths cannot
+        drift apart again.
+        """
+        if status >= HTTP_ERROR_FLOOR:
+            _logger.error("provider_request_failed", target=target, attempt=attempt, status=status)
+        else:
+            _logger.debug("provider_request", target=target, attempt=attempt, status=status)
 
     async def _wait(self, delay_ms: int, *, target: str, attempt: int, reason: str) -> None:
         """Log the retry and sleep for it.
@@ -615,17 +720,30 @@ class RetryingTransport(httpx.AsyncBaseTransport):
     def _response_delay_ms(self, response: httpx.Response, attempt: int) -> int:
         """How long to wait after this response: what the server asked for, or backoff.
 
-        A `Retry-After` the server sent wins over the computed backoff, clamped to
-        `max_backoff_ms`. An absent or unparseable header falls back to the backoff --
-        `parse_retry_after` returns `None` for both, which is why `0` has to be
-        distinguishable from "nothing to say".
+        A `Retry-After` the server sent is honoured, clamped to `max_backoff_ms` above and
+        floored by our own backoff below. An absent or unparseable header falls back to
+        the backoff alone -- `parse_retry_after` returns `None` for both, which is why `0`
+        has to be distinguishable from "nothing to say".
+
+        **The floor matters as much as the ceiling, and only the ceiling was here first.**
+        `Retry-After: 0` is valid and means "immediately", and so does any HTTP-date that
+        has already passed -- five seconds of clock skew against an absolute date is
+        enough. Taking the header at its word then fires every remaining attempt back to
+        back, spaced only by the limiter, at the host that has just told us it is
+        struggling. `max` means a server can lengthen our wait but never shorten it.
+
+        Note what that does *not* claim: it is not a guarantee of a non-zero wait, because
+        full jitter draws from `[0, bound)` and may legitimately return near zero. The
+        guarantee is that the delay is never *less than what our own policy would have
+        chosen*, so a server cannot turn a randomised backoff into a deterministic hammer.
         """
         demanded_ms = parse_retry_after(
             response.headers.get("retry-after"),
             self._now(),
             cap_ms=self._policy.max_backoff_ms,
         )
-        return demanded_ms if demanded_ms is not None else self._backoff_ms(attempt)
+        backoff_ms = self._backoff_ms(attempt)
+        return backoff_ms if demanded_ms is None else max(demanded_ms, backoff_ms)
 
     def _backoff_ms(self, attempt: int) -> int:
         """Full jitter: a draw from `[0, min(cap, base * 2**(attempt - 1)))`.

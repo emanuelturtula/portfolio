@@ -82,15 +82,30 @@ class ProviderRateLimitedError(ProviderUnavailableError):
     the remedy differs: an unavailable host is waited out, while being throttled means
     `HostRateLimiter`'s interval is too short for this vendor and the fix is a
     configuration change rather than patience.
+
+    A provider raises this for a 429 that survived the transport's retries. It is the
+    easiest of the three to forget, precisely because "try later" is not a *wrong* reading
+    of a 429 -- it is just the reading that loses the only actionable fact in it. Neither
+    this class nor `ProviderUnavailableError` has a raiser in #6; both arrive with the
+    first provider.
     """
 
 
 class ProviderResponseError(ProviderError):
-    """The chain answered, and the answer cannot be trusted.
+    """The chain answered, and the answer is either untrustworthy or a refusal.
 
     Raised by `align_balances` when a batch response does not correspond to the batch
     request -- an address nobody asked about, or a negative base-unit count -- and by a
     provider whose parser meets a shape the vendor's documentation does not describe.
+
+    **Also every 4xx that is not a 429**, which is the mapping most easily got wrong.
+    A 400, 401, 403 or 404 means the chain understood the request and said no; that is a
+    fact about *this request*, not about the chain's availability. Reporting one as a
+    `ProviderUnavailableError` is the concrete failure the hierarchy exists to prevent:
+    put a self-hosted Esplora behind an auth proxy and it starts returning 401, and a
+    provider that maps it to "unavailable" tells the owner their chain is down forever
+    while never mentioning the credential. `docs/providers.md` carries the mapping a new
+    provider copies.
 
     **Not retryable, deliberately.** The same request produces the same unusable answer,
     and three attempts at it only turn one wrong result into three. Something has changed

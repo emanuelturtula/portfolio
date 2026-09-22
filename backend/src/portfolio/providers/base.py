@@ -236,6 +236,7 @@ def align_balances(
     |---|---|
     | a requested address is missing from `found` | a zero balance |
     | `found` carries an address that was not requested | `ProviderResponseError` |
+    | a count that is not a whole number of base units | `ProviderResponseError` |
     | a negative base-unit count | `ProviderResponseError` |
     | the same address requested twice | `ValueError` |
 
@@ -259,8 +260,9 @@ def align_balances(
 
     Raises:
         ValueError: `requested` contains the same address more than once.
-        ProviderResponseError: `found` has an address nobody asked about, or a negative
-            base-unit count.
+        ProviderResponseError: `found` has an address nobody asked about, a negative
+            base-unit count, or a count that is not a whole number of base units -- a
+            `float` from a vendor that renders its balances with a decimal point, say.
     """
     asked = set(requested)
     if len(asked) != len(requested):
@@ -280,12 +282,50 @@ def align_balances(
 
     balances: list[AddressBalance] = []
     for address in requested:
-        units = found.get(address, 0)
+        units = _require_base_units(found.get(address, 0))
         if units < 0:
             message = f"The response carried a negative base-unit count of {units}."
             raise ProviderResponseError(message)
         balances.append(AddressBalance(address=address, confirmed=units, decimals=decimals))
     return tuple(balances)
+
+
+def _require_base_units(value: object) -> int:
+    """Refuse anything that is not a whole number of base units, before it is stored.
+
+    **`Mapping[str, int]` is a static claim, and this boundary meets values `mypy` never
+    saw.** A provider parses its response with `json.loads`, which hands back whatever the
+    vendor sent: a vendor that renders a balance as `1.0e8`, or as `100000000.0`, produces
+    a `float`, and `100000000.0 < 0` is perfectly `False`. Without this guard that float
+    is stored on an `AddressBalance` and lives inside `providers/`, where the AST ban in
+    `backend/tests/security/test_no_float.py` cannot see it -- the ban reads source, and
+    this float has no literal and no `float` anywhere in the file.
+
+    `from_base_units` would eventually refuse it, but only when somebody calls `.amount()`.
+    Anything that sums or compares `confirmed` first -- a total, a sort, an equality check
+    against a stored snapshot -- has already done float arithmetic on money by then, which
+    is the whole failure rule 2 exists to prevent, arriving at the one boundary that claims
+    to be the enforcement point.
+
+    A `bool` is refused with everything else, for the reason `domain/money.py` gives: it is
+    an `int` subclass, so `True` would pass an `isinstance(..., int)` check and convert to
+    one base unit and be reported as a holding.
+
+    Takes `object` rather than `int` on purpose. Declared as `int` the check would be
+    statically dead, and `warn_unreachable` would -- correctly -- report the raise as
+    unreachable code. The parameter type is the honest description of what actually
+    arrives here.
+
+    The message names the type, never the address: which address a vendor mangled is the
+    owner's holdings, and the type is the part anyone can act on.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        message = (
+            f"The response carried a base-unit count of type {type(value).__name__}; "
+            "a balance must be a whole number of base units."
+        )
+        raise ProviderResponseError(message)
+    return value
 
 
 def chunk_addresses(
