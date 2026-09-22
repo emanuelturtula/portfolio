@@ -218,6 +218,35 @@ class Settings(BaseSettings):
         deliberately below it -- has no counterpart here: every test that builds a
         `Settings` either leaves these at their defaults or passes a real-looking URL.
 
+        ## Never serialise the `ValidationError` these raises produce
+
+        Measured, and it is not what the `SecretStr` on `bootstrap_password` leads anyone
+        to expect:
+
+        | Rendering | Carries `PORTFOLIO_BOOTSTRAP_PASSWORD`? |
+        |---|---|
+        | `str(exc)` | no -- pydantic elides the middle of the input |
+        | `exc.errors()` | **yes, in plaintext** |
+        | `exc.json()` | **yes, in plaintext** |
+
+        Each error entry carries an `input` dict holding every `PORTFOLIO_*` variable as
+        the raw environment string -- which is to say *before* pydantic coerced it into the
+        `SecretStr` that would have masked it. The field type protects a value that has
+        been parsed; it cannot protect the copy of the input that failed to parse.
+
+        Two things keep that off stdout today, and neither is a rule anybody stated. Only
+        `str(exc)` reaches the log when the process refuses to start, and the one caller of
+        `.errors()` in this application -- `api/errors.py` -- is registered for a
+        `RequestValidationError` from a request body and projects each entry down to
+        `loc`, `msg` and `type`, dropping `input` before anything is rendered. So the
+        hazard is a future `logger.exception`, a debug dump, or a startup handler written
+        to be helpful.
+
+        `tests/providers/test_provider_urls.py` pins the unsafe outcome deliberately, so
+        that anything which starts redacting it announces itself rather than looking like a
+        regression. Do not turn that assertion around; if this is to be fixed it is fixed
+        at the startup boundary, which is a decision with a caller behind it.
+
         The cost floor is the one check gated on `prod` for a reason beyond symmetry: the
         test suite runs the real application at `memory_cost=64` so that it can hash
         several hundred times in a few seconds, and a floor that applied in `dev` would
