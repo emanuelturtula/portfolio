@@ -82,18 +82,46 @@ becomes the ban mempool.space's documentation warns about. The stickiness resets
 calls, because an instance that was throttled five minutes ago is the one we would rather
 be using now.
 
+**Amended after review; the original rule is kept below because the reasoning that was
+wrong is the useful part.** Every failure to answer moves to the next endpoint. Only a 200
+whose body cannot be parsed stops the call.
+
 | Outcome on an endpoint | Next step |
 |---|---|
-| transport error, or 5xx that outlived the transport's retries | try the next endpoint |
+| transport error | try the next endpoint |
 | 429 that outlived the transport's retries | try the next endpoint |
-| any other 4xx | **stop**, `ProviderResponseError` |
+| 5xx that outlived the transport's retries | try the next endpoint |
+| any other non-200 — 400, 401, 403, 404, a 3xx | try the next endpoint |
 | 200 whose body does not parse | **stop**, `ProviderResponseError` |
-| every endpoint exhausted | `ProviderRateLimitedError` if the last failure was a 429, else `ProviderUnavailableError` |
+| every endpoint exhausted | classified by the **last** failure: a 429 raises `ProviderRateLimitedError`, another non-200 raises `ProviderResponseError`, a transport error or a 5xx raises `ProviderUnavailableError` |
 
-A 4xx and a malformed body do not fail over, deliberately. The second instance runs the
-same software against the same chain, so it produces the same refusal — and if it does
-*not*, then two instances disagree about a request, which is a fact worth surfacing rather
-than papering over with whichever answer came second.
+This spec originally stopped on any 4xx, and argued: *the second instance runs the same
+software against the same chain, so it produces the same refusal.* That is true of a 400 on
+a malformed address — which this provider cannot produce anyway, because it validates
+offline first — and **false of every refusal that is scoped to an instance rather than to a
+request**, which is the realistic set:
+
+- mempool.space enforces its unpublished limit with a ban, and neither vendor documents
+  what status a ban returns. If it is 403 rather than 429, the original rule made the first
+  address raise, produced nothing for the sync, and never asked the healthy, unauthenticated
+  fallback — the one failure the two-instance design exists for, arriving in the one shape
+  where the fallback was unreachable.
+- `providers/errors.py` already names the other case: a self-hosted Esplora behind an auth
+  proxy returns 401.
+- An operator who sets the base URL to the host and forgets `/api` gets 404 on every
+  request, forever, and a valid URL passes the startup check.
+
+The misconfiguration those hide is not lost, it is relocated: `health()` probes each
+instance in turn and is what tells an operator that one of them is broken. Failover keeps
+the balances arriving; health is where the fact surfaces. That division is what makes
+moving on from a 404 honest rather than merely convenient.
+
+**The unparseable 200 is the one case that still stops, and the asymmetry is the point.** A
+non-200 is an instance declining to answer, and another instance may well answer. A 200 we
+cannot read is a statement about *our own parser or the vendor's schema* — asking a second
+instance either produces the same unreadable body or, worse, produces a number that hides
+the fact that we no longer understand the first one. That is the "needs a human" branch of
+the error taxonomy, and criterion 5 names it.
 
 ### An address is validated before it is ever interpolated into a URL
 
