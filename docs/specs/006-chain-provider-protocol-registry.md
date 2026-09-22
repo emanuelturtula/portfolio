@@ -1,7 +1,7 @@
 # 006 — Chain provider protocol and registry
 
 Issue: #6
-Status: draft
+Status: done
 
 ## Problem
 
@@ -442,3 +442,108 @@ answer is missing tests, not a smaller number.
   `tests/security/test_address_logging.py` covers the wallet modules today; extending it to
   `providers/` is cheap and belongs with the first provider that has a log call of its own
   (#7), not with a package that has none.
+
+## What this plan got wrong
+
+### The acceptance criterion was satisfiable while the disclosure still happened
+
+Criterion 4 says "URLs are logged with the query string removed". `strip_query` satisfies
+it verbatim and was never in doubt. This spec then argued the criterion was insufficient,
+because both target APIs put the address in the *path*, and added criterion 4b.
+
+Both were right. **Both were also asking the wrong question, in the same way.** They
+constrain what *our code* writes. The leak that was actually there came from above our
+code: `httpx.AsyncClient.send` calls `logger.info("HTTP Request: %s %s ...")` with the full
+URL, on the standard library logger, at INFO — the production default. `RetryingTransport`
+sits *below* `send` and never sees it, and `redact_sensitive` is a structlog processor, so
+a foreign stdlib record never enters the chain. Every balance read would have put a wallet
+address on stdout, and a signed exchange request the key and the signature.
+
+The right question is not "what does our code log" but "what reaches the log". Only one of
+those is answerable by reading our own diff.
+
+### The thing that caught it was a habit carried from #5, not a criterion
+
+No criterion here would have found it. The test plan's instruction to **read stdout rather
+than inspect our own log calls** did — written because #5 learned that
+`structlog.testing.capture_logs` replaces the processor chain and then reports on the
+pipeline. A lesson aimed at a different failure is what made this one visible.
+
+Worth stating as a rule: **assert on the artifact, not on the code's account of it.** A
+test that parses stdout into JSON records and inspects those would still have missed this,
+because `HTTP Request: ...` is not JSON. The raw substring assertion over the whole capture
+is the one that works.
+
+`URL_LOGGING_LIBRARIES = ("httpx", "httpcore")` closes the measured leak and is a named
+list, not a mechanism. It is already incomplete: `asyncio` reaches stdout the same way. #49
+carries the general case with three options and their costs.
+
+### A test that controls an input can no longer observe that input's default
+
+The new one, and the one worth carrying furthest. A mutation survived the whole suite:
+`RetryPolicy.max_attempts` 3 → 1, with 1102 tests green. `DEFAULT_RETRY_POLICY` is what
+`build_http_client` uses when no policy is passed, so the retry subsystem could have
+shipped dead in production with every retry test passing.
+
+**The tests were not sloppy; the cause was a good rule.** Every retry test injected a fast
+policy so that nothing waited on a wall clock — exactly the discipline #5 demanded after a
+test whose verdict depended on host speed. That discipline is what left the shipped default
+unobserved. Two correct rules pointing in opposite directions, and nobody was looking at
+the gap between them.
+
+Closed with seven tests that pass no `policy` argument at all. Still pinned only by
+signature identity rather than behaviour, and knowingly: `jitter`, `sleep` and `now`.
+
+### The label validation is structural against accident and not against intent
+
+Review found that `request_target` interpolated the endpoint label unvalidated, so
+criterion 4b's whole guarantee rested on one f-string. `ENDPOINT_LABEL` now constrains it;
+20 of 21 adversarial inputs fall back to `UNLABELLED`.
+
+The twenty-first does not. A *truncated* bech32 address matches `[a-z][a-z0-9_]{0,31}`
+exactly, because bech32 is lowercase alphanumeric. The 32-character cap rejects a full
+42-character address and does nothing about a prefix, which is why it is documented as
+hygiene rather than as the control. The completion is an allowlist shaped like
+`PUBLIC_API_PATHS`; it would be empty today and would render every real request
+`<unlabelled>`, so it is an acceptance criterion on #7 instead. The test asserts the unsafe
+outcome as *current behaviour* with a comment naming #7, so closing it shows up as that
+test failing rather than as a silent change.
+
+### The ownership table did not cover the file the fix landed in
+
+`backend/src/portfolio/logging.py` was in nobody's column. #4 recorded that a file owned by
+nobody stalls the team and that the table must cover configuration; this generalises it.
+**A table enumerating the files the work is expected to touch cannot cover the file a
+defect turns out to live in.** Assigning it mid-flight worked and should not have needed an
+incident.
+
+### Three process failures worth more than the code lessons
+
+- **Mutating the live worktree while agents were committing.** A harness written to
+  `scratchpad/mutate.py` — a generic name in a directory shared between agents — overwrote
+  the tester's file of that name. They re-invoked it and it held mutations in the real
+  checkout for about two minutes, during which an implementer committed a file it was
+  mutating. The commit was verified clean by grepping the committed blob for every mutation
+  string; that was luck. The reviewer had independently flagged a squashed-in mutation as
+  the worst possible outcome of this change.
+- **An accusation before an investigation.** The mutation was attributed to the tester. It
+  came from the tech lead's own harness. The tester found the true cause.
+- **A harness that matches nothing reports a perfect score.** Several files carry CRLF,
+  and patterns written with bare newlines silently matched nothing. Caught only because the
+  harness prints `SKIPPED` instead of counting a non-match as a kill.
+
+### What the plan got right, under measurement rather than by luck
+
+- **The naive-datetime hazard.** The Risks section said the asctime form of `Retry-After`
+  "needs an explicit test, not a code review". Measured before the code existed:
+  `parsedate_to_datetime("Sun Nov  6 08:49:37 1994")` returns `tzinfo=None`, and
+  subtracting an aware `now` raises `TypeError` — on the path that only runs during an
+  outage.
+- **Criterion 6's vacuity**, named in advance and built around.
+- **Durations as integer milliseconds**, predicted necessary because `float` is banned in
+  `providers/`, and also the better representation: a test compares `250` exactly.
+
+One practice to carry to #7 and #8: an independent reference implementation of
+`Retry-After`, written from RFC 9110 **before** reading the code it checks, agreed with the
+shipped parser on all 17 vectors. Writing it first is what makes it evidence; written
+afterwards it is a second opinion derived from the first.
