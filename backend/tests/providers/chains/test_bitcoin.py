@@ -476,6 +476,33 @@ async def test_the_same_address_requested_twice_is_the_callers_mistake() -> None
             await provider.fetch_balances([BIP173_TESTNET_P2WPKH, BIP173_TESTNET_P2WPKH])
 
     assert not isinstance(caught.value, ProviderResponseError)
+    # **Refused before any request, not after all of them.** `align_balances` catches the
+    # duplicate, and it runs at the *end* of `fetch_balances` -- so a naive implementation
+    # makes the full set of calls to a public index and then throws the answers away. The
+    # `fetch_balances` docstring two paragraphs above the loop says validation happens
+    # first; this is the assertion that makes that true rather than aspirational, and the
+    # count is the only thing that can see the difference.
+    assert fake.requests == []
+    assert fake.counts == {PRIMARY_HOST: 0, FALLBACK_HOST: 0}
+
+
+async def test_a_duplicate_in_a_long_request_costs_no_requests_at_all() -> None:
+    """The same rule at the length where it costs something, and against a paced host.
+
+    Twenty addresses with one repeated is a realistic wallet table after a careless
+    import. Refusing after the fact means twenty requests, spaced by a one-second limiter,
+    to a vendor that bans for volume -- twenty seconds of a public index's goodwill spent
+    on an answer that is discarded.
+    """
+    requested = [BIP173_TESTNET_P2WPKH, BIP350_TESTNET_V1, BIP173_TESTNET_P2WSH] * 3
+    fake = EsploraFake()
+    provider, client = esplora_provider(fake)
+
+    async with client:
+        with pytest.raises(ValueError, match=r"distinct"):
+            await provider.fetch_balances(requested)
+
+    assert fake.requests == []
 
 
 async def test_the_request_carries_the_documented_endpoint_label_and_path() -> None:
@@ -785,6 +812,61 @@ async def test_the_last_failure_decides_which_error_is_raised_not_the_worst_one(
             await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
 
 
+async def test_the_attached_cause_is_the_last_failure_and_not_an_earlier_one() -> None:
+    """`raise ... from` has to name the instance that actually failed last.
+
+    A primary that refuses the connection and a fallback that answers 429 must raise
+    `ProviderRateLimitedError` **from** something describing the 429 -- not from the
+    primary's `ConnectError`. The type and the cause would otherwise tell an operator two
+    different stories about one sync: "you are being throttled", caused by "the connection
+    was refused", which sends them to check a host that was never the problem.
+
+    Asserted on `__cause__` and not only on the type, because **every existing assertion
+    in this file passes either way**. That is the property that lets this stay wrong
+    forever: the exception class is right, the message is right, and only the traceback --
+    which nobody reads until an outage -- says something false.
+
+    A `ConnectError` cause is asserted absent rather than a specific right answer being
+    demanded, because "what a 429 with no exception behind it should be caused by" is the
+    implementation's call: `None` is a perfectly good answer.
+    """
+    fake = EsploraFake(
+        primary=ScriptedInstance(Reply(error=httpx.ConnectError("connection refused"))),
+        fallback=ScriptedInstance(Reply(status=429)),
+    )
+    provider, client = esplora_provider(fake, max_attempts=1)
+
+    async with client:
+        with pytest.raises(ProviderRateLimitedError) as caught:
+            await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
+
+    assert not isinstance(caught.value.__cause__, httpx.ConnectError), (
+        "the error is classified from the fallback's 429 but blamed on the primary's "
+        "transport failure, so the type and the traceback disagree"
+    )
+
+
+async def test_the_cause_survives_when_the_last_failure_really_was_a_transport_error() -> None:
+    """The control. A provider that simply stopped attaching a cause would pass the test
+    above and throw away the one piece of information an outage leaves behind.
+
+    Two transport errors: the cause must be the **second**, which is the one that decided
+    the outcome.
+    """
+    last = httpx.ConnectTimeout("timed out")
+    fake = EsploraFake(
+        primary=ScriptedInstance(Reply(error=httpx.ConnectError("connection refused"))),
+        fallback=ScriptedInstance(Reply(error=last)),
+    )
+    provider, client = esplora_provider(fake, max_attempts=1)
+
+    async with client:
+        with pytest.raises(ProviderUnavailableError) as caught:
+            await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
+
+    assert caught.value.__cause__ is last
+
+
 async def test_a_transport_error_falls_over_to_the_fallback() -> None:
     """A connection that never opened is a reason to try the other instance.
 
@@ -827,32 +909,133 @@ async def test_a_transport_error_on_both_instances_becomes_a_typed_provider_erro
     assert PRIMARY_HOST not in str(caught.value)
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 418])
-async def test_a_client_error_is_not_retried_against_the_fallback(status: int) -> None:
-    """A 4xx stops the call. The second instance runs the same software.
+@pytest.mark.parametrize(
+    ("status", "why"),
+    [
+        pytest.param(403, "a ban spelled 403, which is what a public index actually sends"),
+        pytest.param(429, "the documented throttle"),
+        pytest.param(451, "a legal block, which is per-jurisdiction and so per-instance"),
+        pytest.param(404, "a route that moved, or an API version retired"),
+        pytest.param(401, "an auth proxy in front of one instance and not the other"),
+        pytest.param(400, "a refusal of the request itself"),
+        pytest.param(418, "a status nobody planned for"),
+        pytest.param(301, "a redirect, which the shared client does not follow"),
+        pytest.param(302, "a captive portal's redirect to a login page"),
+        pytest.param(503, "the ordinary outage"),
+    ],
+)
+async def test_any_refusal_at_all_moves_to_the_fallback(status: int, why: str) -> None:
+    """The failover rule as `03ee9d1` restated it: **every** failure to answer moves on.
 
-    Both instances run Esplora against the same chain, so a refusal is reproduced rather
-    than repaired -- and if it is *not*, then two instances disagree about one request,
-    which is a fact worth surfacing rather than papering over with whichever answer came
-    second.
+    This replaces `test_a_client_error_is_not_retried_against_the_fallback`, which
+    asserted the opposite and was named after the old table. The old reasoning was that
+    both instances run the same software against the same chain, so a 4xx is reproduced
+    rather than repaired. That reasoning is wrong about the case the two-instance design
+    exists for, and the 403 row is why.
 
-    The count is the assertion that matters: exactly one request, to the primary, with the
-    fallback never touched. A provider that failed over here would double every wrong
-    request and hide a misconfigured auth proxy behind a working fallback.
+    **A public index bans by returning 403, not 429.** mempool.space's documentation warns
+    about a ban and says nothing about the status it arrives as; a ban, an auth proxy, a
+    per-jurisdiction block and a retired API version are all per-*instance* facts, and
+    every one of them presents as a non-429 refusal. Stopping the call on those leaves a
+    healthy fallback unasked at the exact moment it is the only thing that would work --
+    which is the single failure a second endpoint is for.
+
+    Only a 200 whose body will not parse still stops, and that is a different claim: there
+    the instance *answered*, and the answer is unusable in a way the other instance would
+    reproduce.
+
+    The counts are the assertion. A provider that still stopped would show
+    `{primary: 1, fallback: 0}` and raise, and no assertion about the returned balance
+    could tell the two apart.
     """
+    del why  # In the parameter id, where a failure can read it.
     fake = EsploraFake(
         primary=ScriptedInstance(Reply(status=status, body="nope")),
         fallback=ScriptedInstance(Reply(funded=ONE_COIN)),
     )
-    provider, client = esplora_provider(fake, max_attempts=3)
+    provider, client = esplora_provider(fake, max_attempts=1)
 
     async with client:
-        with pytest.raises(ProviderResponseError) as caught:
+        balances = await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
+
+    assert balances[0].confirmed == ONE_COIN
+    assert fake.counts == {PRIMARY_HOST: 1, FALLBACK_HOST: 1}
+    assert fake.hosts_in_order == [PRIMARY_HOST, FALLBACK_HOST]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected", "why"),
+    [
+        pytest.param(429, ProviderRateLimitedError, "a throttle names its own remedy"),
+        pytest.param(403, ProviderResponseError, "a ban is not an outage and not a throttle"),
+        pytest.param(401, ProviderResponseError, "a credential, which waiting will not fix"),
+        pytest.param(404, ProviderResponseError, "a route that is gone"),
+        pytest.param(301, ProviderResponseError, "a redirect nobody followed"),
+        pytest.param(503, ProviderUnavailableError, "an outage, which waiting does fix"),
+        pytest.param(500, ProviderUnavailableError, "the other outage"),
+    ],
+)
+async def test_the_exhausted_error_is_classified_by_the_last_failure(
+    status: int, expected: type[Exception], why: str
+) -> None:
+    """With every endpoint exhausted, the *last* failure decides the type. Three outcomes.
+
+    The three have different remedies and that is the whole reason they are different
+    classes: a 429 means our own interval is too short and the fix is configuration; a
+    5xx or a transport error means wait; anything else means a person has to look, and
+    retrying it produces the same answer.
+
+    Both instances answer the same status here, so "the last failure" and "any failure"
+    agree -- which is deliberate, because this test is about the *mapping*.
+    `test_the_last_failure_decides_which_error_is_raised_not_the_worst_one` drives the
+    case where they disagree.
+    """
+    del why  # In the parameter id.
+    fake = EsploraFake(
+        primary=ScriptedInstance(Reply(status=status, body="nope")),
+        fallback=ScriptedInstance(Reply(status=status, body="nope")),
+    )
+    provider, client = esplora_provider(fake, max_attempts=1)
+
+    async with client:
+        with pytest.raises(expected) as caught:
             await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
 
-    assert fake.counts == {PRIMARY_HOST: 1, FALLBACK_HOST: 0}
-    assert not isinstance(caught.value, ProviderUnavailableError)
+    assert type(caught.value) is expected, (
+        f"HTTP {status} raised {type(caught.value).__name__}; a subclass is not the same "
+        "answer, because a caller branching on the remedy reads the exact type"
+    )
+    assert fake.counts == {PRIMARY_HOST: 1, FALLBACK_HOST: 1}
     assert BIP173_TESTNET_P2WPKH not in str(caught.value)
+    assert "nope" not in str(caught.value)
+
+
+async def test_a_ban_on_the_primary_still_reads_the_fallback_for_every_address() -> None:
+    """The scenario the rule change exists for, at the length a real sync has.
+
+    A public index that has decided it has had enough of us returns 403 on every request.
+    Under the old rule the first address raised and the remaining nineteen were never
+    attempted, against a fallback that was working the whole time -- a portfolio reporting
+    nothing, with a healthy endpoint sitting unused.
+
+    Stickiness still applies, so the primary is asked exactly once and the fallback
+    answers the rest. That pairing is the point: fail over on everything, but do not go
+    back to an instance that just refused.
+    """
+    requested = (BIP173_TESTNET_P2WPKH, BIP350_TESTNET_V1, BIP173_TESTNET_P2WSH, CORE_SIGNET_P2PKH)
+    fake = EsploraFake(
+        primary=ScriptedInstance(Reply(status=403, body="banned")),
+        fallback=ScriptedInstance(Reply(funded=DUST)),
+    )
+    provider, client = esplora_provider(fake, max_attempts=1)
+
+    async with client:
+        balances = await provider.fetch_balances(requested)
+
+    assert tuple(balance.address for balance in balances) == requested
+    assert all(balance.confirmed == DUST for balance in balances)
+    assert fake.counts == {PRIMARY_HOST: 1, FALLBACK_HOST: 4}
+    assert fake.addresses_asked_of(PRIMARY_HOST) == [BIP173_TESTNET_P2WPKH]
 
 
 async def test_a_malformed_body_does_not_fall_over_either() -> None:
@@ -893,6 +1076,73 @@ async def test_a_blank_fallback_url_means_one_instance_and_says_so_when_it_fails
     assert fake.counts == {PRIMARY_HOST: 2, FALLBACK_HOST: 0}
 
 
+async def test_two_identical_base_urls_are_one_instance_and_not_two() -> None:
+    """A "fallback" pointing at the same host is not a fallback, and it doubles the cost.
+
+    This is the self-hoster's configuration: one Esplora on the Pi, and both variables set
+    to it because leaving the second blank looked like turning something off. The result
+    under a naive implementation is two entries in the instance list, so a 429 from that
+    host is followed immediately by a second request **to the same host** -- double the
+    requests to an index that has just said stop, which is precisely the behaviour the
+    per-host limiter and the whole failover design exist to avoid.
+
+    `test_the_two_shipped_endpoints_are_different_instances` only inspects the shipped
+    defaults, so nothing in the suite notices the configured case. This is that test.
+
+    The count is the assertion, and it is the only thing that can be: the balances, the
+    error type and the message are identical whether the host is asked once or twice.
+    """
+    fake = EsploraFake(primary=ScriptedInstance(Reply(status=429)))
+    provider, client = esplora_provider(
+        fake, primary_url=PRIMARY_URL, fallback_url=PRIMARY_URL, max_attempts=1
+    )
+
+    async with client:
+        with pytest.raises(ProviderRateLimitedError):
+            await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
+
+    assert fake.counts == {PRIMARY_HOST: 1, FALLBACK_HOST: 0}
+
+
+async def test_two_urls_that_differ_only_in_spelling_are_still_one_instance() -> None:
+    """The same host written two ways is still one host, and a trailing slash is spelling.
+
+    A de-duplication on exact string equality passes the test above and fails here, which
+    is the realistic version: an operator copies the URL into the second variable and the
+    editor, or the shell, adds a slash.
+    """
+    fake = EsploraFake(primary=ScriptedInstance(Reply(status=429)))
+    provider, client = esplora_provider(
+        fake, primary_url=PRIMARY_URL, fallback_url=f"{PRIMARY_URL}/", max_attempts=1
+    )
+
+    async with client:
+        with pytest.raises(ProviderRateLimitedError):
+            await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
+
+    assert fake.counts == {PRIMARY_HOST: 1, FALLBACK_HOST: 0}
+
+
+async def test_two_genuinely_different_urls_are_still_two_instances() -> None:
+    """The control. De-duplication that collapsed everything would disable failover.
+
+    Without this, "two identical URLs are one instance" could ship as "there is only ever
+    one instance", which passes both tests above and silently removes the fallback from
+    every deployment.
+    """
+    fake = EsploraFake(
+        primary=ScriptedInstance(Reply(status=429)),
+        fallback=ScriptedInstance(Reply(funded=ONE_COIN)),
+    )
+    provider, client = esplora_provider(fake, max_attempts=1)
+
+    async with client:
+        balances = await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
+
+    assert balances[0].confirmed == ONE_COIN
+    assert fake.counts == {PRIMARY_HOST: 1, FALLBACK_HOST: 1}
+
+
 async def test_a_blank_fallback_url_is_not_consulted_on_the_happy_path_either() -> None:
     """The control for the test above: one instance still reads a balance."""
     fake = EsploraFake(primary=ScriptedInstance(Reply(funded=DUST)))
@@ -912,6 +1162,141 @@ async def test_a_blank_fallback_url_is_not_consulted_on_the_happy_path_either() 
 # Direct, because nine refusal arms reached only through a mock transport would be nine
 # tests that also depend on the retry loop, the limiter and the URL builder -- and a break
 # anywhere in that chain would be reported as a parsing bug.
+
+
+#: A JSON integer of 5000 digits. CPython refuses to convert an integer string longer than
+#: 4300 digits -- a denial-of-service mitigation added in 3.11 -- and `json.loads` does the
+#: conversion, so this raises `ValueError` from *inside* the decoder rather than from any
+#: check the parser performs. It is not a hypothetical: a compromised or confused upstream
+#: returning a long digit run is exactly the input the CPython limit exists for.
+HUGE_INTEGER: Final = "9" * 5000
+
+#: 5000 nested arrays. `json.loads` recurses, so this raises `RecursionError`, which is a
+#: `RuntimeError` and therefore outside anything `except (UnicodeDecodeError, JSONDecodeError)`
+#: catches.
+DEEPLY_NESTED: Final = "[" * 5000 + "]" * 5000
+
+
+def body_with_sum(raw_sum: str) -> str:
+    """An otherwise well-formed address body whose `funded_txo_sum` is `raw_sum` verbatim.
+
+    Built as text rather than through `json.dumps`, because the inputs under test are ones
+    `json` cannot round-trip: a 5000-digit integer is not something a Python `int` will
+    survive being written back out as.
+    """
+    return (
+        f'{{"address": "{BIP173_TESTNET_P2WPKH}", '
+        f'"chain_stats": {{"funded_txo_sum": {raw_sum}, "spent_txo_sum": 0}}}}'
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(body_with_sum(HUGE_INTEGER), id="a sum of 5000 digits: ValueError"),
+        pytest.param(DEEPLY_NESTED, id="5000 nested arrays: RecursionError"),
+    ],
+)
+def test_a_body_that_breaks_the_decoder_itself_still_raises_the_typed_error(body: str) -> None:
+    """Criterion 5 covers *every* malformed body, including the two `json` raises itself.
+
+    `_decode` catches `UnicodeDecodeError` and `JSONDecodeError`, which is the set a
+    reader expects `json.loads` to raise. It is not the set it actually raises. Measured
+    against the shipped parser:
+
+        funded_txo_sum of 5000 digits -> ValueError: Exceeds the limit (4300 digits)
+        5000 nested arrays            -> RecursionError
+
+    Both escape `parse_address_response` untyped. Criterion 5 says a malformed body raises
+    a typed schema error rather than propagating a parse error, and for these two it does
+    not -- so a service told to catch `ProviderError` meets a bare `ValueError` instead,
+    from inside a package it is forbidden from importing the exceptions of.
+
+    The `RecursionError` row is the worse of the two. It is a `RuntimeError`, so it is
+    outside every `except Exception`-adjacent habit as well, and it arrives having already
+    consumed most of the stack -- so whatever handles it runs with very little left.
+    """
+    with pytest.raises(ProviderResponseError) as caught:
+        parse_address_response(body, BIP173_TESTNET_P2WPKH)
+
+    assert BIP173_TESTNET_P2WPKH not in str(caught.value)
+    # No fragment of the body either: a message quoting what it refused would carry the
+    # address in the first row and 5000 characters of nothing in the second.
+    assert HUGE_INTEGER[:40] not in str(caught.value)
+    assert "[[[[" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(HUGE_INTEGER, id="an integer of 5000 digits"),
+        pytest.param(DEEPLY_NESTED, id="5000 nested arrays"),
+    ],
+)
+def test_a_tip_height_that_breaks_the_decoder_still_raises_the_typed_error(body: str) -> None:
+    """The same two inputs at the health endpoint, which has the same hole.
+
+    `parse_tip_height` decodes the same way, so it inherits both escapes -- and this one
+    matters more, because `health()` promises it never raises and is what an operations
+    view calls on a schedule.
+    """
+    with pytest.raises(ProviderResponseError):
+        parse_tip_height(body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(HUGE_INTEGER, id="an integer of 5000 digits"),
+        pytest.param(DEEPLY_NESTED, id="5000 nested arrays"),
+    ],
+)
+async def test_health_still_returns_rather_than_raising_on_a_body_that_breaks_the_decoder(
+    body: str,
+) -> None:
+    """ "`health()` never raises" has to survive the inputs the decoder itself raises on.
+
+    The promise is not a nicety: an operations view calls this to tell a broken vendor
+    from a broken sync, and a health check that raises takes down the page that was
+    supposed to explain the outage. Asserted as an unhealthy *answer*, with the endpoint
+    position in the detail and nothing quoted from the body.
+    """
+    fake = EsploraFake(
+        primary=ScriptedInstance(Reply(body=body)),
+        fallback=ScriptedInstance(Reply(body=body)),
+    )
+    provider, client = esplora_provider(fake, max_attempts=1)
+
+    async with client:
+        health = await provider.health()
+
+    assert health.healthy is False
+    assert health.detail is not None
+    assert health.detail.startswith((PRIMARY, FALLBACK))
+    assert body[:40] not in health.detail
+
+
+async def test_a_body_that_breaks_the_decoder_does_not_escape_fetch_balances_either() -> None:
+    """The same hole reached through the path a sync actually takes.
+
+    The parser tests above drive the function directly. This drives it through the
+    transport, so a `ValueError` that escaped would escape into whatever #10's scheduler
+    does with an unhandled exception -- which is the failure the typed hierarchy exists to
+    make impossible.
+    """
+    fake = EsploraFake(
+        primary=ScriptedInstance(
+            Reply(
+                body=f'{{"address": "{BIP173_TESTNET_P2WPKH}", "chain_stats": '
+                f'{{"funded_txo_sum": {HUGE_INTEGER}, "spent_txo_sum": 0}}}}'
+            )
+        )
+    )
+    provider, client = esplora_provider(fake, fallback_url="")
+
+    async with client:
+        with pytest.raises(ProviderResponseError):
+            await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
 
 
 def test_the_parser_reads_the_documented_shape() -> None:

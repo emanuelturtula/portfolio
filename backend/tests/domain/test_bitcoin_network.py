@@ -166,11 +166,16 @@ def test_a_published_vector_reads_as_the_network_its_source_says_it_is_on(
 def test_a_base58_regtest_address_cannot_say_it_is_regtest() -> None:
     """The residual, asserted rather than documented, because it has a consequence.
 
-    Regtest reuses testnet's version bytes, so `2MxFajLApXpYk4VodBSZSt7rw8y4ryABkfA` --
-    Bitcoin Core's own `key_io_valid.json` row for chain `regtest` -- is indistinguishable
-    from a testnet P2SH address. Nothing pure can recover the fact, so the honest answer
-    is `TESTNET` and the provider's honest response to it, when configured for regtest, is
-    a refusal rather than a guess.
+    Regtest reuses testnet's version bytes, so `CORE_REGTEST_P2SH` -- Bitcoin Core's own
+    `key_io_valid.json` row for chain `regtest` -- is indistinguishable from a testnet
+    P2SH address. Nothing pure can recover the fact, so the honest answer is `TESTNET` and
+    the provider's honest response to it, when configured for regtest, is a refusal rather
+    than a guess.
+
+    The vector is named rather than spelled out, here and everywhere else. Provenance is
+    the entire reason `tests/address_vectors.py` exists: a literal pasted into a docstring
+    has no source attached to it, drifts silently when the constant it was copied from
+    changes, and is invisible to the scans that check where an address came from.
 
     This test exists so that "fixing" it -- by sniffing something else, or by returning
     `REGTEST` on a hunch -- fails here rather than producing confident wrong balances.
