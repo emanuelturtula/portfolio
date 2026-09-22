@@ -23,6 +23,12 @@ dependencies = [
     # Already present transitively through Starlette, but the lifespan calls
     # anyio.to_thread.run_sync directly, so it is declared directly too.
     "anyio",
+    # Runtime rather than dev since #6: `providers/http.py` is the shared client every
+    # chain provider makes its calls through, and it ships in the image. It was already
+    # installed everywhere as a test dependency -- `httpx.ASGITransport` is what drives
+    # the API tests -- so nothing new is downloaded; what changes is that the arm64 image
+    # now depends on it being there, which is the build that would notice if it were not.
+    "httpx",
 ]
 
 [dependency-groups]
@@ -30,7 +36,6 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
-    "httpx",
     "mypy",
     "ruff",
     "import-linter",
@@ -159,12 +164,25 @@ concurrency = ["thread", "greenlet"]
 # dependency and should not become one. Together they are 0.30 points, and no test can
 # take them back.
 #
-# 99 rather than 99.5: the gap between the floor and the measured 99.70 is the headroom a
-# refactor gets before it has to argue about coverage, and 0.70 points is roughly nine
-# statements or branches. At 99.5 it would be two or three, which is not headroom -- it is
-# a floor that fails on a change that has nothing to do with testing, and a floor that
-# fails for the wrong reason is one the next person lowers. That is how a ratchet breaks.
-fail_under = 99
+# 99 rather than 99.5, at the #3 ratchet: the gap between the floor and the measured 99.70
+# is the headroom a refactor gets before it has to argue about coverage, and 0.70 points is
+# roughly nine statements or branches. At 99.5 it would be two or three, which is not
+# headroom -- it is a floor that fails on a change that has nothing to do with testing, and
+# a floor that fails for the wrong reason is one the next person lowers. That is how a
+# ratchet breaks.
+#
+# 99 -> 99.5 with the chain provider seam (#6), measured at 99.83% over 1960 statements and
+# 332 branches. **The number did not move; the base did.** The reasoning above is unchanged
+# and is what decides this: nine units of headroom is the standard it set, and 0.33 points
+# of a codebase that has grown from 1136 statements to 1960 is now about seven and a half
+# units rather than the two or three it would have bought at #3. A percentage point is
+# worth more than it used to be, which is the only reason 99.5 is acceptable today and was
+# not then.
+#
+# The three misses are still the same three and still cannot be taken back, so they are
+# 0.17 points now rather than 0.30. `providers/` contributes none of them: the package
+# added by #6 is fully covered, including both refusal branches that a review added late.
+fail_under = 99.5
 show_missing = true
 skip_covered = true
 exclude_also = [

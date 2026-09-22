@@ -542,6 +542,7 @@ dependencies = [
     { name = "anyio" },
     { name = "argon2-cffi" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -551,7 +552,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "hypothesis" },
     { name = "import-linter" },
     { name = "mypy" },
@@ -568,6 +568,7 @@ requires-dist = [
     { name = "anyio" },
     { name = "argon2-cffi" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
@@ -577,7 +578,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx" },
     { name = "hypothesis" },
     { name = "import-linter" },
     { name = "mypy" },
