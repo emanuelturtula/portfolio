@@ -86,6 +86,29 @@ class Settings(BaseSettings):
     # logs by accident; `logging.py` is the second line of defence, not the first.
     bootstrap_password: SecretStr | None = None
 
+    # The two Esplora instances the Bitcoin provider reads, primary first, and the network
+    # they serve. Public defaults so the product works out of the box; an operator running
+    # their own index points both at it and nothing else changes.
+    #
+    # Two scalars rather than one `list[str]`, deliberately: pydantic-settings parses a
+    # list out of the environment as JSON, which is not a syntax anybody types correctly
+    # into a `.env` file at three in the morning. A blank fallback means "one instance
+    # only" and is a self-hoster setting one URL and clearing the other.
+    bitcoin_esplora_url: str = "https://mempool.space/api"
+    bitcoin_esplora_fallback_url: str = "https://blockstream.info/api"
+
+    # An Esplora instance serves exactly one network, and neither vendor documents what it
+    # answers for an address from another one -- checked on 2026-09-22. So the provider
+    # refuses a wrong-network address offline instead of trusting an undocumented 400.
+    # The failure this prevents is the expensive one: a balance read against the wrong
+    # chain is a number rather than an error, and nothing downstream can tell it from a
+    # right one.
+    #
+    # A `Literal` rather than the `BitcoinNetwork` enum itself, so that a typo in the
+    # environment is a startup failure that names the three acceptable values. `providers`
+    # converts it to the domain enum, which is the layer allowed to know both.
+    bitcoin_network: Literal["mainnet", "testnet", "regtest"] = "mainnet"
+
     @property
     def session_cookie_name(self) -> str:
         """`__Host-psid`, degrading to `psid` on the one configuration that cannot use it."""
