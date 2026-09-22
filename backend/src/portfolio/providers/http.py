@@ -148,6 +148,13 @@ character can reach a log through it, so `extensions={"endpoint": request.url.pa
 the helpful thing a provider author reaches for when they cannot see their request --
 renders as `UNLABELLED` rather than as the owner's address.
 
+**`[a-z]` is ASCII by construction, and that is load-bearing rather than incidental.**
+Widening it to `\\w` reads like a tidy-up -- same intent, fewer characters -- and Python's
+`re` makes `\\w` Unicode-aware by default, so it would admit an entire alphabet of
+look-alikes. Measured: a label of Cyrillic U+0430 followed by `ddress_balance` is rejected
+by this pattern and accepted by `\\w{1,32}`. A test pins the homoglyph case so that the
+tidy-up fails there instead of quietly widening what may reach a log.
+
 See `request_target` for what this does not cover.
 """
 

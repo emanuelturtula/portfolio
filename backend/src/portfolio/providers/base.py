@@ -311,6 +311,14 @@ def _require_base_units(value: object) -> int:
     an `int` subclass, so `True` would pass an `isinstance(..., int)` check and convert to
     one base unit and be reported as a holding.
 
+    **The `bool` arm is the one the static type cannot stand in for**, which is worth
+    knowing before someone deletes it as redundant. Measured under `mypy --strict`:
+    `takes({"a": True})` against a `Mapping[str, int]` parameter is accepted with no
+    error, because `bool` is a subtype of `int` and `Mapping` is covariant in its value;
+    `takes({"a": 1.0})` on the same signature *is* rejected. So the annotation catches a
+    literal float and never catches a bool -- and catches neither once the value has come
+    through `json.loads`, which is typed `Any`.
+
     Takes `object` rather than `int` on purpose. Declared as `int` the check would be
     statically dead, and `warn_unreachable` would -- correctly -- report the raise as
     unreachable code. The parameter type is the honest description of what actually
