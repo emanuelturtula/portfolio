@@ -211,6 +211,15 @@ configuration at all, and an operator running their own index changes two variab
 Set them in `secrets.env` and recreate the container, as in section 1. No trailing slash is
 needed on either URL; one is removed if you leave it.
 
+**Include the scheme.** A URL with no scheme, no host, or a scheme other than `http` or
+`https` is refused at startup: the container never becomes healthy and the deployment rolls
+back, the same as the other unsafe configurations in section 1. That is deliberate and it
+is the cheaper failure. `mempool.space/api` without the `https://` cannot be requested at
+all, and `htp://` — one missing `t` — would otherwise be reported as "the chain is
+unavailable" on every sync forever, with nothing anywhere mentioning the typo. The startup
+message names the variable and the problem, and never echoes the URL, because these may
+carry a username and password for a private instance.
+
 **`PORTFOLIO_BITCOIN_NETWORK` is not cosmetic, and it is the one to get right.** An Esplora
 instance serves exactly one network, and neither vendor documents what theirs answers for an
 address from another one. So the application refuses an address that does not belong to the
@@ -263,6 +272,7 @@ application does not care which instance answers, and the fallback URL may be le
 | Logged out roughly weekly | Working as intended: the 7-day idle window |
 | Logged out roughly monthly despite daily use | Working as intended: the 30-day absolute ceiling, which activity does not extend |
 | Edited `secrets.env`, nothing changed | `env_file` is read at container creation — recreate, do not restart |
+| Container never becomes healthy after setting the Esplora URLs | One of them has no scheme, no host, or a scheme other than `http`/`https` — the startup log names which — section 8 |
 | A Bitcoin wallet reports "the address is on a different network" | `PORTFOLIO_BITCOIN_NETWORK` does not match the address — section 8 |
 | Bitcoin balances stop updating and the log shows 429 | The public index is throttling us. Lengthen nothing by hand; run your own Esplora — section 8 |
 | Reading many Bitcoin addresses takes a minute | Working as intended: one request per second per host — section 8 |

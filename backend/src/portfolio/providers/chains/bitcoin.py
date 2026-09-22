@@ -496,10 +496,14 @@ class EsploraProvider:
         without having to catch anything, and `detail` carries a reason and at most which
         position answered -- never a URL, never a body, never an address.
 
-        The one residual: a base URL that `httpx` cannot parse at all raises
-        `httpx.InvalidURL` from here. That is a configuration error rather than a vendor
-        failure, it is the same on every request this provider makes, and it should be
-        loud rather than reported as an unhealthy chain.
+        That statement used to carry a residual, and the residual turned out to be a
+        defect rather than a footnote. A base URL with no scheme or no host reaches
+        `client.get` as a bare `ValueError` out of `urllib` -- not an `httpx` exception at
+        all, so nothing here could have caught it by type, and "never raises" was simply
+        untrue for three plausible typos. It is closed upstream instead:
+        `config.provider_url_violation` refuses such a URL at startup, so no running
+        application holds one. Nothing is caught here, because catching an exception that
+        cannot arrive is a branch no test can reach and a claim no reader can check.
         """
         reason = "no endpoint configured"
         for instance in self._instances:

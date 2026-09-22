@@ -385,6 +385,20 @@ Two scalars rather than one list, because pydantic-settings parses a `list[str]`
 environment as JSON and a self-hoster clearing one URL should not have to learn a syntax.
 `docs/operations.md` carries the same table for whoever is editing `secrets.env`.
 
+**A base URL is validated at startup, and a new provider's should be too.** `config`'s
+`provider_url_violation` refuses a URL with no scheme, no host, or a scheme other than
+`http`/`https`, because none of those can be requested and the failure does not arrive as
+something a provider can translate. Measured on httpx 0.28.1: `mempool.space/api`,
+`not a url` and `http://` all reach `client.get` as a bare `builtins.ValueError` from
+inside `urllib` — past `except httpx.TransportError`, which is where `httpx` is supposed to
+stop, and past a `health()` whose contract is that it never raises. A mistyped scheme like
+`htp://` is quieter and worse: it *is* an `httpx.UnsupportedProtocol`, so it is caught and
+reported as an unavailable chain on every sync forever while nothing mentions the typo.
+
+The validator parses with `httpx.URL` rather than `urllib.parse` on purpose. The question
+is not "is this a URL" but "will the client this is handed to accept it", and a check that
+answers a different question is how a validator passes while the thing it guards fails.
+
 Do not invent an endpoint path because a third-party wrapper uses it. Verify against the
 vendor's own documentation, and record here what you confirmed and what you assumed, in
 those words, **with the date you read it** -- an unverified fact and a fact verified two

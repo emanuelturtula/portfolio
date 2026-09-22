@@ -8,6 +8,7 @@ carries a default that would be unsafe if it survived into production.
 from functools import lru_cache
 from typing import Final, Literal, Self
 
+import httpx
 from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -27,6 +28,70 @@ DEV_ALLOWED_ORIGIN: Final = "http://localhost:5173"
 # derived from the flag rather than written down twice.
 SECURE_SESSION_COOKIE_NAME: Final = "__Host-psid"
 INSECURE_SESSION_COOKIE_NAME: Final = "psid"
+
+PROVIDER_URL_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
+"""The schemes a provider base URL may use. `https` everywhere except a local index."""
+
+
+def provider_url_violation(url: str) -> str | None:
+    """Why this provider base URL is unusable, or `None` if it is fine. Blank is fine.
+
+    **Measured, not imagined.** Every one of these arrives at `httpx.AsyncClient.get` as an
+    exception that a provider cannot translate, which is the one way `httpx` can currently
+    reach a caller that must never import it:
+
+    | Configured value | What `client.get` does |
+    |---|---|
+    | `mempool.space/api` (no scheme) | `builtins.ValueError: unknown url type` |
+    | `not a url` | the same bare `ValueError` |
+    | `http://` (no host) | the same bare `ValueError` |
+    | `htp://host/api` (scheme typo) | `httpx.UnsupportedProtocol`, which *is* a `TransportError` |
+
+    The first three escape `fetch_balances` and `health()` as a `ValueError` from inside
+    `urllib`, past an `except httpx.TransportError` that cannot see it -- and past a
+    `health()` whose contract is that it never raises. The fourth is worse for being
+    quieter: it is caught, and reported as `ProviderUnavailableError` on every sync
+    forever, so the owner is told their chain is down while nothing anywhere mentions the
+    typo. That is the exact failure `providers/errors.py` names in its 401-behind-an-auth-
+    proxy example.
+
+    All four are configuration errors that are wrong from the first request and stay wrong,
+    so the right moment to refuse them is startup -- where `_refuse_unsafe_configuration`
+    already turns four other unsafe configurations into a container that fails its health
+    check and a deployment that rolls back.
+
+    **Parsed with `httpx.URL` on purpose**, rather than with `urllib.parse`: the question is
+    not "is this a URL" in the abstract but "will the client this URL is handed to accept
+    it", and a validator that answers a different question than the one that matters is how
+    a check passes while the thing it guards fails. A space in the host survives both and is
+    deliberately allowed through -- it resolves to nothing, and a host that does not resolve
+    is honestly indistinguishable from one that is down.
+
+    Userinfo is allowed. `https://user:pass@host/api` is how a self-hoster puts their own
+    Esplora behind basic auth, which is a supported deployment rather than a mistake, and
+    `strip_query` already keeps it out of any URL that reaches a log.
+
+    Returns:
+        A short reason, or `None`. **The reason never quotes the URL**, because a provider
+        URL may legitimately carry userinfo; the scheme is enough to act on.
+    """
+    candidate = url.strip()
+    if not candidate:
+        # Blank is a configuration, not an omission: for the fallback it means "one
+        # instance only", and for the primary it means this chain is not read at all.
+        return None
+    try:
+        parsed = httpx.URL(candidate)
+    except httpx.InvalidURL as error:
+        # `httpx.URL` refuses a handful of inputs outright -- an unclosed IPv6 bracket, a
+        # non-printable character. The class name rather than the message, which quotes
+        # the offending URL.
+        return f"it is not a URL ({type(error).__name__})"
+    if parsed.scheme not in PROVIDER_URL_SCHEMES:
+        return f"the scheme must be http or https, not {parsed.scheme!r}"
+    if not parsed.host:
+        return "it names no host"
+    return None
 
 
 class Settings(BaseSettings):
@@ -134,9 +199,19 @@ class Settings(BaseSettings):
           not malice: `memory_cost` is in KiB, so an operator tuning after a
           `hash-benchmark` run and reading the number as MiB sets 64 and drops the cost by
           a factor of a thousand.
+        * a provider base URL with no scheme, no host or a mistyped scheme cannot be
+          requested, and reaches a caller either as a bare `ValueError` out of `urllib` --
+          past the `except httpx.TransportError` that is supposed to be where `httpx` stops
+          -- or, for the scheme typo, as "the chain is unavailable" on every sync forever
+          while nothing mentions the typo. `provider_url_violation` says which.
 
-        Refusing to start turns all four into a container that fails its health check,
+        Refusing to start turns all five into a container that fails its health check,
         which is a failure the deployment pipeline already knows how to roll back.
+
+        **Unconditional, not gated on `prod`.** A URL that cannot be requested is wrong in
+        development too, and the case for gating the cost floor -- that the test suite runs
+        deliberately below it -- has no counterpart here: every test that builds a
+        `Settings` either leaves these at their defaults or passes a real-looking URL.
 
         The cost floor is the one check gated on `prod` for a reason beyond symmetry: the
         test suite runs the real application at `memory_cost=64` so that it can hash
@@ -173,6 +248,14 @@ class Settings(BaseSettings):
                 f"minimum of {OWASP_MINIMUM_TIME_COST}."
             )
             raise ValueError(message)
+        for name, url in (
+            ("PORTFOLIO_BITCOIN_ESPLORA_URL", self.bitcoin_esplora_url),
+            ("PORTFOLIO_BITCOIN_ESPLORA_FALLBACK_URL", self.bitcoin_esplora_fallback_url),
+        ):
+            reason = provider_url_violation(url)
+            if reason is not None:
+                message = f"{name} is not usable: {reason}"
+                raise ValueError(message)
         return self
 
 
