@@ -33,14 +33,14 @@ about why.** Both target APIs put the address in the *path*:
 Stripping the query does nothing for either. An address in a log is precisely the
 disclosure `SENSITIVE_KEY_FRAGMENTS` and the wallet registry's no-address rule exist to
 prevent, so `request_target` -- which is what this transport actually logs -- never emits
-a path at all. It emits `"{scheme}://{host}/{label}"`, where the label is a constant the
-provider sets in `request.extensions["endpoint"]`, such as `"address_balance"`. A request
-that sets no label logs `"<unlabelled>"`.
+a path at all. It emits `"{scheme}://{host}/{label}"`, where the label must be a member of
+`ENDPOINT_LABELS`, the allowlist this module owns. A request whose label is not on it logs
+`"<unlabelled>"`, whatever the label's shape.
 
 Deny by default, the same shape as rule 8: adding an endpoint protects it, and saying more
-about one is a deliberate edit that shows up in a diff. The alternative -- scanning each
-path segment for something address-shaped -- is slow, breaks on a truncated address, and
-is a guess dressed up as a control.
+about one is a deliberate edit to a named constant that shows up in a diff. The
+alternative -- scanning each path segment for something address-shaped -- is slow, breaks
+on a truncated address, and is a guess dressed up as a control.
 
 No log line in this module carries a response body.
 
@@ -64,13 +64,17 @@ Confirmed against the vendors' published documentation: the endpoint shapes abov
 Esplora documents no batch endpoint, and that the Kaspa REST server's batch balance call is
 `POST /addresses/balances`.
 
-**Assumed, because neither vendor documents it:** any rate limit, any `Retry-After`
-behaviour, and any cap on a batch. Esplora's documentation mentions no limit and points at
-self-hosting instead. That is a reason to run our own limiter -- there is no server-side
-contract to lean on -- rather than a reason to skip one. The defaults below are
-conservative guesses awaiting a measurement, which is why they are a policy object and a
-constructor argument rather than literals buried in the request path: #7 and #8 correct
-them by changing a value. `docs/providers.md` records the same split.
+Confirmed on 2026-09-22, and the reason `DEFAULT_MIN_HOST_INTERVAL_MS` is what it is:
+mempool.space's REST documentation states that exceeding its limits returns HTTP 429 and
+that repeatedly exceeding them may result in a ban, while publishing no numbers.
+Blockstream's `API.md` documents no rate limit at all.
+
+**Assumed, because neither vendor documents it:** the actual limit, any `Retry-After`
+behaviour, and any cap on a batch. A warning without numbers is a reason to run our own
+limiter -- there is no server-side contract to lean on -- rather than a reason to skip
+one. The defaults below are conservative guesses awaiting a measurement, which is why they
+are a policy object and a constructor argument rather than literals buried in the request
+path: correcting them is a change to a value. `docs/providers.md` records the same split.
 """
 
 from __future__ import annotations
@@ -91,10 +95,14 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
 __all__ = [
+    "ADDRESS_BALANCE",
+    "BLOCK_TIP_HEIGHT",
+    "DEFAULT_MIN_HOST_INTERVAL_MS",
     "DEFAULT_RETRY_POLICY",
     "DEFAULT_TIMEOUT",
     "ENDPOINT_EXTENSION",
     "ENDPOINT_LABEL",
+    "ENDPOINT_LABELS",
     "HTTP_ERROR_FLOOR",
     "RETRYABLE_STATUSES",
     "UNLABELLED",
@@ -134,28 +142,51 @@ UNLABELLED: Final = "<unlabelled>"
 """What a request with no usable endpoint label is logged as.
 
 The default discloses nothing. Labelling a request is an opt-in to saying more about it,
-so a provider added without one is quiet rather than leaky -- and so is one whose label
-does not match `ENDPOINT_LABEL`.
+so a provider added without one is quiet rather than leaky -- and so is one whose label is
+not on `ENDPOINT_LABELS`.
 """
 
 ENDPOINT_LABEL: Final = re.compile(r"[a-z][a-z0-9_]{0,31}")
 """The only shape an endpoint label may take: lower snake case, at most 32 characters.
 
-A constant the provider author writes down, not a value derived from the request. The
-pattern is what makes `request_target`'s promise structural instead of conventional: no
-string containing a slash, a dot, a colon, a percent-escape, whitespace or an upper-case
-character can reach a log through it, so `extensions={"endpoint": request.url.path}` --
-the helpful thing a provider author reaches for when they cannot see their request --
-renders as `UNLABELLED` rather than as the owner's address.
+**This is no longer the gate, and the change is deliberate.** `ENDPOINT_LABELS` below is
+what `request_target` checks a request against; the pattern is now a shape check on the
+*constants in that set*, asserted by a test rather than applied to a request. It stays
+because a well-shaped label is still worth insisting on -- a name with a slash or an
+upper-case character in it is a label somebody built out of a request rather than wrote
+down -- and because it is the rule a future label has to satisfy before it may be added.
 
 **`[a-z]` is ASCII by construction, and that is load-bearing rather than incidental.**
 Widening it to `\\w` reads like a tidy-up -- same intent, fewer characters -- and Python's
 `re` makes `\\w` Unicode-aware by default, so it would admit an entire alphabet of
 look-alikes. Measured: a label of Cyrillic U+0430 followed by `ddress_balance` is rejected
 by this pattern and accepted by `\\w{1,32}`. A test pins the homoglyph case so that the
-tidy-up fails there instead of quietly widening what may reach a log.
+tidy-up fails there instead of quietly widening what may be added to the allowlist.
+"""
 
-See `request_target` for what this does not cover.
+ADDRESS_BALANCE: Final = "address_balance"
+"""A read of one address's balance. Esplora's `GET /address/:address` is one of these."""
+
+BLOCK_TIP_HEIGHT: Final = "block_tip_height"
+"""A read of the chain tip's height, which is what a provider's `health()` asks for."""
+
+ENDPOINT_LABELS: Final[frozenset[str]] = frozenset({ADDRESS_BALANCE, BLOCK_TIP_HEIGHT})
+"""Every label that may reach a log. Membership is the gate; the shape is not.
+
+**This is the completion #6 said belonged to #7.** Until a provider existed there was
+nothing to put in an allowlist, so `request_target` checked the label's *shape* and said
+so in its own docstring: a truncated address is lower-case, alphanumeric and under 32
+characters, so it passed the pattern and reached the log. Membership in a frozen set
+closes that, because a string that is not one of these two renders as `UNLABELLED` no
+matter how well it is shaped.
+
+Same shape as `PUBLIC_API_PATHS`: adding an endpoint protects it, and saying more about
+one is a visible edit to a named constant rather than a value computed at a call site.
+
+A frozen constant rather than a `register_endpoint_label()` call, because a registration
+function makes the set depend on which modules happened to be imported -- and a label that
+works in production and renders `<unlabelled>` in a test is worse than either outcome
+applied consistently.
 """
 
 # All four explicit, none left to the library: `httpx`'s default is five seconds on
@@ -200,13 +231,21 @@ or widen it without editing the request path. **No other 4xx is here, deliberate
 200 by asking again.
 """
 
-DEFAULT_MIN_HOST_INTERVAL_MS: Final = 250
-"""A guess, not a measurement: neither vendor documents a rate limit.
+DEFAULT_MIN_HOST_INTERVAL_MS: Final = 1000
+"""A guess, not a measurement, but a guess with a published warning behind it.
 
-Four requests a second to one host. This application reads a handful of addresses on a
-schedule rather than bursting, so a conservative floor costs it seconds per sync and buys
-it not being the reason a free public index starts refusing us. Replace it with a measured
-number when one exists; `docs/providers.md` records that it is unverified.
+One request a second to one host. mempool.space's REST documentation, read on 2026-09-22,
+states that exceeding its limits returns HTTP 429 and that repeatedly exceeding them may
+result in a ban, and it publishes no numbers at all; Blockstream's `API.md` documents no
+limit either way. Being banned from a free public index is a failure that outlives the
+sync that caused it and that no amount of retrying fixes, so the floor went from 250 ms to
+1000 ms with the first provider that actually makes requests.
+
+This application reads a handful of addresses on a schedule rather than bursting, so the
+cost is seconds per sync. It is a shared default, so Kaspa (#8) inherits it -- acceptable
+because Kaspa batches. If a batch endpoint ever finds this too slow the answer is a
+per-host override table, not a lower shared floor. `docs/providers.md` records that the
+number remains unverified.
 """
 
 
@@ -291,47 +330,42 @@ def request_target(request: httpx.Request) -> str:
     line built from the path would disclose exactly what the wallet registry refuses to.
 
     The label comes from `request.extensions["endpoint"]` -- a constant the provider
-    chooses, such as `"address_balance"`, which says what kind of call it was without
-    saying what it was about.
+    chooses, such as `ADDRESS_BALANCE`, which says what kind of call it was without saying
+    what it was about.
 
-    **The label is validated against `ENDPOINT_LABEL`, not merely checked for being a
-    string, and that is the difference between a convention and a guarantee.** Until it
-    was, this function's promise held only for labels we had thought of. Measured on this
-    branch, with a well-behaved label the security tests stayed green throughout:
+    **The label must be a member of `ENDPOINT_LABELS`, and membership rather than shape is
+    what makes this a guarantee instead of a convention.** #6 checked the label against
+    `ENDPOINT_LABEL`'s pattern and recorded the hole that left, because there was no
+    provider yet and an empty allowlist would have rendered every real request
+    `<unlabelled>`. The hole was this: a *truncated* address is lower-case, alphanumeric
+    and under 32 characters, so it matched the pattern and reached the log. A full 42-
+    character bech32 address did not, only because of a length cap that was hygiene rather
+    than a control.
+
+    Now anything that is not one of the two labels this release uses renders as
+    `UNLABELLED` regardless of how it is spelled:
 
         'address_balance'              -> https://api.example/address_balance
-        'address/tb1qw508d6q...'       -> https://api.example/address/tb1qw508d6q...
-        '/address/tb1q.../utxo'        -> https://api.example//address/tb1q.../utxo
-        'address_balance/tb1qw508d6qe' -> https://api.example/address_balance/tb1qw508d6qe
+        'tb1qw508d6qejxtdg'            -> https://api.example/<unlabelled>
+        'address/tb1qw508d6q...'       -> https://api.example/<unlabelled>
+        'address_balance/tb1qw508d6qe' -> https://api.example/<unlabelled>
 
-    The third line is the realistic one, and the cause is helpfulness rather than malice:
-    a provider author who wants more detail in the log writes
-    `extensions={"endpoint": request.url.path}`, or appends an address prefix to
-    correlate two lines, and every retry and failure line carries it -- out of a function
-    whose docstring says it cannot. Anything not matching the pattern now renders as
-    `UNLABELLED`, empty string included.
+    The third and fourth lines are the realistic ones, and the cause is helpfulness rather
+    than malice: a provider author who wants more detail in the log writes
+    `extensions={"endpoint": request.url.path}`, or appends an address prefix to correlate
+    two lines, and every retry and failure line carries it -- out of a function whose
+    docstring says it cannot. The second is the one the pattern could not catch.
 
-    **The residual, stated so nobody reads more into the pattern than it says.** A label
-    that *is* a short address still passes: a bech32 address is lowercase alphanumeric and
-    `"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".isidentifier()` is `True`. What the
-    pattern makes structurally impossible is the *accidental* case -- anything carrying a
-    slash, a dot, a colon, a percent-escape, whitespace or an upper-case character cannot
-    get through. Deliberately naming a label after an address is still possible and is no
-    longer something anyone does by accident. The honest completion of this is an
-    allowlist of known labels, the same shape as `PUBLIC_API_PATHS`; it is not here
-    because there are no providers yet and an empty allowlist would render every real
-    request `<unlabelled>`. It belongs with #7.
-
-    The length cap is hygiene, not the control -- it bounds a log line, and it happens to
-    reject a full 42-character bech32 address while doing nothing at all about a truncated
-    one. A truncated address is still an address, which is why the shape and not the
-    length is what this rests on.
+    `isinstance(label, str)` still comes first, and not as a formality: `request.extensions`
+    is a plain mapping of anything, and testing `[] in frozenset()` raises `TypeError` on
+    an unhashable value. A logging helper that can raise is a logging helper that takes
+    the request down with it.
 
     The port is left out too. It identifies a deployment, not a call, and it is one more
     thing a reader might mistake for part of the target.
     """
     label = request.extensions.get(ENDPOINT_EXTENSION)
-    endpoint = label if isinstance(label, str) and ENDPOINT_LABEL.fullmatch(label) else UNLABELLED
+    endpoint = label if isinstance(label, str) and label in ENDPOINT_LABELS else UNLABELLED
     return f"{request.url.scheme}://{request.url.host}/{endpoint}"
 
 
