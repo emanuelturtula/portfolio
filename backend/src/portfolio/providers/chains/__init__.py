@@ -1,7 +1,7 @@
 """Every chain provider, imported here exactly once, on purpose.
 
-**This package is empty of providers today.** Bitcoin is #7 and Kaspa is #8; this change
-lands the seam and nothing that travels through it.
+**Bitcoin is here; Kaspa is #8.** #6 landed the seam and #7 sent the first provider
+through it.
 
 A provider module registers itself by decorating its class with
 `@register_chain_provider(ChainKey.X)`, and a decorator only runs when its module is
@@ -28,3 +28,5 @@ Nothing is re-exported from here. A caller asks the registry for a provider by c
 it does not import a provider class by name, which is what keeps the set of chains a
 runtime fact rather than something every call site has to know.
 """
+
+from portfolio.providers.chains import bitcoin  # noqa: F401 - imported for its registration
