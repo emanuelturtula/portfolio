@@ -69,7 +69,12 @@ def provider_url_violation(url: str) -> str | None:
 
     Userinfo is allowed. `https://user:pass@host/api` is how a self-hoster puts their own
     Esplora behind basic auth, which is a supported deployment rather than a mistake, and
-    `strip_query` already keeps it out of any URL that reaches a log.
+    a provider URL never reaches a log in the first place: the transport logs
+    `request_target`, which emits a scheme, a host and an endpoint label and never sees
+    userinfo at all. **Not `strip_query`**, which is a separate helper for a future
+    exchange provider and is not on this path -- `http.py` warns by name that reaching for
+    it to log a chain request meets the letter of the rule and leaks anyway, and crediting
+    it here would be that confusion written down as reassurance.
 
     Returns:
         A short reason, or `None`. **The reason never quotes the URL**, because a provider
