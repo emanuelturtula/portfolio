@@ -235,10 +235,21 @@ Two limits of that check, both of which the address itself cannot resolve:
 - a legacy address (one starting `m`, `n` or `2`) on regtest looks exactly like a testnet
   one, so with `PORTFOLIO_BITCOIN_NETWORK=regtest` it is refused. Use a `bcrt1` address.
 
-**Failover, and why the reads are slow on purpose.** A connection failure, a 5xx or a 429
-moves to the fallback instance and the rest of that read continues there; any other refusal
-stops, because the second instance runs the same software and would refuse it too. Requests
-to one host are spaced by at least one second: mempool.space's documentation says that
+**Failover, and why the reads are slow on purpose.** Anything other than an answer moves to
+the fallback instance, and the rest of that read continues there — a connection failure, a
+503, a 429, and equally a 401, a 403 or a 404. An instance that will not answer is exactly
+what the second one is for, and the shapes a ban or an auth proxy actually take are refusals
+rather than outages. **If one instance is misconfigured you will not see it in your
+balances, which will keep arriving from the other one — you will see it in the health
+check**, which probes each instance separately and is the thing to look at when something
+feels wrong.
+
+The one failure that does not fail over is an instance answering `200` with a body the
+application cannot read. That is not a refusal, it is a sign that we no longer understand
+what the vendor is sending, and asking somebody else would either produce the same
+unreadable answer or a number that hides the problem.
+
+Requests to one host are spaced by at least one second: mempool.space's documentation says that
 exceeding its rate limit returns 429 and that repeatedly exceeding it may result in a ban,
 and it publishes no numbers, so the interval is deliberately cautious. A ban would outlast
 the sync that caused it. If a sync of many addresses feels slow, that is this, and the fix

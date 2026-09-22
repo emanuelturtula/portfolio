@@ -194,6 +194,20 @@ does not retry and does demand a person, which is what it is.
 remedy is different: a 429 that survived the transport's retries means our interval for
 that vendor is too short, and that is a configuration change, not something waiting fixes.
 
+**If your chain has more than one instance, that mapping decides what to raise, not when to
+give up.** The Bitcoin provider tries the next instance on *every* non-200 and classifies
+only once they are all exhausted, by the last failure. The rule it started with — stop on
+any 4xx, because the second instance runs the same software and would refuse identically —
+sounds right and is false for every refusal scoped to an instance rather than to a request:
+a ban that is spelled 403, an auth proxy returning 401, a base URL missing its `/api` path
+returning 404. Those are precisely the cases a second instance exists for, and stopping made
+the fallback unreachable in exactly them. The misconfiguration is not lost by moving on; it
+surfaces in `health`, which probes each instance in turn.
+
+A 200 whose body will not parse is the exception and still stops: that is a statement about
+our parser or the vendor's schema, not about one instance, and a second opinion would either
+repeat it or hide it behind a number.
+
 Do not raise a `ProviderError` from a transport or from a shared helper. The transport
 implements `httpx.AsyncBaseTransport` and owes that interface its own exception types, and
 translating a connection failure there while a 503 stayed a response would hand every

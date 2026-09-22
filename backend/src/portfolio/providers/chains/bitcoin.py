@@ -49,11 +49,41 @@ and never a value. No rejection in this module contains an address or any part o
 
 ## Two instances, and what is worth moving on for
 
-A transport error, a 5xx or a 429 that outlived the shared transport's retries moves to
-the next instance. **Any other 4xx, and any 200 whose body does not parse, stops.** The
-second instance runs the same software against the same chain, so it produces the same
-refusal -- and if it does not, then two instances disagree about one request, which is a
-fact worth surfacing rather than papering over with whichever answer came second.
+**Every failure to answer moves to the next instance.** A transport error, a 5xx, a 429, a
+403, a 401, a 404, a 3xx -- all of them. Only a 200 whose body cannot be parsed stops the
+call.
+
+That is an amendment, and the reasoning that was wrong is worth keeping because it is
+persuasive. The original rule stopped on any 4xx, arguing that the second instance runs the
+same software against the same chain and so produces the same refusal. True of a 400 on a
+malformed address -- which this provider cannot produce anyway, since it validates offline
+first -- and **false of every refusal scoped to an instance rather than to a request**,
+which is the realistic set:
+
+* mempool.space enforces its unpublished limit with a ban, and neither vendor documents
+  what status a ban returns. If it is 403 rather than 429, the original rule raised on the
+  first address, produced nothing for the sync, and never asked the healthy, unauthenticated
+  fallback -- the one failure two instances exist for, in the one shape where the fallback
+  was unreachable.
+* `providers/errors.py` already names the other: a self-hosted Esplora behind an auth proxy
+  returns 401.
+* An operator who sets the base URL to the host and forgets `/api` gets 404 forever, and
+  that URL passes the startup check because it is a perfectly good URL.
+
+**The misconfiguration is not lost by failing over, it is relocated.** `health()` probes
+each instance in turn and is what tells an operator that one of them is broken. Failover
+keeps the balances arriving; health is where the fact surfaces. That division is what makes
+moving on from a 404 honest rather than merely convenient.
+
+**The unparseable 200 still stops, and the asymmetry is the point.** A non-200 is an
+instance declining to answer, and another instance may well answer. A 200 we cannot read is
+a statement about our own parser or the vendor's schema -- asking a second instance either
+produces the same unreadable body or, worse, produces a number that hides the fact that we
+no longer understand the first one. That is the "needs a human" branch of the taxonomy.
+
+On exhaustion the error is chosen by the **last** failure, not by the worst or the first: a
+429 raises `ProviderRateLimitedError`, another non-200 raises `ProviderResponseError`, and
+a transport error or a 5xx raises `ProviderUnavailableError`.
 
 Failover is **sticky within a single `fetch_balances` call**: once an instance fails, the
 remaining addresses in that call start at the next one. Reading twenty addresses against an
@@ -92,6 +122,7 @@ from portfolio.domain.chains import ChainKey
 from portfolio.domain.chains import validate_address as validate_chain_address
 from portfolio.providers.base import ChainCapabilities, ProviderHealth, align_balances
 from portfolio.providers.errors import (
+    ProviderError,
     ProviderRateLimitedError,
     ProviderResponseError,
     ProviderUnavailableError,
@@ -187,6 +218,76 @@ class _Instance:
         return f"{self.base_url}{path}"
 
 
+@dataclass(frozen=True, slots=True)
+class _Failure:
+    """Why one instance did not answer, and what to raise if it turns out to be the last.
+
+    One record rather than the two loose variables this replaced. Those could disagree:
+    the transport arm set a cause and the status arm did not, so a primary that refused
+    the connection followed by a fallback answering 429 raised
+    `ProviderRateLimitedError(...) from ConnectError(...)` -- an error about the fallback
+    chained to a cause from the primary, which sends whoever reads the traceback after the
+    wrong host. Carrying the class, the message and the cause together makes that
+    impossible to express rather than merely unlikely.
+
+    `cause` is `None` for a status-based failure, because there is no exception to chain:
+    the instance answered, it simply answered with a refusal.
+    """
+
+    error: type[ProviderError]
+    message: str
+    cause: BaseException | None = None
+
+
+_NOTHING_CONFIGURED: Final = _Failure(
+    error=ProviderUnavailableError,
+    message="No Esplora instance is configured.",
+)
+"""What a read fails with when both base URLs are blank.
+
+Unavailable rather than a refusal: nothing was asked, so nothing refused. It is the
+starting value of the failover loop's `failure`, which means the no-instance case takes
+the ordinary exhaustion path instead of needing a branch of its own.
+"""
+
+
+def _failure_for(status: int) -> _Failure:
+    """Classify a non-200 for the moment it turns out to be the last thing we heard.
+
+    The three-way split `providers/errors.py` exists to keep apart, decided on the status
+    alone -- which is all either vendor documents, and deliberately so: neither publishes
+    an error body for an invalid address, and one of them does not publish what a ban
+    looks like either.
+
+    * **429 -> `ProviderRateLimitedError`.** It survived the transport's retries, so our
+      interval is too short for this vendor: a configuration change, not patience.
+    * **5xx -> `ProviderUnavailableError`.** The vendor is broken rather than us, and the
+      previous reading is still the best information available.
+    * **anything else -> `ProviderResponseError`.** It understood and refused. Retrying
+      changes nothing, and a person has to look at it.
+
+    Note what this does **not** decide: whether to try the next instance. Every one of
+    these fails over now; this only says what the last one meant.
+    """
+    if status == HTTPStatus.TOO_MANY_REQUESTS:
+        return _Failure(
+            error=ProviderRateLimitedError,
+            message="Every Esplora instance was tried; the last one is throttling us.",
+        )
+    if status >= HTTPStatus.INTERNAL_SERVER_ERROR:
+        return _Failure(
+            error=ProviderUnavailableError,
+            message=f"Every Esplora instance was tried; the last one failed with HTTP {status}.",
+        )
+    return _Failure(
+        error=ProviderResponseError,
+        message=(
+            f"Every Esplora instance was tried; the last one refused the request "
+            f"with HTTP {status}."
+        ),
+    )
+
+
 def parse_address_response(body: str | bytes, expected_address: str) -> AddressStats:
     """Read the two balances out of an Esplora address response, or refuse it.
 
@@ -277,18 +378,36 @@ def parse_tip_height(body: str | bytes) -> int:
 
 
 def _decode(body: str | bytes) -> object:
-    """`json.loads`, with its failure translated into this package's vocabulary.
+    """`json.loads`, with every failure it has translated into this package's vocabulary.
 
-    `UnicodeDecodeError` is caught alongside `JSONDecodeError` because `json.loads` raises
-    it for bytes that are not UTF-8, and a vendor answering with a mis-encoded body is the
-    same class of event as one answering with an HTML page.
+    **`ValueError` and `RecursionError`, not `JSONDecodeError` and `UnicodeDecodeError`**,
+    and that is a correction rather than defensive breadth. Measured against this parser:
+
+    | Body | What `json.loads` raises |
+    |---|---|
+    | `not json` | `json.JSONDecodeError` |
+    | bytes that are not UTF-8 | `UnicodeDecodeError` |
+    | a `funded_txo_sum` of 5000 digits | `ValueError: Exceeds the limit (4300 digits)` |
+    | 5000 nested arrays | `RecursionError` |
+
+    The first two are `ValueError` subclasses, so naming `ValueError` subsumes them and
+    catches the integer-limit case that the narrower pair let escape untyped. The last one
+    is not a `ValueError` at all and has to be named. Both escaping arms reached
+    `parse_address_response` **and** `parse_tip_height`, which is to say they reached
+    `health()`, whose contract is that it never raises -- from a body a hostile or broken
+    instance chooses freely.
+
+    `CPython` sets the digit limit and the recursion limit; neither is something this
+    application configures, and both are the kind of boundary a vendor can cross by
+    accident. Criterion 5 says a malformed body raises a typed schema error rather than
+    propagating a parse error, and "parse error" is exactly what these two were.
 
     The message says the body did not parse and **never shows it**. A parser error that
     quotes the offending text is the shape of defect this module was written to avoid.
     """
     try:
         return json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (ValueError, RecursionError) as error:
         message = "The response body is not JSON."
         raise ProviderResponseError(message) from error
 
@@ -358,22 +477,39 @@ def _require_sum(stats: Mapping[str, object], field: str, name: str) -> int:
 
 
 def _configured_instances(settings: Settings) -> tuple[_Instance, ...]:
-    """The instances to try, in order, dropping any that is configured blank.
+    """The instances to try, in order, dropping blanks and dropping a repeat of the first.
 
     A blank fallback means "one instance only", which is what a self-hoster running their
     own index sets. Both blank yields no instances at all: `fetch_balances` then raises
     `ProviderUnavailableError` and `health` reports unhealthy, which is what an operator
     who has configured no index should be told, rather than a zero balance.
+
+    **The two URLs being the same is not a fallback, and treating it as one is actively
+    harmful.** A self-hoster who points both variables at their own index -- which is a
+    thing people do, because two variables look like they both want filling -- would
+    otherwise get a "fallback" that is the same host: a 429 costs `max_attempts` requests,
+    and then the failover spends `max_attempts` more on the host that has just asked us to
+    stop. The one vendor whose limit is enforced by a ban is the one most likely to be
+    asked twice this way.
+
+    Compared after trimming and after the trailing slash is removed, so
+    `https://x.test/api` and `https://x.test/api/` are recognised as one instance. Order is
+    preserved and the *first* spelling wins, so an operator who configures the same index
+    twice gets one instance called `primary` rather than one called `fallback`.
     """
     candidates = (
         (PRIMARY, settings.bitcoin_esplora_url),
         (FALLBACK, settings.bitcoin_esplora_fallback_url),
     )
-    return tuple(
-        _Instance(position=position, base_url=url.strip().rstrip("/"))
-        for position, url in candidates
-        if url.strip()
-    )
+    instances: list[_Instance] = []
+    seen: set[str] = set()
+    for position, url in candidates:
+        base_url = url.strip().rstrip("/")
+        if not base_url or base_url in seen:
+            continue
+        seen.add(base_url)
+        instances.append(_Instance(position=position, base_url=base_url))
+    return tuple(instances)
 
 
 @register_chain_provider(ChainKey.BITCOIN)
@@ -452,9 +588,13 @@ class EsploraProvider:
 
         Sequential, never `gather`: see the module docstring. Sticky failover, also there.
 
-        A duplicated address is refused by `align_balances`, as a `ValueError` and after
-        the reads -- the caller's mistake rather than the vendor's, and one no caller in
-        this application makes, because addresses come out of a unique index.
+        **A duplicate is refused here, before any request, and not only by
+        `align_balances`.** `align_balances` does refuse it, and remains the enforcement
+        point for every other caller -- but it runs last, so leaving it as the only check
+        meant twenty duplicated addresses cost twenty requests at a vendor whose limit is
+        unpublished and enforced by a ban, and then raised. That also contradicted the
+        paragraph above it, which promises that a bad address costs no requests at all. A
+        promise that holds for one kind of bad address is not the promise it appears to be.
 
         Raises:
             AddressInvalidError: one of the addresses is not one this instance can read.
@@ -465,6 +605,15 @@ class EsploraProvider:
             ValueError: the same address was requested twice.
         """
         canonical = [self.validate_address(raw).canonical for raw in addresses]
+        distinct = set(canonical)
+        if len(distinct) != len(canonical):
+            # Deliberately the same shape of message `align_balances` raises, because it
+            # is the same mistake; what differs is only that this one costs no requests.
+            message = (
+                f"fetch_balances was given {len(canonical)} addresses "
+                f"of which only {len(distinct)} are distinct"
+            )
+            raise ValueError(message)
 
         confirmed: dict[str, int] = {}
         pending: dict[str, int] = {}
@@ -548,27 +697,32 @@ class EsploraProvider:
         mechanism: an instance that failed is never asked again within one call, and
         nothing has to remember to skip it.
 
-        The status mapping, and each row is a decision the hierarchy in `providers/errors`
-        exists to keep apart:
+        **Every failure to answer moves on**, including a 400, a 401, a 403, a 404 and a
+        3xx. The module docstring argues it at length; the short version is that a refusal
+        scoped to an *instance* -- a ban spelled 403, an auth proxy, a base URL missing its
+        `/api` -- is exactly the case two instances exist for, and the original rule made
+        that case the one where the fallback was never asked. A 3xx is a refusal to answer
+        rather than a hop, because the shared client does not follow redirects.
 
-        | Status | What happens |
-        |---|---|
-        | a transport error | the next instance; this one said nothing at all |
-        | 429 | the next instance; it survived the retries, so our interval is too short |
-        | 5xx | the next instance; the vendor is broken, not us |
-        | any other non-200 | **stop**: it understood and refused, and the other instance will too |
+        Only a 200 whose body will not parse stops the call, and that happens in the
+        caller, not here: this method's job ends at "an instance answered".
 
-        A 3xx lands in the last row with the 4xx. The shared client does not follow
-        redirects -- a balance API that starts redirecting is a change to notice rather
-        than absorb -- so a `Location` is a refusal to answer here, not a hop.
+        The error on exhaustion is chosen by the **last** failure, and the cause is that
+        same failure's. Both halves matter. A 429 followed by a 5xx is a broken vendor, and
+        telling an operator to lengthen an interval would send them after the wrong thing;
+        and a `ProviderRateLimitedError` chained to a `ConnectError` from the *other*
+        instance sends whoever reads the traceback after the wrong host, which is what this
+        did before the last failure was tracked as one record rather than as two variables
+        that could disagree.
 
         Raises:
-            ProviderResponseError: an instance refused the request.
             ProviderRateLimitedError: every instance was tried and the last said 429.
-            ProviderUnavailableError: every instance was tried and none answered.
+            ProviderResponseError: every instance was tried and the last refused with some
+                other non-200.
+            ProviderUnavailableError: every instance was tried and the last did not answer
+                or failed with a 5xx -- and the same when none is configured.
         """
-        throttled = False
-        cause: BaseException | None = None
+        failure = _NOTHING_CONFIGURED
         for index in range(start, len(self._instances)):
             instance = self._instances[index]
             try:
@@ -576,23 +730,20 @@ class EsploraProvider:
                     instance.url(path), extensions={ENDPOINT_EXTENSION: label}
                 )
             except httpx.TransportError as error:
-                throttled, cause = False, error
+                failure = _Failure(
+                    error=ProviderUnavailableError,
+                    # The class name, never `str(error)`: `httpx` puts the request's URL
+                    # into some of its messages, and the URL names the deployment.
+                    message=(
+                        "Every Esplora instance was tried; the last one did not answer "
+                        f"({type(error).__name__})."
+                    ),
+                    cause=error,
+                )
                 continue
 
-            status = response.status_code
-            if status == HTTPStatus.TOO_MANY_REQUESTS or status >= HTTPStatus.INTERNAL_SERVER_ERROR:
-                throttled = status == HTTPStatus.TOO_MANY_REQUESTS
-                continue
-            if status != HTTPStatus.OK:
-                message = f"An Esplora instance refused the request with HTTP {status}."
-                raise ProviderResponseError(message)
-            return response.text, index
+            if response.status_code == HTTPStatus.OK:
+                return response.text, index
+            failure = _failure_for(response.status_code)
 
-        # Which error depends on the *last* failure, not on whether a 429 appeared at all:
-        # a 429 followed by a 5xx is a broken vendor, and telling an operator to lengthen
-        # an interval would send them after the wrong thing.
-        if throttled:
-            message = "Every Esplora instance is throttling us."
-            raise ProviderRateLimitedError(message) from cause
-        message = "No Esplora instance answered."
-        raise ProviderUnavailableError(message) from cause
+        raise failure.error(failure.message) from failure.cause
