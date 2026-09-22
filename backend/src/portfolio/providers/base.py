@@ -354,9 +354,18 @@ def _refuse_unrequested(reported: Mapping[str, int], asked: set[str]) -> None:
 def _pending_units(pending: Mapping[str, int] | None, address: str) -> int | None:
     """This address's mempool delta, or `None` for "the chain did not say".
 
-    Two ways to arrive at `None` and they mean the same thing to a caller: the provider
-    passed no mapping at all, or it passed one that has no entry for this address --
-    which is what an Esplora response carrying no `mempool_stats` produces.
+    Three ways to arrive at `None`, and they mean the same thing to a caller: the provider
+    passed no mapping at all, or it passed one with no entry for this address -- which is
+    what an Esplora response carrying no `mempool_stats` produces -- or it passed one
+    holding an explicit `None` for it.
+
+    The third is off the static contract, since the parameter is `Mapping[str, int]`, and
+    it is treated as the other two rather than refused on purpose. A provider that builds
+    its mapping with `pending[address] = parsed.pending` before checking for `None` has
+    written down the same fact in the spelling the type does not allow, and turning that
+    into a `ProviderResponseError` would report a vendor for a mistake the provider made.
+    `tests/providers/test_base.py` pins the equivalence, so it is a decision rather than
+    an accident of `dict.get`.
     """
     if pending is None:
         return None
