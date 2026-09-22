@@ -146,7 +146,7 @@ so a provider added without one is quiet rather than leaky -- and so is one whos
 not on `ENDPOINT_LABELS`.
 """
 
-ENDPOINT_LABEL: Final = re.compile(r"[a-z][a-z0-9_]{0,31}")
+ENDPOINT_LABEL: Final = re.compile(r"\A[a-z][a-z0-9_]{0,31}\Z")
 """The only shape an endpoint label may take: lower snake case, at most 32 characters.
 
 **This is no longer the gate, and the change is deliberate.** `ENDPOINT_LABELS` below is
@@ -155,6 +155,13 @@ what `request_target` checks a request against; the pattern is now a shape check
 because a well-shaped label is still worth insisting on -- a name with a slash or an
 upper-case character in it is a label somebody built out of a request rather than wrote
 down -- and because it is the rule a future label has to satisfy before it may be added.
+
+**Anchored with `\\A` and `\\Z`, which is not redundant even though every use is
+`fullmatch`.** Unanchored, `.match()` on this pattern accepts `address_balance/` followed
+by an address prefix -- so a reader who reaches for the more familiar method gets a
+pattern whose docstring claims it describes "the only shape a label may take" and which
+happily matches a label carrying an address. Nothing does that today. The anchors mean
+nothing can do it tomorrow either, which is cheaper than a comment asking people not to.
 
 **`[a-z]` is ASCII by construction, and that is load-bearing rather than incidental.**
 Widening it to `\\w` reads like a tidy-up -- same intent, fewer characters -- and Python's
