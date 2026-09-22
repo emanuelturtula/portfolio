@@ -826,9 +826,12 @@ async def test_the_attached_cause_is_the_last_failure_and_not_an_earlier_one() -
     forever: the exception class is right, the message is right, and only the traceback --
     which nobody reads until an outage -- says something false.
 
-    A `ConnectError` cause is asserted absent rather than a specific right answer being
-    demanded, because "what a 429 with no exception behind it should be caused by" is the
-    implementation's call: `None` is a perfectly good answer.
+    The assertion is `is None`, not merely "not a `ConnectError`", and that is the house
+    rule about pinning the **settled** state rather than the first state that matches.
+    Measured against the shipped provider: a 429 that no exception produced carries no
+    cause at all, in every ordering. A weaker assertion would go on passing if the cause
+    later became some other stale exception, which is the same defect wearing a different
+    class.
     """
     fake = EsploraFake(
         primary=ScriptedInstance(Reply(error=httpx.ConnectError("connection refused"))),
@@ -840,9 +843,9 @@ async def test_the_attached_cause_is_the_last_failure_and_not_an_earlier_one() -
         with pytest.raises(ProviderRateLimitedError) as caught:
             await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
 
-    assert not isinstance(caught.value.__cause__, httpx.ConnectError), (
-        "the error is classified from the fallback's 429 but blamed on the primary's "
-        "transport failure, so the type and the traceback disagree"
+    assert caught.value.__cause__ is None, (
+        "the error is classified from the fallback's 429 but chained to the primary's "
+        f"{type(caught.value.__cause__).__name__}, so the type and the traceback disagree"
     )
 
 
@@ -851,7 +854,9 @@ async def test_the_cause_survives_when_the_last_failure_really_was_a_transport_e
     above and throw away the one piece of information an outage leaves behind.
 
     Two transport errors: the cause must be the **second**, which is the one that decided
-    the outcome.
+    the outcome. Asserted by identity rather than by type, because two `ConnectError`s
+    would satisfy an `isinstance` check whichever one was attached -- and which one is
+    attached is the entire subject.
     """
     last = httpx.ConnectTimeout("timed out")
     fake = EsploraFake(
@@ -865,6 +870,29 @@ async def test_the_cause_survives_when_the_last_failure_really_was_a_transport_e
             await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
 
     assert caught.value.__cause__ is last
+
+
+async def test_a_throttle_followed_by_a_dropped_connection_is_blamed_on_the_connection() -> None:
+    """The mirror of the first test, and the pair is what makes either one mean something.
+
+    429 then a transport error: the classification moves to `ProviderUnavailableError` --
+    the last failure -- and the cause becomes the `ConnectError` that produced it. The
+    first test says a stale cause is not carried forward; this says a real one is not
+    dropped. A provider that simply never attached a cause would pass that one and fail
+    this.
+    """
+    fake = EsploraFake(
+        primary=ScriptedInstance(Reply(status=429)),
+        fallback=ScriptedInstance(Reply(error=httpx.ConnectError("connection refused"))),
+    )
+    provider, client = esplora_provider(fake, max_attempts=1)
+
+    async with client:
+        with pytest.raises(ProviderUnavailableError) as caught:
+            await provider.fetch_balances([BIP173_TESTNET_P2WPKH])
+
+    assert not isinstance(caught.value, ProviderRateLimitedError)
+    assert isinstance(caught.value.__cause__, httpx.ConnectError)
 
 
 async def test_a_transport_error_falls_over_to_the_fallback() -> None:

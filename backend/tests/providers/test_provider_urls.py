@@ -270,10 +270,15 @@ def test_pydantics_structured_errors_carry_the_whole_environment_and_ours_does_n
 
     So the `SecretStr` on the field is not the protection anyone assumes it is at this
     boundary, and one `logger.exception` or one `.errors()` in a future startup handler
-    turns a typo'd setting into every credential on the host reaching a log. Nothing in
-    `src/` calls `.errors()` on a settings error today -- `api/errors.py` does, but only
-    for a `RequestValidationError` from a request body -- which is why this is a pin and
-    not a failure.
+    turns a typo'd setting into every credential on the host reaching a log.
+
+    **Two independent barriers stand between that and today, and both were verified.**
+    `api/errors.py` is registered for `RequestValidationError` only, so a settings error
+    never reaches it -- and even if it did, `handle_validation_error` projects each entry
+    down to `loc`, `msg` and `type`, dropping `input` before anything is rendered. So the
+    realistic hazard is not an existing call site but a *new* one: a debug dump, a
+    `logger.exception`, or precisely the helpful startup handler somebody would write to
+    improve this message. That is why this is a pin rather than a failure.
 
     **Asserting the unsafe outcome deliberately**, the same shape that
     `tests/providers/test_url_scrubbing.py` used for the truncated-label residual before
@@ -289,13 +294,18 @@ def test_pydantics_structured_errors_carry_the_whole_environment_and_ours_does_n
 
     rendered = str(caught.value)
     structured = str(caught.value.errors())
+    serialised = caught.value.json()
 
     # Ours: clean. Theirs: not. Both asserted, so the boundary between them is visible.
     assert SENTINEL_USERINFO not in rendered
-    assert SENTINEL_USERINFO in structured, (
-        "pydantic no longer echoes the full input in errors(); if that is now redacted, "
-        "the residual this test pins has closed and the warning above can go"
-    )
+    for form, name in ((structured, "errors()"), (serialised, "json()")):
+        assert SENTINEL_USERINFO in form, (
+            f"pydantic no longer echoes the full input in {name}; if that is now "
+            "redacted, the residual this test pins has closed and the warning above "
+            "can go -- along with this assertion"
+        )
+    # `json()` matters on its own: it is what a structured logger reaches for, and it is
+    # one `logger.error(exc.json())` away from being the whole environment on stdout.
     # And the reason our own message contributes is clean regardless of the wrapper.
     reason = provider_url_violation(leaky)
     assert reason is not None
