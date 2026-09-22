@@ -526,8 +526,14 @@ incident.
   mutating. The commit was verified clean by grepping the committed blob for every mutation
   string; that was luck. The reviewer had independently flagged a squashed-in mutation as
   the worst possible outcome of this change.
-- **An accusation before an investigation.** The mutation was attributed to the tester. It
-  came from the tech lead's own harness. The tester found the true cause.
+- **An accusation before an investigation, twice, against the same agent.** The live-tree
+  mutation was attributed to the tester; it came from the tech lead's own harness, and the
+  tester found the true cause. Separately, a commit containing another agent's working tree
+  was attributed to the tester; the tech lead had made it. Both times the agent holding the
+  least state was blamed for a shared-state incident caused by the one holding the most.
+  The tester disproved both with commands rather than with assertions, which is the only
+  reason the record is right. **In a shared worktree, "who did this" is a question to
+  answer with `git log` and a file listing before it is put to anybody.**
 - **A harness that matches nothing reports a perfect score.** Several files carry CRLF,
   and patterns written with bare newlines silently matched nothing. Caught only because the
   harness prints `SKIPPED` instead of counting a non-match as a kill.
