@@ -18,13 +18,20 @@ is deliberate: a balance snapshot that outlives the provider instance -- a row i
 a value in a queue -- has to be interpretable without going back to ask which provider
 produced it.
 
-**There is no `pending` or `unconfirmed` field.** Of the two target APIs, only Esplora
-exposes mempool figures (`mempool_stats` beside `chain_stats`); the Kaspa REST balance
-endpoint exposes nothing of the kind. A field that one provider always sets to zero makes
-zero ambiguous between "nothing is pending" and "this chain cannot tell you", and the
-second is not a balance -- it is the absence of one. If #7 wants mempool visibility it adds
-the field *and* a way to say "not answerable here", which is a decision with a caller
-behind it rather than one made in advance.
+**`pending` is `int | None`, and the `None` is the whole reason the field exists.** #6
+refused a `pending` field and named the condition on which it would be reasonable: the
+field *plus* a way to say "not answerable here", so that zero is never ambiguous between
+"nothing is pending" and "this chain cannot tell you". #7 meets that condition rather than
+overriding it. Of the two target APIs only Esplora exposes mempool figures
+(`mempool_stats` beside `chain_stats`); the Kaspa REST balance endpoint exposes nothing of
+the kind and its provider will leave the field `None` for every address, which is a
+statement about the chain rather than a balance of zero.
+
+**It is also signed, and that is not a detail.** A mempool delta is not a balance: an
+outgoing payment sitting in the mempool spends a confirmed output and funds nothing, so it
+reads negative, which is exactly right and exactly what a naive "balances cannot be
+negative" guard would reject. `align_balances` applies its negative refusal to `confirmed`
+and deliberately not to `pending`.
 
 ## The protocol is checked by `mypy`, never by `isinstance`
 
@@ -77,11 +84,19 @@ class AddressBalance:
     `align_balances`, which refuses a negative count with a `ProviderResponseError`; a
     second refusal in this constructor would give one condition two exception types and
     leave a caller guessing which to catch.
+
+    `pending` is the net mempool delta in the same base units, **signed**, and `None`
+    means this chain cannot answer the question rather than that the answer is zero. It
+    defaults to `None` so that a provider which says nothing about the mempool says
+    nothing rather than claiming a zero. Spendable is `confirmed + pending`; nothing here
+    computes it, because a caller that has to reach for `pending` has also had to decide
+    what to do about its `None`.
     """
 
     address: str
     confirmed: int
     decimals: int
+    pending: int | None = None
 
     def amount(self) -> Decimal:
         """The balance as a decimal amount, by the domain's conversion rule.
@@ -224,6 +239,7 @@ def align_balances(
     found: Mapping[str, int],
     *,
     decimals: int,
+    pending: Mapping[str, int] | None = None,
 ) -> tuple[AddressBalance, ...]:
     """Turn what a provider parsed out of a response into the answer the contract promises.
 
@@ -247,6 +263,21 @@ def align_balances(
     a `ValueError` rather than a `ProviderResponseError` because the caller made that
     mistake, not the vendor, and the two deserve different blame.
 
+    **`pending` does not zero-fill, and the asymmetry with `found` is the point.** A
+    requested address missing from `found` is a zero, because an address with no history
+    holds nothing and that is a fact about the chain. A requested address missing from
+    `pending` is `None`, because the chain said nothing about its mempool and "nothing
+    pending" is not the same statement. Zero-filling it would collapse exactly the two
+    meanings the field was added to keep apart. Omitting the argument entirely is the
+    short spelling of "this chain cannot answer at all", and every result then carries
+    `pending=None`.
+
+    The other two rules do apply to `pending`: an address nobody requested is refused
+    there as well, and `_require_base_units` guards it too, because a batch that
+    correlates wrongly correlates wrongly in both halves and a vendor that renders one sum
+    as a float renders both that way. **The negative refusal does not apply to it**, and
+    must not: a spend sitting in the mempool is a negative delta and is the normal case.
+
     No message here names an address. The count is enough to act on, and the addresses are
     the owner's holdings.
 
@@ -254,15 +285,18 @@ def align_balances(
         requested: the addresses, canonical, in the order the answer must come back in.
         found: what the provider parsed, keyed by the same canonical form.
         decimals: the chain's exponent, copied onto every balance.
+        pending: the net mempool deltas the provider parsed, signed, keyed the same way.
+            `None`, or an address absent from it, means "this chain cannot tell you".
 
     Returns:
         One `AddressBalance` per entry in `requested`, in that order.
 
     Raises:
         ValueError: `requested` contains the same address more than once.
-        ProviderResponseError: `found` has an address nobody asked about, a negative
-            base-unit count, or a count that is not a whole number of base units -- a
-            `float` from a vendor that renders its balances with a decimal point, say.
+        ProviderResponseError: `found` or `pending` has an address nobody asked about, a
+            count that is not a whole number of base units -- a `float` from a vendor that
+            renders its balances with a decimal point, say -- or, for `found` alone, a
+            negative base-unit count.
     """
     asked = set(requested)
     if len(asked) != len(requested):
@@ -272,13 +306,9 @@ def align_balances(
         )
         raise ValueError(message)
 
-    unexpected = len(set(found) - asked)
-    if unexpected:
-        message = (
-            f"The response carried {unexpected} address(es) that were not requested, "
-            "so it cannot be matched to the request."
-        )
-        raise ProviderResponseError(message)
+    _refuse_unrequested(found, asked)
+    if pending is not None:
+        _refuse_unrequested(pending, asked)
 
     balances: list[AddressBalance] = []
     for address in requested:
@@ -286,8 +316,54 @@ def align_balances(
         if units < 0:
             message = f"The response carried a negative base-unit count of {units}."
             raise ProviderResponseError(message)
-        balances.append(AddressBalance(address=address, confirmed=units, decimals=decimals))
+        balances.append(
+            AddressBalance(
+                address=address,
+                confirmed=units,
+                decimals=decimals,
+                pending=_pending_units(pending, address),
+            )
+        )
     return tuple(balances)
+
+
+def _refuse_unrequested(reported: Mapping[str, int], asked: set[str]) -> None:
+    """Refuse a mapping that answers about an address nobody requested.
+
+    A batch API answering about something we did not ask about is a correlation bug -- a
+    paging mistake, an off-by-one in the request, a vendor echoing a cached batch -- and
+    silently dropping the entry would hide it behind a total that still looks plausible.
+
+    One function rather than the check written twice, because `found` and `pending` come
+    out of the same response and a check applied to only one of them is a check that
+    passes for half of a correlation failure.
+
+    Raises:
+        ProviderResponseError: at least one key was not requested. The message says how
+            many; which ones is the owner's holdings.
+    """
+    unexpected = len(set(reported) - asked)
+    if unexpected:
+        message = (
+            f"The response carried {unexpected} address(es) that were not requested, "
+            "so it cannot be matched to the request."
+        )
+        raise ProviderResponseError(message)
+
+
+def _pending_units(pending: Mapping[str, int] | None, address: str) -> int | None:
+    """This address's mempool delta, or `None` for "the chain did not say".
+
+    Two ways to arrive at `None` and they mean the same thing to a caller: the provider
+    passed no mapping at all, or it passed one that has no entry for this address --
+    which is what an Esplora response carrying no `mempool_stats` produces.
+    """
+    if pending is None:
+        return None
+    reported = pending.get(address)
+    if reported is None:
+        return None
+    return _require_base_units(reported)
 
 
 def _require_base_units(value: object) -> int:
