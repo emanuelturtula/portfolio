@@ -138,6 +138,12 @@ so a provider added without one is quiet rather than leaky.
 # connection -- it is a public API that accepts the connection and then stalls, which
 # would hold a sync open indefinitely. `read` is the generous one because a chain index
 # answering a batch legitimately takes longer than a handshake.
+#
+# A test pins `READ_TIMEOUT_MS > CONNECT_TIMEOUT_MS` -- the *relationship* the sentence
+# above claims -- rather than either number. All four are guesses awaiting a measurement,
+# so a measurement must be free to move them; what it must not do is quietly invert them,
+# because a read timeout at or below the connect timeout makes the generous one the
+# binding one and turns every slow batch into a timeout nobody ordered.
 CONNECT_TIMEOUT_MS: Final = 5_000
 READ_TIMEOUT_MS: Final = 20_000
 WRITE_TIMEOUT_MS: Final = 10_000

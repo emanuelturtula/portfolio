@@ -183,6 +183,13 @@ Three further rules, none of them optional:
   which is to say the address.
 - **Never log a URL you built yourself.** The transport is the only thing enforcing the log
   contract, and a provider with a log call of its own bypasses all of it.
+- **Never turn the `httpx` logger back up.** `configure_logging` holds `httpx` and
+  `httpcore` at WARNING, because `httpx.AsyncClient.send` logs every request at INFO with
+  the full URL -- path and query string -- through the standard library, above the
+  transport and outside structlog's redaction chain. Raising it to debug one provider call
+  puts every wallet address and every exchange signature on stdout, which is exactly when
+  someone is tailing the log. Use the transport's own `provider_request` line, or add a
+  temporary field to it; both are address-safe by construction.
 - **`ProviderHealth.detail` is for an operator**, so it carries "connect timeout" or
   "HTTP 503" and never an address, a URL or a body.
 
