@@ -90,6 +90,27 @@ The second row is the one worth internalising. A batch API answering about somet
 not ask about is a correlation bug, and dropping the entry silently would hide it behind a
 total that still looks plausible.
 
+If your chain can see its mempool, pass the deltas as well:
+
+```python
+align_balances(requested, found, decimals=8, pending=pending)
+```
+
+**`pending` is signed, and a missing entry is `None` rather than zero.** Those are two
+separate decisions and both matter:
+
+- Signed, because a mempool delta is not a balance. An outgoing payment spends a confirmed
+  output and funds nothing, so it reads negative, and a "balances cannot be negative" guard
+  applied here would reject the normal case. The negative refusal is on `confirmed` only.
+- `None` rather than zero, because "nothing is pending" and "this chain cannot tell you"
+  are different statements and only one of them is a balance. Omit the argument entirely if
+  your chain has no mempool endpoint; leave an address out of the mapping if a particular
+  response carried no figures. Both arrive as `pending=None`.
+
+The unrequested-address refusal and the whole-number guard apply to `pending` too: a
+response that correlates wrongly correlates wrongly in both halves, and a vendor that
+renders one sum with a decimal point renders both that way.
+
 **Balances are integer base units, never `Decimal` and never `float`.** Satoshis, sompi.
 `AddressBalance.amount()` converts on demand through `domain.money.from_base_units`, which
 is the only conversion rule in the system. `float` is banned in `providers/` and an AST
@@ -142,7 +163,7 @@ out of `services/`:
 
 ```python
 try:
-    response = await self._client.get(url, extensions={"endpoint": "address_balance"})
+    response = await self._client.get(url, extensions={ENDPOINT_EXTENSION: ADDRESS_BALANCE})
 except httpx.TransportError as error:
     # Nobody answered. Transient by assumption: keep the last known balance.
     raise ProviderUnavailableError("the chain did not answer") from error
@@ -189,16 +210,32 @@ in a diff, which is the house rule for making something less safe.
 
 ## Logging: label the endpoint, never the path
 
-Set an endpoint label on every request:
+Set an endpoint label on every request, and take it from `providers/http.py` rather than
+writing the string at the call site:
 
 ```python
-response = await self._client.get(url, extensions={"endpoint": "address_balance"})
+from portfolio.providers.http import ADDRESS_BALANCE, ENDPOINT_EXTENSION
+
+response = await self._client.get(url, extensions={ENDPOINT_EXTENSION: ADDRESS_BALANCE})
 ```
 
 The transport logs `"{scheme}://{host}/{label}"` and **never the path**. Both current
 vendors put the address in the path, so a log line built from the URL would disclose
-exactly what the wallet registry refuses to disclose. A request with no label logs
-`"<unlabelled>"`: the default says nothing, and saying more about an endpoint is an opt-in.
+exactly what the wallet registry refuses to disclose.
+
+**A label reaches the log only if it is a member of `ENDPOINT_LABELS`.** Anything else --
+including a perfectly well-shaped string -- renders `"<unlabelled>"`. That is the completion
+of a residual #6 recorded and #7 closed: the gate used to be a *pattern*, and a truncated
+address is lower-case, alphanumeric and under 32 characters, so it matched the pattern and
+reached the log. Membership in a frozen set cannot be satisfied by accident.
+
+The set this release ships is exactly two: `address_balance`, for a balance read, and
+`block_tip_height`, for the tip-height call a `health()` makes.
+
+So a new endpoint is two lines, not one: the constant, and its name in `ENDPOINT_LABELS`.
+The same shape as `PUBLIC_API_PATHS` in rule 8 -- the default says nothing, and saying more
+about an endpoint is a visible edit to a named constant. The label must still match
+`ENDPOINT_LABEL`'s pattern, which a test asserts over the set's contents.
 
 `strip_query(url)` exists separately and removes the query string, the fragment and any
 userinfo. It is the rule `CLAUDE.md` states, and it is what a future **exchange** provider
@@ -232,39 +269,65 @@ use testnet addresses only -- `tb1`, `bcrt1`, `kaspatest:`, `tpub` -- and they l
   always a field. Esplora's confirmed balance is a derivation,
   `chain_stats.funded_txo_sum - chain_stats.spent_txo_sum`; Kaspa's REST balance endpoint
   returns a single figure.
-- **Whether mempool or unconfirmed value is even expressible.** `AddressBalance` has no
-  `pending` field, and that is the reason: Esplora exposes `mempool_stats`, the Kaspa REST
-  balance endpoint exposes nothing of the kind. A shared field would read zero on one chain
-  for two different reasons -- "nothing is pending" and "this chain cannot tell you" -- and
-  the second is not a balance. Adding the field means also adding a way to say "not
-  answerable here".
+- **Whether mempool or unconfirmed value is even expressible.** `AddressBalance.pending` is
+  `int | None` and the `None` is the answer for a chain that cannot see its mempool -- which
+  is the Kaspa REST balance endpoint. Do not report zero to mean "I could not tell": zero is
+  a balance and the absence of one is not.
+- **Which network an address is on, if the vendor serves one network per instance.** Esplora
+  does. That question belongs in `domain/` beside the codec -- `bitcoin_network_of` is the
+  Bitcoin one -- and the provider refuses a wrong-network address offline, before it builds
+  a URL. The alternative is trusting an undocumented error response, and the failure it
+  hides is the expensive one: a balance read from the wrong chain is a number, not an error.
 - **What the vendor's rate limit actually is.** See below: for both current vendors, nobody
-  knows.
+  knows, and one of them enforces the limit it does not publish with a ban.
 
 ## Vendor facts, and the line between confirmed and assumed
 
 The next person cannot tell a verified endpoint from a plausible one unless the difference
 is written down, and will trust both equally.
 
-### Confirmed against the published documentation
+### Confirmed against the published documentation, read on 2026-09-22
 
 | | Bitcoin (Esplora) | Kaspa (kaspa-rest-server) |
 |---|---|---|
 | single address | `GET /address/:address` | `GET /addresses/{address}/balance` |
 | batch | none documented | `POST /addresses/balances`, body `{"addresses": [...]}` |
-| response | `chain_stats` / `mempool_stats`, each with `funded_txo_sum` and `spent_txo_sum` | `[{"address": ..., "balance": ...}]` |
+| response | `chain_stats` / `mempool_stats`, each with `tx_count`, `funded_txo_count`, `funded_txo_sum`, `spent_txo_count`, `spent_txo_sum` | `[{"address": ..., "balance": ...}]` |
 | units | satoshis | sompi, 1 KAS = 1e8 |
+| health | `GET /blocks/tip/height`, "the height of the last block", a plain integer body | not checked |
+| public instances | `https://blockstream.info/api` (also `/testnet/api`, `/signet/api`) and `https://mempool.space/api` (also `/testnet/api`) | not checked |
+
+The Esplora rows are Blockstream's published `API.md` and mempool.space's REST
+documentation; the two implement the same interface, which is what makes one a usable
+fallback for the other.
 
 Two consequences the design already reflects. The address is in the path on both, which is
 why `request_target` logs a label instead of a path -- necessary, not defensive. And Esplora
 documents no batch endpoint while Kaspa documents one, which is why
 `max_addresses_per_call` is an integer.
 
+### The rate limit is unpublished, and one vendor enforces it with a ban
+
+Verified on 2026-09-22 and stated here because it is the risk that outlives a bad sync:
+
+- **mempool.space's REST documentation states that exceeding its limits returns HTTP 429,
+  and that repeatedly exceeding them may result in a ban. It publishes no numbers at all**,
+  and points at enterprise sponsorship for higher limits.
+- **Blockstream's `API.md` documents no rate limit either way.**
+
+So the number in `DEFAULT_MIN_HOST_INTERVAL_MS` is not a measurement. It is one request per
+second, chosen from the shape of that warning rather than from evidence, and the first real
+evidence will be a 429 in a production log. A ban from a free public index is not fixed by
+retrying and is not fixed by waiting; it is the failure mode the conservative floor is
+buying insurance against.
+
 ### Not confirmed, because neither vendor documents it
 
-- **Any rate limit.** Esplora's documentation mentions none and points at self-hosting
-  instead. That is a reason to run our own limiter -- there is no server-side contract to
-  lean on -- rather than a reason to skip one.
+- **What an instance answers for an address it considers invalid.** Neither documents an
+  error body, or even a status, for that case. **Every status-to-error mapping in a provider
+  must therefore be written against the status code alone** -- that is the part both vendors
+  do have to get right -- and a check that can be made offline should be made offline rather
+  than inferred from an undocumented refusal.
 - **Any `Retry-After` behaviour.** The transport honours the header if it arrives, in both
   RFC 9110 forms, and clamps it to `RetryPolicy.max_backoff_ms`. Whether either vendor ever
   sends one is unknown.
@@ -272,6 +335,25 @@ documents no batch endpoint while Kaspa documents one, which is why
   say how long a list.
 - **Pagination and retention.** Neither matters for a balance read. Both will matter for
   transaction history, and neither has been checked.
+- **That `mempool_stats` is always present.** The Bitcoin provider reads its absence as
+  `pending=None` rather than as a zero, which is the safe reading of a field the vendor
+  never promised.
+
+### A residual the address cannot close
+
+An Esplora instance serves exactly one network, and `PORTFOLIO_BITCOIN_NETWORK` says which
+one this deployment reads. The provider refuses an address from another network offline. Two
+gaps remain, and neither is detectable from the address:
+
+- **`tb1` is testnet3, testnet4 and signet alike.** An operator pointing the base URL at
+  signet while holding testnet4 addresses gets confident, wrong answers.
+- **A legacy base58 address on regtest is indistinguishable from testnet**, because Bitcoin
+  Core gives both the same version bytes, `0x6F` and `0xC4`. `bitcoin_network_of` answers
+  `TESTNET` for it, so a regtest-configured provider refuses it; `bcrt1` is the spelling
+  that reads as regtest.
+
+The first is a wrong number and the second is a refusal, which is the direction this is
+allowed to be wrong in.
 
 The defaults below are conservative guesses, chosen so that being wrong costs seconds per
 sync rather than getting us refused by a free public index. They are a policy object and a
@@ -280,7 +362,7 @@ measurement is a change to a value.
 
 | Setting | Default | Basis |
 |---|---|---|
-| `DEFAULT_MIN_HOST_INTERVAL_MS` | 250 | guess: 4 requests/second to one host |
+| `DEFAULT_MIN_HOST_INTERVAL_MS` | 1000 | guess: 1 request/second to one host, from mempool.space's unpublished limit and its ban warning |
 | `RetryPolicy.max_attempts` | 3 | guess |
 | `RetryPolicy.base_backoff_ms` | 250 | guess |
 | `RetryPolicy.max_backoff_ms` | 30_000 | guess; the ceiling exists for a server that asks for a day |
@@ -289,9 +371,24 @@ measurement is a change to a value.
 | `WRITE_TIMEOUT_MS` | 10_000 | guess |
 | `POOL_TIMEOUT_MS` | 5_000 | guess |
 
+Those are module constants, and promoting one to a setting is a change an operator's
+measurement should drive. The values an operator *does* set are these, and they are settings
+because the answer differs per deployment rather than because a number was uncertain:
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PORTFOLIO_BITCOIN_ESPLORA_URL` | `https://mempool.space/api` | the instance tried first |
+| `PORTFOLIO_BITCOIN_ESPLORA_FALLBACK_URL` | `https://blockstream.info/api` | tried when the first fails; blank means one instance only |
+| `PORTFOLIO_BITCOIN_NETWORK` | `mainnet` | `mainnet`, `testnet` or `regtest`; must match what the URLs above serve |
+
+Two scalars rather than one list, because pydantic-settings parses a `list[str]` out of the
+environment as JSON and a self-hoster clearing one URL should not have to learn a syntax.
+`docs/operations.md` carries the same table for whoever is editing `secrets.env`.
+
 Do not invent an endpoint path because a third-party wrapper uses it. Verify against the
 vendor's own documentation, and record here what you confirmed and what you assumed, in
-those words.
+those words, **with the date you read it** -- an unverified fact and a fact verified two
+years ago are different things, and only one of them says so.
 
 ## Not done yet, and who owns it
 
@@ -301,10 +398,19 @@ those words.
   says. Nothing calls a provider yet, so nothing builds one at startup; creating and
   closing it in `main.py` today would be an unused connection pool held open for the life
   of the application. **#10 owns building it in the lifespan and closing it there.**
-- **Settings.** Every number above is a module constant. Promoting one to a
-  `PORTFOLIO_PROVIDER_*` setting is a change an operator's measurement should drive, not a
-  guess made before anything has ever made a request.
+- **Tuning settings.** Every number in the first table above is still a module constant.
+  Promoting one to a `PORTFOLIO_PROVIDER_*` setting is a change an operator's measurement
+  should drive, not a guess made before anything has ever made a request.
+- **A per-address cache.** Not the provider's: an instance is built per `registry.create()`
+  call, so a cache on it would be dead on arrival, and a cached balance looks exactly like a
+  read one -- which is the failure `ProviderUnavailableError` exists to prevent. **#10 owns
+  it**, because the scheduler knows how often a read may repeat and the snapshot table is
+  where a previous reading already lives.
 - **The source-walk test over `providers/`.** `backend/tests/security/test_address_logging.py`
-  walks the wallet modules and fails on a log call that could carry an address. Extending it
-  to `providers/` belongs with the first provider that has a log call of its own (#7), not
-  with a package that has none.
+  walks the wallet modules and fails on a log call that could carry an address. The Bitcoin
+  provider has no log call at all -- deliberately, since the transport's contract is the only
+  one that is enforced rather than remembered -- so the walk is worth extending the day a
+  provider needs one.
+- **Network-aware address registration.** A wrong-network address is refused by the
+  *provider*, at read time, not when the wallet is registered. Making registration
+  network-aware changes #5's contract and needs a story for rows that already exist.

@@ -1,7 +1,8 @@
 # Operations
 
 Day-two tasks on the running instance: creating the account, tuning the password hash to the
-hardware, changing the password, and understanding when a session ends.
+hardware, changing the password, understanding when a session ends, and pointing the
+application at the chain index it reads balances from.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -195,6 +196,48 @@ network — see `docs/specs/003-single-user-password-login.md`.
 
 If you lock yourself out, wait 15 minutes or recreate the container.
 
+## 8. Where Bitcoin balances are read from
+
+Balances come from an [Esplora](https://github.com/Blockstream/esplora) instance. Two are
+configured, tried in order, and the defaults are the public ones — so this works with no
+configuration at all, and an operator running their own index changes two variables.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PORTFOLIO_BITCOIN_ESPLORA_URL` | `https://mempool.space/api` | The instance tried first. |
+| `PORTFOLIO_BITCOIN_ESPLORA_FALLBACK_URL` | `https://blockstream.info/api` | Tried when the first one fails. **Blank means one instance only.** |
+| `PORTFOLIO_BITCOIN_NETWORK` | `mainnet` | `mainnet`, `testnet` or `regtest`. Must match the network the URLs above serve. |
+
+Set them in `secrets.env` and recreate the container, as in section 1. No trailing slash is
+needed on either URL; one is removed if you leave it.
+
+**`PORTFOLIO_BITCOIN_NETWORK` is not cosmetic, and it is the one to get right.** An Esplora
+instance serves exactly one network, and neither vendor documents what theirs answers for an
+address from another one. So the application refuses an address that does not belong to the
+configured network, offline, before it makes a request — because the alternative failure is
+the expensive one: a balance read against the wrong chain comes back as a number rather than
+an error, and nothing downstream can tell it from a correct one. If you point the URLs at a
+testnet instance, set this to `testnet` in the same edit.
+
+Two limits of that check, both of which the address itself cannot resolve:
+
+- testnet3, testnet4 and signet are one network to this application. Pointing at a signet
+  instance while holding testnet4 addresses produces confident, wrong answers.
+- a legacy address (one starting `m`, `n` or `2`) on regtest looks exactly like a testnet
+  one, so with `PORTFOLIO_BITCOIN_NETWORK=regtest` it is refused. Use a `bcrt1` address.
+
+**Failover, and why the reads are slow on purpose.** A connection failure, a 5xx or a 429
+moves to the fallback instance and the rest of that read continues there; any other refusal
+stops, because the second instance runs the same software and would refuse it too. Requests
+to one host are spaced by at least one second: mempool.space's documentation says that
+exceeding its rate limit returns 429 and that repeatedly exceeding it may result in a ban,
+and it publishes no numbers, so the interval is deliberately cautious. A ban would outlast
+the sync that caused it. If a sync of many addresses feels slow, that is this, and the fix
+is your own Esplora instance rather than a shorter interval.
+
+Neither URL is a credential, and neither is logged: a provider request appears in the log as
+its host and an endpoint label, never a path — the address is in the path on this API.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -208,3 +251,6 @@ If you lock yourself out, wait 15 minutes or recreate the container.
 | Logged out roughly weekly | Working as intended: the 7-day idle window |
 | Logged out roughly monthly despite daily use | Working as intended: the 30-day absolute ceiling, which activity does not extend |
 | Edited `secrets.env`, nothing changed | `env_file` is read at container creation — recreate, do not restart |
+| A Bitcoin wallet reports "the address is on a different network" | `PORTFOLIO_BITCOIN_NETWORK` does not match the address — section 8 |
+| Bitcoin balances stop updating and the log shows 429 | The public index is throttling us. Lengthen nothing by hand; run your own Esplora — section 8 |
+| Reading many Bitcoin addresses takes a minute | Working as intended: one request per second per host — section 8 |
