@@ -27,7 +27,7 @@ it.
 - A pure, offline network check in `domain/`: which Bitcoin network an address belongs to,
   so a provider configured for one network refuses an address from another before it builds
   a URL out of it.
-- Four settings: the primary base URL, the fallback base URL, the network, and nothing
+- Three settings: the primary base URL, the fallback base URL, the network, and nothing
   else.
 - The per-host rate floor raised from 250 ms to 1000 ms, and `docs/providers.md` updated
   with what was confirmed against the live documentation on 2026-09-22 and what was not.
@@ -62,9 +62,9 @@ it.
 | `providers/base.py` | `AddressBalance.pending`, `align_balances(..., pending=...)` |
 | `providers/http.py` | `ENDPOINT_LABELS` allowlist; `DEFAULT_MIN_HOST_INTERVAL_MS` 250 to 1000 |
 | `domain/addresses.py` | `BitcoinNetwork`, `bitcoin_network_of`, `AddressRejection.WRONG_NETWORK` |
-| `config.py` | four settings |
+| `config.py` | three settings |
 | `docs/providers.md` | vendor facts confirmed on 2026-09-22; the label allowlist |
-| `docs/operations.md` | the four settings, in the existing table style |
+| `docs/operations.md` | the three settings, in the existing table style |
 
 ### Two instances, tried in order, and what counts as a reason to move on
 

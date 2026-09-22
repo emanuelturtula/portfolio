@@ -182,6 +182,17 @@ concurrency = ["thread", "greenlet"]
 # The three misses are still the same three and still cannot be taken back, so they are
 # 0.17 points now rather than 0.30. `providers/` contributes none of them: the package
 # added by #6 is fully covered, including both refusal branches that a review added late.
+#
+# **99.5 held at the Bitcoin provider (#7)**, measured at 99.84% over 2157 statements and
+# 376 branches. Not an oversight, and not a ratchet skipped out of convenience: the
+# standard this comment set at #3 is nine units of headroom, and 0.34 points of 2533 units
+# is about eight and a half. Raising the floor to 99.7 would leave three and a half, which
+# is the two-or-three situation the paragraph above rejects by name -- a floor that fails
+# on a change that has nothing to do with testing is one the next person lowers. The floor
+# moves again when the base grows enough to pay for it, which is the same argument that
+# moved it at #6.
+#
+# The three misses are 0.16 points now. `providers/chains/bitcoin.py` contributes none.
 fail_under = 99.5
 show_missing = true
 skip_covered = true
