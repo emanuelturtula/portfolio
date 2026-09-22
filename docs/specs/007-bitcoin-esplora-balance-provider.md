@@ -1,7 +1,7 @@
 # 007 — Bitcoin balance provider on the Esplora API
 
 Issue: #7
-Status: draft
+Status: done
 
 ## Problem
 
@@ -429,3 +429,80 @@ measurement below 99.5 is missing tests, not a smaller number.
 - **Raising the shared rate floor slows every provider**, including one that has not been
   written. If #8 finds it too slow for a batch endpoint, the answer is the per-host override
   table this spec rejected, not a lower shared floor.
+
+## What this plan got wrong
+
+### The failover rule protected a case that cannot happen and broke the one that will
+
+The spec stopped the whole call on any 4xx, and argued: *the second instance runs the same
+software against the same chain, so it produces the same refusal.* That sentence is true of
+a refusal scoped to the **request** -- a 400 on a malformed address -- and false of every
+refusal scoped to the **instance**. The realistic refusals are all the second kind: a ban,
+whose status neither vendor documents and which is likelier spelled 403 than 429; a
+self-hosted node behind an auth proxy returning 401, which `providers/errors.py` names by
+itself; a base URL missing its `/api`, returning 404 forever.
+
+The part that makes it worth writing down is the symmetry of the mistake. This provider
+validates every address offline before it builds a URL, **so the request-scoped 400 the
+rule was written to handle cannot occur at all.** The rule guarded an impossible case at
+the cost of the one case the two-instance design exists for, in the exact shape where the
+fallback was healthy, configured, and never asked.
+
+Worth carrying: when a design says two parties will answer alike, sort the failures into
+those scoped to the *question* and those scoped to the *party being asked*. Only the first
+kind justifies not asking the second party. And when failing over hides a misconfiguration,
+name where it surfaces instead -- here, `health()` probes each instance in turn, which is
+what keeps moving on from a 404 honest rather than merely convenient.
+
+### A library's exception hierarchy is not the shape of its taxonomy
+
+The provider catches `httpx.TransportError` and the spec called that the boundary where
+`httpx` stops. It is not: `httpx.InvalidURL` inherits from `Exception` directly, so a
+malformed base URL escaped `fetch_balances` as a raw `httpx` exception -- into a caller
+that `import-linter` forbids from importing `httpx` at all.
+
+Two lessons, and the second is the larger one. A hierarchy nobody has read is a guess that
+reads like a fact; `issubclass` takes one line and settles it. And the fix was not a wider
+`except`: it was refusing the configuration at startup, which is where every other unusable
+setting in `config.py` is already refused. A wider `except` would have turned an operator's
+typo into a runtime error on every sync forever; the startup refusal turns it into a
+container that does not start, with a message naming the variable.
+
+### Criterion 5 was tested against the obvious malformed body, not the dangerous one
+
+"Malformed JSON raises a typed schema error rather than propagating a parse error" was met
+for a body that is not JSON, and not met for two bodies that are: a `funded_txo_sum` of
+5000 digits raises `ValueError` from CPython's 4300-digit integer limit, and 5000 nested
+arrays raise `RecursionError`. Both escaped the parser untyped, and `parse_tip_height`
+carried the same hole -- which means `health()`, documented as never raising, raised.
+
+The catch clause had been written from the exception the documentation headlines rather
+than from what the callee can actually raise. For a parser at a trust boundary, enumerate
+the callee's failures; a vendor that is broken or hostile sends the body nobody pictured,
+which is the only kind this boundary exists for.
+
+### Thirty-seven planned tests and not one asked what the exception was chained to
+
+The mis-blamed cause -- `ProviderRateLimitedError` chained to a `ConnectError` from the
+*other* instance -- survives every assertion the test plan named, because all of them
+assert the exception's type. An operator does not read the type; they read the traceback,
+and this one sent them after the wrong host.
+
+`__cause__` is part of the answer, and nothing in the plan pinned it. The same gap almost
+certainly exists elsewhere in this codebase.
+
+### The fix to the second item opened a question bigger than this issue
+
+Covering the new startup refusal turned up that `pydantic.ValidationError.errors()` and
+`.json()` carry every `PORTFOLIO_*` variable in full, `PORTFOLIO_BOOTSTRAP_PASSWORD`
+included, because the raw environment string sits in the error's `input` dict *before*
+pydantic coerces it into the `SecretStr` that would have masked it. **`SecretStr` is not
+the protection anyone would assume at that boundary.**
+
+Not reachable today -- nothing in `src/` calls `.errors()` on a settings error, `str(exc)`
+elides the input, and `api/errors.py` projects entries down to `loc`, `msg` and `type`
+before rendering -- and four of the five raises that can produce it predate this issue. The
+hazard is a future caller: a `logger.exception`, a debug dump, or precisely the helpful
+startup handler somebody would write to improve this. A test asserts the unsafe outcome
+deliberately, so it fails the day anything changes, and the general fix is filed as its own
+issue.
