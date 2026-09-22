@@ -238,6 +238,18 @@ is your own Esplora instance rather than a shorter interval.
 Neither URL is a credential, and neither is logged: a provider request appears in the log as
 its host and an endpoint label, never a path — the address is in the path on this API.
 
+**What the defaults disclose, stated plainly.** This application goes to some trouble to
+keep your addresses out of its own logs and out of this repository. It cannot do anything
+about the other end: reading a balance means asking somebody who has the chain, and with the
+defaults above that somebody is mempool.space and Blockstream. Every address you register is
+sent to one of them, over TLS, on every sync, and they can see which addresses arrive
+together from one IP — which is the set of addresses you own.
+
+That is the price of not running an index, and it is the usual one; a block explorer in a
+browser tab discloses the same thing. If it is not a price you want to pay, run your own
+[Esplora](https://github.com/Blockstream/esplora) and point both variables at it. The
+application does not care which instance answers, and the fallback URL may be left blank.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
