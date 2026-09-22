@@ -1,9 +1,10 @@
 """Criterion 6: every module in `providers/chains/` is wired in -- and the scan is not vacuous.
 
-**This is the criterion that can pass by being empty.** `providers/chains/` ships with no
-provider in it, so "every module in the package is registered" is satisfied by a directory
-containing nothing, forever, without a single assertion ever looking at a real module. That
-is the exact failure #5 catalogued: a verifier whose subject is missing reports success.
+**This is the criterion that can pass by being empty.** `providers/chains/` shipped with no
+provider in it on #6, so "every module in the package is registered" was satisfied by a
+directory containing nothing, forever, without a single assertion ever looking at a real
+module. That is the exact failure #5 catalogued: a verifier whose subject is missing
+reports success.
 
 So the scan is built as a pure function over a directory path, and it is driven three ways:
 
@@ -11,10 +12,13 @@ So the scan is built as a pure function over a directory path, and it is driven 
 2. against a `tmp_path` holding one that **is**, asserting it is not;
 3. against the real `providers/chains/` directory.
 
-The third is paired with `EXPECTED_PROVIDER_MODULES`, a pinned literal that is
-`frozenset()` today. The empty state is therefore *asserted* rather than assumed, and #7 has
-to come here and change it -- which is the moment the assertion stops being vacuous and
-starts being the thing that catches a file added without its import line.
+The third is paired with `EXPECTED_PROVIDER_MODULES`, a pinned literal. It was
+`frozenset()` until #7, and the empty state was *asserted* rather than assumed precisely so
+that #7 had to come here and change it. It has: the set is `{"bitcoin"}` now, the directory
+is no longer empty, and the guard that demanded emptiness is **inverted rather than
+deleted** -- it demands the opposite now, so a pinned set that goes empty again fails
+instead of quietly passing against a package with nothing in it. Same sentence, pointing
+the other way. See `test_the_expected_provider_modules_match_the_pinned_literal`.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 
+from portfolio.domain.chains import ChainKey
 from portfolio.providers.registry import CHAIN_PROVIDERS
 
 if TYPE_CHECKING:
@@ -35,17 +40,16 @@ CHAINS_DIR: Final = REPO_ROOT / "backend" / "src" / "portfolio" / "providers" / 
 
 #: Every provider module `providers/chains/` is expected to hold, as a literal.
 #:
-#: `frozenset()` today, and that is the assertion rather than an oversight: #7 adds
-#: `bitcoin` here and #8 adds `kaspa`. Deriving this from the directory listing would make
-#: it agree with whatever it found, which is the defect `PURE_PACKAGES` had in
+#: `{"bitcoin"}` since #7; #8 adds `kaspa`. Deriving this from the directory listing would
+#: make it agree with whatever it found, which is the defect `PURE_PACKAGES` had in
 #: `tests/security/test_no_float.py` -- a guard that shrinks along with its subject cannot
 #: fail.
-EXPECTED_PROVIDER_MODULES: Final[frozenset[str]] = frozenset()
+EXPECTED_PROVIDER_MODULES: Final[frozenset[str]] = frozenset({"bitcoin"})
 
 #: The chain keys expected to have a provider registered, as a literal, for the same
 #: reason. A module that lands and imports correctly but never calls the decorator is
 #: caught by this and by nothing else.
-EXPECTED_REGISTERED_KEYS: Final[tuple[str, ...]] = ()
+EXPECTED_REGISTERED_KEYS: Final[tuple[str, ...]] = ("bitcoin",)
 
 
 def chain_modules(package_dir: Path) -> set[str]:
@@ -231,16 +235,36 @@ def test_a_directory_that_is_not_a_package_is_not_a_provider(tmp_path: Path) -> 
 def test_the_expected_provider_modules_match_the_pinned_literal() -> None:
     """The scan is not vacuous: what is in the package is asserted against a literal.
 
-    Today both sides are empty, and stating that is the whole job. The moment #7 adds
-    `bitcoin.py`, this fails until somebody adds `"bitcoin"` here -- so the empty state
-    cannot drift into a populated one without a person looking at this file.
+    Until #7 the literal was `frozenset()` and the guard below asserted **emptiness**, so
+    that a provider landing without a person editing this file failed the build. The
+    package is no longer empty, so that guard would now be a lie -- and deleting it would
+    leave the pinned literal free to be edited into agreement with whatever the directory
+    happens to hold, which is the vacuity the whole file exists against.
+
+    The guard is therefore inverted rather than removed, and it is the same statement
+    pointing the other way. Emptiness must now **fail**: a pinned set that has gone empty
+    means either a provider module was deleted or this literal was edited down to match a
+    directory somebody had already emptied. A scan whose expectation is `frozenset()`
+    passes against a package with nothing in it, whatever the reason it got there.
+
+    The second half is what the first cannot say. Every expected module name has to be a
+    real file on disk under the name an import would use, so a literal that grew a typo --
+    `bitcion` -- fails here rather than silently excusing the module it was meant to pin.
     """
     assert CHAINS_DIR.is_dir(), f"{CHAINS_DIR} does not exist"
     assert chain_modules(CHAINS_DIR) == EXPECTED_PROVIDER_MODULES
-    assert not EXPECTED_PROVIDER_MODULES, (
-        "a provider module landed: add its name above, and add its chain key to "
-        "EXPECTED_REGISTERED_KEYS, so the registry assertion stays honest too"
+    assert EXPECTED_PROVIDER_MODULES, (
+        "the pinned set is empty again. Either a provider module was deleted, or this "
+        "literal was edited to agree with the directory -- and an empty expectation is "
+        "satisfied by an empty package, which is the vacuity this file exists against."
     )
+    on_disk = {
+        entry.stem if entry.is_file() else entry.name
+        for entry in CHAINS_DIR.iterdir()
+        if entry.name != "__pycache__"
+    }
+    missing = sorted(EXPECTED_PROVIDER_MODULES - on_disk)
+    assert missing == [], f"pinned provider modules that are not on disk: {missing}"
 
 
 def test_every_module_in_the_chains_package_is_registered() -> None:
@@ -272,6 +296,24 @@ def test_importing_the_package_registers_exactly_the_expected_chains() -> None:
 
     assert CHAIN_PROVIDERS.registered_keys() == EXPECTED_REGISTERED_KEYS
     assert len(CHAIN_PROVIDERS.registered_keys()) == len(EXPECTED_PROVIDER_MODULES)
+
+
+def test_every_pinned_key_is_a_chain_the_domain_actually_defines() -> None:
+    """A registered key that is not a `ChainKey` is a provider nothing can ever ask for.
+
+    `registry.create` is called with `wallets.chain_key`, which comes out of the database
+    as one of the domain's own values. A provider registered under `"btc"` would be
+    present, correct, fully tested and unreachable -- and the symptom is `UnknownChainError`
+    at the one call site, with the registry cheerfully listing a key nobody uses.
+
+    Stated as a literal comparison rather than a membership test so it also says the
+    pinned tuple above is not empty: `set() <= anything` is true.
+    """
+    known = {key.value for key in ChainKey}
+
+    assert set(EXPECTED_REGISTERED_KEYS) <= known
+    assert EXPECTED_REGISTERED_KEYS, "the pinned key tuple is empty, so it asserts nothing"
+    assert ChainKey.BITCOIN.value in EXPECTED_REGISTERED_KEYS
 
 
 def test_the_chains_package_documents_why_the_imports_are_explicit() -> None:

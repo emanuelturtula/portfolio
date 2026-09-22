@@ -262,11 +262,55 @@ async def test_a_zero_interval_is_a_limiter_that_never_waits() -> None:
     assert sleep.slept_ms == []
 
 
-def test_the_default_interval_is_a_stated_number_rather_than_an_accident() -> None:
-    """Pinned so that changing the pace of every provider is a visible line in a diff.
+def test_the_default_interval_is_the_documented_floor() -> None:
+    """One request per second, pinned as a literal, because it is what #7 raised it to.
 
-    It is a guess, not a measurement -- neither vendor documents a rate limit -- which is
-    the reason it should be hard to change quietly rather than easy.
+    mempool.space's documentation -- read on 2026-09-22 -- states that exceeding its
+    limits returns 429 and that repeatedly exceeding them can get the caller banned, and
+    it publishes no numbers. Being banned from a free public index is a failure that
+    outlives the sync that caused it, so the floor is the issue's own: 1000 ms, up from
+    the 250 ms #6 guessed at when there was no vendor to read.
+
+    The literal is the assertion. `DEFAULT_MIN_HOST_INTERVAL_MS == DEFAULT_MIN_HOST_INTERVAL_MS`
+    is true of any value at all, including the zero that would turn the limiter off for
+    every provider at once with nothing in any log to say so.
+
+    The value is shared, so Kaspa (#8) inherits it. That is deliberate and it is recorded
+    in the spec: if a batch endpoint finds it too slow, the answer is a per-host override
+    table, not a lower shared floor.
     """
-    assert DEFAULT_MIN_HOST_INTERVAL_MS == 250
+    assert DEFAULT_MIN_HOST_INTERVAL_MS == 1000
     assert isinstance(DEFAULT_MIN_HOST_INTERVAL_MS, int)
+    assert not isinstance(DEFAULT_MIN_HOST_INTERVAL_MS, bool)
+
+
+async def test_the_shipped_floor_is_the_one_a_provider_would_actually_be_paced_by() -> None:
+    """The #6 lesson: a test that injects a value can no longer observe that value's default.
+
+    Every other test in this file passes `min_interval_ms=INTERVAL_MS`, so the assertions
+    are exact without waiting on a wall clock. That discipline is right, and it is exactly
+    what leaves the shipped number unobserved -- which is how `RetryPolicy.max_attempts`
+    could have shipped as `1` with 1102 tests green.
+
+    `HostRateLimiter` has no default interval of its own -- `min_interval_ms` is required,
+    deliberately, so that "how fast may I call this host" is never a question somebody
+    forgets to answer. The shipped number reaches a request through `RetryingTransport`,
+    which builds `HostRateLimiter(min_interval_ms=DEFAULT_MIN_HOST_INTERVAL_MS, ...)` when
+    no limiter is passed. That wiring is driven over a real request in
+    `tests/providers/test_http.py::test_a_client_built_with_no_limiter_paces_itself_at_the_shipped_interval`,
+    whose clock is the real monotonic one and whose assertion is therefore a bound rather
+    than an equality.
+
+    **This test supplies the exactness that bound cannot.** Given the shipped constant and
+    nothing else, the limiter's spacing is asserted to the millisecond -- so the pair is a
+    literal pin on the number, a behavioural check that the number reaches a request, and
+    this, which says what the number *does*. A zero would fail all three.
+    """
+    clock = FakeClock()
+    sleep = RecordingSleep()
+    limiter = limiter_with(clock, sleep, interval_ms=DEFAULT_MIN_HOST_INTERVAL_MS)
+
+    for _ in range(3):
+        await limiter.acquire(TEST_HOST)
+
+    assert sleep.slept_ms == [1000, 2000]

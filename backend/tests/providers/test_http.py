@@ -24,6 +24,7 @@ from portfolio.providers.http import (
     CONNECT_TIMEOUT_MS,
     DEFAULT_MIN_HOST_INTERVAL_MS,
     DEFAULT_RETRY_POLICY,
+    DEFAULT_TIMEOUT,
     POOL_TIMEOUT_MS,
     READ_TIMEOUT_MS,
     RETRYABLE_STATUSES,
@@ -33,6 +34,7 @@ from portfolio.providers.http import (
     RetryPolicy,
     build_http_client,
     sleep_ms,
+    utc_now,
 )
 from tests.providers.harness import (
     MILLISECONDS_PER_SECOND,
@@ -670,13 +672,23 @@ def test_the_shipped_retry_policy_is_pinned_field_by_field() -> None:
     assert DEFAULT_RETRY_POLICY.max_backoff_ms == 30_000
     assert DEFAULT_RETRY_POLICY.retry_methods == frozenset({"GET", "HEAD"})
     assert DEFAULT_RETRY_POLICY.retry_statuses == RETRYABLE_STATUSES
-    assert DEFAULT_MIN_HOST_INTERVAL_MS == 250
+    # 1000 since #7, up from the 250 #6 guessed at with no vendor documentation to read.
+    # mempool.space states that exceeding its unpublished limits returns 429 and that
+    # doing so repeatedly may get the caller banned; one request per second is the issue's
+    # own floor. `test_the_default_interval_is_the_documented_floor`, in
+    # `tests/providers/test_rate_limiter.py`, carries the reasoning and the exact spacing
+    # this number produces.
+    assert DEFAULT_MIN_HOST_INTERVAL_MS == 1000
     # The factory's own defaults, so a test that passes the same values back in is not
     # quietly substituting something else for what production uses.
     factory = inspect.signature(build_http_client).parameters
     assert factory["policy"].default is DEFAULT_RETRY_POLICY
     assert factory["jitter"].default is secrets.randbelow
     assert factory["sleep"].default is sleep_ms
+    assert factory["timeout"].default is DEFAULT_TIMEOUT
+    assert factory["now"].default is utc_now
+    assert factory["transport"].default is None
+    assert factory["limiter"].default is None
 
 
 async def test_a_client_built_with_no_policy_at_all_still_retries() -> None:
