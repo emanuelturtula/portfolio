@@ -577,9 +577,20 @@ def parse_rate_limit(headers: httpx.Headers, *, cap_ms: int | None = None) -> Ra
     Two spellings are read: the draft's lower-case `ratelimit-limit`,
     `ratelimit-remaining`, `ratelimit-reset`, and the older `x-ratelimit-*` prefix.
     `httpx.Headers` matches case-insensitively, so those are two lookups per field rather
-    than four, and `X-RateLimit-Remaining` is found by the lower-case name. The draft
-    spelling is preferred: if any of its three fields is present, the `x-` trio is not
-    consulted, so a server sending both does not get its two answers interleaved.
+    than four, and `X-RateLimit-Remaining` is found by the lower-case name.
+
+    **The draft spelling is preferred, and the fallthrough is on usability rather than on
+    presence.** The `x-` trio is consulted only when not one of the three draft fields
+    yielded a usable value -- absent and unparseable alike, since `_rate_limit_value`
+    reports both as `None`. Two consequences, and the second is the one a reader would
+    guess wrong:
+
+    * a server sending both trios does not get its two answers interleaved, because one
+      usable draft field is enough to settle the whole hint;
+    * a server whose draft headers are *all* junk -- `RateLimit-Limit: unlimited` and
+      nothing else readable -- still gets its legacy trio read, rather than being reported
+      as having said nothing. That is the better outcome and it is why the condition tests
+      the parsed values rather than `in headers`.
 
     **Every value is clamped and every failure is ignored rather than raised**, for the
     reason `parse_retry_after` already gives at length: a malformed header is not a reason
