@@ -202,7 +202,8 @@ vendor". Its docstring says so, because the isolation is the guarantee.
 
 | Path | Holds |
 |---|---|
-| `providers/prices/base.py` | `PriceQuote`, `PriceSource` protocol, the pair registry |
+| `providers/prices/base.py` | `PriceQuote`, the `PriceSource` protocol, `sources_for`, `SUPPORTED_PAIRS` |
+| `providers/prices/registry.py` | `price_sources`. Separate from `base.py` because holding it there makes the package import itself in a circle |
 | `providers/prices/kraken.py` | one batched call for every pair |
 | `providers/prices/coinbase.py` | one call per pair; BTC only |
 | `providers/prices/kaspa.py` | KAS/USD only, currency assumed |

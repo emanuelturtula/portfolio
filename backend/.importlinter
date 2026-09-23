@@ -84,6 +84,13 @@ name = no request path reaches a price provider
 # keeps it honest is not its presence but the test that plants a violating module and asserts
 # this contract reports it -- the same shape as the `mypy` conformance check in
 # `tests/providers/test_protocol.py`.
+#
+# **The vacuity moved rather than closed.** `portfolio.providers.prices` now exists, so the
+# forbidden end is real -- but no router imports any price service yet, so the chain this
+# contract describes cannot exist at either end until #11 lands the valuation endpoint. What
+# the service split in #9 bought is that when that endpoint arrives, the contract will still
+# be able to fail: `services/prices.py` is provider-free, so a future "just refresh it if it
+# is stale" is a *new* edge rather than one that was always there.
 type = forbidden
 source_modules =
     portfolio.api.routers
