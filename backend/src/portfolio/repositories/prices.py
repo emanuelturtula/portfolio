@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
+from sqlalchemy.exc import StatementError
 
 from portfolio.db.models import AssetPrice
 from portfolio.domain.money import require_amount
@@ -128,13 +129,18 @@ class PriceRepository:
             quote_currency: `USD` or `EUR`; the `CHECK` on the column refuses anything else.
             amount: the price, exact.
             source: the name of the source that actually answered.
-            as_of: when the price was observed. Not a vendor quote time -- none supplies one.
+            as_of: our clock, and specifically the instant the refresh began. Not a vendor
+                quote time -- none supplies one. See `db.models.AssetPrice`.
             fetched_at: when this row was written.
 
         Raises:
             TypeError: `amount` is not a `Decimal` -- a `float` out of a vendor's JSON is
                 the case this exists for.
-            ValueError: `amount` is a NaN or an infinity, which is not an amount.
+            ValueError: `amount` is a NaN or an infinity, or is an amount the column
+                refuses -- too large for the digits before the point, or so fine that
+                rounding it to `PRICE_SCALE` places leaves nothing of it. The last two are
+                raised by `NumericText` during the flush and unwrapped by `_flush`, so
+                they arrive as themselves rather than inside a `StatementError`.
 
         Returns:
             The row, whether it was created or updated.
@@ -151,12 +157,55 @@ class PriceRepository:
                 fetched_at=fetched_at,
             )
             self._session.add(row)
-            await self._session.flush()
+            await self._flush()
             return row
 
         existing.amount = amount
         existing.source = source
         existing.as_of = as_of
         existing.fetched_at = fetched_at
-        await self._session.flush()
+        await self._flush()
         return existing
+
+    async def _flush(self) -> None:
+        """Flush, and never let a `sqlalchemy` exception out of this repository.
+
+        **A column type that refuses a value raises at *bind* time, inside `flush()`, and
+        SQLAlchemy wraps whatever it raised in a `StatementError`.** So `NumericText`'s two
+        careful refusals -- an amount too large for the digits in front of the point, and a
+        non-zero amount that rounds away to nothing -- reach a caller as
+        `sqlalchemy.exc.StatementError`, carrying the `INSERT` statement with them.
+
+        Three things are wrong with letting that travel. It is a `sqlalchemy` exception in
+        a caller that `import-linter` forbids from importing `sqlalchemy`, which is the
+        same layering breach as a raw `httpx` error reaching a service, in the other
+        direction. It is a traceback where a message belongs, since `cli.py` catches the
+        application's own exception types and not the driver's. And the sentence
+        `NumericText` wrote to be read by a person is buried inside one the driver wrote
+        to be read by a developer.
+
+        The original is re-raised rather than translated into a repository-specific type.
+        `WalletConstraintError` exists because an `IntegrityError` means only "a constraint
+        refused this" and deciding *which* is the service's job; here there is nothing to
+        decide -- the column has already said exactly what is wrong with the value, in a
+        `ValueError` or a `TypeError` that the rest of this application already handles.
+        Wrapping it again would bury a good message a second time.
+
+        Anything whose cause is not one of those two is a real database failure and is left
+        alone: it is re-raised as itself, because a connection that dropped is not a value
+        this method can explain.
+
+        Raises:
+            TypeError: a column type refused the value's type.
+            ValueError: a column type refused the value.
+            sqlalchemy.exc.StatementError: anything else the flush hit -- a genuine
+                database failure, which this method has no better account of.
+        """
+        try:
+            await self._session.flush()
+        except StatementError as exc:
+            # `orig` is whatever was raised underneath: the DBAPI's error for a real
+            # database failure, and the column type's own exception for a bind refusal.
+            if isinstance(exc.orig, TypeError | ValueError):
+                raise exc.orig from exc
+            raise

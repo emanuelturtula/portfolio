@@ -49,6 +49,8 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Final, Protocol
 
+from portfolio.db.models import PRICE_SCALE
+from portfolio.domain.money import MONEY_PRECISION
 from portfolio.providers.errors import ProviderError, ProviderResponseError
 
 if TYPE_CHECKING:
@@ -92,6 +94,24 @@ the same duplication `_WALLET_CHAIN_KEY_CHECK` carries and is covered the same w
 reflects the constraint off a migrated database and compares it. `db` may not import
 `providers`, so the direction that would remove the duplication is the one the layering
 forbids.
+"""
+
+MAX_PRICE_INTEGER_DIGITS: Final = MONEY_PRECISION - PRICE_SCALE
+"""How many digits a price may carry before the decimal point: 38 - 12 = 26.
+
+**Derived from the column, not invented here**, and that is what makes it exact. A price
+this application cannot store is not a price it should accept, and the two numbers it
+depends on already exist -- `MONEY_PRECISION` is the domain's significant-digit budget and
+`PRICE_SCALE` is what `prices.amount` rounds to. Writing a plausible-looking bound here
+instead would be a third number that drifts from both.
+
+The import that makes this possible is `providers -> db`, which the layering contract
+allows: `db` sits below `providers`, for the same reason `NumericText` rounds by
+`domain.money`'s rule rather than carrying a second copy of it.
+
+Twenty-six digits in front of the point is roughly 10**26 units of fiat for one coin. No
+asset will approach it, which is the point: the bound exists to catch a vendor sending
+something that is not a price at all, not to express a view about the market.
 """
 
 type PricePair = tuple[str, str]
@@ -373,7 +393,9 @@ def require_price(value: object, *, source: str) -> Decimal:
     reason `domain/money.py` gives -- `True` would become a price of 1.
 
     Refused: a zero or negative price, which is not a price and would value a holding at
-    nothing; a non-finite `Decimal`; and anything else at all, including a `float`, which
+    nothing; a price with more integer digits than `MAX_PRICE_INTEGER_DIGITS`, which this
+    application cannot store and which must fail as a vendor error rather than inside a
+    database flush; a non-finite `Decimal`; and anything else at all, including a `float`, which
     cannot arrive through `decode_json` but could from a parser that built one some other
     way.
 
@@ -414,5 +436,32 @@ def require_price(value: object, *, source: str) -> Decimal:
         raise ProviderResponseError(message)
     if amount <= 0:
         message = f"The {source} price is not greater than zero, so it is not a price."
+        raise ProviderResponseError(message)
+    if amount.adjusted() >= MAX_PRICE_INTEGER_DIGITS:
+        # **Refused here so that it is a vendor failure rather than a database failure.**
+        # Kraken and Coinbase send prices as strings, so `"1e300"` is a well-formed
+        # response body as far as every layer above this one is concerned. Without this
+        # check the quote is built, survives the service, and dies inside `flush()` --
+        # where `NumericText` raises a `ValueError` that SQLAlchemy wraps in a
+        # `StatementError`. Three things go wrong at that point and none of them is the
+        # bad price: a `sqlalchemy` exception escapes a service into a caller that may not
+        # import it, the operator gets a traceback from a CLI command, and **every pair
+        # that had already been fetched in the same refresh is discarded**, which is the
+        # outcome `fetch_prices` is written to make impossible.
+        #
+        # As a `ProviderResponseError` it is instead one more thing a vendor can get
+        # wrong: the failover loop passes the source over, the other pairs are kept, and
+        # this one is answered by the next source or becomes a reason. No new vocabulary
+        # and no new report line -- the path already exists.
+        #
+        # `adjusted()` is the exponent of the leading digit, so it is `d - 1` for a value
+        # with `d` integer digits; `>=` is therefore the bound on `d > MAX`. Nothing is
+        # rejected for being too *small* here: a price finer than the scale is destroyed
+        # rather than merely imprecise, and `NumericText` refuses it for every money
+        # column rather than this function refusing it for one.
+        message = (
+            f"The {source} price has more than {MAX_PRICE_INTEGER_DIGITS} digits before "
+            "the decimal point, which is more than this application can represent."
+        )
         raise ProviderResponseError(message)
     return amount
