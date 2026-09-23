@@ -8,6 +8,7 @@ carries a default that would be unsafe if it survived into production.
 from functools import lru_cache
 from typing import Final, Literal, Self
 
+import httpx
 from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -27,6 +28,75 @@ DEV_ALLOWED_ORIGIN: Final = "http://localhost:5173"
 # derived from the flag rather than written down twice.
 SECURE_SESSION_COOKIE_NAME: Final = "__Host-psid"
 INSECURE_SESSION_COOKIE_NAME: Final = "psid"
+
+PROVIDER_URL_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
+"""The schemes a provider base URL may use. `https` everywhere except a local index."""
+
+
+def provider_url_violation(url: str) -> str | None:
+    """Why this provider base URL is unusable, or `None` if it is fine. Blank is fine.
+
+    **Measured, not imagined.** Every one of these arrives at `httpx.AsyncClient.get` as an
+    exception that a provider cannot translate, which is the one way `httpx` can currently
+    reach a caller that must never import it:
+
+    | Configured value | What `client.get` does |
+    |---|---|
+    | `mempool.space/api` (no scheme) | `builtins.ValueError: unknown url type` |
+    | `not a url` | the same bare `ValueError` |
+    | `http://` (no host) | the same bare `ValueError` |
+    | `htp://host/api` (scheme typo) | `httpx.UnsupportedProtocol`, which *is* a `TransportError` |
+
+    The first three escape `fetch_balances` and `health()` as a `ValueError` from inside
+    `urllib`, past an `except httpx.TransportError` that cannot see it -- and past a
+    `health()` whose contract is that it never raises. The fourth is worse for being
+    quieter: it is caught, and reported as `ProviderUnavailableError` on every sync
+    forever, so the owner is told their chain is down while nothing anywhere mentions the
+    typo. That is the exact failure `providers/errors.py` names in its 401-behind-an-auth-
+    proxy example.
+
+    All four are configuration errors that are wrong from the first request and stay wrong,
+    so the right moment to refuse them is startup -- where `_refuse_unsafe_configuration`
+    already turns four other unsafe configurations into a container that fails its health
+    check and a deployment that rolls back.
+
+    **Parsed with `httpx.URL` on purpose**, rather than with `urllib.parse`: the question is
+    not "is this a URL" in the abstract but "will the client this URL is handed to accept
+    it", and a validator that answers a different question than the one that matters is how
+    a check passes while the thing it guards fails. A space in the host survives both and is
+    deliberately allowed through -- it resolves to nothing, and a host that does not resolve
+    is honestly indistinguishable from one that is down.
+
+    Userinfo is allowed. `https://user:pass@host/api` is how a self-hoster puts their own
+    Esplora behind basic auth, which is a supported deployment rather than a mistake, and
+    a provider URL never reaches a log in the first place: the transport logs
+    `request_target`, which emits a scheme, a host and an endpoint label and never sees
+    userinfo at all. **Not `strip_query`**, which is a separate helper for a future
+    exchange provider and is not on this path -- `http.py` warns by name that reaching for
+    it to log a chain request meets the letter of the rule and leaks anyway, and crediting
+    it here would be that confusion written down as reassurance.
+
+    Returns:
+        A short reason, or `None`. **The reason never quotes the URL**, because a provider
+        URL may legitimately carry userinfo; the scheme is enough to act on.
+    """
+    candidate = url.strip()
+    if not candidate:
+        # Blank is a configuration, not an omission: for the fallback it means "one
+        # instance only", and for the primary it means this chain is not read at all.
+        return None
+    try:
+        parsed = httpx.URL(candidate)
+    except httpx.InvalidURL as error:
+        # `httpx.URL` refuses a handful of inputs outright -- an unclosed IPv6 bracket, a
+        # non-printable character. The class name rather than the message, which quotes
+        # the offending URL.
+        return f"it is not a URL ({type(error).__name__})"
+    if parsed.scheme not in PROVIDER_URL_SCHEMES:
+        return f"the scheme must be http or https, not {parsed.scheme!r}"
+    if not parsed.host:
+        return "it names no host"
+    return None
 
 
 class Settings(BaseSettings):
@@ -86,6 +156,29 @@ class Settings(BaseSettings):
     # logs by accident; `logging.py` is the second line of defence, not the first.
     bootstrap_password: SecretStr | None = None
 
+    # The two Esplora instances the Bitcoin provider reads, primary first, and the network
+    # they serve. Public defaults so the product works out of the box; an operator running
+    # their own index points both at it and nothing else changes.
+    #
+    # Two scalars rather than one `list[str]`, deliberately: pydantic-settings parses a
+    # list out of the environment as JSON, which is not a syntax anybody types correctly
+    # into a `.env` file at three in the morning. A blank fallback means "one instance
+    # only" and is a self-hoster setting one URL and clearing the other.
+    bitcoin_esplora_url: str = "https://mempool.space/api"
+    bitcoin_esplora_fallback_url: str = "https://blockstream.info/api"
+
+    # An Esplora instance serves exactly one network, and neither vendor documents what it
+    # answers for an address from another one -- checked on 2026-09-22. So the provider
+    # refuses a wrong-network address offline instead of trusting an undocumented 400.
+    # The failure this prevents is the expensive one: a balance read against the wrong
+    # chain is a number rather than an error, and nothing downstream can tell it from a
+    # right one.
+    #
+    # A `Literal` rather than the `BitcoinNetwork` enum itself, so that a typo in the
+    # environment is a startup failure that names the three acceptable values. `providers`
+    # converts it to the domain enum, which is the layer allowed to know both.
+    bitcoin_network: Literal["mainnet", "testnet", "regtest"] = "mainnet"
+
     @property
     def session_cookie_name(self) -> str:
         """`__Host-psid`, degrading to `psid` on the one configuration that cannot use it."""
@@ -111,9 +204,48 @@ class Settings(BaseSettings):
           not malice: `memory_cost` is in KiB, so an operator tuning after a
           `hash-benchmark` run and reading the number as MiB sets 64 and drops the cost by
           a factor of a thousand.
+        * a provider base URL with no scheme, no host or a mistyped scheme cannot be
+          requested, and reaches a caller either as a bare `ValueError` out of `urllib` --
+          past the `except httpx.TransportError` that is supposed to be where `httpx` stops
+          -- or, for the scheme typo, as "the chain is unavailable" on every sync forever
+          while nothing mentions the typo. `provider_url_violation` says which.
 
-        Refusing to start turns all four into a container that fails its health check,
+        Refusing to start turns all five into a container that fails its health check,
         which is a failure the deployment pipeline already knows how to roll back.
+
+        **Unconditional, not gated on `prod`.** A URL that cannot be requested is wrong in
+        development too, and the case for gating the cost floor -- that the test suite runs
+        deliberately below it -- has no counterpart here: every test that builds a
+        `Settings` either leaves these at their defaults or passes a real-looking URL.
+
+        ## Never serialise the `ValidationError` these raises produce
+
+        Measured, and it is not what the `SecretStr` on `bootstrap_password` leads anyone
+        to expect:
+
+        | Rendering | Carries `PORTFOLIO_BOOTSTRAP_PASSWORD`? |
+        |---|---|
+        | `str(exc)` | no -- pydantic elides the middle of the input |
+        | `exc.errors()` | **yes, in plaintext** |
+        | `exc.json()` | **yes, in plaintext** |
+
+        Each error entry carries an `input` dict holding every `PORTFOLIO_*` variable as
+        the raw environment string -- which is to say *before* pydantic coerced it into the
+        `SecretStr` that would have masked it. The field type protects a value that has
+        been parsed; it cannot protect the copy of the input that failed to parse.
+
+        Two things keep that off stdout today, and neither is a rule anybody stated. Only
+        `str(exc)` reaches the log when the process refuses to start, and the one caller of
+        `.errors()` in this application -- `api/errors.py` -- is registered for a
+        `RequestValidationError` from a request body and projects each entry down to
+        `loc`, `msg` and `type`, dropping `input` before anything is rendered. So the
+        hazard is a future `logger.exception`, a debug dump, or a startup handler written
+        to be helpful.
+
+        `tests/providers/test_provider_urls.py` pins the unsafe outcome deliberately, so
+        that anything which starts redacting it announces itself rather than looking like a
+        regression. Do not turn that assertion around; if this is to be fixed it is fixed
+        at the startup boundary, which is a decision with a caller behind it.
 
         The cost floor is the one check gated on `prod` for a reason beyond symmetry: the
         test suite runs the real application at `memory_cost=64` so that it can hash
@@ -150,6 +282,14 @@ class Settings(BaseSettings):
                 f"minimum of {OWASP_MINIMUM_TIME_COST}."
             )
             raise ValueError(message)
+        for name, url in (
+            ("PORTFOLIO_BITCOIN_ESPLORA_URL", self.bitcoin_esplora_url),
+            ("PORTFOLIO_BITCOIN_ESPLORA_FALLBACK_URL", self.bitcoin_esplora_fallback_url),
+        ):
+            reason = provider_url_violation(url)
+            if reason is not None:
+                message = f"{name} is not usable: {reason}"
+                raise ValueError(message)
         return self
 
 

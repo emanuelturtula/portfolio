@@ -31,6 +31,8 @@ import pytest
 
 from portfolio.logging import URL_LOGGING_LIBRARIES, VENDOR_LOG_FLOOR
 from portfolio.providers.http import (
+    ADDRESS_BALANCE,
+    BLOCK_TIP_HEIGHT,
     ENDPOINT_EXTENSION,
     UNLABELLED,
     HostRateLimiter,
@@ -40,8 +42,11 @@ from portfolio.providers.http import (
 from tests.address_vectors import (
     BIP173_TESTNET_P2WPKH,
     BIP173_TESTNET_P2WPKH_UPPERCASE,
+    BIP350_TESTNET_V1,
+    CORE_SIGNET_P2PKH,
     KASPA_TESTNET_V1_KEY,
 )
+from tests.providers.chains.harness import EsploraFake, Reply, ScriptedInstance, esplora_provider
 from tests.security.conftest import assert_absent, assert_carried_something
 
 if TYPE_CHECKING:
@@ -401,6 +406,159 @@ def test_the_guard_is_restored_after_the_control_lifted_it(
     production_logging()
 
     assert logging.getLogger("httpx").level == VENDOR_LOG_FLOOR
+
+
+# --------------------------------------------------------------------------------------
+# Criterion 9 of #7: the label allowlist, measured on stdout
+# --------------------------------------------------------------------------------------
+#
+# #6 closed the accidental disclosure -- a label carrying a slash, a dot or an upper-case
+# character -- with `ENDPOINT_LABEL`, and recorded in its own docstring the one input it
+# could not close: a **truncated** bech32 address is lowercase, alphanumeric and under 32
+# characters, so it matched the pattern exactly. Twenty characters of a bech32 address is
+# unique on chain and is enough to search an explorer with.
+#
+# `tests/providers/test_url_scrubbing.py` asserts that `request_target` now renders it
+# `<unlabelled>`. That is a statement about a function. These two tests are the statement
+# about the artifact: what the process actually wrote to stdout, through the real
+# transport, with the production pipeline installed.
+
+
+async def test_a_truncated_address_used_as_a_label_does_not_reach_the_log(
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[..., None],
+) -> None:
+    """Criterion 9, over the bytes the process wrote.
+
+    The label is deliberately the leak #6 could not close, and it is driven at `DEBUG` so
+    the success line is visible -- a test that could not see the success line would be
+    asserting about the failure paths only, and `DEBUG` is what an operator turns on when
+    something is wrong, which is precisely when nobody is watching for a disclosure.
+
+    The absence assertion is paired with two companions, because an absence over an empty
+    capture passes for the wrong reason and #5 catalogued that twice. First, that stdout
+    carried a provider log line at all. Second, that the line rendered `<unlabelled>` --
+    which says the label was *seen and refused*, not merely that the request never
+    happened.
+    """
+    production_logging(log_level="DEBUG")
+    truncated = BIP173_TESTNET_P2WPKH[:20]
+    assert truncated.isascii()
+    assert truncated.islower()
+    assert len(truncated) <= 32
+
+    await drive(esplora_style_url(BIP173_TESTNET_P2WPKH), 200, endpoint=truncated)
+
+    written = capsys.readouterr().out
+
+    assert_carried_something(written, marker=SUCCESS_EVENT)
+    assert_carried_something(written, marker=UNLABELLED)
+    assert_absent(written, BIP173_TESTNET_P2WPKH)
+    assert truncated not in written
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        pytest.param(BIP173_TESTNET_P2WPKH[:20], id="twenty characters of a bech32 address"),
+        pytest.param(BIP173_TESTNET_P2WPKH[:12], id="twelve characters"),
+        pytest.param(KASPA_TESTNET_V1_KEY[10:30], id="twenty characters of a kaspa payload"),
+    ],
+)
+async def test_a_well_shaped_label_that_is_not_on_the_allowlist_reaches_no_log_line(
+    label: str,
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[..., None],
+) -> None:
+    """Every line a request can produce, not only the successful one.
+
+    Three 503s with `max_attempts=3` produces two retry warnings and one final error, at
+    the production default level. Those are the lines most likely to quote what failed --
+    "the request failed" is exactly when a developer reaches for the target to make the
+    message useful -- and they are the lines an operator copies into an issue.
+    """
+    production_logging()
+
+    await drive(esplora_style_url(BIP173_TESTNET_P2WPKH), 503, endpoint=label, max_attempts=3)
+
+    written = capsys.readouterr().out
+
+    assert_carried_something(written, marker=RETRY_EVENT)
+    assert_carried_something(written, marker=FAILURE_EVENT)
+    assert_carried_something(written, marker=UNLABELLED)
+    assert label not in written
+    assert_absent(written, BIP173_TESTNET_P2WPKH, KASPA_TESTNET_V1_KEY)
+
+
+async def test_a_balance_read_logs_no_address_on_any_line(
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[..., None],
+) -> None:
+    """The real provider, reading a real balance, with the production pipeline installed.
+
+    Every other test in this module drives a bare `client.get` at a URL the test wrote.
+    This one drives `EsploraProvider.fetch_balances`, so the URL, the label and the retry
+    are the provider's own -- which is the only configuration in which "a balance read
+    logs no address" is a claim about the thing that will actually run on the Pi.
+
+    Four addresses, two instances and a throttled primary, so the success line, the retry
+    warning and the failure line are all produced by one call. `DEBUG`, so the success
+    line is visible.
+
+    The companions are the point again: stdout carried a provider line, and it carried the
+    allowlisted label -- so the absence below is an absence in a log that ran, and the
+    label that is present is the one the provider chose rather than a fallback.
+    """
+    production_logging(log_level="DEBUG")
+    requested = [
+        BIP173_TESTNET_P2WPKH,
+        BIP173_TESTNET_P2WPKH_UPPERCASE.lower(),
+        CORE_SIGNET_P2PKH,
+        BIP350_TESTNET_V1,
+    ]
+    fake = EsploraFake(
+        primary=ScriptedInstance(Reply(status=429)),
+        fallback=ScriptedInstance(Reply(funded=100_000)),
+    )
+    provider, client = esplora_provider(fake, max_attempts=2)
+
+    async with client:
+        balances = await provider.fetch_balances(list(dict.fromkeys(requested)))
+
+    written = capsys.readouterr().out
+
+    assert [balance.confirmed for balance in balances] == [100_000] * 3
+    assert_carried_something(written, marker=SUCCESS_EVENT)
+    assert_carried_something(written, marker=RETRY_EVENT)
+    assert_carried_something(written, marker=ADDRESS_BALANCE)
+    assert_absent(written, *requested)
+    assert "/address/" not in written
+
+
+async def test_a_health_check_logs_no_address_and_names_its_own_endpoint(
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[..., None],
+) -> None:
+    """The health endpoint names no address, so its log line must name none either.
+
+    It is the endpoint an operations view calls on a schedule, which makes it the most
+    frequently logged line in the system -- and a line that appears every minute is the
+    one somebody eventually enriches with "which chain, which wallet" to make a dashboard
+    work.
+    """
+    production_logging(log_level="DEBUG")
+    fake = EsploraFake(primary=ScriptedInstance(Reply()))
+    provider, client = esplora_provider(fake)
+
+    async with client:
+        health = await provider.health()
+
+    written = capsys.readouterr().out
+
+    assert health.healthy is True
+    assert_carried_something(written, marker=BLOCK_TIP_HEIGHT)
+    assert_absent(written, BIP173_TESTNET_P2WPKH, KASPA_TESTNET_V1_KEY)
+    assert "/blocks/tip/height" not in written
 
 
 # --------------------------------------------------------------------------------------

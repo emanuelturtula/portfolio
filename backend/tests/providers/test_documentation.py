@@ -110,6 +110,63 @@ def test_the_document_marks_the_unverified_vendor_numbers_as_unverified() -> Non
     assert "rate limit" in text or "rate-limit" in text
 
 
+def test_the_document_records_the_rate_limit_as_unpublished() -> None:
+    """Criterion 6 of #7: the limit is unpublished, enforced by ban, and dated.
+
+    Verified against mempool.space's own documentation on 2026-09-22: it states that
+    exceeding the limits returns 429 and that repeatedly exceeding them may result in a
+    ban, and it publishes **no numbers**. One request per second is therefore a guess made
+    from the shape of a warning rather than from a measurement, and the first real
+    evidence will be a 429 in a production log.
+
+    Three separate things have to be in the document and each is a different failure if it
+    is missing. That the limit is unpublished, or the next person reads `1000` as a
+    measured figure and halves it. That the enforcement is a **ban**, or it reads as an
+    ordinary throttle to wait out -- and being banned from a free public index outlives
+    the sync that caused it. And the **date**, because a vendor fact with no date is a
+    fact nobody can tell has expired.
+    """
+    text = document()
+
+    assert "1000" in text or "1,000" in text or "one request per second" in text.lower()
+    assert "ban" in text.lower(), "the enforcement mechanism is the reason for the floor"
+    assert "2026-09-22" in text, "a vendor fact with no date cannot be known to be stale"
+    lowered = text.lower()
+    assert "unpublished" in lowered or "publishes no" in lowered or "not published" in lowered
+
+
+def test_the_document_records_the_wrong_network_residual() -> None:
+    """The failure nothing in this change can detect, written down where #8 will read it.
+
+    `tb1` is testnet3, testnet4 and signet alike, and a base58 regtest address is
+    indistinguishable from a testnet one. An operator who points the base URL at signet
+    while holding testnet4 addresses gets confident, wrong answers, and no check built out
+    of the address can see it. A residual that is not documented is a residual the next
+    person rediscovers from a wrong balance.
+    """
+    text = document()
+    lowered = text.lower()
+
+    assert "signet" in lowered
+    assert "regtest" in lowered
+    assert "testnet4" in lowered or "testnet3" in lowered
+
+
+def test_the_document_names_the_endpoint_label_allowlist() -> None:
+    """Criterion 8's mechanism, in the document a new provider author copies from.
+
+    A provider author who does not know `ENDPOINT_LABELS` exists writes a label, sees
+    `<unlabelled>` in the log, and either removes the label or -- far worse -- concludes
+    the logging is broken and writes their own log line with the URL in it. That is the
+    one route around the transport's whole guarantee, and a document is what closes it.
+    """
+    text = document()
+
+    assert "ENDPOINT_LABELS" in text
+    assert "address_balance" in text
+    assert "block_tip_height" in text
+
+
 def test_the_document_records_the_work_this_change_deliberately_left_undone() -> None:
     """The lifespan wiring is #10's, and an undocumented omission reads as an oversight.
 

@@ -1,7 +1,8 @@
 # Operations
 
 Day-two tasks on the running instance: creating the account, tuning the password hash to the
-hardware, changing the password, and understanding when a session ends.
+hardware, changing the password, understanding when a session ends, and pointing the
+application at the chain index it reads balances from.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -195,6 +196,80 @@ network — see `docs/specs/003-single-user-password-login.md`.
 
 If you lock yourself out, wait 15 minutes or recreate the container.
 
+## 8. Where Bitcoin balances are read from
+
+Balances come from an [Esplora](https://github.com/Blockstream/esplora) instance. Two are
+configured, tried in order, and the defaults are the public ones — so this works with no
+configuration at all, and an operator running their own index changes two variables.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PORTFOLIO_BITCOIN_ESPLORA_URL` | `https://mempool.space/api` | The instance tried first. |
+| `PORTFOLIO_BITCOIN_ESPLORA_FALLBACK_URL` | `https://blockstream.info/api` | Tried when the first one fails. **Blank means one instance only.** |
+| `PORTFOLIO_BITCOIN_NETWORK` | `mainnet` | `mainnet`, `testnet` or `regtest`. Must match the network the URLs above serve. |
+
+Set them in `secrets.env` and recreate the container, as in section 1. No trailing slash is
+needed on either URL; one is removed if you leave it.
+
+**Include the scheme.** A URL with no scheme, no host, or a scheme other than `http` or
+`https` is refused at startup: the container never becomes healthy and the deployment rolls
+back, the same as the other unsafe configurations in section 1. That is deliberate and it
+is the cheaper failure. `mempool.space/api` without the `https://` cannot be requested at
+all, and `htp://` — one missing `t` — would otherwise be reported as "the chain is
+unavailable" on every sync forever, with nothing anywhere mentioning the typo. The startup
+message names the variable and the problem, and never echoes the URL, because these may
+carry a username and password for a private instance.
+
+**`PORTFOLIO_BITCOIN_NETWORK` is not cosmetic, and it is the one to get right.** An Esplora
+instance serves exactly one network, and neither vendor documents what theirs answers for an
+address from another one. So the application refuses an address that does not belong to the
+configured network, offline, before it makes a request — because the alternative failure is
+the expensive one: a balance read against the wrong chain comes back as a number rather than
+an error, and nothing downstream can tell it from a correct one. If you point the URLs at a
+testnet instance, set this to `testnet` in the same edit.
+
+Two limits of that check, both of which the address itself cannot resolve:
+
+- testnet3, testnet4 and signet are one network to this application. Pointing at a signet
+  instance while holding testnet4 addresses produces confident, wrong answers.
+- a legacy address (one starting `m`, `n` or `2`) on regtest looks exactly like a testnet
+  one, so with `PORTFOLIO_BITCOIN_NETWORK=regtest` it is refused. Use a `bcrt1` address.
+
+**Failover, and why the reads are slow on purpose.** Anything other than an answer moves to
+the fallback instance, and the rest of that read continues there — a connection failure, a
+503, a 429, and equally a 401, a 403 or a 404. An instance that will not answer is exactly
+what the second one is for, and the shapes a ban or an auth proxy actually take are refusals
+rather than outages. **If one instance is misconfigured you will not see it in your
+balances, which will keep arriving from the other one — you will see it in the health
+check**, which probes each instance separately and is the thing to look at when something
+feels wrong.
+
+The one failure that does not fail over is an instance answering `200` with a body the
+application cannot read. That is not a refusal, it is a sign that we no longer understand
+what the vendor is sending, and asking somebody else would either produce the same
+unreadable answer or a number that hides the problem.
+
+Requests to one host are spaced by at least one second: mempool.space's documentation says that
+exceeding its rate limit returns 429 and that repeatedly exceeding it may result in a ban,
+and it publishes no numbers, so the interval is deliberately cautious. A ban would outlast
+the sync that caused it. If a sync of many addresses feels slow, that is this, and the fix
+is your own Esplora instance rather than a shorter interval.
+
+Neither URL is a credential, and neither is logged: a provider request appears in the log as
+its host and an endpoint label, never a path — the address is in the path on this API.
+
+**What the defaults disclose, stated plainly.** This application goes to some trouble to
+keep your addresses out of its own logs and out of this repository. It cannot do anything
+about the other end: reading a balance means asking somebody who has the chain, and with the
+defaults above that somebody is mempool.space and Blockstream. Every address you register is
+sent to one of them, over TLS, on every sync, and they can see which addresses arrive
+together from one IP — which is the set of addresses you own.
+
+That is the price of not running an index, and it is the usual one; a block explorer in a
+browser tab discloses the same thing. If it is not a price you want to pay, run your own
+[Esplora](https://github.com/Blockstream/esplora) and point both variables at it. The
+application does not care which instance answers, and the fallback URL may be left blank.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -208,3 +283,7 @@ If you lock yourself out, wait 15 minutes or recreate the container.
 | Logged out roughly weekly | Working as intended: the 7-day idle window |
 | Logged out roughly monthly despite daily use | Working as intended: the 30-day absolute ceiling, which activity does not extend |
 | Edited `secrets.env`, nothing changed | `env_file` is read at container creation — recreate, do not restart |
+| Container never becomes healthy after setting the Esplora URLs | One of them has no scheme, no host, or a scheme other than `http`/`https` — the startup log names which — section 8 |
+| A Bitcoin wallet reports "the address is on a different network" | `PORTFOLIO_BITCOIN_NETWORK` does not match the address — section 8 |
+| Bitcoin balances stop updating and the log shows 429 | The public index is throttling us. Lengthen nothing by hand; run your own Esplora — section 8 |
+| Reading many Bitcoin addresses takes a minute | Working as intended: one request per second per host — section 8 |

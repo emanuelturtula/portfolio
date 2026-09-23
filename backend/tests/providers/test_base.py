@@ -271,17 +271,212 @@ def test_a_balance_carries_its_own_exponent() -> None:
     assert balance.decimals == BITCOIN_DECIMALS
 
 
-def test_there_is_no_pending_field() -> None:
-    """Pinned, because the spec rules it out with a reason and #7 may be tempted.
+# --------------------------------------------------------------------------------------
+# Criterion 10 of #7: pending is signed, optional, and its None means something
+# --------------------------------------------------------------------------------------
+#
+# #6 refused a `pending` field and named the condition on which it would be reasonable:
+# the field *plus* a way to say "not answerable here", so that zero is never ambiguous
+# between "nothing is pending" and "this chain cannot tell you". #7 meets that condition
+# rather than overriding it, which is why the test that pinned the field's absence is
+# replaced by tests that pin the condition instead of simply being deleted.
 
-    A field one provider always sets to zero makes zero ambiguous between "nothing
-    pending" and "this chain cannot tell you". Adding it needs something that expresses
-    the second, which is a decision with a caller behind it -- so it fails this test first
-    and gets made on purpose.
+
+def test_the_balance_carries_a_pending_field_whose_none_is_a_statement() -> None:
+    """The field set, pinned -- and `None` as the default rather than `0`.
+
+    The default is the whole decision in one line. A provider that says nothing about the
+    mempool -- Kaspa's REST balance endpoint exposes nothing of the kind -- produces
+    `None`, which a caller can render as "unknown"; a default of `0` would make every
+    Kaspa address indistinguishable from one with nothing pending, which is the ambiguity
+    #6 refused the field over.
     """
     fields = set(AddressBalance.__dataclass_fields__)
 
-    assert fields == {"address", "confirmed", "decimals"}
+    assert fields == {"address", "confirmed", "decimals", "pending"}
+    assert AddressBalance(address=BIP173_TESTNET_P2WPKH, confirmed=0, decimals=8).pending is None
+
+
+def test_a_provider_that_says_nothing_about_pending_reports_none() -> None:
+    """`align_balances` with no `pending` mapping: every result carries `None`.
+
+    This is the signature every provider written before #7 already calls, so the default
+    has to be the safe one. A zero-filling default would silently convert "this chain
+    cannot tell you" into "nothing is pending" for the entire Kaspa provider, at the one
+    call nobody would think to re-read.
+    """
+    aligned = align_balances(THREE_ADDRESSES, {CORE_SIGNET_P2PKH: 5}, decimals=BITCOIN_DECIMALS)
+
+    assert [balance.pending for balance in aligned] == [None, None, None]
+    assert [balance.confirmed for balance in aligned] == [5, 0, 0]
+
+
+def test_a_negative_pending_survives_alignment_and_a_negative_confirmed_does_not() -> None:
+    """The asymmetry, in one test, because the two guards are one line apart in the code.
+
+    `pending` is a **net mempool delta**, not a balance: an outgoing payment sitting in
+    the mempool spends a confirmed output and funds nothing, so it reads negative, which
+    is exactly right. A `confirmed` below zero is a chain that is not telling the truth.
+
+    Asserted together rather than in two tests, because the failure being guarded against
+    is a single guard applied to both mappings -- the tempting tidy-up -- and only an
+    assertion that pins both directions at once catches it.
+    """
+    aligned = align_balances(
+        (BIP173_TESTNET_P2WPKH,),
+        {BIP173_TESTNET_P2WPKH: ONE_COIN_IN_BASE_UNITS},
+        decimals=BITCOIN_DECIMALS,
+        pending={BIP173_TESTNET_P2WPKH: -1_000},
+    )
+
+    assert aligned[0].pending == -1_000
+    assert aligned[0].confirmed == ONE_COIN_IN_BASE_UNITS
+
+    with pytest.raises(ProviderResponseError):
+        align_balances(
+            (BIP173_TESTNET_P2WPKH,),
+            {BIP173_TESTNET_P2WPKH: -1},
+            decimals=BITCOIN_DECIMALS,
+            pending={BIP173_TESTNET_P2WPKH: 0},
+        )
+
+
+def test_an_address_missing_from_pending_is_unknown_rather_than_zero() -> None:
+    """The asymmetry with `found`, which is the other half of what the field means.
+
+    A requested address missing from `found` is a **zero** -- that is what an unused
+    address holds on chain. A requested address missing from `pending` is **`None`** --
+    the provider did not answer, and inventing a zero for it would be the same lie the
+    field exists to avoid.
+
+    Both in one assertion, over one call, so a zero-fill applied to both mappings fails.
+    """
+    aligned = align_balances(
+        THREE_ADDRESSES,
+        {CORE_SIGNET_P2PKH: 7},
+        decimals=BITCOIN_DECIMALS,
+        pending={CORE_SIGNET_P2PKH: 3},
+    )
+    by_address = {balance.address: balance for balance in aligned}
+
+    assert by_address[CORE_SIGNET_P2PKH].pending == 3
+    assert by_address[BIP173_TESTNET_P2WPKH].pending is None
+    assert by_address[BIP173_TESTNET_P2WPKH].confirmed == 0
+
+
+def test_a_pending_entry_for_an_address_nobody_asked_about_is_refused() -> None:
+    """The correlation rule applies to both halves, because a batch correlates as a whole.
+
+    A response that carried a mempool figure for an address we did not request is the same
+    paging or caching mistake `found` already refuses -- and dropping it silently would
+    hide it behind a total that still looks plausible.
+    """
+    with pytest.raises(ProviderResponseError):
+        align_balances(
+            (BIP173_TESTNET_P2WPKH,),
+            {BIP173_TESTNET_P2WPKH: 1},
+            decimals=BITCOIN_DECIMALS,
+            pending={BIP173_TESTNET_P2WPKH: 1, KASPA_TESTNET_V1_KEY: 2},
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(1.0, id="a float that is a whole number"),
+        pytest.param(-0.5, id="a fractional float"),
+        pytest.param(True, id="a bool, which is an int subclass"),
+        pytest.param("1", id="a string of digits"),
+    ],
+)
+def test_a_pending_value_that_is_not_a_whole_number_of_base_units_is_refused(
+    value: object,
+) -> None:
+    """The same guard as `confirmed`, because the same `json.loads` produced both.
+
+    `Mapping[str, int]` is a static claim and this boundary meets values `mypy` never saw.
+    A float reaching `pending` lives inside `providers/`, where the AST ban in
+    `tests/security/test_no_float.py` cannot see it -- it reads source, and this float has
+    no literal. `True` is the row the annotation provably cannot catch: `bool` is a
+    subtype of `int` and `Mapping` is covariant in its value.
+    """
+    with pytest.raises(ProviderResponseError):
+        align_balances(
+            (BIP173_TESTNET_P2WPKH,),
+            {BIP173_TESTNET_P2WPKH: 1},
+            decimals=BITCOIN_DECIMALS,
+            pending={BIP173_TESTNET_P2WPKH: value},  # type: ignore[dict-item]
+        )
+
+
+def test_an_explicit_none_in_the_pending_mapping_is_unknown_and_not_a_refusal() -> None:
+    """An entry whose value is `None` means the same as no entry at all.
+
+    Worth its own test because the obvious reading is the other one -- `None` is not an
+    `int`, so refuse it alongside the float and the string -- and that reading would make
+    a provider's choice between `pending.pop(address)` and `pending[address] = None` the
+    difference between a balance and a `ProviderResponseError`. Two spellings of "the
+    chain did not say" have to mean the chain did not say.
+
+    Asserted next to the type refusals above so the boundary between them is one place
+    rather than two, and paired with the absent-key case so a change to either arm cannot
+    silently diverge from the other.
+    """
+    absent = align_balances(
+        (BIP173_TESTNET_P2WPKH,),
+        {BIP173_TESTNET_P2WPKH: 1},
+        decimals=BITCOIN_DECIMALS,
+        pending={},
+    )
+    explicit = align_balances(
+        (BIP173_TESTNET_P2WPKH,),
+        {BIP173_TESTNET_P2WPKH: 1},
+        decimals=BITCOIN_DECIMALS,
+        pending={BIP173_TESTNET_P2WPKH: None},  # type: ignore[dict-item]
+    )
+
+    assert absent[0].pending is None
+    assert explicit[0].pending is None
+
+
+def test_a_pending_refusal_names_the_type_and_never_the_address() -> None:
+    """The #44 rule, at the boundary the new mapping opened.
+
+    An exception message ends up in a log, in a response body, or in a traceback, and the
+    set of addresses this application watches *is* the owner's holdings. The type is the
+    part anyone can act on; which address a vendor mangled is not.
+    """
+    with pytest.raises(ProviderResponseError) as caught:
+        align_balances(
+            (BIP173_TESTNET_P2WPKH,),
+            {BIP173_TESTNET_P2WPKH: 1},
+            decimals=BITCOIN_DECIMALS,
+            pending={BIP173_TESTNET_P2WPKH: 1.5},  # type: ignore[dict-item]
+        )
+
+    assert "float" in str(caught.value)
+    assert BIP173_TESTNET_P2WPKH not in str(caught.value)
+    assert BIP173_TESTNET_P2WPKH[:20] not in str(caught.value)
+    assert all(BIP173_TESTNET_P2WPKH not in str(argument) for argument in caught.value.args)
+
+
+def test_spendable_is_the_sum_and_the_sign_is_what_makes_it_work() -> None:
+    """Nothing in #7 computes spendable; #11 does, and it gets a sign that already works.
+
+    Stated here because it is the reason the sign is not a detail. `confirmed + pending`
+    is the whole calculation, and it only produces the right answer for an outgoing
+    payment if the delta is allowed to be negative.
+    """
+    aligned = align_balances(
+        (BIP173_TESTNET_P2WPKH, CORE_SIGNET_P2PKH),
+        {BIP173_TESTNET_P2WPKH: ONE_COIN_IN_BASE_UNITS, CORE_SIGNET_P2PKH: ONE_COIN_IN_BASE_UNITS},
+        decimals=BITCOIN_DECIMALS,
+        pending={BIP173_TESTNET_P2WPKH: -25_000, CORE_SIGNET_P2PKH: 25_000},
+    )
+
+    spendable = [balance.confirmed + (balance.pending or 0) for balance in aligned]
+
+    assert spendable == [ONE_COIN_IN_BASE_UNITS - 25_000, ONE_COIN_IN_BASE_UNITS + 25_000]
 
 
 # --------------------------------------------------------------------------------------

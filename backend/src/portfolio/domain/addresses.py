@@ -70,6 +70,7 @@ class AddressRejection(StrEnum):
     UNKNOWN_VERSION_BYTE = "unknown_version_byte"
     EXTENDED_KEY = "extended_key"
     MALFORMED = "malformed"
+    WRONG_NETWORK = "wrong_network"
 
 
 REJECTION_MESSAGES: Final[Mapping[AddressRejection, str]] = {
@@ -85,6 +86,7 @@ REJECTION_MESSAGES: Final[Mapping[AddressRejection, str]] = {
     AddressRejection.UNKNOWN_VERSION_BYTE: "The version byte is not one this chain uses.",
     AddressRejection.EXTENDED_KEY: "This is an extended public key, not an address.",
     AddressRejection.MALFORMED: "The address is not shaped like an address for this chain.",
+    AddressRejection.WRONG_NETWORK: "The address belongs to a different network of this chain.",
 }
 """One fixed sentence per reason. **Not one of them interpolates anything.**
 
@@ -669,3 +671,109 @@ def validate_kaspa_address(raw: str) -> ValidatedAddress:
     """
     kaspa_decode(raw)
     return ValidatedAddress(canonical=raw.lower(), display=raw)
+
+
+# ---------------------------------------------------------------------------------------
+# Which Bitcoin network an address belongs to
+# ---------------------------------------------------------------------------------------
+#
+# `validate_bitcoin_address` answers "is this a Bitcoin address", which is a question about
+# the string, and it accepts every network on purpose. Which *network* the address is on is
+# a separate question, and the first thing that ever needed it is the Esplora provider:
+# one instance serves exactly one network, so an address from another one has to be refused
+# before a URL is built out of it.
+#
+# It lives here rather than in `providers/` because it reads the same prefix and version
+# tables the codecs above already own, and two copies of a prefix table is how they drift
+# apart. It is pure, like everything else in this module: no settings, no clock, no socket.
+# Which network the *provider* is configured for is the provider's business; this function
+# only says what the address says about itself.
+
+
+class BitcoinNetwork(StrEnum):
+    """The Bitcoin networks an address can be read as belonging to.
+
+    Three members rather than one per chain Bitcoin Core knows about, because an address
+    cannot distinguish more than three. `tb` is testnet3, testnet4 and signet alike, and
+    the base58 testnet version bytes cover regtest as well -- see `bitcoin_network_of` for
+    what that costs.
+    """
+
+    MAINNET = "mainnet"
+    TESTNET = "testnet"
+    REGTEST = "regtest"
+
+
+BITCOIN_NETWORK_BY_HRP: Final[Mapping[str, BitcoinNetwork]] = {
+    "bc": BitcoinNetwork.MAINNET,
+    "tb": BitcoinNetwork.TESTNET,
+    "bcrt": BitcoinNetwork.REGTEST,
+}
+"""The human-readable part to its network, from the same `chainparams.cpp` as `BITCOIN_HRPS`.
+
+Total over `BITCOIN_HRPS` by construction, and a test asserts it: an hrp the codec accepts
+but this table does not know would make `bitcoin_network_of` raise on an address that had
+just validated, which is the kind of contradiction that surfaces as a wallet nobody can
+read.
+"""
+
+BITCOIN_NETWORK_BY_VERSION_BYTE: Final[Mapping[int, BitcoinNetwork]] = {
+    0x00: BitcoinNetwork.MAINNET,
+    0x05: BitcoinNetwork.MAINNET,
+    0x6F: BitcoinNetwork.TESTNET,
+    0xC4: BitcoinNetwork.TESTNET,
+}
+"""The base58 version byte to its network, total over `BITCOIN_VERSION_BYTES`.
+
+**0x6F and 0xC4 map to `TESTNET` and there is no honest alternative.** Bitcoin Core gives
+testnet, testnet4, signet and regtest the identical pair, so a legacy address on regtest
+and the same address on testnet are the same 25 bytes. `REGTEST` is reachable from `bcrt1`
+and from nothing else.
+"""
+
+
+def bitcoin_network_of(canonical: str) -> BitcoinNetwork:
+    """Which Bitcoin network an address is on, offline, from the address alone.
+
+    Reads the human-readable part for a segwit address and the version byte for a legacy
+    one, through the same decoders `validate_bitcoin_address` uses -- so the checksum is
+    verified again here rather than assumed. That makes the function safe on any string,
+    not only on one that has already validated, which matters because the caller is a
+    provider holding a value that came out of a database column.
+
+    **Two networks are indistinguishable for a legacy address**, and the consequence is
+    worth stating where it can be read rather than in a commit message. Testnet and regtest
+    share both base58 version bytes, so a regtest P2PKH address answers `TESTNET`, and a
+    provider configured for regtest therefore refuses it. That is a refusal rather than a
+    wrong number, which is the direction this is allowed to be wrong in: a balance read
+    against the wrong network is a number, not an error, and nothing downstream can tell it
+    from a right one. `bcrt1` is the spelling that answers `REGTEST`.
+
+    `tb` is testnet3, testnet4 and signet alike for the same reason, and that one has no
+    refusal to hide behind: an operator pointing an instance at signet while holding
+    testnet4 addresses gets confident, wrong answers. Recorded in `docs/providers.md`; the
+    address does not carry the fact and no check built out of it can.
+
+    Args:
+        canonical: the canonical form of a Bitcoin address, as `ValidatedAddress` carries it.
+
+    Returns:
+        The network the address names.
+
+    Raises:
+        AddressInvalidError: the string is not a Bitcoin address at all, or its prefix or
+            version byte is not one this chain uses. As everywhere in this module, neither
+            the message nor the arguments contain the address.
+    """
+    if _looks_like_bech32(canonical):
+        hrp = bech32_decode(canonical).hrp
+        network = BITCOIN_NETWORK_BY_HRP.get(hrp)
+        if network is None:
+            raise AddressInvalidError(AddressRejection.UNKNOWN_PREFIX)
+        return network
+
+    version_byte = base58check_decode(canonical)[0]
+    network = BITCOIN_NETWORK_BY_VERSION_BYTE.get(version_byte)
+    if network is None:
+        raise AddressInvalidError(AddressRejection.UNKNOWN_VERSION_BYTE)
+    return network

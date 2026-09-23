@@ -20,11 +20,15 @@ import httpx
 import pytest
 
 from portfolio.providers.http import (
+    ADDRESS_BALANCE,
+    BLOCK_TIP_HEIGHT,
     ENDPOINT_EXTENSION,
+    ENDPOINT_LABELS,
     UNLABELLED,
     request_target,
     strip_query,
 )
+from portfolio.providers.http import ENDPOINT_LABEL as ENDPOINT_LABEL_PATTERN
 from tests.address_vectors import BIP173_TESTNET_P2WPKH, KASPA_TESTNET_V1_KEY
 from tests.providers.harness import ENDPOINT_LABEL, TEST_HOST, TEST_ORIGIN
 
@@ -200,14 +204,19 @@ def test_the_unlabelled_placeholder_is_a_constant_rather_than_a_repeated_literal
 
 
 # --------------------------------------------------------------------------------------
-# The label is a pattern, not a promise
+# The shapes that were never labels, and are still not
 # --------------------------------------------------------------------------------------
 #
 # `request_target` could not keep its docstring's promise while the label was anything a
 # caller put in `extensions`. A provider author wanting more detail writes
 # `{"endpoint": request.url.path}` -- helpfulness, not malice -- and the address is in
-# every retry and failure line, out of the one function that says it cannot be. The label
-# now has to match `ENDPOINT_LABEL`; anything else renders as `UNLABELLED`.
+# every retry and failure line, out of the one function that says it cannot be.
+#
+# #6 answered with `ENDPOINT_LABEL`, a shape check, and documented what it could not
+# cover. #7 replaced the gate with membership in `ENDPOINT_LABELS`, which covers those
+# too. The rows below are kept exactly as they were: they must still render `UNLABELLED`,
+# and if the allowlist were ever loosened back into a pattern they would be the first
+# things through.
 
 
 @pytest.mark.parametrize(
@@ -253,18 +262,17 @@ def test_a_label_that_is_not_a_plain_identifier_renders_as_unlabelled(label: str
 @pytest.mark.parametrize(
     "label",
     [
-        pytest.param("address_balance", id="the label #7 will use"),
-        pytest.param("a", id="one character, the shortest legal label"),
-        pytest.param("balances", id="no underscore"),
-        pytest.param("utxo_set_v2", id="digits and underscores"),
-        pytest.param("a" * 32, id="exactly the length cap"),
+        pytest.param(ADDRESS_BALANCE, id="the balance read"),
+        pytest.param(BLOCK_TIP_HEIGHT, id="the health check"),
     ],
 )
 def test_a_well_formed_label_is_still_carried(label: str) -> None:
-    """The control. A pattern that rejected everything would pass every test above.
+    """The control. A gate that rejected everything would pass every test above.
 
-    Without this the fix could ship as "always `<unlabelled>`", which would satisfy every
-    absence assertion in this file and destroy the one thing the label is for.
+    Without this the allowlist could ship as `frozenset()`, which would satisfy every
+    absence assertion in this file -- every request would render `<unlabelled>` -- and
+    destroy the one thing the label is for. Driven over every member of the allowlist,
+    so a label that is listed but unreachable fails here.
     """
     request = httpx.Request(
         "GET", f"{TEST_ORIGIN}/anything", extensions={ENDPOINT_EXTENSION: label}
@@ -273,56 +281,142 @@ def test_a_well_formed_label_is_still_carried(label: str) -> None:
     assert request_target(request) == f"{TEST_ORIGIN}/{label}"
 
 
-def test_the_label_pattern_does_not_make_a_deliberate_address_impossible() -> None:
-    """The residual, asserted rather than left for a reader to discover.
+# --------------------------------------------------------------------------------------
+# Criterion 8 of #7: membership in a named allowlist, not a pattern match
+# --------------------------------------------------------------------------------------
+#
+# #6 closed the *accidental* case -- a path, a suffix, anything with a slash or an
+# upper-case letter -- and said so in `request_target`'s own docstring: a truncated bech32
+# address is lowercase alphanumeric and under 32 characters, so it matched the pattern and
+# reached a log. The pattern could not be narrowed to exclude it without excluding real
+# labels, because the two are the same shape. Only membership can tell them apart.
 
-    A bech32 address is lowercase alphanumeric, so a label that *is* a short address
-    matches the pattern. What the pattern removes is the accidental case -- a path, a
-    suffix, anything with a slash or a dot or an upper-case letter. Stating the limit in
-    a test is the difference between a control and a control people believe is stronger
-    than it is.
 
-    The honest completion is an allowlist of known labels, the shape `PUBLIC_API_PATHS`
-    has. That belongs with #7, when there are labels to list.
+@pytest.mark.parametrize(
+    "label",
+    [
+        pytest.param(BIP173_TESTNET_P2WPKH[:20], id="a truncated address, which #6 let through"),
+        pytest.param(BIP173_TESTNET_P2WPKH[:12], id="twelve characters of an address"),
+        pytest.param("a", id="one character, which the pattern allows"),
+        pytest.param("balances", id="well shaped and simply not a label we use"),
+        pytest.param("utxo_set_v2", id="digits and underscores, still not on the list"),
+        pytest.param("a" * 32, id="exactly the length cap, still not on the list"),
+        pytest.param("address_balances", id="the real label with one letter added"),
+        pytest.param("address_balanc", id="the real label with one letter removed"),
+    ],
+)
+def test_a_label_that_is_not_on_the_allowlist_renders_unlabelled(label: str) -> None:
+    """Criterion 8: **whatever its shape**, a label that is not listed says nothing.
+
+    The first two rows are the criterion's reason for existing. A truncated bech32 address
+    passes `ENDPOINT_LABEL` -- lowercase, alphanumeric, under 32 characters -- and twenty
+    characters of one is unique on chain and enough to search an explorer with. #6
+    documented that as a residual it could not close; membership closes it.
+
+    The last two rows are the realistic mistake rather than the adversarial one: a
+    provider author who mistypes the constant gets a quiet log line instead of a wrong
+    one, and the test that notices is this one.
     """
-    truncated = BIP173_TESTNET_P2WPKH[:20]
-    assert truncated.isascii()
-    assert truncated.islower()
-
+    assert label not in ENDPOINT_LABELS
     request = httpx.Request(
-        "GET", f"{TEST_ORIGIN}/anything", extensions={ENDPOINT_EXTENSION: truncated}
+        "GET",
+        f"{TEST_ORIGIN}/api/address/{BIP173_TESTNET_P2WPKH}/utxo",
+        extensions={ENDPOINT_EXTENSION: label},
     )
 
-    # Deliberately asserting the *unsafe* outcome, because it is the current contract.
-    # If a later change makes this render as `<unlabelled>`, this test failing is the
-    # notification that the residual closed -- not a regression.
-    assert request_target(request) == f"{TEST_ORIGIN}/{truncated}"
+    target = request_target(request)
+
+    assert target == f"{TEST_ORIGIN}/{UNLABELLED}"
+    assert BIP173_TESTNET_P2WPKH not in target
+    assert BIP173_TESTNET_P2WPKH[:12] not in target
+    # Only for labels long enough to be a disclosure. A one-character label is a substring
+    # of the host itself, so asserting its absence would fail against a target that is
+    # perfectly correct -- and a test that fails for a reason it does not mean is a test
+    # somebody weakens rather than reads.
+    if len(label) >= 8:
+        assert label not in target
 
 
-def test_the_length_cap_is_hygiene_and_the_shape_is_the_control() -> None:
+def test_the_allowlist_names_the_labels_this_release_uses() -> None:
+    """Pinned against literals, the same shape as `PUBLIC_API_PATHS`.
+
+    Adding an endpoint protects it; saying more about one is an edit to a named constant,
+    which is a visible line in a diff and a deliberate act. Derived from nothing: an
+    assertion of the form `ENDPOINT_LABELS == frozenset(ENDPOINT_LABELS)` would be true of
+    any set at all, including one somebody widened to make a log line prettier.
+
+    The emptiness assertion is the other half. An empty allowlist renders every real
+    request `<unlabelled>`, which satisfies every absence test in this module and quietly
+    removes the only thing distinguishing a balance read from a health check in a
+    production log.
+    """
+    assert sorted(ENDPOINT_LABELS) == ["address_balance", "block_tip_height"]
+    assert ADDRESS_BALANCE == "address_balance"
+    assert BLOCK_TIP_HEIGHT == "block_tip_height"
+    assert ENDPOINT_LABELS, "an empty allowlist makes every request <unlabelled>"
+    assert isinstance(ENDPOINT_LABELS, frozenset), (
+        "a mutable set would let any module widen what may be logged at import time, "
+        "which is the `register_endpoint_label()` design the spec rejected"
+    )
+
+
+@pytest.mark.parametrize("label", sorted(ENDPOINT_LABELS))
+def test_every_allowlisted_label_is_also_well_shaped(label: str) -> None:
+    """The pattern did not go away; it moved from the request to the constants.
+
+    A listed label still has to be lower snake case and at most 32 characters, because a
+    label carrying a slash, a dot, a colon, a percent-escape or a newline is a label
+    somebody built out of a request rather than wrote down -- and a newline in one would
+    let it forge a second line in a JSON log stream.
+
+    Checked over the allowlist itself rather than over a request, which is what makes this
+    a gate on *adding* a label instead of a gate on using one.
+    """
+    assert ENDPOINT_LABEL_PATTERN.fullmatch(label), f"{label!r} is not a well-shaped label"
+    assert label.isascii()
+    assert label.islower()
+    assert "\n" not in label
+    assert "\r" not in label
+    assert len(label) <= 32
+
+
+def test_the_length_cap_is_hygiene_and_the_allowlist_is_the_control() -> None:
     """A full address is rejected by the cap; a truncated one is not. Say so.
 
     42 characters of bech32 exceeds the 32-character cap, which reads like a defence and
-    is not one: a truncated address is still an address, and 20 characters of it is
-    enough to search an explorer with. The cap bounds a log line. The pattern is what
-    does the work.
+    is not one: a truncated address is still an address, and 20 characters of it is enough
+    to search an explorer with. The cap bounds a log line, the pattern removes the
+    accidental shapes, and **membership is what actually decides** -- which is why the
+    truncated form now renders `<unlabelled>` in
+    `test_a_label_that_is_not_on_the_allowlist_renders_unlabelled` rather than being
+    asserted here as a residual that could not be closed.
     """
+    truncated = BIP173_TESTNET_P2WPKH[:20]
+
     assert len(BIP173_TESTNET_P2WPKH) > 32
-    assert len(BIP173_TESTNET_P2WPKH[:20]) <= 32
+    assert len(truncated) <= 32
+    # It still satisfies the shape, which is the whole reason the shape is not the gate.
+    assert ENDPOINT_LABEL_PATTERN.fullmatch(truncated)
+    assert truncated not in ENDPOINT_LABELS
 
 
 def test_a_unicode_homoglyph_label_renders_as_unlabelled() -> None:
     """A label that looks like a legal one but is not ASCII.
 
-    `[a-z]` in a Python regex does not match a Cyrillic small a, so this is already
-    refused -- but only because the pattern is ASCII by construction rather than because
-    anybody chose it. Asserted so that widening the pattern to `\\w`, which reads like a
-    tidy-up and is Unicode-aware by default in Python, fails here instead of silently
-    admitting a whole alphabet of look-alikes.
+    Refused twice over now, and both refusals are worth keeping. Membership refuses it
+    because `"\u0430ddress_balance"` is not `"address_balance"` -- string equality is not fooled
+    by a homoglyph -- and the pattern refuses it because `[a-z]` in a Python regex does not
+    match a Cyrillic small a.
+
+    The second is asserted directly so that widening the pattern to `\\w`, which reads like
+    a tidy-up and is Unicode-aware by default in Python, fails here rather than silently
+    admitting a whole alphabet of look-alikes into what may be *added* to the allowlist.
     """
     cyrillic_a = "\u0430"
     label = f"{cyrillic_a}ddress_balance"
     assert label != "address_balance"
+    assert label not in ENDPOINT_LABELS
+    assert not ENDPOINT_LABEL_PATTERN.fullmatch(label)
 
     request = httpx.Request(
         "GET", f"{TEST_ORIGIN}/anything", extensions={ENDPOINT_EXTENSION: label}
