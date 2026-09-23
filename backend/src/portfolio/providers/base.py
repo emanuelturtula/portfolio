@@ -51,6 +51,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+
+# A real import, not a `TYPE_CHECKING` one: `decode_json` hands this class to `json.loads`
+# as `parse_float`, so it is needed at run time and not only in an annotation.
+from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
 from portfolio.domain.money import from_base_units
@@ -58,7 +62,6 @@ from portfolio.providers.errors import ProviderResponseError
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-    from decimal import Decimal
 
     from portfolio.domain.chains import ChainKey, ValidatedAddress
 
@@ -479,11 +482,37 @@ def decode_json(body: str | bytes) -> object:
     quotes the offending text is the disclosure every parser in this package is written to
     avoid: the text is a response body containing the owner's addresses.
 
+    ## `parse_float=Decimal`, which is rule 2 applied at the only moment it can be
+
+    A JSON number is read into an IEEE-754 double by every mainstream parser, `json.loads`
+    included. **By the time a value reaches the first line any of our code could inspect,
+    the digits the vendor sent are already gone**: `0.04228645` is a `float` whose nearest
+    representable value is not that number, and no care afterwards recovers it. Rule 2 is
+    not "do not write the word `float`"; it is "do not let a monetary value pass through
+    binary floating point", and this hook is where that is decided.
+
+    `Decimal` is constructed from the *literal text* of the number, so a price arrives
+    carrying exactly the digits that were on the wire. The one vendor that forces the
+    issue is the Kaspa price endpoint, whose body is `{"price": 0.04228645}` -- a JSON
+    number where Kraken and Coinbase both send a string -- but this is not a special case
+    for that vendor: any future API rendering money as a number is covered by the same
+    line, in the one place every provider's decode already passes through.
+
+    **It is fixed rather than a parameter, deliberately.** A `parse_float` argument would
+    let a call site ask for the float back, and the guarantee is worth more than the
+    flexibility; there is no vendor for whom the double is the more faithful answer.
+
+    Nothing this change touches loosens a balance parser. `_require_base_units`,
+    `chains.kaspa._require_sompi` and `chains.bitcoin.parse_tip_height` each demand an
+    `int`, and `Decimal("1.0E+8")` is no more an `int` than `1.0e8` was -- so a vendor
+    rendering a balance with a decimal point is refused exactly as before, with the type
+    in the message reading `Decimal` instead of `float`.
+
     Raises:
         ProviderResponseError: the body is not JSON, or is JSON the decoder cannot finish.
     """
     try:
-        return json.loads(body)
+        return json.loads(body, parse_float=Decimal)
     except (ValueError, RecursionError) as error:
         message = "The response body is not JSON."
         raise ProviderResponseError(message) from error
