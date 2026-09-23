@@ -195,18 +195,42 @@ remedy is different: a 429 that survived the transport's retries means our inter
 that vendor is too short, and that is a configuration change, not something waiting fixes.
 
 **If your chain has more than one instance, that mapping decides what to raise, not when to
-give up.** The Bitcoin provider tries the next instance on *every* non-200 and classifies
-only once they are all exhausted, by the last failure. The rule it started with — stop on
-any 4xx, because the second instance runs the same software and would refuse identically —
-sounds right and is false for every refusal scoped to an instance rather than to a request:
-a ban that is spelled 403, an auth proxy returning 401, a base URL missing its `/api` path
+give up -- and you do not write either.** `providers/endpoints.py` owns both:
+
+```python
+self._instances = EndpointSet.configured(
+    client,
+    ((PRIMARY, settings.x_url), (FALLBACK, settings.x_fallback_url)),
+    vendor="X",
+)
+body, start = await self._instances.read(path, LABEL, start)
+```
+
+`EndpointSet` drops blank URLs, recognises two spellings of one URL as one instance, tries
+each in turn, classifies the **last** failure by the mapping above, and chains the exception
+to that same failure's cause. `read` returns the index that answered; pass it back as
+`start` and failover is sticky within your call and resets between calls.
+
+It tries the next instance on *every* non-200. The rule it started with — stop on any 4xx,
+because the second instance runs the same software and would refuse identically — sounds
+right and is false for every refusal scoped to an instance rather than to a request: a ban
+that is spelled 403, an auth proxy returning 401, a base URL missing its `/api` path
 returning 404. Those are precisely the cases a second instance exists for, and stopping made
 the fallback unreachable in exactly them. The misconfiguration is not lost by moving on; it
-surfaces in `health`, which probes each instance in turn.
+surfaces in `health`, which probes each instance in turn — that loop stays in your provider,
+because only you know how to read your vendor's health document.
 
-A 200 whose body will not parse is the exception and still stops: that is a statement about
-our parser or the vendor's schema, not about one instance, and a second opinion would either
-repeat it or hide it behind a number.
+A 200 whose body will not parse is the exception and still stops. That decision is in your
+provider rather than in `EndpointSet`, and deliberately: a non-200 is one instance declining
+to answer, while a 200 we cannot read is a statement about our parser or the vendor's
+schema, and only the provider knows what a body means. A second opinion would either repeat
+it or hide it behind a number.
+
+**This is why the third chain is a file rather than a refactor.** #7 wrote that loop inside
+`chains/bitcoin.py` and review corrected it there; #8 extracted it rather than copying it,
+because two copies of a rule that review has already corrected once is how the correction
+gets un-made. `tests/providers/chains/test_bitcoin.py` passing untouched is what proved the
+extraction changed no behaviour.
 
 Do not raise a `ProviderError` from a transport or from a shared helper. The transport
 implements `httpx.AsyncBaseTransport` and owes that interface its own exception types, and
@@ -217,10 +241,37 @@ judgement about the vendor, which is what a provider is.
 Never invent a response for a request that got no answer. "The chain said nothing" and "the
 chain said something unhelpful" must not collapse into the same zero.
 
+### A read expressed as a `POST`, retried without making every `POST` retryable
+
 Retries apply to `GET` and `HEAD` by default. If a read is expressed as a `POST` -- Kaspa's
-batch balance call is -- opt in explicitly with
-`RetryPolicy(retry_methods=frozenset({"GET", "HEAD", "POST"}))`. That is one visible line
-in a diff, which is the house rule for making something less safe.
+batch balance call is -- opt in **per request**:
+
+```python
+from portfolio.providers.http import ADDRESS_BALANCES, ENDPOINT_EXTENSION, IDEMPOTENT_EXTENSION
+
+await client.post(
+    url,
+    json=payload,
+    extensions={ENDPOINT_EXTENSION: ADDRESS_BALANCES, IDEMPOTENT_EXTENSION: True},
+)
+```
+
+**Do not widen `RetryPolicy.retry_methods` to include `POST`.** #6 proposed exactly that and
+it is wrong: the policy lives on the transport, the transport is process-wide by
+construction, and widening it would make *every* future `POST` retryable -- including an
+exchange request that places an order, where a retry after a transport error can double a
+trade. One provider's convenience would silently become another's duplicate fill. The
+extension is deny-by-default and is checked with `is True`, so a stray truthy value cannot
+opt a request in.
+
+**Pass the body as `json=`, never as a stream.** `httpx` consumes a request stream on the
+first attempt, so a retried streamed body replays as empty: the server answers about no
+addresses at all and the sync reports zeros rather than an error. That failure passes every
+assertion about exception types and is only visible in the *bytes of the second request*,
+which is what `tests/providers/test_http.py` asserts.
+
+In practice a provider does not write that call at all -- `EndpointSet.post` does, and it
+sets both extensions.
 
 ## Logging: label the endpoint, never the path
 
@@ -243,8 +294,9 @@ of a residual #6 recorded and #7 closed: the gate used to be a *pattern*, and a 
 address is lower-case, alphanumeric and under 32 characters, so it matched the pattern and
 reached the log. Membership in a frozen set cannot be satisfied by accident.
 
-The set this release ships is exactly two: `address_balance`, for a balance read, and
-`block_tip_height`, for the tip-height call a `health()` makes.
+The set this release ships is exactly four: `address_balance` for a single balance read,
+`address_balances` for Kaspa's batch read, `block_tip_height` for the tip-height call
+Esplora's `health()` makes, and `node_health` for the health document Kaspa's reads.
 
 So a new endpoint is two lines, not one: the constant, and its name in `ENDPOINT_LABELS`.
 The same shape as `PUBLIC_API_PATHS` in rule 8 -- the default says nothing, and saying more
@@ -287,13 +339,37 @@ use testnet addresses only -- `tb1`, `bcrt1`, `kaspatest:`, `tpub` -- and they l
   `int | None` and the `None` is the answer for a chain that cannot see its mempool -- which
   is the Kaspa REST balance endpoint. Do not report zero to mean "I could not tell": zero is
   a balance and the absence of one is not.
-- **Which network an address is on, if the vendor serves one network per instance.** Esplora
-  does. That question belongs in `domain/` beside the codec -- `bitcoin_network_of` is the
-  Bitcoin one -- and the provider refuses a wrong-network address offline, before it builds
-  a URL. The alternative is trusting an undocumented error response, and the failure it
-  hides is the expensive one: a balance read from the wrong chain is a number, not an error.
-- **What the vendor's rate limit actually is.** See below: for both current vendors, nobody
-  knows, and one of them enforces the limit it does not publish with a ban.
+- **Which network an address is on, if the vendor serves one network per instance.** Both
+  current vendors do. That question belongs in `domain/` beside the codec --
+  `bitcoin_network_of` and `kaspa_network_of` are the two -- and the provider refuses a
+  wrong-network address offline, before it builds a URL. The alternative is trusting an
+  undocumented error response, and the failure it hides is the expensive one: a balance read
+  from the wrong chain is a number, not an error.
+
+  **How exact that check can be is a property of the chain, not of the effort put in.**
+  `bitcoin_network_of` collapses testnet3, testnet4 and signet into one answer and cannot
+  tell a legacy regtest address from a testnet one, so it records a residual nothing can
+  close. `kaspa_network_of` has no such collapse: the three prefixes are folded into the
+  40-bit checksum, so the same payload checksums differently on each network. Say which of
+  the two your chain is; a reader comparing two modules will otherwise assume they are
+  copies.
+- **What "healthy" means for this vendor, which is rarely "it answered".** Esplora has only
+  a tip height, so its provider parses it -- an instance serving an HTML holding page with a
+  200 is unhealthy rather than healthy-and-wrong. Kaspa publishes a health document, so its
+  provider reads it: a synced database *and* a node that is both synced and UTXO-indexed,
+  because a synced node without the UTXO index passes a ping and cannot answer one balance.
+  A reachable-but-unsynced index is the failure this project keeps meeting in new clothes --
+  it returns balances that are stale and well-formed, and a wrong number is worse than an
+  error.
+
+  Whatever the document carries, **`ProviderHealth.detail` must not leak the vendor's
+  topology.** Kaspa's health body names each backing node in `kaspadHost`; the provider's
+  parser drops that field rather than the provider remembering not to render it, because a
+  field that was never carried cannot be leaked by the next person writing a helpful
+  message.
+- **What the vendor's rate limit actually is.** See below: for all three current instances,
+  nobody knows. One vendor enforces the limit it does not publish with a ban, and one sits
+  behind a CDN and sends no rate-limit headers at all.
 
 ## Vendor facts, and the line between confirmed and assumed
 
@@ -306,19 +382,89 @@ is written down, and will trust both equally.
 |---|---|---|
 | single address | `GET /address/:address` | `GET /addresses/{address}/balance` |
 | batch | none documented | `POST /addresses/balances`, body `{"addresses": [...]}` |
-| response | `chain_stats` / `mempool_stats`, each with `tx_count`, `funded_txo_count`, `funded_txo_sum`, `spent_txo_count`, `spent_txo_sum` | `[{"address": ..., "balance": ...}]` |
+| response | `chain_stats` / `mempool_stats`, each with `tx_count`, `funded_txo_count`, `funded_txo_sum`, `spent_txo_count`, `spent_txo_sum` | `{"address": ..., "balance": ...}`, and an **array** of those for the batch |
 | units | satoshis | sompi, 1 KAS = 1e8 |
-| health | `GET /blocks/tip/height`, "the height of the last block", a plain integer body | not checked |
-| public instances | `https://blockstream.info/api` (also `/testnet/api`, `/signet/api`) and `https://mempool.space/api` (also `/testnet/api`) | not checked |
+| documented errors | none, for any case | **422** on the balance endpoint; **503** on health |
+| health | `GET /blocks/tip/height`, "the height of the last block", a plain integer body | `GET /info/health` -> `{"kaspadServers": [{"kaspadHost", "serverVersion", "isUtxoIndexed", "isSynced", "p2pId", "blueScore"}], "database": {"isSynced", "blueScore", "blueScoreDiff", "acceptedTxBlockTime", "acceptedTxBlockTimeDiff"}}`, documented as 503 when the database lags by around ten minutes or no node is synced |
+| public instances | `https://blockstream.info/api` (also `/testnet/api`, `/signet/api`) and `https://mempool.space/api` (also `/testnet/api`) | one operator, and the document declares no `servers` block, so the base URL is ours to configure |
 
 The Esplora rows are Blockstream's published `API.md` and mempool.space's REST
 documentation; the two implement the same interface, which is what makes one a usable
-fallback for the other.
+fallback for the other. The Kaspa rows are the live OpenAPI document, read the same day.
 
 Two consequences the design already reflects. The address is in the path on both, which is
 why `request_target` logs a label instead of a path -- necessary, not defensive. And Esplora
 documents no batch endpoint while Kaspa documents one, which is why
 `max_addresses_per_call` is an integer.
+
+### Measured against the live Kaspa service on 2026-09-23
+
+The document is silent on all of these, so they were measured rather than guessed. Two of
+them changed what was built; two changed nothing and are recorded because they are invisible
+in the document.
+
+- **No `ratelimit-*` or `x-ratelimit-*` header on any response**, from either the balance
+  endpoint or `/info/health`. What the responses do carry is `Server: cloudflare`,
+  `cf-cache-status` and `CF-RAY`, so the service sits behind a CDN and the realistic
+  throttle is Cloudflare's: a 429 with `Retry-After`, which the transport has honoured since
+  #6, or a 403 for a block, which the failover moves on from. `parse_rate_limit` is built
+  anyway, because the criterion says "when present" and a self-hosted instance without a CDN
+  may well send them -- **and it is therefore unexercised production code that looks
+  tested**, which is recorded here and in its own docstring rather than left to be assumed.
+- **`Cache-Control: public, max-age=8`** on the balance response *and on the error*, in
+  front of a Cloudflare cache. A balance read can be served from an edge cache rather than
+  from the index. Eight seconds is immaterial to a sync scheduled in minutes, so this
+  changes no code; it is written down so that whoever next asks "why did two reads a second
+  apart return the same number" finds the answer instead of rediscovering it against a CDN.
+  It is also why the single-address parser checks the echoed `address`: a cache in front of
+  an endpoint is exactly what answers about somebody else.
+- **The public instance is mainnet-only by construction.** A `kaspatest:` address is
+  answered 422, quoting the server's own rule: the path must match
+  `^kaspa:[a-z0-9]{61,63}$`. The prefix is a literal in that regex, so one instance serves
+  one network -- which makes a configured-network refusal a description of something real
+  rather than something imagined.
+- **The vendor does not check the checksum.** That regex is prefix, character set and
+  length and nothing else, so a *mistyped* mainnet address that still matches it is accepted
+  and answered with a balance -- `0`, for a wallet that does not exist. That is precisely
+  the failure the address codecs were built to prevent: a typo that reports an empty wallet
+  forever and looks no different from an empty one. **Our offline validation is strictly
+  stronger than the vendor's**, and since this measurement that is a fact rather than a
+  preference.
+
+### The Kaspa batch ceiling is a guess, and the OpenAPI document is where it is missing
+
+`MAX_ADDRESSES_PER_CALL` is **64**. The document declares `addresses` as an array of strings
+with **no `maxItems`**, and the operation description names no ceiling; confirmed against
+the live document on 2026-09-22. Sixty-four is large enough that any realistic portfolio is
+one request and small enough that a request body stays a few kilobytes, and that is the
+whole of the justification.
+
+`chunk_addresses` sizes every call from the declaration, so correcting it is a change to a
+constant. **The first real evidence will be a refused batch in production**, which is why
+the refusal names *the size of the batch* and never its contents: the size is the number an
+operator can act on, and the contents are the owner's holdings.
+
+There is deliberately **no fallback from a refused batch to single reads**. A batch the
+server refuses is a configured batch size that is too large, which is a value to correct
+rather than a path to code around -- and a silent fallback would turn one call into sixty-four
+at a vendor whose rate limit is unpublished.
+
+### The trap: the Kaspa OpenAPI document's examples are real mainnet addresses
+
+Every example value in that document is a live mainnet address. **Do not copy one into a
+test, a docstring, a comment or this file.** Rule 3 forbids a wallet address in this
+repository at all, mainnet or not, and the temptation is at its strongest exactly here,
+because the document hands you a string that is guaranteed to parse.
+
+Test fixtures use `kaspatest:` vectors from published sources -- rusty-kaspa's own case
+table and the Aspectron documentation -- and they live in `backend/tests/address_vectors.py`.
+`tests/security/test_address_logging.py::test_fixtures_contain_no_mainnet_address` scans
+every test file and this document for a mainnet address, which is what makes that a control
+rather than a request.
+
+The second half of the trap is subtler: the vendor does not verify checksums, so a mainnet
+example that has been *retyped* by hand still gets a 200 and a balance of zero. A test built
+on one would pass, look like it exercised the happy path, and prove nothing at all.
 
 ### The rate limit is unpublished, and one vendor enforces it with a ban
 
@@ -344,16 +490,27 @@ buying insurance against.
   than inferred from an undocumented refusal.
 - **Any `Retry-After` behaviour.** The transport honours the header if it arrives, in both
   RFC 9110 forms, and clamps it to `RetryPolicy.max_backoff_ms`. Whether either vendor ever
-  sends one is unknown.
+  sends one is unknown. For Kaspa it is the *likely* form a throttle takes, since the
+  measurement above found a CDN in front and no `ratelimit-*` headers at all.
 - **Any cap on the Kaspa batch size.** The endpoint takes a list; the documentation does not
-  say how long a list.
+  say how long a list, and declares no `maxItems`. See the section above: 64 is a guess and
+  the refusal is written to name the size.
+- **Kaspa's rate limit.** Nothing is documented anywhere, and no `ratelimit-*` header is
+  sent. `DEFAULT_MIN_HOST_INTERVAL_MS` is shared, so Kaspa inherits one request per second
+  per host -- acceptable because Kaspa batches, which is what makes the shared floor
+  affordable for it.
 - **Pagination and retention.** Neither matters for a balance read. Both will matter for
-  transaction history, and neither has been checked.
+  transaction history, and neither has been checked for either vendor.
+- **What `isUtxoIndexed` means when it is false.** The Kaspa provider requires it, on the
+  reading that a synced node without a UTXO index cannot answer a balance query. If the
+  field means something narrower, the provider reports unhealthy where the vendor reports
+  healthy -- a false alarm rather than a false balance, which is the right direction to be
+  wrong in, but it is a guess about a field's meaning.
 - **That `mempool_stats` is always present.** The Bitcoin provider reads its absence as
   `pending=None` rather than as a zero, which is the safe reading of a field the vendor
   never promised.
 
-### A residual the address cannot close
+### A residual the address cannot close -- for Bitcoin, and not for Kaspa
 
 An Esplora instance serves exactly one network, and `PORTFOLIO_BITCOIN_NETWORK` says which
 one this deployment reads. The provider refuses an address from another network offline. Two
@@ -368,6 +525,14 @@ gaps remain, and neither is detectable from the address:
 
 The first is a wrong number and the second is a refusal, which is the direction this is
 allowed to be wrong in.
+
+**Kaspa has no equivalent residual, and the contrast is worth reading rather than
+assuming.** `kaspa`, `kaspatest` and `kaspadev` are three distinct prefixes and each one is
+folded into the 40-bit CashAddr checksum, so the same payload checksums differently on each
+network and no string can be read as two of them. `kaspa_network_of` is exact where
+`bitcoin_network_of` is approximate. That is a property of the two chains' address formats,
+not of how carefully the two functions were written, and a reader who assumes the second
+module is a copy of the first will draw the wrong conclusion about both.
 
 The defaults below are conservative guesses, chosen so that being wrong costs seconds per
 sync rather than getting us refused by a free public index. They are a policy object and a
@@ -394,6 +559,9 @@ because the answer differs per deployment rather than because a number was uncer
 | `PORTFOLIO_BITCOIN_ESPLORA_URL` | `https://mempool.space/api` | the instance tried first |
 | `PORTFOLIO_BITCOIN_ESPLORA_FALLBACK_URL` | `https://blockstream.info/api` | tried when the first fails; blank means one instance only |
 | `PORTFOLIO_BITCOIN_NETWORK` | `mainnet` | `mainnet`, `testnet` or `regtest`; must match what the URLs above serve |
+| `PORTFOLIO_KASPA_API_URL` | `https://api.kaspa.org` | the instance tried first |
+| `PORTFOLIO_KASPA_API_FALLBACK_URL` | *(blank)* | tried when the first fails; blank is the default, because there is one public operator and no second to name |
+| `PORTFOLIO_KASPA_NETWORK` | `mainnet` | `mainnet`, `testnet` or `devnet`; must match what the URLs above serve |
 
 Two scalars rather than one list, because pydantic-settings parses a `list[str]` out of the
 environment as JSON and a self-hoster clearing one URL should not have to learn a syntax.
@@ -435,10 +603,19 @@ years ago are different things, and only one of them says so.
   it**, because the scheduler knows how often a read may repeat and the snapshot table is
   where a previous reading already lives.
 - **The source-walk test over `providers/`.** `backend/tests/security/test_address_logging.py`
-  walks the wallet modules and fails on a log call that could carry an address. The Bitcoin
-  provider has no log call at all -- deliberately, since the transport's contract is the only
+  walks the wallet modules and fails on a log call that could carry an address. Neither
+  provider has a log call at all -- deliberately, since the transport's contract is the only
   one that is enforced rather than remembered -- so the walk is worth extending the day a
   provider needs one.
 - **Network-aware address registration.** A wrong-network address is refused by the
   *provider*, at read time, not when the wallet is registered. Making registration
   network-aware changes #5's contract and needs a story for rows that already exist.
+- **The Kaspa batch ceiling.** 64 is a guess; see above. The first evidence will be a
+  refused batch in production, and the refusal is written to carry the size so that the
+  evidence is actionable when it arrives.
+- **`parse_rate_limit` has no production exerciser.** Measured on 2026-09-23: neither Kaspa
+  endpoint sends a `ratelimit-*` header, and Esplora was never claimed to. It is tested
+  against synthesised headers only, which is to say it is code that looks tested and is not
+  known to work against any real server. It stays because the criterion is explicit and a
+  self-hosted index without a CDN may send them -- recorded here because unexercised code
+  that looks tested is how a green suite lies.

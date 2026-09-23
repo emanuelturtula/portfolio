@@ -270,6 +270,60 @@ browser tab discloses the same thing. If it is not a price you want to pay, run 
 [Esplora](https://github.com/Blockstream/esplora) and point both variables at it. The
 application does not care which instance answers, and the fallback URL may be left blank.
 
+## 9. Where Kaspa balances are read from
+
+Balances come from a
+[kaspa-rest-server](https://github.com/kaspa-ng/kaspa-rest-server) instance. The same two
+variables and the same failover as section 8, and the same reading of what a refusal means.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PORTFOLIO_KASPA_API_URL` | `https://api.kaspa.org` | The instance tried first. |
+| `PORTFOLIO_KASPA_API_FALLBACK_URL` | *(blank)* | Tried when the first one fails. **Blank means one instance only**, which is the shipped default. |
+| `PORTFOLIO_KASPA_NETWORK` | `mainnet` | `mainnet`, `testnet` or `devnet`. Must match the network the URLs above serve. |
+
+**The fallback is blank on purpose.** Bitcoin has two independent public Esplora operators,
+which is what makes one a usable fallback for the other. Kaspa has one well-known public
+REST operator, so there is no second one to ship — and two variables pointed at the same
+host is not a fallback: a 429 would cost one round of retries, and then the "failover" would
+spend another round on the host that has just asked us to stop. The application recognises
+that case and treats the two as one instance. Fill the fallback in if you run your own.
+
+**`PORTFOLIO_KASPA_NETWORK` matters for the same reason as its Bitcoin counterpart**, and
+here the check has no blind spot. `kaspa:`, `kaspatest:` and `kaspadev:` are three distinct
+prefixes, each folded into the address checksum, so the same payload cannot be read as two
+networks. An address from another network is refused offline, before a request is made.
+
+That refusal is worth more here than it looks, and this was measured against the public
+instance on 2026-09-23 rather than assumed. The server validates an address by matching
+`^kaspa:[a-z0-9]{61,63}$` — prefix, character set and length, **and not the checksum**. So a
+mistyped mainnet address that still matches that pattern is not refused: it is answered with
+a balance of `0`, for a wallet that does not exist, on every sync, forever. This
+application's own validation is strictly stronger, which is why an address that fails it
+never leaves the process.
+
+**Reads are batched, and there is one number in that which is a guess.** More than one
+address is read in a single `POST`, up to 64 addresses per call. The vendor's API
+documentation declares no maximum and names no ceiling anywhere, so 64 is a value chosen to
+be comfortably small rather than one anybody verified. If a server ever refuses a batch, the
+error says how many addresses were in it — that number is the evidence, and the fix is to
+lower the limit in `backend/src/portfolio/providers/chains/kaspa.py`, not to retry.
+
+**The health check is stricter than the vendor's own, deliberately.** It requires the index
+database to be synced *and* at least one backing node that is both synced and UTXO-indexed.
+A node without the UTXO index answers a ping perfectly well and cannot answer a single
+balance query, which is exactly the state where a simpler check says everything is fine and
+every read fails. So this may report unhealthy where the vendor reports healthy. That is a
+false alarm rather than a false balance, which is the direction worth being wrong in. The
+health detail says how many nodes were usable and never which or where they are.
+
+**Kaspa has no mempool figure**, so a Kaspa balance reports its pending amount as *unknown*
+rather than as zero. Zero would be a claim that nothing is pending, which nobody has checked.
+
+The same disclosure applies as in section 8: with the default URL, every Kaspa address you
+register is sent to the public instance on every sync. Run your own if that is not a price
+you want to pay.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -287,3 +341,8 @@ application does not care which instance answers, and the fallback URL may be le
 | A Bitcoin wallet reports "the address is on a different network" | `PORTFOLIO_BITCOIN_NETWORK` does not match the address — section 8 |
 | Bitcoin balances stop updating and the log shows 429 | The public index is throttling us. Lengthen nothing by hand; run your own Esplora — section 8 |
 | Reading many Bitcoin addresses takes a minute | Working as intended: one request per second per host — section 8 |
+| Container never becomes healthy after setting the Kaspa URLs | One of them has no scheme, no host, or a scheme other than `http`/`https` — the startup log names which — section 9 |
+| A Kaspa wallet reports "the address is on a different network" | `PORTFOLIO_KASPA_NETWORK` does not match the address's prefix — section 9 |
+| A Kaspa read fails with "a batch of N addresses was refused" | The server's batch ceiling is below 64. Lower `MAX_ADDRESSES_PER_CALL` — section 9 |
+| Kaspa health says "no node is synced and UTXO-indexed" | The upstream's nodes cannot answer a balance query, whatever a ping says — section 9 |
+| A Kaspa balance shows its pending amount as unknown | Working as intended: this chain exposes no mempool figure — section 9 |
