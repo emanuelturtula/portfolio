@@ -133,8 +133,11 @@ class Price:
     "never stored": it is computed when the snapshot is built, from the clock read that
     built it, and the snapshot is immutable. What is forbidden is a *column*.
 
-    `as_of` is the observation time. No vendor supplies a quote time -- measured on all
-    three key-free sources -- so this says when we asked, not how old the answer was.
+    `as_of` is our clock, copied from the row. No vendor supplies a quote time -- measured
+    on all three key-free sources -- so it says when we asked rather than how old the answer
+    was, and it is specifically the instant the *refresh* that wrote the row began. It
+    therefore errs a few seconds early, never late, which is the direction that cannot make
+    a stale price read as a fresh one. `db.models.AssetPrice` carries the full account.
     """
 
     asset_symbol: str

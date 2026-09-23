@@ -214,7 +214,7 @@ class Settings(BaseSettings):
     # one call that uses it and nowhere else.
     #
     # **`None` means the keyed source is not built at all, rather than built and skipped.**
-    # `providers.prices.base.price_sources` omits it from the tuple, so with no key there
+    # `providers.prices.registry.price_sources` omits it from the tuple, so with no key there
     # is no object holding a blank credential and no code path that could reach the
     # vendor. Criterion 5 asks for "works with and without an API key"; absent is the only
     # spelling of "without" that cannot be defeated by a later caller reaching past the

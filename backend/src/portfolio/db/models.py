@@ -203,13 +203,22 @@ class AssetPrice(Base):
     not foreclose it -- a history table adds `as_of` to the key and an index, and every
     column here is one it would want.
 
-    **`as_of` is when the price was *observed*, not when the vendor says it was true**, and
-    the name is misleading enough that this has to be written down. Measured on 2026-09-23:
-    none of Kraken's ticker, Coinbase's spot endpoint or the Kaspa price endpoint returns a
-    quote timestamp. We know when we asked; we do not know how old the answer was. A vendor
-    that does supply one can populate this field more honestly later without a migration,
-    which is the reason it is a separate column from `fetched_at` rather than one column
-    doing both jobs.
+    **`as_of` is our clock, not the vendor's, and it is the instant the refresh began.**
+    The name is misleading in two directions and both are written down here because nothing
+    else in the schema can say it.
+
+    It is not a vendor quote time: measured on 2026-09-23, none of Kraken's ticker,
+    Coinbase's spot endpoint or the Kaspa price endpoint returns one. We know when we
+    asked; we do not know how old the answer was. A vendor that does supply one can
+    populate this field more honestly later without a migration, which is the reason it is
+    a separate column from `fetched_at` rather than one column doing both jobs.
+
+    Nor is it the instant this particular price was observed. `PriceRefreshService` reads
+    its clock once, before the first request, and stamps every row of that refresh from it,
+    so a row can be dated a few seconds before its answer arrived -- bounded by how long a
+    refresh takes, against a staleness threshold of an hour. That buys one instant for the
+    whole refresh instead of rows that disagree about when their own call happened, and it
+    errs *early*, which is the only direction that cannot make a stale price look fresh.
 
     `fetched_at` is when this row was written, and today the two are the same instant --
     one clock read per refresh, stamped on every row it writes. They diverge the moment a
