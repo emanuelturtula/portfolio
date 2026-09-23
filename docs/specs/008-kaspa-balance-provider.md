@@ -255,6 +255,22 @@ and a `dict` keeps the last value silently — so two entries for one address, w
 balances, would resolve to whichever the vendor happened to send second and no assertion in
 `align_balances` could ever see it. It is refused at the point where both values still exist.
 
+### Two decisions taken during implementation, recorded here rather than in a commit message
+
+**The JSON trust boundary was extracted too, not only the failover loop.** `bitcoin._decode`
+and `_require_object` became `base.decode_json` and `base.require_json_object`, because Kaspa
+needs the identical boundary and because that catch clause -- `(ValueError, RecursionError)`
+rather than the narrower pair a reader would write -- is itself a #7 review correction. Two
+copies of a correction is one correction away from being undone. Messages are byte-identical
+and `test_bitcoin.py` did not move.
+
+**The `GET`/`POST` split is decided per call, not per request.** A chunk holding one address
+is read with the single-address `GET`, so sixty-five addresses at a call size of sixty-four is
+one batch plus one single read rather than two batches. Criterion 2 is satisfied either way --
+more than one address was requested and the batch endpoint was used -- and the spec's own
+argument for the split applies to a trailing chunk exactly as it does to a request of one: a
+`POST` for a single address gives up retry-by-default and every intermediary cache for nothing.
+
 ### Rejected alternatives
 
 | Rejected | Why |
