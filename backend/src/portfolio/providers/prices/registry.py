@@ -55,11 +55,20 @@ def price_sources(
     Placing it behind every source that *states* its currency is the mitigation.
 
     **CoinGecko last, and only when a key is configured.** With no key it is not in this
-    tuple, not constructed, and unreachable -- criterion 5's "absent, not skipped". The
-    check is `is None` on the setting rather than a truthiness test, because an empty string
-    in the environment is a configured-but-blank key and a blank credential sent to a vendor
-    on every refresh is worse than no source: it is a source that fails in a way an operator
-    reads as an outage.
+    tuple, not constructed, and unreachable -- criterion 5's "absent, not skipped".
+
+    The check is `is None` and **deliberately not a truthiness test**, so
+    `PORTFOLIO_COINGECKO_API_KEY=` counts as configured. An empty string is a variable
+    somebody set and got wrong, and the two readings fail differently: treated as absent,
+    the operator gets three sources and no explanation anywhere; treated as present, they
+    get a 401 from the vendor, which the shared transport logs at error level naming the
+    host and the endpoint label. Neither is lovely and only the second can be diagnosed.
+    The cost of the noisy reading is small because this is a last-resort fallback --
+    `fetch_prices` stops as soon as every pair is answered, so a healthy refresh never
+    reaches it and the 401 appears only on a day somebody is already reading the log.
+
+    A tidy-up to `if resolved.coingecko_api_key:` would reverse that silently, which is why
+    `tests/providers/prices/test_registry.py` pins it.
 
     Args:
         client: the shared `httpx.AsyncClient`, whose transport carries the retry policy and

@@ -226,21 +226,22 @@ class PortfolioValue:
 
 
 class PriceService:
-    """Reads the price cache and values holdings against it. Opens no socket.
+    """Reads the price cache and values holdings against it. Opens no socket, writes nothing.
 
-    Holds no transaction of its own: every method here reads, and the session belongs to
-    whoever opened it.
+    **It takes no session, and the absence is a statement.** `WalletService` and
+    `PriceRefreshService` both hold one because both commit; every method here reads, so a
+    session on this class would be a field nothing uses and a claim no test can check --
+    and worse, it would suggest this service owns a transaction. `build_price_service`
+    takes the session, because the repositories need one.
     """
 
     def __init__(
         self,
         *,
-        session: AsyncSession,
         prices: PriceRepository,
         assets: AssetRepository,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
-        self._session = session
         self._prices = prices
         self._assets = assets
         self._clock = clock
@@ -388,9 +389,11 @@ def build_price_service(
     The repositories are built here rather than injected because there is exactly one
     implementation of each; the clock is injectable so that a test can name the instant and
     watch one row go from fresh to stale without waiting an hour.
+
+    The session goes into the repositories and no further: see `PriceService` for why it
+    does not reach the service itself.
     """
     return PriceService(
-        session=session,
         prices=PriceRepository(session),
         assets=AssetRepository(session),
         clock=clock,

@@ -35,7 +35,11 @@ from typing import TYPE_CHECKING, Final
 
 from portfolio.providers.base import require_json_object
 from portfolio.providers.endpoints import PRIMARY, EndpointSet
-from portfolio.providers.errors import ProviderError, ProviderResponseError
+from portfolio.providers.errors import (
+    ProviderError,
+    ProviderRateLimitedError,
+    ProviderResponseError,
+)
 from portfolio.providers.http import ASSET_PRICE
 from portfolio.providers.prices.base import (
     BTC,
@@ -186,6 +190,16 @@ class CoinbasePriceSource:
         swallowed rather than raised, and it is swallowed because the loop above treats a
         missing pair correctly.
 
+        **A rate limit stops the loop rather than continuing to the next pair**, and that
+        is the one failure treated differently. `providers/endpoints.py` states the rule
+        this follows: re-asking a host that has just told us to stop is how a soft throttle
+        becomes the ban one vendor warns about. A 429 has already survived the shared
+        transport's retries, so the next request would be the third thing this host has
+        refused in a row. The outstanding pairs go to the next source, which is what
+        failover is for -- and `ProviderRateLimitedError` is caught first because it is a
+        *subclass* of `ProviderUnavailableError`, so ordering the arms the other way round
+        would make this branch unreachable.
+
         A pair outside `SPOT_PAIRS` is skipped without a request: `fetch_prices` filters on
         `pairs` already, and this is the second guard for a caller that does not.
         """
@@ -195,9 +209,13 @@ class CoinbasePriceSource:
                 continue
             try:
                 quotes.append(await self._fetch_one(pair))
+            except ProviderRateLimitedError:
+                # Stop asking this host entirely; see the docstring. Whatever is still
+                # outstanding is the next source's.
+                break
             except ProviderError:
-                # One pair's failure leaves the others; see the docstring. Nothing is logged
-                # here, as nowhere in this package logs.
+                # One pair's failure leaves the others. Nothing is logged here, as nowhere
+                # in this package logs.
                 continue
         return tuple(quotes)
 

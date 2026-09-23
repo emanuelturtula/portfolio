@@ -220,10 +220,25 @@ class Settings(BaseSettings):
     # spelling of "without" that cannot be defeated by a later caller reaching past the
     # check.
     #
-    # Deliberately **not** validated by `_refuse_unsafe_configuration`. There is no shape
-    # a CoinGecko key has to have that this application knows, and a length or prefix rule
-    # invented here would refuse a valid key the day the vendor changes its format. A
-    # wrong key surfaces as a refusal from that one source, which the failover moves past.
+    # Deliberately **not** validated for *shape* by `_refuse_unsafe_configuration`. There
+    # is no form a CoinGecko key has to take that this application knows, and a length or
+    # prefix rule invented here would refuse a valid key the day the vendor changes its
+    # format. A wrong key surfaces as a refusal from that one source, which the failover
+    # moves past.
+    # **A blank value is a configured key, not an absent one**, and that is a decision
+    # rather than an oversight. `PORTFOLIO_COINGECKO_API_KEY=` yields `SecretStr("")`,
+    # which is not `None`, so the source is built and the vendor answers 401 -- and the
+    # shared transport logs that at error level, naming the host and the endpoint label.
+    # Normalising the blank to `None` instead would drop the source silently, and an
+    # operator who typed the variable and got three sources would have nothing at all to
+    # look at.
+    #
+    # Note what makes the cost of the noisy option small: this source is a *last-resort
+    # fallback*, so `fetch_prices` never reaches it on a healthy day. The 401 appears only
+    # on the days the operator is already looking at a log.
+    #
+    # It is also the one shape rule this application would be making about a vendor's
+    # credential format, which is exactly what the paragraph above refuses to do.
     coingecko_api_key: SecretStr | None = None
 
     @property
