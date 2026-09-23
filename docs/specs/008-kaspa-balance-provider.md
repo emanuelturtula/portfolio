@@ -1,7 +1,7 @@
 # 008 — Kaspa balance provider on the public REST API
 
 Issue: #8
-Status: draft
+Status: done
 
 ## Problem
 
@@ -404,3 +404,81 @@ standard.
   means something narrower than the schema suggests, this reports unhealthy where the vendor
   reports healthy — a false alarm rather than a false balance, which is the right direction to
   be wrong in, but it is a guess about a field's meaning and is recorded as one.
+
+## What this plan got wrong
+
+### The evidence for criterion 10 lived inside the one component that makes the failure impossible
+
+The spec named the hazard precisely -- `httpx` consumes a request stream on the first
+attempt, so a retried streamed body replays as empty -- and then named the test:
+"a test asserts the second attempt carries the same body as the first".
+
+**That test could not have failed.** `httpx.MockTransport.handle_async_request` begins with
+`await request.aread()`, and `Request.aread` caches the bytes *and replaces a non-replayable
+stream with a `ByteStream`*. Every mock-transport test in this suite therefore replays a body
+that could never have been replayed in production. The implementer proposed the assertion,
+the tester accepted it, and it took reading `inspect.getsource` on the pinned `httpx` to see
+that the harness was answering the question instead of the code.
+
+Closed by driving `RetryingTransport` over a hand-written transport that only iterates
+`request.stream`, with a body that is an async iterable but **not** an async generator --
+measured, because `httpx` raises `StreamConsumed` for a generator, which is loud, and
+silently yields `b""` for anything else, which is the case that matters. Its falsification
+control asserts `[payload, b""]`.
+
+**Worth carrying past this issue: when a criterion is about a failure the harness itself
+prevents, the harness needs its own falsification test.** Otherwise the green is the
+harness's, not the code's.
+
+### A test plan that names the parts can be complete and still not test the system
+
+Criterion 4 was specified as a pure parser and a limiter method, and the test plan named
+tests for both. Both were written, both passed, and the four lines joining them -- the
+`observe(host, parse_rate_limit(...))` call in the transport -- could be deleted with 1144
+tests still green. The parser was proven, the limiter was proven, and the feature was not.
+
+This is #6's lesson arriving through the front door rather than the back: there, a shipped
+default went unobserved because every test injected its own. Here, two halves went observed
+and their join did not. The plan is where it was lost -- a test plan organised by *function*
+produces tests organised by function, and nothing in it asks whether the system does the
+thing.
+
+### An expected value that the fixture could supply by accident
+
+`test_a_refused_batch_names_its_size_and_no_address` asserted `str(len(THREE)) in message`,
+which is `"3" in message`, against a fixture answering **413**. The status code contained the
+answer, so the entire mitigation the Risks section leans on -- "the batch ceiling is a guess,
+which is why the refusal names the size" -- was protected by an assertion that passed with the
+naming removed.
+
+The rule this earns: when asserting that a message contains a computed value, check that no
+other part of the message can supply it, and look at the fixture's own constants first,
+because they are the nearest source. The fix asserts the phrase and pins that the count's
+digit cannot appear in the status.
+
+### Extracting "the failover loop" was the right idea and the wrong boundary
+
+The spec listed exactly what to share: `Endpoint`, `EndpointSet`, the loop, `_Failure`. The
+JSON trust boundary was not on that list, and it needed the same treatment for the same
+reason -- its catch clause, `(ValueError, RecursionError)` rather than the narrower pair
+anyone would write, is itself a #7 review correction, and a correction that exists in two
+copies is one edit away from existing in one.
+
+The related miss is sharper. This spec argues at length that a retry opt-in belongs at the
+call site, because a shared policy would make a future exchange order retryable. It then
+introduced `EndpointSet.post`, the shared helper such a provider would reach for, with
+`IDEMPOTENT_EXTENSION: True` hard-coded. **The rule was enforced at the transport and
+contradicted one layer above it**, in a module this very change added. Review caught it;
+`post` now takes a required `idempotent: bool` with no default.
+
+### A note on what did not go wrong
+
+The extraction control worked exactly as intended. `tests/providers/chains/test_bitcoin.py`
+and its harness are absent from `git diff 5e16201..HEAD` up to `f6a17de`, and review diffed
+the extracted module line by line against the merged Bitcoin provider to confirm every case
+survived. Naming the control in the spec, and telling the tester in advance to refuse to
+adjust that file, is what made a silent behaviour change impossible rather than unlikely.
+
+`414` was deliberately left out of `BATCH_TOO_LARGE_STATUSES` although review named it: the
+batch is a `POST` to a constant path with no query, so no batch size can lengthen the URI, and
+a branch that cannot fire is a branch no test can check.
