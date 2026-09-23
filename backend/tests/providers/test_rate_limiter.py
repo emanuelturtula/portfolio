@@ -20,6 +20,7 @@ from portfolio.providers.http import (
     DEFAULT_MIN_HOST_INTERVAL_MS,
     NANOSECONDS_PER_MILLISECOND,
     HostRateLimiter,
+    RateLimitHint,
     monotonic_ms,
 )
 from tests.providers.harness import OTHER_HOST, TEST_HOST, FakeClock, RecordingSleep
@@ -28,6 +29,12 @@ if TYPE_CHECKING:
     import pytest
 
 INTERVAL_MS: Final = 250
+
+#: A server-declared reset, deliberately several times the interval so that "it waited the
+#: reset" and "it waited its own interval" are different numbers. Milliseconds, because
+#: `providers/` counts durations in integers; the header is in seconds and
+#: `parse_rate_limit` is what converts.
+RESET_MS: Final = 4_000
 
 
 def limiter_with(
@@ -111,6 +118,121 @@ async def test_two_concurrent_callers_are_spaced_rather_than_both_waiting_the_sa
             tasks.start_soon(limiter.acquire, TEST_HOST)
 
     assert sorted(sleep.slept_ms) == [INTERVAL_MS, 2 * INTERVAL_MS]
+
+
+# --------------------------------------------------------------------------------------
+# Criterion 4 of #8: a budget the server says is exhausted
+# --------------------------------------------------------------------------------------
+#
+# **Nothing in production reaches this.** Measured against the live Kaspa REST service on
+# 2026-09-23: neither `GET /info/health` nor the balance endpoint sends a `ratelimit-*` or
+# `x-ratelimit-*` header, because the API sits behind Cloudflare. The criterion says "when
+# present", so the mechanism is built and tested against synthesised hints, and
+# `tests/providers/test_rate_limit_headers.py` says so in its own docstring. A self-hosted
+# instance with no CDN in front of it is the deployment this is actually for.
+
+
+async def test_a_zero_remaining_budget_waits_for_the_reset() -> None:
+    """`remaining: 0` means the next call to that host waits the reset, not the interval.
+
+    The interval is a floor this application chose from the shape of a warning; a `reset`
+    is the server telling us when it will answer again. Pacing at 250 ms against a server
+    that has just said "nothing more for seven seconds" spends the whole budget producing
+    refusals, which is how a soft throttle becomes the ban the vendor documentation warns
+    about.
+
+    Asserted as the exact millisecond value the limiter asked for, so "it waited" is not
+    enough: a limiter that had simply used its own interval would still have waited.
+    """
+    clock = FakeClock()
+    sleep = RecordingSleep()
+    limiter = limiter_with(clock, sleep)
+
+    await limiter.acquire(TEST_HOST)
+    limiter.observe(TEST_HOST, RateLimitHint(limit=60, remaining=0, reset_ms=RESET_MS))
+    await limiter.acquire(TEST_HOST)
+
+    assert sleep.slept_ms == [RESET_MS]
+
+
+async def test_a_budget_that_still_has_room_paces_at_the_ordinary_interval() -> None:
+    """The control, and it is the case that actually happens.
+
+    A limiter that waited for the reset whenever a hint arrived would turn every response
+    carrying rate-limit headers into a pause -- which is every response, on a server that
+    sends them -- and the sync would run at the server's advertised window rather than at
+    its own interval. Only `remaining == 0` is an instruction to wait.
+    """
+    clock = FakeClock()
+    sleep = RecordingSleep()
+    limiter = limiter_with(clock, sleep)
+
+    await limiter.acquire(TEST_HOST)
+    limiter.observe(TEST_HOST, RateLimitHint(limit=60, remaining=59, reset_ms=RESET_MS))
+    await limiter.acquire(TEST_HOST)
+
+    assert sleep.slept_ms == [INTERVAL_MS]
+
+
+async def test_an_exhausted_budget_with_no_reset_falls_back_to_the_interval() -> None:
+    """A server that says "nothing left" and not when is telling us nothing actionable.
+
+    `reset_ms` is `None` when the header was absent or unparseable, and the honest response
+    to that is the pacing we would have used anyway. Waiting forever, or waiting zero, are
+    both answers invented out of a value the server did not send.
+    """
+    clock = FakeClock()
+    sleep = RecordingSleep()
+    limiter = limiter_with(clock, sleep)
+
+    await limiter.acquire(TEST_HOST)
+    limiter.observe(TEST_HOST, RateLimitHint(limit=60, remaining=0, reset_ms=None))
+    await limiter.acquire(TEST_HOST)
+
+    assert sleep.slept_ms == [INTERVAL_MS]
+
+
+async def test_an_exhausted_budget_on_one_host_does_not_pace_another() -> None:
+    """A budget is a property of a host, which is why the limiter owns it and not a parser.
+
+    One vendor saying it has had enough is no reason to slow down calls to a different
+    vendor -- and on a Raspberry Pi running a self-hosted Esplora and a Kaspa REST server,
+    the two share a hostname and differ only by port, which is exactly the case `host_key`
+    exists for.
+    """
+    clock = FakeClock()
+    sleep = RecordingSleep()
+    limiter = limiter_with(clock, sleep)
+
+    limiter.observe(TEST_HOST, RateLimitHint(limit=60, remaining=0, reset_ms=RESET_MS))
+    await limiter.acquire(OTHER_HOST)
+
+    assert sleep.slept_ms == []
+
+
+async def test_a_reset_is_spent_once_and_does_not_become_the_hosts_new_interval() -> None:
+    """The pause is a one-off instruction, not a new pace for the host forever.
+
+    A limiter that stored the reset as its interval would pace that host at the whole reset
+    per request for the life of the process, and nothing anywhere would say why -- a sync
+    that silently takes twenty times longer is worse than one that fails.
+
+    The clock is moved past each window rather than left at zero, so the assertion is "no
+    further wait at all" rather than an arithmetic identity that depends on how the reset
+    and the interval happen to compose.
+    """
+    clock = FakeClock()
+    sleep = RecordingSleep()
+    limiter = limiter_with(clock, sleep)
+
+    limiter.observe(TEST_HOST, RateLimitHint(limit=60, remaining=0, reset_ms=RESET_MS))
+    await limiter.acquire(TEST_HOST)
+    clock.advance(RESET_MS + INTERVAL_MS)
+    await limiter.acquire(TEST_HOST)
+    clock.advance(INTERVAL_MS)
+    await limiter.acquire(TEST_HOST)
+
+    assert sleep.slept_ms == [RESET_MS]
 
 
 # --------------------------------------------------------------------------------------

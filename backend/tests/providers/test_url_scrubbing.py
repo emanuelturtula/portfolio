@@ -21,9 +21,11 @@ import pytest
 
 from portfolio.providers.http import (
     ADDRESS_BALANCE,
+    ADDRESS_BALANCES,
     BLOCK_TIP_HEIGHT,
     ENDPOINT_EXTENSION,
     ENDPOINT_LABELS,
+    NODE_HEALTH,
     UNLABELLED,
     request_target,
     strip_query,
@@ -263,7 +265,9 @@ def test_a_label_that_is_not_a_plain_identifier_renders_as_unlabelled(label: str
     "label",
     [
         pytest.param(ADDRESS_BALANCE, id="the balance read"),
-        pytest.param(BLOCK_TIP_HEIGHT, id="the health check"),
+        pytest.param(ADDRESS_BALANCES, id="the batch balance read"),
+        pytest.param(BLOCK_TIP_HEIGHT, id="Bitcoin's health check"),
+        pytest.param(NODE_HEALTH, id="Kaspa's health check"),
     ],
 )
 def test_a_well_formed_label_is_still_carried(label: str) -> None:
@@ -301,8 +305,14 @@ def test_a_well_formed_label_is_still_carried(label: str) -> None:
         pytest.param("balances", id="well shaped and simply not a label we use"),
         pytest.param("utxo_set_v2", id="digits and underscores, still not on the list"),
         pytest.param("a" * 32, id="exactly the length cap, still not on the list"),
-        pytest.param("address_balances", id="the real label with one letter added"),
-        pytest.param("address_balanc", id="the real label with one letter removed"),
+        # `address_balances` used to be this row's "one letter added" case. #8 made it a
+        # real label -- the Kaspa batch read -- so the near miss moved one letter further
+        # out. A near-miss case that quietly becomes a real label is a test that stops
+        # testing anything, which is why the id says what the string is rather than only
+        # that it is wrong.
+        pytest.param("address_balancess", id="a real label with one letter added"),
+        pytest.param("address_balanc", id="a real label with one letter removed"),
+        pytest.param("node_healthy", id="the health label with one letter added"),
     ],
 )
 def test_a_label_that_is_not_on_the_allowlist_renders_unlabelled(label: str) -> None:
@@ -349,10 +359,23 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     request `<unlabelled>`, which satisfies every absence test in this module and quietly
     removes the only thing distinguishing a balance read from a health check in a
     production log.
+
+    Two labels at #7, four at #8: the Kaspa provider adds `address_balances` -- its batch
+    read, which is the plural of the single-address one on purpose, because they are the
+    same question asked two ways -- and `node_health`, which is its health probe. Adding
+    them here is the deliberate act rule 8's shape requires; a provider that shipped with a
+    label not on this list would be correct, quiet and impossible to find in a log.
     """
-    assert sorted(ENDPOINT_LABELS) == ["address_balance", "block_tip_height"]
+    assert sorted(ENDPOINT_LABELS) == [
+        "address_balance",
+        "address_balances",
+        "block_tip_height",
+        "node_health",
+    ]
     assert ADDRESS_BALANCE == "address_balance"
+    assert ADDRESS_BALANCES == "address_balances"
     assert BLOCK_TIP_HEIGHT == "block_tip_height"
+    assert NODE_HEALTH == "node_health"
     assert ENDPOINT_LABELS, "an empty allowlist makes every request <unlabelled>"
     assert isinstance(ENDPOINT_LABELS, frozenset), (
         "a mutable set would let any module widen what may be logged at import time, "

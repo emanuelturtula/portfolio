@@ -280,11 +280,11 @@ def test_the_registered_keys_are_sorted_strings_rather_than_enum_members() -> No
 def test_the_module_level_registry_holds_exactly_the_wired_providers(
     client: httpx.AsyncClient,
 ) -> None:
-    """Pinned, and #7 is what changed it. It was `()` until Bitcoin landed.
+    """Pinned. It was `()` until Bitcoin landed at #7 and `("bitcoin",)` until #8.
 
     This is the same hazard criterion 6 has: "the registry works" is satisfiable by a
-    registry with nothing in it. Asserting the empty state as a fact meant the first
-    provider to land had to come back here and say so, which is what this edit is.
+    registry with nothing in it. Asserting the state as a fact means every provider that
+    lands has to come back here and say so, which is what this edit is.
 
     **The import is explicit and it is not a formality.** `CHAIN_PROVIDERS` is populated
     by decorators, which run when `providers/chains/__init__.py` is imported -- so without
@@ -293,13 +293,18 @@ def test_the_module_level_registry_holds_exactly_the_wired_providers(
     order rather than by the code. `tests/providers/test_chain_modules.py` owns the
     "every module is wired" scan; this owns "the shared instance is the one the wiring
     filled".
+
+    The unknown-key arm can no longer use `kaspa`, which is the point of #8: every chain
+    the domain defines now has a provider. It uses a key that is not a `ChainKey` at all,
+    which is the shape of the mistake that remains possible -- a caller passing a string
+    that never came out of the wallets table.
     """
     import portfolio.providers.chains  # noqa: F401 - imported for its registration effect
 
-    assert CHAIN_PROVIDERS.registered_keys() == ("bitcoin",)
+    assert CHAIN_PROVIDERS.registered_keys() == ("bitcoin", "kaspa")
 
     with pytest.raises(UnknownChainError):
-        get_chain_provider("kaspa", client)
+        get_chain_provider("litecoin", client)
 
 
 def test_the_module_level_helpers_operate_on_the_module_level_registry() -> None:
@@ -309,10 +314,12 @@ def test_the_module_level_helpers_operate_on_the_module_level_registry() -> None
     from a test is exactly the shared-state mutation this module avoids: both helpers are
     checked to be bound to `CHAIN_PROVIDERS` by what they close over instead.
 
-    The decorator is taken for `ChainKey.KASPA` rather than `ChainKey.BITCOIN` since #7:
-    Bitcoin is registered now, so `register(ChainKey.BITCOIN)` would raise
-    `DuplicateProviderError` at the moment the decorator is *created* -- which is the
-    registry doing its job and would read here as an unrelated failure.
+    Which key the decorator is taken for stopped mattering at #8, and the reason is worth
+    keeping. `DuplicateProviderError` is raised inside `claim` -- when the decorator is
+    *applied* -- not when it is created, so taking one for an already-claimed key is
+    harmless as long as nothing decorates anything with it. Nothing here does. Since #8
+    every `ChainKey` is claimed, so there is no longer an unclaimed key to reach for even
+    if that were required.
     """
     import portfolio.providers.chains  # noqa: F401 - imported for its registration effect
 
@@ -327,7 +334,7 @@ def test_the_module_level_helpers_operate_on_the_module_level_registry() -> None
     assert from_helper.__qualname__ == from_instance.__qualname__
     # Neither was applied to anything, so this test registered nothing of its own -- which
     # is the property that keeps it from leaking state into every module after it.
-    assert CHAIN_PROVIDERS.registered_keys() == before == ("bitcoin",)
+    assert CHAIN_PROVIDERS.registered_keys() == before == ("bitcoin", "kaspa")
 
 
 def test_a_registered_fake_satisfies_the_provider_protocol(client: httpx.AsyncClient) -> None:

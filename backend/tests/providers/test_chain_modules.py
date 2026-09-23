@@ -40,16 +40,22 @@ CHAINS_DIR: Final = REPO_ROOT / "backend" / "src" / "portfolio" / "providers" / 
 
 #: Every provider module `providers/chains/` is expected to hold, as a literal.
 #:
-#: `{"bitcoin"}` since #7; #8 adds `kaspa`. Deriving this from the directory listing would
-#: make it agree with whatever it found, which is the defect `PURE_PACKAGES` had in
-#: `tests/security/test_no_float.py` -- a guard that shrinks along with its subject cannot
-#: fail.
-EXPECTED_PROVIDER_MODULES: Final[frozenset[str]] = frozenset({"bitcoin"})
+#: `{"bitcoin"}` at #7, `{"bitcoin", "kaspa"}` at #8. Deriving this from the directory
+#: listing would make it agree with whatever it found, which is the defect `PURE_PACKAGES`
+#: had in `tests/security/test_no_float.py` -- a guard that shrinks along with its subject
+#: cannot fail.
+EXPECTED_PROVIDER_MODULES: Final[frozenset[str]] = frozenset({"bitcoin", "kaspa"})
 
 #: The chain keys expected to have a provider registered, as a literal, for the same
 #: reason. A module that lands and imports correctly but never calls the decorator is
 #: caught by this and by nothing else.
-EXPECTED_REGISTERED_KEYS: Final[tuple[str, ...]] = ("bitcoin",)
+#:
+#: **A tuple, and `registered_keys()` sorts**, so this literal has to be in sorted order
+#: too. That is not a detail a reader should have to rediscover: the registry sorts so that
+#: an `UnknownChainError` message and an assertion are both stable regardless of which
+#: module happened to be imported first, which means a pinned tuple in registration order
+#: would fail for a reason that has nothing to do with the code.
+EXPECTED_REGISTERED_KEYS: Final[tuple[str, ...]] = ("bitcoin", "kaspa")
 
 
 def chain_modules(package_dir: Path) -> set[str]:
@@ -314,6 +320,22 @@ def test_every_pinned_key_is_a_chain_the_domain_actually_defines() -> None:
     assert set(EXPECTED_REGISTERED_KEYS) <= known
     assert EXPECTED_REGISTERED_KEYS, "the pinned key tuple is empty, so it asserts nothing"
     assert ChainKey.BITCOIN.value in EXPECTED_REGISTERED_KEYS
+    assert ChainKey.KASPA.value in EXPECTED_REGISTERED_KEYS
+
+
+def test_every_chain_the_domain_defines_now_has_a_provider() -> None:
+    """#8 closes the gap #7 opened: a registered wallet whose chain nothing can read.
+
+    The wallet registry accepts both chains -- #5's codecs validate `bitcoin` and `kaspa`
+    addresses alike -- so between #7 and #8 a portfolio holding both reported one asset and
+    silently omitted the other. That is the issue's own problem statement, and this is the
+    assertion that says it is closed.
+
+    Stated as set equality rather than as a subset. A subset check passes for a `ChainKey`
+    added later with no provider behind it, which is exactly the state this test exists to
+    make visible: the symptom is not an error, it is an asset missing from a total.
+    """
+    assert set(EXPECTED_REGISTERED_KEYS) == {key.value for key in ChainKey}
 
 
 def test_the_chains_package_documents_why_the_imports_are_explicit() -> None:
