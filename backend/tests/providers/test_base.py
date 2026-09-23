@@ -13,6 +13,7 @@ address that happens to sort first.
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
@@ -27,6 +28,7 @@ from portfolio.providers.base import (
     ChainCapabilities,
     align_balances,
     chunk_addresses,
+    decode_json,
 )
 from portfolio.providers.errors import ProviderResponseError
 from tests.address_vectors import (
@@ -665,3 +667,272 @@ def test_an_ordinary_integer_is_still_accepted() -> None:
     )
 
     assert aligned[0].confirmed == ONE_COIN_IN_BASE_UNITS
+
+
+# --------------------------------------------------------------------------------------
+# #9: a JSON number is a Decimal built from the vendor's digits, never a float
+# --------------------------------------------------------------------------------------
+#
+# This is the shared decoder every provider's trust boundary goes through, and #9 is where
+# it starts carrying money. Kraken and Coinbase send prices as JSON **strings**; the Kaspa
+# node's `/info/price` sends `{"price": 0.04228645}` -- a JSON **number**. `json.loads`
+# turns that into a `float` before a single line of this application runs, and by the time
+# a parser could refuse it the digits the vendor sent are already gone.
+#
+# `parse_float=Decimal` is the whole fix, and it is fixed inside `decode_json` with no way
+# to opt out: a parameter would let a provider ask for the float back.
+#
+# **Every expectation below is a literal string.** Building one by calling `decode_json`
+# and comparing the result to itself would be the verifier sharing state with its subject,
+# which is the failure this project has now catalogued seven times. The digits are written
+# out by hand, and the companion test shows that plain `json.loads` produces something
+# different from them -- which is what proves the hook is doing work rather than being
+# present.
+
+#: The measured Kaspa body, byte for byte, and the digits it carries. Public market data,
+#: not an address and not a credential, so it is a fixture rule 3 permits in full.
+KASPA_PRICE_BODY: Final = '{"price": 0.04228645}'
+KASPA_PRICE_DIGITS: Final = "0.04228645"
+
+
+def test_a_json_number_is_decoded_as_a_decimal_not_a_float() -> None:
+    """The decoder's answer is a `Decimal` carrying exactly the characters in the body.
+
+    Three assertions, and none of them is redundant:
+
+    * the **type** is `Decimal`, because a `float` here is the bug;
+    * `str()` is the literal from the body, so the *digits* agree and not merely the
+      value -- `==` on a `Decimal` ignores a trailing zero and would not notice
+      `0.042286450` either way;
+    * and the value equals `Decimal(KASPA_PRICE_DIGITS)`, built from the same literal
+      string the body contains, which is a constant this test typed out rather than a
+      number the code under test produced.
+    """
+    decoded = decode_json(KASPA_PRICE_BODY)
+
+    assert isinstance(decoded, dict)
+    price = decoded["price"]
+
+    assert isinstance(price, Decimal)
+    assert str(price) == KASPA_PRICE_DIGITS
+    assert price == Decimal(KASPA_PRICE_DIGITS)
+
+
+def test_plain_json_loads_produces_something_different_from_those_digits() -> None:
+    """The companion, and without it the test above proves nothing about the hook.
+
+    If `decode_json` were still a bare `json.loads`, the assertion above would fail on the
+    type -- but only because somebody chose to assert the type. This one shows what the
+    unpatched decoder actually does to the same body: it produces a `float`, and the exact
+    value of that float is not the number the vendor sent.
+
+    `Decimal(0.04228645)` is
+    `0.0422864500000000032020608387028914876282215118408203125`. Those twenty-odd extra
+    digits are not a rounding display artefact; they are the value, and every multiplication
+    by a quantity carries them forward into a portfolio total.
+    """
+    naive = json.loads(KASPA_PRICE_BODY)["price"]
+
+    assert isinstance(naive, float)
+    assert Decimal(naive) != Decimal(KASPA_PRICE_DIGITS)
+    assert str(Decimal(naive)) != KASPA_PRICE_DIGITS
+    # And the thing that makes it dangerous rather than merely wrong: it *prints* right.
+    assert str(naive) == KASPA_PRICE_DIGITS
+
+
+@pytest.mark.parametrize(
+    "digits",
+    [
+        pytest.param("0.04228645", id="a sub-cent price, as the Kaspa node sends it"),
+        pytest.param("86000.10000", id="trailing zeros a float would drop"),
+        pytest.param("0.1", id="the value IEEE-754 cannot represent at all"),
+        pytest.param("1e-8", id="exponent form, which a vendor is free to send"),
+        pytest.param("123456789012345678901234567890.123456789", id="more digits than a double"),
+        pytest.param("-0.5", id="negative, because a parser must not read the sign twice"),
+    ],
+)
+def test_every_json_number_keeps_the_characters_the_vendor_sent(digits: str) -> None:
+    """The property, over the shapes a vendor actually sends, not only the measured one.
+
+    `86000.10000` is the row that matters most after the Kaspa one. A `float` round trip
+    renders it `86000.1`, which is the *same number* and a different string -- and the
+    string is what `NumericText` stores and what a diff of the database shows. The
+    exponent form is the row that catches a parser reaching for `str()` on a float
+    somewhere in the middle.
+    """
+    decoded = decode_json(f'{{"amount": {digits}}}')
+
+    assert isinstance(decoded, dict)
+    amount = decoded["amount"]
+
+    assert isinstance(amount, Decimal)
+    assert amount == Decimal(digits)
+    assert str(amount) == str(Decimal(digits))
+
+
+def test_a_json_integer_is_still_an_int_and_not_a_decimal() -> None:
+    """`parse_int` is untouched, and that is what keeps both balance providers working.
+
+    Bitcoin and Kaspa both count in integer base units, and both parsers refuse anything
+    that is not an `int` -- `Decimal("100000000")` included. Turning every JSON number into
+    a `Decimal` would have turned every balance in the application into a refusal, so the
+    hook has to apply to *floats* and nothing else.
+
+    The bool row is here because `json` has no bool number: `true` decodes to `True`, which
+    is an `int` subclass, and a parser that only checked `isinstance(value, int)` would read
+    it as one satoshi. That guard lives in `align_balances` and is tested above; this
+    assertion pins that the decoder does not quietly change what reaches it.
+    """
+    decoded = decode_json('{"confirmed": 100000000, "flag": true, "nothing": null}')
+
+    assert isinstance(decoded, dict)
+    confirmed = decoded["confirmed"]
+
+    assert confirmed == ONE_COIN_IN_BASE_UNITS
+    # `type(...) is int` rather than a pair of `isinstance` checks. Two reasons: it is the
+    # stronger claim, excluding `bool` as well as `Decimal`; and `isinstance(x, int)`
+    # followed by `isinstance(x, Decimal)` narrows `x` to `int` and mypy then reports the
+    # second line as unreachable, which is a correct static observation about an
+    # assertion whose subject is a runtime value the annotation cannot see.
+    assert type(confirmed) is int
+    assert decoded["flag"] is True
+    assert decoded["nothing"] is None
+
+
+def test_the_decoder_still_refuses_the_bodies_it_refused_before() -> None:
+    """The regression control on a shared decoder that two shipped providers go through.
+
+    `parse_float=` changes how a number is built and must change nothing about which bodies
+    are rejected. All four arms in `decode_json`'s own table, in one place, because the
+    risk this change carries is not that it fails loudly -- it is that it quietly widens or
+    narrows the catch clause that #7's review put there.
+    """
+    for body in (
+        "not json",
+        b"\xff\xfe not utf-8",
+        "1" * 5000,  # over CPython's 4300-digit integer limit: a ValueError, not a JSON one
+        "[" * 5000 + "]" * 5000,  # RecursionError, which is not a ValueError at all
+    ):
+        with pytest.raises(ProviderResponseError):
+            decode_json(body)
+
+
+def test_a_refusal_never_quotes_the_body_that_caused_it() -> None:
+    """Unchanged by #9 and asserted here because #9 is what made bodies carry money.
+
+    A price body is public market data, but the same decoder reads address balances, and a
+    parser error that quoted the text it failed on would put the owner's holdings into a
+    log line. The message says the body did not parse and shows nothing.
+    """
+    secret = f"{{not json {BIP173_TESTNET_P2WPKH}"
+
+    with pytest.raises(ProviderResponseError) as caught:
+        decode_json(secret)
+
+    rendered = f"{caught.value}{caught.value!r}"
+    assert BIP173_TESTNET_P2WPKH not in rendered
+    assert "not json" not in rendered
+
+
+# --------------------------------------------------------------------------------------
+# The three JSON tokens `parse_float` never sees
+# --------------------------------------------------------------------------------------
+#
+# `parse_float=Decimal` covers every number in a JSON document **except** three, and the
+# exception is not documented anywhere a reader would look: `NaN`, `Infinity` and
+# `-Infinity` go through `parse_constant`, not `parse_float`. Measured --
+# `json.loads('{"p": NaN}', parse_float=Decimal)["p"]` is `nan`, a Python **float**.
+#
+# So the decoder written to keep floats out of `providers/` was producing one, through the
+# one path nobody would check. Invisible to the AST ban as well: there is no literal and no
+# name `float` anywhere in the source that produces it.
+#
+# None of the three is valid JSON. RFC 8259 admits no non-finite number, so refusing them
+# turns off a Python extension rather than rejecting a vendor's legitimate output.
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("NaN", id="NaN"),
+        pytest.param("Infinity", id="Infinity"),
+        pytest.param("-Infinity", id="-Infinity"),
+    ],
+)
+def test_the_three_non_finite_json_extensions_are_refused(token: str) -> None:
+    """A typed refusal naming the token, not a `float` handed onward to a parser.
+
+    The message names the token and nothing else. It is one of three fixed words from a
+    closed set, so it discloses nothing about the body -- which is the standard every other
+    refusal in this package is held to.
+    """
+    with pytest.raises(ProviderResponseError) as caught:
+        decode_json(f'{{"price": {token}}}')
+
+    assert token in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("NaN", id="NaN"),
+        pytest.param("Infinity", id="Infinity"),
+        pytest.param("-Infinity", id="-Infinity"),
+    ],
+)
+def test_plain_json_loads_hands_back_a_float_for_each_of_them(token: str) -> None:
+    """The companion, and the reason the refusal is in the decoder rather than in a parser.
+
+    `json.loads` accepts all three out of the box and produces a `float` for each, **even
+    with `parse_float=Decimal`**. That is the whole finding in one assertion: the hook a
+    reader would assume covers every number does not cover these, and a parser downstream
+    would be refusing a value that had already been through binary floating point.
+
+    A NaN is the worst of the three in a money column, because it compares false against
+    itself forever -- including against the row it was read from.
+    """
+    naive = json.loads(f'{{"price": {token}}}', parse_float=Decimal)["price"]
+
+    # `type(...) is float` rather than a pair of `isinstance` checks, for the reason
+    # `test_a_json_integer_is_still_an_int_and_not_a_decimal` gives: narrowing to `float`
+    # and then asking about `Decimal` is a question mypy can answer statically -- the two
+    # have disjoint bases -- and it reports the second line as unreachable.
+    assert type(naive) is float
+    # And it really did go through `parse_float=Decimal`, which is the finding: the hook
+    # was applied and these three tokens went round it.
+    assert type(json.loads('{"price": 1.5}', parse_float=Decimal)["price"]) is Decimal
+
+
+def test_an_ordinary_number_still_decodes_beside_them() -> None:
+    """The control. A `parse_constant` that refused everything would pass the tests above.
+
+    `parse_constant` is only consulted for the three tokens, so an ordinary number must be
+    unaffected -- and the assertion is on the same document shape the refusals use, so the
+    difference is the token and nothing else.
+    """
+    decoded = decode_json('{"price": 0.04228645}')
+
+    assert isinstance(decoded, dict)
+    assert decoded["price"] == Decimal(KASPA_PRICE_DIGITS)
+
+
+def test_the_refusal_is_not_lost_inside_the_decoders_own_catch_clause() -> None:
+    """`decode_json` catches `ValueError`, and a `ValueError` here would be swallowed.
+
+    The refusal is raised from inside `json.loads`, so it passes through
+    `except (ValueError, RecursionError)` on its way out. A `ProviderResponseError` is not
+    a `ValueError`, so it travels untouched and the caller gets the message naming the
+    token; raising a `ValueError` instead would have it caught two frames later and
+    re-raised as the generic "the response body is not JSON", which every malformed body
+    already produces and which names nothing.
+
+    Asserted by comparing the two messages, because the exception **type** is identical
+    either way -- which is exactly why this would have been invisible.
+    """
+    with pytest.raises(ProviderResponseError) as specific:
+        decode_json('{"price": NaN}')
+    with pytest.raises(ProviderResponseError) as generic:
+        decode_json("not json at all")
+
+    assert str(specific.value) != str(generic.value)
+    assert "NaN" in str(specific.value)

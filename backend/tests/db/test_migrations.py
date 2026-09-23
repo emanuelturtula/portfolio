@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
     from sqlalchemy.engine import Connection
 
-APPLICATION_TABLES = frozenset({"users", "sessions", "assets", "wallets"})
+APPLICATION_TABLES = frozenset({"users", "sessions", "assets", "wallets", "prices"})
 """Every table the application owns, compared **exactly** rather than with `>=`.
 
 `>=` was the original spelling and it covered less than it looked like it did: a table a
@@ -64,6 +64,14 @@ compared, rather than being listed here as though the application owned it.
 
 STAMP_TABLE = "alembic_version"
 FIRST_REVISION = "0001_initial_schema"
+
+#: The revision immediately below #9's, so the prices migration can be reversed on its own
+#: rather than only as part of a walk all the way down to base. A downgrade to base drops
+#: everything and would pass for a `downgrade()` that dropped the wrong table; a downgrade
+#: of one step has to leave the other four standing, which is the property an operator
+#: actually relies on when a release is rolled back on the Pi.
+REVISION_BEFORE_PRICES = "0003_wallets"
+PRICES_REVISION = "0004_prices"
 
 EXPECTED_SEED_ROWS = [
     ("BTC", "Bitcoin", 8, "crypto"),
@@ -82,6 +90,16 @@ EXPECTED_CONSTRAINT_NAMES = {
         "uq_wallets_user_chain_address",
         "ck_wallets_chain_key",
         "fk_wallets_user_id_users",
+    },
+    # #9. `uq_prices_asset_currency` is what makes this the *current* price rather than a
+    # history: the refresh upserts onto it. `ck_prices_quote_currency` is the only thing
+    # standing between the column and a third currency arriving without a migration --
+    # and, like every other CHECK here, it is invisible to the drift check.
+    "prices": {
+        "pk_prices",
+        "uq_prices_asset_currency",
+        "ck_prices_quote_currency",
+        "fk_prices_asset_id_assets",
     },
 }
 
@@ -234,6 +252,59 @@ def test_the_seed_downgrade_leaves_other_rows_alone(
     command.downgrade(build_alembic_config(database_url), FIRST_REVISION)
 
     assert seed_rows(sync_engine) == [("TEST", "Test asset", 2, "crypto")]
+
+
+def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """#9's migration, downgraded one step. `prices` goes; nothing else moves.
+
+    `test_downgrade_base_leaves_no_application_tables` already walks the whole history
+    down, and it would pass for a `downgrade()` that dropped `wallets` instead of
+    `prices` -- by the time base is reached, everything is gone either way. A single-step
+    reversal is the only thing that can tell the two apart, and a single step is what a
+    rollback on the Pi actually performs.
+
+    The seed rows are asserted afterwards because a `downgrade()` written with a stray
+    `op.execute` would be invisible to a table-name comparison.
+    """
+    upgrade_to_head(database_url)
+    assert "prices" in table_names(sync_engine)
+
+    command.downgrade(build_alembic_config(database_url), REVISION_BEFORE_PRICES)
+
+    assert table_names(sync_engine) == (APPLICATION_TABLES - {"prices"}) | {STAMP_TABLE}
+    assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
+def test_the_prices_revision_sits_directly_on_top_of_the_wallets_one() -> None:
+    """The revision ids are pinned, because the downgrade test is written in terms of them.
+
+    `REVISION_BEFORE_PRICES` and `PRICES_REVISION` are strings handed to
+    `command.downgrade`, and Alembic answers an unknown revision with an error rather than
+    a no-op -- which would at least be loud. The quieter failure is a revision that still
+    exists under a different parent: the single-step downgrade above would then reverse a
+    different migration, and its assertions would be about the wrong table while still
+    passing.
+
+    Their *adjacency* is asserted rather than the head, deliberately. #10 adds a revision
+    on top of this one, and a test pinning the head would fail on that change for a reason
+    that has nothing to do with prices -- which is how a pin teaches people to edit it
+    without reading it.
+    """
+    revisions = [
+        script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+    ]
+
+    assert PRICES_REVISION in revisions
+    assert REVISION_BEFORE_PRICES in revisions
+    # `walk_revisions` yields newest first, so the child comes one before its parent.
+    assert revisions.index(PRICES_REVISION) == revisions.index(REVISION_BEFORE_PRICES) - 1
 
 
 def test_the_migrated_schema_carries_the_convention_names(

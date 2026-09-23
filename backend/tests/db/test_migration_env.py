@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy import Engine
 
-APPLICATION_TABLES = frozenset({"users", "sessions", "assets", "wallets"})
+APPLICATION_TABLES = frozenset({"users", "sessions", "assets", "wallets", "prices"})
 """Every table the application owns, compared **exactly** rather than with `>=`.
 
 Under `>=` a table nobody added here satisfied every assertion below, so the list could

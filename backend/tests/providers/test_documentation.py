@@ -14,6 +14,7 @@ it, which is how a document stays a description of the thing rather than of its 
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Final
 
@@ -21,9 +22,30 @@ import pytest
 
 from portfolio.providers import errors
 from portfolio.providers.base import ChainProvider
+from portfolio.providers.prices.base import SUPPORTED_PAIRS, sources_for
+from portfolio.providers.prices.registry import price_sources
+from portfolio.services.prices import STALE_AFTER
+from tests.providers.prices.harness import (
+    SYNTHETIC_COINGECKO_KEY,
+    PriceFake,
+    price_client,
+    price_settings,
+)
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[3]
 PROVIDER_DOC: Final = REPO_ROOT / "docs" / "providers.md"
+
+#: The multiplication sign the document is written with, as an escape rather than as the
+#: character. Ruff's RUF001 flags a literal U+00D7 in source as ambiguous with the letter
+#: `x`, which is a fair complaint about a character nobody can tell apart in a diff -- and
+#: the document is prose, where the typographic sign is the right one to read.
+TIMES: Final = "\u00d7"
+
+#: Every `a TIMES b = c` written in the document, so the arithmetic can be evaluated
+#: rather than read. A budget nobody checked is a number somebody once believed.
+MULTIPLICATION: Final = re.compile(rf"(\d[\d,]*)\s*[{TIMES}x]\s*(\d[\d,]*)\s*=\s*(\d[\d,]*)")
+
+HOURS_PER_DAY: Final = 24
 
 
 def document() -> str:
@@ -287,3 +309,225 @@ def test_the_document_says_why_a_4xx_is_not_unavailability() -> None:
 
     assert "401" in text
     assert "404" in text or "400" in text
+
+
+# --------------------------------------------------------------------------------------
+# Criterion 7 of #9: the monthly call budget is calculated and written down
+# --------------------------------------------------------------------------------------
+#
+# "Calculated and written down" is two claims, and a document can satisfy the second
+# without the first. So the arithmetic in it is evaluated rather than read, and the figure
+# everything else rests on -- 24 refreshes a day -- is tied back to `STALE_AFTER`, which is
+# the only thing that makes 24 the right number.
+
+
+def test_the_document_states_the_measured_call_budget() -> None:
+    """Criterion 7: the number, the request, the date, and the claim it rests on.
+
+    Each of these is a different failure if it is missing. Without **720** there is no
+    budget. Without **one request per refresh** the 720 is unexplained, and that figure is
+    what the whole design rests on -- an unbatched primary would make it 2,880. Without the
+    **date** it is a vendor fact nobody can tell has expired. And without the measured
+    request a reader cannot reproduce it.
+    """
+    text = document()
+    lowered = text.lower()
+
+    assert "720" in text, "the monthly budget is the number criterion 7 asks for"
+    assert "0/public/Ticker" in text, "the measured request has to be reproducible"
+    assert "2026-09-23" in text, "a vendor fact with no date cannot be known to be stale"
+    assert "budget" in lowered
+    assert "one request per refresh" in lowered
+
+
+def test_the_arithmetic_in_the_document_is_right() -> None:
+    """Every `a x b = c` in the document, evaluated rather than read.
+
+    A budget is only worth writing down if it is correct, and a written multiplication is
+    the one kind of claim a test can check completely. The 30-day figure, the 31-day worst
+    case and the yearly total are all stated; a typo in any of them would survive every
+    substring assertion above.
+    """
+    text = document()
+
+    statements = MULTIPLICATION.findall(text)
+
+    assert statements, "the document states no arithmetic at all"
+    wrong = [
+        f"{left} x {right} = {product}"
+        for left, right, product in statements
+        if int(left.replace(",", "")) * int(right.replace(",", "")) != int(product.replace(",", ""))
+    ]
+    assert wrong == [], f"docs/providers.md states arithmetic that is wrong: {wrong}"
+
+
+def test_the_document_states_the_budget_the_shipped_threshold_actually_produces() -> None:
+    """The join: 24 refreshes a day is right **because** `STALE_AFTER` is one hour.
+
+    This is the assertion that stops the document going quietly stale. Change `STALE_AFTER`
+    to fifteen minutes and every figure in that table is wrong by a factor of four -- the
+    arithmetic still checks out, the date is still there, and nothing else in the suite has
+    an opinion. Deriving the cadence from the constant is what ties the two together.
+
+    The monthly figure is derived here and then looked for in the document, rather than the
+    document being trusted: `720` written next to a `24` that no longer follows from
+    anything is exactly the shape of a number nobody rechecked.
+    """
+    text = document()
+
+    refreshes_per_day = int(HOURS_PER_DAY * 3600 // STALE_AFTER.total_seconds())
+    per_month = refreshes_per_day * 30
+
+    assert refreshes_per_day == HOURS_PER_DAY, (
+        f"STALE_AFTER is {STALE_AFTER}, so a refresh keyed to it runs {refreshes_per_day} "
+        f"times a day and the document's figures no longer follow from it"
+    )
+    assert str(per_month) in text
+    assert f"{refreshes_per_day} {TIMES} 30 = {per_month}" in text
+
+
+def test_the_document_bounds_what_a_bad_day_costs() -> None:
+    """The budget on the day the primary is down, which is the number nobody writes down.
+
+    720 is the healthy case and it is the easy half. The fallbacks are not batched --
+    Coinbase is one request per pair -- so a reader who had only the healthy figure would be
+    surprised by the first outage. Bounding it is what makes the design's own claim ("it
+    never costs more than one request per pair per source") checkable rather than soothing.
+    """
+    # Whitespace collapsed before the search. Markdown wraps at eighty columns, so a phrase
+    # this test cares about is as likely to be split across two lines as not -- and an
+    # assertion that fails on a line break is one somebody deletes rather than reads.
+    flattened = " ".join(document().split()).lower()
+
+    assert "if kraken fails" in flattened or "kraken down" in flattened
+    assert "per pair per source" in flattened
+    assert "3 requests" in flattened, "the bound itself, not only the claim that there is one"
+
+
+@pytest.mark.parametrize(
+    "pair",
+    sorted(SUPPORTED_PAIRS),
+    ids=lambda pair: f"{pair[0]}/{pair[1]}",
+)
+def test_the_document_names_the_source_order_the_code_actually_produces(
+    pair: tuple[str, str],
+) -> None:
+    """The per-pair table, derived from the shipped code and looked up in the document.
+
+    Derived rather than listed, the same choice the protocol members make and for the same
+    reason: adding a source, or reordering `price_sources`, must fail this test until the
+    table follows. A hand-written expectation here would agree with a document that had gone
+    stale.
+
+    Every source name in the shipped order has to appear in that pair's row, **in that
+    order** -- so a table listing the right sources in the wrong sequence is caught, and the
+    sequence is the whole of what the table is claiming.
+    """
+    asset_symbol, quote_currency = pair
+    sources = price_sources(
+        price_client(PriceFake()),
+        settings=price_settings(coingecko_api_key=SYNTHETIC_COINGECKO_KEY),
+    )
+    expected = [source.name for source in sources_for(asset_symbol, quote_currency, sources)]
+
+    row = next(
+        (
+            line
+            for line in document().splitlines()
+            if line.startswith(f"| {asset_symbol}/{quote_currency} ")
+        ),
+        None,
+    )
+
+    assert row is not None, f"docs/providers.md has no row for {asset_symbol}/{quote_currency}"
+    positions = [row.lower().find(name) for name in expected]
+    assert all(position >= 0 for position in positions), (
+        f"{asset_symbol}/{quote_currency} is documented as {row!r}, "
+        f"which does not name every source in {expected}"
+    )
+    assert positions == sorted(positions), (
+        f"{asset_symbol}/{quote_currency} is documented in the wrong order; "
+        f"the code tries {expected}"
+    )
+
+
+def test_the_document_records_what_is_assumed_rather_than_measured() -> None:
+    """Three guesses this change ships with, each named where the next reader will meet it.
+
+    The Kaspa endpoint's **currency** is an inference from a number's magnitude. CoinGecko's
+    **response shape** comes from documentation, because measuring it needs a key this
+    repository must not contain. And KAS/EUR has exactly one key-free source, so losing
+    Kraken loses that pair. A document that stated all three flatly would turn three guesses
+    into three facts, and #10 would build on them without checking.
+    """
+    lowered = document().lower()
+
+    assert "assum" in lowered, "the Kaspa currency assumption has to be named as one"
+    assert "not measured" in lowered or "not verified" in lowered
+    assert "coingecko" in lowered
+    assert "kas/eur" in lowered
+
+
+def test_the_document_names_the_contract_that_keeps_prices_off_a_request_path() -> None:
+    """Criterion 2's mechanism, in the document a future provider author reads first.
+
+    Somebody who does not know the contract exists writes "just refresh it if it is stale"
+    into the valuation service, watches CI fail on a layering check they have never seen,
+    and either reads the contract or works around it. Which of those happens is decided by
+    whether this paragraph is here.
+    """
+    text = document()
+
+    assert "prices-are-never-fetched-in-a-request" in text
+    assert "allow_indirect_imports" in text
+    assert "services/price_refresh.py" in text
+
+
+def test_the_document_explains_the_float_boundary_and_where_it_is() -> None:
+    """Rule 2 at the one place in this change where it is not where anyone would look.
+
+    A vendor sending a price as a JSON number is the whole subject of #9, and the fix is in
+    a **shared decoder** rather than in the parser that meets it. Naming `decode_json` and
+    `parse_float` is what stops the next provider author writing their own `json.loads` and
+    quietly reintroducing the thing this issue existed to remove.
+    """
+    text = document()
+
+    assert "decode_json" in text
+    assert "parse_float" in text
+    assert "NumericText" in text
+
+
+def test_the_document_carries_no_credential_and_no_key_shaped_string() -> None:
+    """Rule 3 over the document, including a plausible-looking fake.
+
+    An example in a document is the thing people copy, so a key-shaped string here would be
+    copied into a `.env` and then into a screenshot. The header **name** is expected to be
+    present -- an operator needs it -- and no value beside it.
+    """
+    text = document()
+
+    assert "x-cg-demo-api-key" in text, "the header name is documentation, not a secret"
+    assert "CG-" not in text, "a CoinGecko key shape must not appear, even as an example"
+    assert SYNTHETIC_COINGECKO_KEY not in text
+    assert not re.search(r"PORTFOLIO_COINGECKO_API_KEY\s*=\s*\S", text), (
+        "the document assigns a value to the key variable"
+    )
+
+
+def test_building_the_documented_sources_reaches_no_vendor() -> None:
+    """The control on this module's own harness: construction costs no request.
+
+    The table test above builds the shipped sources once per pair. If construction made a
+    call, a documentation test would be reaching four real vendors on every CI run -- which
+    is the sort of thing nobody notices until a rate limiter does.
+    """
+    fake = PriceFake()
+
+    price_sources(price_client(fake), settings=price_settings())
+    price_sources(
+        price_client(fake),
+        settings=price_settings(coingecko_api_key=SYNTHETIC_COINGECKO_KEY),
+    )
+
+    assert fake.requests == []
