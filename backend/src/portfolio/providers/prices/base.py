@@ -171,6 +171,13 @@ class PriceSource(Protocol):
         and a parser that dropped it silently would hide it behind a price that still looks
         plausible.
 
+        **That last rule is enforced by `fetch_prices`, not merely stated here.** A
+        response carrying a pair nobody asked for is discarded whole and the source is
+        passed over, because the quotes we did ask for came out of the same document. Each
+        parser checks its own correlation as well, and the duplication is deliberate: four
+        copies of a rule is four chances to drop it, and the source nobody has written yet
+        is the one that would.
+
         Raises:
             ProviderUnavailableError: the vendor could not be reached, or did not answer.
             ProviderRateLimitedError: it refused because we asked too often.
@@ -289,6 +296,17 @@ async def fetch_prices(
             # failed reaches an operator as a `source` column naming whoever did answer,
             # or as a reason when nobody did.
             continue
+        if not _answers_only_what_was_asked(quotes, wanted):
+            # **The whole response is discarded, not just the extra quote**, and the
+            # outstanding pairs go to the next source as though this one had not answered.
+            # A response that does not correspond to its request has proved that its
+            # correlation is broken; the quotes for pairs we *did* ask for come out of the
+            # same document and are no more trustworthy than the one that gave it away.
+            # Keeping them and dropping the extra would hide a paging mistake, a cached
+            # answer for somebody else's request or a mis-keyed lookup behind prices that
+            # still look plausible -- which is the argument `align_balances` makes about an
+            # address nobody requested, applied to the other end of the same idea.
+            continue
         for quote in quotes:
             answered[quote.pair] = quote
         outstanding = [pair for pair in outstanding if pair not in answered]
@@ -299,6 +317,36 @@ async def fetch_prices(
         quotes=tuple(answered.values()),
         unanswered=tuple(sorted(outstanding)),
     )
+
+
+def _answers_only_what_was_asked(
+    quotes: Sequence[PriceQuote],
+    wanted: Sequence[PricePair],
+) -> bool:
+    """Whether every quote is about a pair this source was actually asked for.
+
+    **The rule `PriceSource.fetch` states, enforced in the loop rather than trusted to four
+    parsers.** All four do check their own documents today -- `parse_ticker` against the
+    codes it requested, `parse_spot` against the echoed `base` and `currency`,
+    `parse_simple_price` against the coin ids it asked for, and `parse_price` returns a
+    constant pair -- so nothing reaches this check in the shipped configuration. It is here
+    for the reason `align_balances` refuses an unrequested address in the shared alignment
+    step instead of leaving it to each provider: a rule enforced in four places is a rule
+    one of them can drop, and the fifth source nobody has written yet is the one that
+    would.
+
+    Answering about *fewer* pairs than were asked is fine and is the normal case: a partial
+    answer leaves the rest to the next source, which is what failover is for. Only an
+    answer about something nobody asked for is a correlation failure.
+
+    Returns `False` rather than raising. The caller is a loop over sources whose one rule is
+    that a source which does not answer moves us to the next one, and an exception would
+    have to be caught two lines later to mean the same thing. It also must not abort the
+    whole fetch: three pairs already obtained from an earlier source are real and a fourth
+    vendor misbehaving is no reason to throw them away.
+    """
+    asked = set(wanted)
+    return all(quote.pair in asked for quote in quotes)
 
 
 def require_price(value: object, *, source: str) -> Decimal:

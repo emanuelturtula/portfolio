@@ -68,11 +68,24 @@ __all__ = [
 class UnknownAssetError(Exception):
     """A source answered about an asset that has no row in `assets`.
 
-    A wiring mistake rather than a runtime condition, and therefore loud: the supported
-    pairs are built from symbols that `0002_seed_assets` inserts, so reaching this means a
-    pair was added to `SUPPORTED_PAIRS` without the migration that gives it somewhere to be
-    stored. Silently dropping the quote would leave a pair that reports "never fetched"
-    forever, with every refresh appearing to succeed.
+    Loud rather than a dropped quote, because the failure it prevents is silent: a pair
+    that reports "never fetched" forever while every refresh appears to succeed.
+
+    **Two ways to arrive here, and neither is a misbehaving vendor.** A quote can only
+    exist for a pair in `SUPPORTED_PAIRS` -- `sources_for` refuses anything else without a
+    request, and `fetch_prices` discards a response that volunteers a pair nobody asked
+    for -- so a vendor cannot cause this.
+
+    * **A pair was added to `SUPPORTED_PAIRS` without the migration that seeds its asset.**
+      A code change, caught the first time the refresh runs.
+    * **The `assets` row is missing from a database that should have it.** A file restored
+      from before `0002_seed_assets`, or a row deleted by hand on the host. This is the one
+      that happens in production, and it is why the guard is a raise rather than an
+      assertion about our own constants: the process cannot fix it and must not paper over
+      it.
+
+    Nothing is committed when it fires, so a refresh that hits it leaves the previous
+    prices standing rather than writing a partial set.
 
     Names the symbol, which is a public ticker rather than anything about the owner.
     """
