@@ -1,4 +1,4 @@
-"""Operator commands: `create-user` and `hash-benchmark`.
+"""Operator commands: `create-user`, `hash-benchmark` and `refresh-prices`.
 
 A sibling of `portfolio.api`, not a layer above it: both are entry points onto the same
 services, and neither imports the other. Everything here is a thin shell around
@@ -39,11 +39,18 @@ from portfolio.domain.passwords import (
     OWASP_MINIMUM_TIME_COST,
     PasswordPolicyError,
 )
+from portfolio.providers.http import build_http_client
+from portfolio.providers.prices.registry import price_sources
 from portfolio.services.auth import AuthError, LoginThrottle, build_auth_service
 from portfolio.services.password_hasher import PasswordHasher
+from portfolio.services.price_refresh import (
+    UnknownAssetError,
+    build_price_refresh_service,
+)
 
 if TYPE_CHECKING:
     from portfolio.config import Settings
+    from portfolio.services.price_refresh import RefreshReport
 
 # What the issue asks the Raspberry Pi to be tuned to. Reported as guidance rather than
 # enforced: the right number depends on how many people share the machine, and the only
@@ -199,6 +206,76 @@ def _time_one_hash(hasher: PasswordHasher, sample: str) -> int:
     return perf_counter_ns() - started
 
 
+async def run_price_refresh(settings: Settings) -> RefreshReport:
+    """Build the client, the sources and the service, run one refresh, and close it all.
+
+    **The `httpx.AsyncClient` is built here and closed here**, which is the whole reason
+    this is one function rather than three. The client owns the connection pool and carries
+    the per-host rate limiter's state on its transport, so it has exactly one lifetime and
+    it is this command's; `docs/providers.md` records that #10 owns the equivalent in the
+    application's lifespan. Leaving it open would leak a pool into an operator's shell.
+
+    The engine is disposed in a `finally` for the same reason `store_user` does it: a
+    command that exits without releasing its SQLite handle leaves a file lock behind on the
+    one copy of the data.
+
+    `price_sources` is called **here, in the entry point**, and the built sources are handed
+    to the service. That is what keeps `services/price_refresh.py` dependent on the
+    `PriceSource` protocol rather than on which vendors exist, and it is the same shape the
+    scheduler in #10 will use.
+    """
+    engine = create_database_engine(settings.database_url)
+    client = build_http_client()
+    try:
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            service = build_price_refresh_service(
+                session,
+                sources=price_sources(client, settings=settings),
+            )
+            return await service.refresh_prices()
+    finally:
+        await client.aclose()
+        await engine.dispose()
+
+
+def refresh_prices(args: argparse.Namespace) -> int:
+    """`refresh-prices`: fetch every supported pair once, store it, and say what happened.
+
+    **This exists so the call budget can be measured before #10 automates it.** Run it by
+    hand, count the requests in the log -- one `asset_prices` line per healthy refresh --
+    and the number in `docs/providers.md` stops being arithmetic and becomes an
+    observation.
+
+    **An incomplete refresh is exit code 1 and still prints everything it did.** A command
+    that succeeded at three pairs out of four has not succeeded: a scheduler reading only
+    the exit code would record a good run, and the missing pair would surface days later as
+    a portfolio total that has been quietly short the whole time. The pairs that did work
+    are still reported, because the operator needs to know which vendor answered.
+
+    Prices are printed. They are public market data rather than the owner's holdings --
+    nothing here names a wallet, an address or a quantity -- and the number is the point of
+    running the command.
+    """
+    del args  # The command takes no options; every supported pair is refreshed.
+    settings = get_settings()
+    report = asyncio.run(run_price_refresh(settings))
+
+    emit(f"as of {report.as_of.isoformat()}")
+    for entry in report.refreshed:
+        emit(f"{entry.asset_symbol}/{entry.quote_currency} {entry.amount} via {entry.source}")
+    for missing in report.unavailable:
+        emit_error(f"{missing.asset_symbol}/{missing.quote_currency} unavailable: {missing.reason}")
+
+    if report.unavailable:
+        emit_error(
+            f"{len(report.unavailable)} of "
+            f"{len(report.refreshed) + len(report.unavailable)} pair(s) were not refreshed."
+        )
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The command line. Note what is absent: there is no way to pass a password."""
     parser = argparse.ArgumentParser(prog="portfolio", description=__doc__)
@@ -232,6 +309,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark.set_defaults(handler=hash_benchmark)
 
+    refresh = commands.add_parser(
+        "refresh-prices",
+        help="fetch every supported pair once and store it (no scheduler; #10 owns that)",
+    )
+    refresh.set_defaults(handler=refresh_prices)
+
     return parser
 
 
@@ -240,7 +323,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         exit_code: int = args.handler(args)
-    except (CommandError, PasswordPolicyError, AuthError) as exc:
+    except (CommandError, PasswordPolicyError, AuthError, UnknownAssetError) as exc:
+        # `UnknownAssetError` is a wiring mistake rather than a crash worth a traceback: a
+        # supported pair whose asset was never seeded. The message names the symbol and the
+        # remedy, which is all an operator can act on.
         emit_error(str(exc))
         return 1
     return exit_code
