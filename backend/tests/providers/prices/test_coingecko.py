@@ -288,15 +288,21 @@ def test_a_json_number_from_this_vendor_keeps_its_digits_too() -> None:
         pytest.param("86000.10000", id="trailing zeros full precision is asked for"),
         pytest.param("0.1", id="the value IEEE-754 cannot represent at all"),
         pytest.param("1e-8", id="exponent form"),
-        pytest.param("0.000000000000000000001", id="finer than the column's own scale"),
+        pytest.param("0.04228645123456789", id="finer than the scale, and still storable"),
     ],
 )
 def test_every_shape_of_number_survives_this_parser(digits: str) -> None:
     """The property over the shapes `precision=full` can produce, not only the measured ones.
 
-    The last row is finer than `PRICE_SCALE`, which is deliberate: the parser's job is to
-    carry what the vendor sent, and deciding what the column can hold is `NumericText`'s.
-    A parser that rounded early would make the column's declared scale a fiction.
+    The last row is seventeen decimal places, finer than `PRICE_SCALE`, and it is carried
+    through **unrounded**: the parser's job is to hand on what the vendor sent, and deciding
+    what the column can hold is `NumericText`'s. A parser that rounded early would make the
+    column's declared scale a fiction.
+
+    It used to be `1E-21`, which is finer than the scale in a different way: it rounds to
+    *nothing*. Carrying that through was this test asserting that a parser may pass on a
+    price the column will store as `0.000000000000` -- the blocking defect's own shape, one
+    layer up. `test_a_price_this_vendor_sends_that_would_round_away_is_refused` has it now.
     """
     body = coingecko_body({"bitcoin": {"usd": digits}})
 
@@ -304,6 +310,47 @@ def test_every_shape_of_number_survives_this_parser(digits: str) -> None:
 
     assert quotes[0].amount == Decimal(digits)
     assert str(quotes[0].amount) == str(Decimal(digits))
+
+
+@pytest.mark.parametrize(
+    "digits",
+    [
+        pytest.param("0.000000000000000000001", id="1E-21, far below the scale"),
+        pytest.param("0.0000000000005", id="the boundary: rounds to zero at twelve places"),
+    ],
+)
+def test_a_price_this_vendor_sends_that_would_round_away_is_refused(digits: str) -> None:
+    """A JSON number small enough to vanish is refused here as well as at the column.
+
+    CoinGecko is asked for `precision=full`, so it is the source most likely to send a
+    number with more places than the column holds -- which makes it the one where the
+    difference between "rounded" and "destroyed" actually shows up.
+
+    Refused at the parser rather than only at the column because of *where* the column
+    refuses: at bind time, inside `flush()`, with the other pairs of the same refresh
+    already in the transaction that is about to be rolled back. One bad number from one
+    vendor would cost a whole refresh.
+    """
+    body = coingecko_body({"bitcoin": {"usd": digits}})
+
+    with pytest.raises(ProviderResponseError, match=r"(?i)round it away to zero"):
+        parse_simple_price(body, [BTC_USD])
+
+
+def test_the_boundary_is_rounding_and_not_magnitude() -> None:
+    """`5E-13` is refused and `6E-13` is kept, one digit apart at the same exponent.
+
+    The bound is `quantize(amount, PRICE_SCALE).is_zero()` and not a comparison against an
+    exponent, and the two differ on exactly this pair: both are thirteen places, one rounds
+    to zero and one rounds to `1E-12`. A magnitude test would refuse both, which would
+    reject the smallest price the column can actually hold.
+    """
+    kept = parse_simple_price(coingecko_body({"bitcoin": {"usd": "0.0000000000006"}}), [BTC_USD])
+
+    assert kept[0].amount == Decimal("6E-13")
+
+    with pytest.raises(ProviderResponseError):
+        parse_simple_price(coingecko_body({"bitcoin": {"usd": "0.0000000000005"}}), [BTC_USD])
 
 
 # --------------------------------------------------------------------------------------

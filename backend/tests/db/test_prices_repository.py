@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 from sqlalchemy import inspect, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, StatementError
 
 from portfolio.db.engine import create_session_factory
 from portfolio.db.models import _PRICE_QUOTE_CURRENCY_CHECK, PRICE_SCALE, Asset, AssetPrice
@@ -80,11 +80,21 @@ BTC_USD_DIGITS: Final = "86000.10000"
 KAS_USD_STORED: Final = "0.042286450000"
 BTC_USD_STORED: Final = "86000.100000000000"
 
-#: A price finer than the column's scale, and what it must become. The thirteenth decimal
-#: place is the boundary: `ROUND_HALF_EVEN` at scale 12 turns `...0005` into `...000`,
-#: because the digit before it is even. A `ROUND_HALF_UP` column would write `...001`.
-OVER_PRECISE_DIGITS: Final = "0.0000000000005"
-OVER_PRECISE_STORED: Final = "0.000000000000"
+#: A price finer than the column's scale that **survives** it: the thirteenth decimal place
+#: is rounded away and something is left. This is what "rounded to the declared scale"
+#: means, and it is the only over-precise case the column accepts.
+OVER_PRECISE_DIGITS: Final = "0.0422864500004"
+OVER_PRECISE_STORED: Final = "0.042286450000"
+
+#: A price finer than the column's scale that **does not survive** it: rounding to twelve
+#: places leaves zero.
+#:
+#: This constant used to sit above with `"0.000000000000"` beside it, asserted as a
+#: rounding property -- which was this module asserting the one outcome it exists to
+#: refuse. Measured end to end before the guard landed: a positive price stored as a zero,
+#: and `value_portfolio` then reporting `total=0E-12 complete=True unpriced=()`. A renderer
+#: is told the total is whole; there is no absent row for a valuation to notice.
+VANISHING_DIGITS: Final = "0.0000000000005"
 
 INSERT_PRICE: Final = text(
     "INSERT INTO prices (asset_id, quote_currency, amount, source, as_of, fetched_at) "
@@ -316,17 +326,21 @@ async def test_the_shipped_scale_is_twelve_and_the_column_is_the_one_that_uses_i
     assert AssetPrice.__tablename__ == "prices"
 
 
-async def test_a_price_finer_than_the_scale_is_rounded_half_to_even(
+async def test_a_price_finer_than_the_scale_is_rounded_to_it(
     repository: PriceRepository,
     session: AsyncSession,
 ) -> None:
-    """The thirteenth decimal place, which is where the declared scale starts to mean something.
+    """The thirteenth decimal place, rounded away, with something left behind.
 
     Not a hazard for either asset this release prices -- KAS quotes at eight places -- but
-    the column's behaviour at its own boundary should be a decision rather than a surprise,
-    and `ROUND_HALF_EVEN` is a decision `domain/money.py` made for the whole application.
-    A `ROUND_HALF_UP` column would write `0.000000000001` here, which is a different number
-    in a direction that accumulates.
+    the column's behaviour at its own boundary should be a decision rather than a surprise.
+    This is the accepted half of that boundary: `0.0422864500004` loses a four and stays a
+    price.
+
+    The refused half is the test below. Earlier this module asserted **that** case as a
+    rounding property too, which was a mistake worth naming: it wrote down the column
+    destroying an amount as the column's declared behaviour, and the assertion would have
+    gone on passing through every mutation of the guard that now prevents it.
     """
     kas = await asset_id(session, KAS)
 
@@ -341,6 +355,174 @@ async def test_a_price_finer_than_the_scale_is_rounded_half_to_even(
     await session.commit()
 
     assert await stored_text(session, symbol=KAS, currency=USD) == OVER_PRECISE_STORED
+
+
+async def test_a_price_that_would_round_away_to_zero_is_refused(
+    repository: PriceRepository,
+    session: AsyncSession,
+) -> None:
+    """A positive price the scale cannot represent is refused, and no row is written.
+
+    This is criterion 3 arriving through the column instead of through an absent row, and
+    it is the more dangerous of the two routes: a missing row produces `NEVER_FETCHED` and
+    an incomplete total, which a renderer has to handle. A stored zero produces a
+    **complete** total that is silently short, and nothing anywhere says so.
+
+    The empty table is the half that matters. A refusal that still left the zero behind
+    would be the original defect with a traceback attached.
+    """
+    kas = await asset_id(session, KAS)
+
+    with pytest.raises(ValueError, match=r"finer than its scale") as caught:
+        await repository.upsert(
+            asset_id=kas,
+            quote_currency=USD,
+            amount=Decimal(VANISHING_DIGITS),
+            source=KRAKEN,
+            as_of=AS_OF,
+            fetched_at=AS_OF,
+        )
+
+    # **A `ValueError`, not the `StatementError` SQLAlchemy wraps it in.** The column raises
+    # at bind time, inside `flush()`, and the driver's wrapper would carry the `INSERT`
+    # statement out through a repository into a service -- a `sqlalchemy` exception in a
+    # layer `import-linter` forbids from importing `sqlalchemy`, which is the same breach
+    # as a raw `httpx` error reaching a service, in the other direction.
+    assert not isinstance(caught.value, StatementError)
+    assert type(caught.value).__module__ == "builtins"
+    # The wrapper is kept as the cause, so the traceback still shows where it happened.
+    assert isinstance(caught.value.__cause__, StatementError)
+
+    await session.rollback()
+    assert (await session.scalars(select(AssetPrice))).all() == []
+
+
+async def test_the_refusal_carries_no_price_and_no_row(
+    repository: PriceRepository,
+    session: AsyncSession,
+) -> None:
+    """The message names the scale and not the amount, through the statement wrapper too.
+
+    SQLAlchemy renders bound parameters into a `StatementError` by default; `hide_parameters`
+    is what stops it, and `tests/db/test_wallets_repository.py` proves that for an address.
+    Here the value is a price, which is public -- but the same column will hold a quantity,
+    and a quantity is the owner's holdings. Asserting it now is what keeps the habit rather
+    than discovering the exception later.
+    """
+    kas = await asset_id(session, KAS)
+
+    with pytest.raises(ValueError, match=r"finer than its scale") as caught:
+        await repository.upsert(
+            asset_id=kas,
+            quote_currency=USD,
+            amount=Decimal(VANISHING_DIGITS),
+            source=KRAKEN,
+            as_of=AS_OF,
+            fetched_at=AS_OF,
+        )
+
+    rendered = f"{caught.value}{caught.value!r}{caught.value.__cause__}"
+
+    assert VANISHING_DIGITS not in rendered
+    assert str(PRICE_SCALE) in str(caught.value)
+    await session.rollback()
+
+
+@pytest.mark.parametrize(
+    ("amount", "expected"),
+    [
+        pytest.param(Decimal(VANISHING_DIGITS), ValueError, id="an amount that rounds away"),
+        pytest.param(Decimal("1E+300"), ValueError, id="an amount too large for the scale"),
+        pytest.param(0.04228645, TypeError, id="a float"),
+        pytest.param(True, TypeError, id="a bool"),
+    ],
+)
+async def test_a_column_types_refusal_is_never_delivered_as_a_driver_exception(
+    repository: PriceRepository,
+    session: AsyncSession,
+    amount: object,
+    expected: type[Exception],
+) -> None:
+    """Every value the column refuses reaches a caller as the column's own exception.
+
+    This is a layering assertion rather than a value one, and it is the generalisation of
+    the two tests above. `NumericText` refuses at **bind** time, which is inside
+    `flush()`, and SQLAlchemy wraps whatever the type raised in a `StatementError` that
+    carries the `INSERT` with it. Letting that travel puts a `sqlalchemy` exception in
+    `services/`, which the layering contract forbids from importing `sqlalchemy` at all --
+    a caller cannot even name it in an `except` clause.
+
+    `1E+300` is the row this test was written for: it took down a whole refresh as an
+    uncaught `StatementError`, leaving zero rows written for three pairs that had answered
+    perfectly well.
+
+    The type is asserted rather than only the absence of the wrapper, because `TypeError`
+    and `ValueError` mean different things to a caller -- one is a programming mistake and
+    the other is a value this column cannot hold -- and collapsing them would be the same
+    loss of information in a smaller package.
+
+    **The rule is narrower than "no `sqlalchemy` type escapes", deliberately**, and the
+    name of this test says the narrow form. A genuine database failure -- a dropped
+    connection, a `CHECK` violation -- has no better account available at this layer, and
+    inventing one would be the wrong kind of helpful.
+    `test_a_real_database_failure_is_left_as_itself` is the other half, and without it a
+    clause that unwrapped *everything* would satisfy this test while delivering a lost
+    connection under the column's vocabulary.
+    """
+    kas = await asset_id(session, KAS)
+
+    with pytest.raises(expected) as caught:
+        await repository.upsert(
+            asset_id=kas,
+            quote_currency=USD,
+            amount=amount,  # type: ignore[arg-type]
+            source=KRAKEN,
+            as_of=AS_OF,
+            fetched_at=AS_OF,
+        )
+
+    assert not isinstance(caught.value, StatementError)
+    assert type(caught.value).__module__ == "builtins", (
+        f"{type(caught.value).__module__}.{type(caught.value).__name__} escaped the repository"
+    )
+    await session.rollback()
+
+
+async def test_a_real_database_failure_is_left_as_itself(
+    repository: PriceRepository,
+    session: AsyncSession,
+) -> None:
+    """The discriminator for the unwrap: a `CHECK` violation is still an `IntegrityError`.
+
+    Without this, a `_flush` that unwrapped **every** `StatementError` would satisfy the
+    test above -- and a dropped connection, or a constraint refusing a row, would arrive
+    at a caller as whatever the driver happened to have underneath, dressed in the
+    vocabulary the column type uses for a bad value. The pair together says the actual
+    rule: *a column type's refusal of a value is translated; a database failure is not.*
+
+    `GBP` is the cause because it is the one refusal this schema can produce on demand --
+    `ck_prices_quote_currency` admits two currencies -- and because it is genuinely a
+    database's verdict rather than a type's. An operator seeing `IntegrityError` here is
+    being told something true: the row was refused by the database, and the fix is a
+    migration.
+    """
+    btc = await asset_id(session, BTC)
+
+    with pytest.raises(IntegrityError) as caught:
+        await repository.upsert(
+            asset_id=btc,
+            quote_currency="GBP",
+            amount=Decimal("1"),
+            source=KRAKEN,
+            as_of=AS_OF,
+            fetched_at=AS_OF,
+        )
+
+    assert "ck_prices_quote_currency" in str(caught.value)
+    assert isinstance(caught.value, StatementError), (
+        "an IntegrityError is a StatementError; it must reach the caller as the driver's"
+    )
+    await session.rollback()
 
 
 async def test_a_float_amount_never_reaches_the_column(

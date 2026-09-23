@@ -58,7 +58,7 @@ from portfolio.providers.prices.kaspa import KASPA
 from portfolio.providers.prices.kraken import KRAKEN
 from portfolio.providers.prices.registry import price_sources
 from portfolio.services.price_refresh import build_price_refresh_service
-from portfolio.services.prices import PriceUnavailable, build_price_service
+from portfolio.services.prices import Holding, PriceUnavailable, build_price_service
 from tests.providers.prices.harness import (
     COINBASE_HOST,
     KASPA_PRICE_BODY,
@@ -669,6 +669,201 @@ async def test_a_later_refresh_that_fails_leaves_the_previous_price_standing(
 
     assert stored.source == KRAKEN
     assert stored.amount == Decimal(KRAKEN_PRICES["XXBTZUSD"])
+
+
+# --------------------------------------------------------------------------------------
+# A price this application cannot store must not cost the refresh the pairs that worked
+# --------------------------------------------------------------------------------------
+#
+# Both of these were blocking review findings, and they are two ends of one bound. Measured
+# before either was fixed:
+#
+#     Decimal("1E+300")     beside three good pairs -> sqlalchemy.exc.StatementError
+#                                                      out of refresh_prices, 0 rows written
+#     Decimal("5E-13")      stored TEXT "0.000000000000"
+#                           value_portfolio(1_000_000 KAS) -> total=0E-12 complete=True
+#
+# The first threw away three prices that had already been paid for. The second is worse,
+# because nothing failed: a positive price became a zero, and `complete=True` told every
+# renderer the total was whole. There is no absent row for a valuation to notice.
+#
+# Both are now refused by `require_price`, which puts them on the vendor error path that
+# already exists -- the source is passed over, the other pairs are kept, and the offending
+# pair falls to the next source or becomes a reason. These two tests drive that through the
+# real sources and assert the rows, because every layer in between is where the old
+# behaviour lived.
+
+
+async def test_one_unstorable_price_does_not_cost_the_other_pairs_their_rows(
+    price_session: AsyncSession,
+) -> None:
+    """Kraken sends one impossible number among four; three pairs are still written.
+
+    `1e300` is a well-formed string in a well-formed ticker envelope, so nothing above the
+    parser can tell it from a price. Refused there, it costs Kraken the whole response --
+    which is `parse_ticker`'s existing rule for a body carrying a value that cannot be
+    trusted -- and the pairs fall through to the sources behind it.
+
+    The assertion that carries this is the **row count**. The old behaviour produced zero
+    rows and an exception; the new one produces three rows and a report. Asserting only
+    that no exception was raised would pass for a refresh that quietly wrote nothing.
+    """
+    fake = PriceFake(
+        kraken=ScriptedVendor(
+            Reply(renderer=kraken_echo(dict(KRAKEN_PRICES) | {"KASUSD": "1e300"}))
+        ),
+        coinbase=ScriptedVendor(
+            Reply(
+                renderer=lambda request: coinbase_body(
+                    base=BTC,
+                    currency=request.url.path.removesuffix("/spot")[-3:],
+                    amount=COINBASE_BTC_USD,
+                )
+            )
+        ),
+        kaspa=ScriptedVendor(Reply(body=KASPA_PRICE_BODY)),
+    )
+    client = price_client(fake)
+    service = build_price_refresh_service(
+        price_session,
+        sources=price_sources(client, settings=price_settings()),
+        clock=_fixed_clock,
+    )
+
+    async with client:
+        report = await service.refresh_prices()
+
+    assert [(line.asset_symbol, line.quote_currency) for line in report.refreshed] == [
+        (BTC, EUR),
+        (BTC, USD),
+        (KAS, USD),
+    ]
+    assert [(line.asset_symbol, line.quote_currency) for line in report.unavailable] == [(KAS, EUR)]
+
+    price_session.expunge_all()
+    stored = (await price_session.scalars(select(AssetPrice))).all()
+
+    assert len(stored) == 3, "three pairs answered; one bad number must not discard them"
+    assert {row.source for row in stored} == {COINBASE, KASPA}
+
+
+async def test_a_price_that_would_round_away_never_becomes_a_complete_total(
+    price_session: AsyncSession,
+) -> None:
+    """The blocking finding, end to end: no zero row, and no total claiming to be whole.
+
+    Every source that can answer KAS/USD sends a price below the column's resolution, so
+    the pair is genuinely unpriceable -- which is the honest outcome for a number this
+    application cannot store. What matters is what a renderer is then told.
+
+    Three assertions, in the order they matter:
+
+    * **no row holds a zero.** A stored zero is the defect; its absence is the fix.
+    * **`complete` is false and KAS is named.** This is the difference between a total that
+      is short and a total that is short *and says so*, which is criterion 3 in one line.
+    * **the total is the BTC holding alone.** Asserted last and never on its own: an
+      implementation that silently dropped the Kaspa holding produces exactly this number,
+      so it is only meaningful beside the flag.
+    """
+    vanishing = "0.0000000000005"
+    fake = PriceFake(
+        kraken=ScriptedVendor(
+            Reply(renderer=kraken_echo(dict(KRAKEN_PRICES) | {"KASUSD": vanishing}))
+        ),
+        coinbase=ScriptedVendor(
+            Reply(
+                renderer=lambda request: coinbase_body(
+                    base=BTC,
+                    currency=request.url.path.removesuffix("/spot")[-3:],
+                    amount=COINBASE_BTC_USD,
+                )
+            )
+        ),
+        kaspa=ScriptedVendor(Reply(body=f'{{"price": {vanishing}}}')),
+    )
+    client = price_client(fake)
+
+    async with client:
+        report = await build_price_refresh_service(
+            price_session,
+            sources=price_sources(client, settings=price_settings()),
+            clock=_fixed_clock,
+        ).refresh_prices()
+
+    # The refresh knows *why*: it asked, and every source that could answer sent a number
+    # this application cannot store.
+    assert {
+        (line.asset_symbol, line.quote_currency): line.reason for line in report.unavailable
+    } == {
+        (KAS, USD): PriceUnavailable.EVERY_SOURCE_FAILED,
+        (KAS, EUR): PriceUnavailable.EVERY_SOURCE_FAILED,
+    }
+
+    price_session.expunge_all()
+    stored = (await price_session.scalars(select(AssetPrice))).all()
+
+    assert all(not row.amount.is_zero() for row in stored), (
+        "a stored zero values every holding of that asset at nothing"
+    )
+    assert {row.quote_currency for row in stored} == {USD, EUR}
+    assert len(stored) == 2, "only the two BTC pairs could be priced"
+
+    value = await build_price_service(price_session, clock=_fixed_clock).value_portfolio(
+        (
+            Holding(asset_symbol=BTC, quantity=Decimal("0.5")),
+            Holding(asset_symbol=KAS, quantity=Decimal("1000000")),
+        ),
+        quote_currency=USD,
+    )
+
+    assert value.complete is False
+    assert [holding.asset_symbol for holding in value.unpriced] == [KAS]
+    # **`NEVER_FETCHED`, not `EVERY_SOURCE_FAILED`, and the difference is the layer.** The
+    # valuation reads the table and nothing else, so "there is no row" is the only thing it
+    # can honestly say; the refresh, which made the calls, is where the vendor's failure is
+    # recorded. The two vocabularies meet at the table and neither borrows the other's --
+    # which is what the `services.prices` / `services.price_refresh` split is for, and what
+    # `backend/.importlinter`'s price contract keeps true.
+    assert value.unpriced[0].reason is PriceUnavailable.NEVER_FETCHED
+    assert value.total == Decimal(COINBASE_BTC_USD) / 2
+
+
+async def test_a_vanishing_price_from_one_source_still_falls_over_to_a_good_one(
+    price_session: AsyncSession,
+) -> None:
+    """The control: refusing the number must not refuse the pair.
+
+    Kraken sends a price that would round away and the Kaspa node sends the measured one.
+    KAS/USD is priced -- by the source behind the bad number -- which is what makes the
+    refusal a *failover* rather than a way of losing a pair. Without this, both tests above
+    are satisfied by a bound that simply gave up on any pair it saw a bad price for.
+    """
+    fake = PriceFake(
+        kraken=ScriptedVendor(
+            Reply(renderer=kraken_echo(dict(KRAKEN_PRICES) | {"KASUSD": "0.0000000000005"}))
+        ),
+        coinbase=ScriptedVendor(
+            Reply(
+                renderer=lambda request: coinbase_body(
+                    base=BTC,
+                    currency=request.url.path.removesuffix("/spot")[-3:],
+                    amount=COINBASE_BTC_USD,
+                )
+            )
+        ),
+        kaspa=ScriptedVendor(Reply(body=KASPA_PRICE_BODY)),
+    )
+    client = price_client(fake)
+
+    async with client:
+        report = await build_price_refresh_service(
+            price_session,
+            sources=price_sources(client, settings=price_settings()),
+            clock=_fixed_clock,
+        ).refresh_prices([KAS_USD])
+
+    assert [(line.asset_symbol, line.source) for line in report.refreshed] == [(KAS, KASPA)]
+    assert report.refreshed[0].amount == Decimal(KASPA_PRICE_DIGITS)
 
 
 # --------------------------------------------------------------------------------------

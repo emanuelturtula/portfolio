@@ -30,6 +30,8 @@ here names a wallet, an address or a quantity. The assertions below check that.
 
 from __future__ import annotations
 
+import re
+import sys
 from typing import TYPE_CHECKING, Final
 
 import pytest
@@ -100,6 +102,41 @@ def with_vendors(monkeypatch: pytest.MonkeyPatch, fake: PriceFake) -> None:
     monkeypatch.setattr(cli, "build_http_client", lambda: price_client(fake))
 
 
+#: A refreshed line: `SYMBOL/CURRENCY amount via source`, anchored end to end.
+#:
+#: A regex rather than a `startswith` or an index, and that is the whole of what this
+#: module got wrong the first time. `lines[0].startswith("as of ")` asserts that the
+#: command's first line is the command's -- which is true only while nothing else has
+#: written to stdout, and `tests/security/conftest.py`'s teardown calls
+#: `structlog.reset_defaults()`, leaving structlog printing into the same captured stream.
+#: The suite was green because `tests/cli` sorts before `tests/security`, which is not a
+#: fact about this application.
+#:
+#: Anchored, so a stray log line cannot satisfy it: a structlog record contains spaces and
+#: `=` and would match a loose `" via " in line` check the day a vendor's name appeared in
+#: one.
+REFRESHED_LINE: Final = re.compile(r"^[A-Z]+/[A-Z]{3} \S+ via \S+$")
+
+#: An unavailability line on stderr: `SYMBOL/CURRENCY unavailable: reason`.
+UNAVAILABLE_LINE: Final = re.compile(r"^[A-Z]+/[A-Z]{3} unavailable: \S+$")
+
+#: The one timestamp line, which is how an operator tells a refresh that ran from one that
+#: printed last hour's prices.
+AS_OF_LINE: Final = re.compile(r"^as of \S+$")
+
+
+def matching(pattern: re.Pattern[str], stream: str) -> list[str]:
+    """Every line of `stream` the pattern matches, in order.
+
+    Selecting the command's own lines out of the stream rather than assuming it owns the
+    whole of it. That is what makes these assertions independent of what else in the
+    process happens to be writing to stdout -- which, for a command whose whole job is to
+    run under a scheduler alongside a configured logger, is the realistic condition rather
+    than a testing convenience.
+    """
+    return [line for line in stream.splitlines() if pattern.match(line)]
+
+
 def stored_prices(sync_engine: Engine) -> dict[tuple[str, str], tuple[str, str]]:
     """Every row in `prices`, keyed by pair, as the raw `TEXT` amount and its source.
 
@@ -128,11 +165,17 @@ def test_a_complete_refresh_prints_every_pair_and_exits_zero(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """One line per pair on stdout, nothing on stderr, and exit code 0.
+    """One line per pair on stdout, no failure reported, and exit code 0.
 
     The `as of` line is asserted separately from the price lines because it is the one an
     operator uses to tell a refresh that ran from one that did nothing: without it, a
     command that printed four prices from the previous run would look identical.
+
+    Counted by pattern rather than by position. The earlier spelling asserted
+    `lines[0].startswith("as of ")` and `len(lines) == 5`, both of which are claims about
+    the command owning the whole of stdout -- and both of which failed the moment this
+    module ran after `tests/security`, whose teardown leaves structlog writing into the
+    same captured stream.
     """
     del migrated_cli_database
     fake = PriceFake(kraken=ScriptedVendor(Reply(renderer=kraken_echo())))
@@ -141,14 +184,22 @@ def test_a_complete_refresh_prints_every_pair_and_exits_zero(
     exit_code = cli.main(REFRESH)
 
     captured = capsys.readouterr()
-    lines = captured.out.splitlines()
+    refreshed = matching(REFRESHED_LINE, captured.out)
 
     assert exit_code == 0
-    assert captured.err == "", "a complete refresh has nothing to report as a failure"
-    assert lines[0].startswith("as of ")
-    assert len(lines) == 1 + len(SUPPORTED_PAIRS)
-    assert f"{BTC}/{USD} {KRAKEN_PRICES['XXBTZUSD']} via {KRAKEN}" in lines
-    assert f"{KAS}/{EUR} {KRAKEN_PRICES['KASEUR']} via {KRAKEN}" in lines
+    assert matching(UNAVAILABLE_LINE, captured.err) == [], (
+        "a complete refresh has nothing to report as a failure"
+    )
+    assert len(matching(AS_OF_LINE, captured.out)) == 1
+    assert len(refreshed) == len(SUPPORTED_PAIRS)
+    # The **stored** value, at the column's full scale, not the string the vendor sent.
+    # Kraken sent `86000.10000`; `prices.amount` is `NumericText(12)`, so what the table
+    # holds -- and what every later valuation reads -- is `86000.100000000000`. Pinned as a
+    # literal here because `test_the_printed_number_is_the_number_the_table_holds` derives
+    # it from the row, and a derived assertion alone would agree with any format at all.
+    assert f"{BTC}/{USD} 86000.100000000000 via {KRAKEN}" in refreshed
+    assert f"{KAS}/{EUR} 0.038851200000 via {KRAKEN}" in refreshed
+    assert KRAKEN_PRICES["XXBTZUSD"] == "86000.10000", "the vendor's string, for contrast"
 
 
 def test_a_complete_refresh_writes_every_pair_to_the_database(
@@ -175,6 +226,88 @@ def test_a_complete_refresh_writes_every_pair_to_the_database(
     assert set(stored) == SUPPORTED_PAIRS
     assert {source for _amount, source in stored.values()} == {KRAKEN}
     assert stored[(KAS, USD)][0] == "0.042286450000"
+
+
+def test_the_printed_number_is_the_number_the_table_holds(
+    migrated_cli_database: Path,
+    sync_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every printed price equals the row, character for character, derived from the row.
+
+    The command used to print the **quote** -- what the vendor said -- while the table held
+    it rounded to `PRICE_SCALE`. For the prices this release fetches the two happened to
+    agree, which is why nothing noticed; for any price finer than twelve places they do
+    not, and an operator would be reading a transcript that disagrees with the row every
+    later valuation reads, at the one moment somebody is actually watching.
+
+    Derived from the database rather than written out, so this assertion cannot drift with
+    the rendering: whatever the command prints, it has to be what is stored. The literal
+    form is pinned separately in
+    `test_a_complete_refresh_prints_every_pair_and_exits_zero`, so between the two the
+    format is fixed *and* the agreement is checked.
+
+    A vendor price finer than the column is used deliberately: `0.0422864500004` is what
+    makes the rounding visible, and it is the case the old spelling got wrong.
+    """
+    del migrated_cli_database
+    finer_than_the_column = dict(KRAKEN_PRICES) | {"KASUSD": "0.0422864500004"}
+    fake = PriceFake(kraken=ScriptedVendor(Reply(renderer=kraken_echo(finer_than_the_column))))
+    with_vendors(monkeypatch, fake)
+
+    assert cli.main(REFRESH) == 0
+
+    captured = capsys.readouterr()
+    printed = {line.split()[0]: line.split()[1] for line in matching(REFRESHED_LINE, captured.out)}
+    stored = {
+        f"{symbol}/{currency}": amount
+        for (symbol, currency), (amount, _) in stored_prices(sync_engine).items()
+    }
+
+    assert printed == stored
+    # And the rounding really happened, so this is not two identical values agreeing by
+    # accident of the fixture: the vendor sent a thirteenth decimal place and it is gone.
+    assert printed[f"{KAS}/{USD}"] == "0.042286450000"
+    assert printed[f"{KAS}/{USD}"] != "0.0422864500004"
+
+
+def test_the_output_is_found_even_when_something_else_wrote_to_stdout_first(
+    migrated_cli_database: Path,
+    sync_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The control on this module's own assertions, and the reason they were rewritten.
+
+    A foreign line is written to stdout **before** the command runs, which is exactly the
+    condition that made the original assertions fail: `tests/security/conftest.py`'s
+    teardown calls `structlog.reset_defaults()`, and structlog then prints into the stream
+    `capsys` has replaced. The suite was green only because `tests/cli` sorts before
+    `tests/security`, and collection order is not a property of this application.
+
+    It is also the realistic production condition rather than a testing artefact. This
+    command runs under a scheduler beside a configured logger, and the log lines and the
+    operator's lines share one stream.
+
+    Without this test the rewritten assertions are merely *currently* passing; with it they
+    are passing for the reason they claim.
+    """
+    del migrated_cli_database, sync_engine
+    fake = PriceFake(kraken=ScriptedVendor(Reply(renderer=kraken_echo())))
+    with_vendors(monkeypatch, fake)
+
+    sys.stdout.write("a log line from something else entirely target=https://host/label\n")
+    exit_code = cli.main(REFRESH)
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert len(matching(AS_OF_LINE, captured.out)) == 1
+    assert len(matching(REFRESHED_LINE, captured.out)) == len(SUPPORTED_PAIRS)
+    # And the foreign line is genuinely there, so this is not a capture that came back
+    # empty -- the failure mode `tests/security/conftest.py` records having hit twice.
+    assert "something else entirely" in captured.out
 
 
 def test_the_command_costs_one_request_which_is_the_whole_point_of_it(
@@ -243,9 +376,18 @@ def test_an_incomplete_refresh_exits_one_and_still_reports_what_worked(
     captured = capsys.readouterr()
 
     assert exit_code == 1
-    assert f"{BTC}/{USD} {COINBASE_BTC_USD} via {COINBASE}" in captured.out
-    assert f"{KAS}/{USD} unavailable: {PriceUnavailable.EVERY_SOURCE_FAILED.value}" in captured.err
-    assert f"{KAS}/{EUR} unavailable: {PriceUnavailable.EVERY_SOURCE_FAILED.value}" in captured.err
+    # Whole lines rather than substrings of the stream: `"BTC/USD ... via coinbase" in out`
+    # is satisfied by that text appearing anywhere at all, including inside a log record
+    # that happened to quote it.
+    assert set(matching(REFRESHED_LINE, captured.out)) == {
+        f"{BTC}/{USD} 85999.900000000000 via {COINBASE}",
+        f"{BTC}/{EUR} 85999.900000000000 via {COINBASE}",
+    }
+    assert COINBASE_BTC_USD == "85999.90", "the vendor's string, which is not what is printed"
+    assert set(matching(UNAVAILABLE_LINE, captured.err)) == {
+        f"{KAS}/{USD} unavailable: {PriceUnavailable.EVERY_SOURCE_FAILED.value}",
+        f"{KAS}/{EUR} unavailable: {PriceUnavailable.EVERY_SOURCE_FAILED.value}",
+    }
     assert "2 of 4 pair(s) were not refreshed." in captured.err
 
 
@@ -274,8 +416,11 @@ def test_an_entirely_failed_refresh_exits_one_and_writes_nothing(
     captured = capsys.readouterr()
 
     assert exit_code == 1
-    assert captured.out.splitlines()[0].startswith("as of ")
-    assert len(captured.out.splitlines()) == 1, "nothing was refreshed, so nothing is listed"
+    assert len(matching(AS_OF_LINE, captured.out)) == 1
+    assert matching(REFRESHED_LINE, captured.out) == [], (
+        "nothing was refreshed, so nothing is listed"
+    )
+    assert len(matching(UNAVAILABLE_LINE, captured.err)) == len(SUPPORTED_PAIRS)
     assert "4 of 4 pair(s) were not refreshed." in captured.err
     assert stored_prices(sync_engine) == {}
 

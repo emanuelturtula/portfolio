@@ -31,9 +31,11 @@ from typing import Final
 
 import pytest
 
+from portfolio.db.models import PRICE_SCALE
+from portfolio.domain.money import MONEY_PRECISION
 from portfolio.providers.base import decode_json
 from portfolio.providers.errors import ProviderResponseError
-from portfolio.providers.prices.base import require_price
+from portfolio.providers.prices.base import MAX_PRICE_INTEGER_DIGITS, require_price
 
 VENDOR: Final = "A Vendor"
 
@@ -50,7 +52,7 @@ VENDOR: Final = "A Vendor"
         pytest.param("86000.10000", id="trailing zeros the vendor sent"),
         pytest.param("0.1", id="the value IEEE-754 cannot represent"),
         pytest.param("1e-8", id="exponent form"),
-        pytest.param("0.000000000000000000001", id="finer than the column's own scale"),
+        pytest.param("0.0422864500004", id="finer than the column's scale, and surviving it"),
     ],
 )
 def test_a_string_price_becomes_the_decimal_those_characters_spell(digits: str) -> None:
@@ -60,8 +62,13 @@ def test_a_string_price_becomes_the_decimal_those_characters_spell(digits: str) 
     `86000.10000` versus `86000.1` is exactly the difference a `float` round trip makes --
     the same number, a different string, and the string is what the column stores.
 
-    The last row is deliberately finer than `PRICE_SCALE`: rounding is `NumericText`'s job
-    and a parser that rounded early would make the column's declared scale a fiction.
+    The last row is finer than `PRICE_SCALE` and **still leaves something** when rounded to
+    it: this function does not round, because rounding is `NumericText`'s job and a parser
+    that rounded early would make the column's declared scale a fiction. A value fine
+    enough to round away to *nothing* is a different case and is refused; see
+    `test_a_price_too_small_for_the_column_to_hold_is_refused`. That row used to live here,
+    asserted as a pass-through, which was this module agreeing that the column may destroy
+    an amount.
     """
     amount = require_price(digits, source=VENDOR)
 
@@ -244,3 +251,160 @@ def test_the_type_refusal_names_the_type_so_a_reader_knows_what_arrived() -> Non
         require_price(None, source=VENDOR)
 
     assert "NoneType" in str(caught.value)
+
+
+# --------------------------------------------------------------------------------------
+# A price too large to store is a vendor error, not a database error
+# --------------------------------------------------------------------------------------
+#
+# Kraken and Coinbase send prices as **strings**, so `"1e300"` is a well-formed response as
+# far as every layer above this function is concerned. Without a bound here the quote is
+# built, survives the service, and dies inside `flush()` -- where `NumericText` raises and
+# SQLAlchemy wraps it in a `StatementError`.
+#
+# Measured before the bound existed: `Decimal("1E+300")` beside three good pairs raised
+# `sqlalchemy.exc.StatementError` out of `refresh_prices` and left **zero** rows written.
+# Three separate things were wrong and none of them was the bad price: a `sqlalchemy`
+# exception escaped into a layer the contract forbids from importing it, an operator got a
+# traceback from a CLI command, and every pair already fetched in that refresh was thrown
+# away -- the one outcome `fetch_prices`' own docstring promises is impossible.
+#
+# Refused here it is one more thing a vendor can get wrong: the loop passes the source over,
+# the other pairs are kept, and this one is answered by somebody else or becomes a reason.
+
+
+def test_the_integer_bound_is_derived_from_the_column_and_not_invented() -> None:
+    """26 digits, and it is `MONEY_PRECISION - PRICE_SCALE` rather than a round number.
+
+    A price this application cannot *store* is not one it should *accept*, so the bound has
+    to be the column's. A plausible-looking literal here would be a third number free to
+    drift from the two it is supposed to agree with -- and it would drift in the direction
+    that matters, accepting a value the database then refuses.
+
+    The arithmetic is written out as well as the name, because "derived" is a claim about
+    the source and 26 is what a reader needs to check against `PRICE_SCALE`.
+    """
+    assert MAX_PRICE_INTEGER_DIGITS == MONEY_PRECISION - PRICE_SCALE
+    assert MAX_PRICE_INTEGER_DIGITS == 26
+
+
+@pytest.mark.parametrize(
+    "digits",
+    [
+        pytest.param("1E+300", id="the measured value, in exponent form"),
+        pytest.param("1" + "0" * 26, id="one digit over the bound, written out"),
+        pytest.param("9" * 27, id="twenty-seven nines"),
+        pytest.param("1e400", id="beyond what a double could even hold"),
+    ],
+)
+def test_a_price_with_more_integer_digits_than_the_column_holds_is_refused(digits: str) -> None:
+    """A `ProviderResponseError`, so the failover loop already knows what to do with it.
+
+    No new vocabulary and no new report line: the path for "this vendor sent something that
+    cannot be trusted" exists, and an unstorable number is exactly that. The alternative --
+    a bespoke reason, or a service-level catch -- would be a second way of saying the same
+    thing, for a case every other malformed field already covers.
+    """
+    with pytest.raises(ProviderResponseError, match=r"(?i)digits before the decimal point"):
+        require_price(digits, source=VENDOR)
+
+
+@pytest.mark.parametrize(
+    "digits",
+    [
+        pytest.param("9" * 26, id="exactly at the bound"),
+        pytest.param("86000.10000", id="a real price, nowhere near it"),
+        pytest.param("0.04228645", id="a sub-cent price, at the other end"),
+    ],
+)
+def test_a_price_the_column_can_hold_is_accepted(digits: str) -> None:
+    """The boundary from the allowed side, so the check is `>` on the digit count.
+
+    Twenty-six nines is the largest price this application represents and it must bind.
+    Without this row the bound could be off by one in the refusing direction and nothing
+    would say so -- and an off-by-one there refuses a legitimate value forever, which is
+    the harder failure to notice because it looks like a vendor problem.
+    """
+    assert require_price(digits, source=VENDOR) == Decimal(digits)
+
+
+def test_the_bound_refuses_before_the_database_is_ever_reached() -> None:
+    """The point of putting it here: the value never becomes a `PriceQuote` at all.
+
+    Asserted as the absence of a `sqlalchemy` exception in the type raised. It is a thin
+    assertion on its own -- this function has no database -- and it is the statement of
+    intent the end-to-end test in `tests/providers/prices/test_failover.py` then proves:
+    three pairs keep their prices when a fourth is impossible.
+    """
+    with pytest.raises(ProviderResponseError) as caught:
+        require_price("1E+300", source=VENDOR)
+
+    assert type(caught.value).__module__.startswith("portfolio.")
+    assert "1E+300" not in str(caught.value)
+
+
+# --------------------------------------------------------------------------------------
+# And a price too small to store, which is the other end of the same bound
+# --------------------------------------------------------------------------------------
+#
+# `NumericText` refuses a non-zero amount that rounds away to nothing, for every money
+# column. That refusal happens at **bind** time, inside `flush()`, which is far too late:
+# the quote has been built, the service has accepted it, and the other pairs in the same
+# refresh are already in the transaction that is about to be rolled back.
+#
+# So the same value is refused here as well, where it is a vendor error like any other.
+# The duplication is deliberate and the two are not redundant: the column's guard protects
+# every money column from every caller, and this one keeps a vendor's number from costing a
+# refresh the pairs that worked.
+
+
+@pytest.mark.parametrize(
+    "digits",
+    [
+        pytest.param("0.0000000000005", id="the measured vanishing price"),
+        pytest.param("1E-30", id="far below the scale"),
+        pytest.param("0.0000000000004", id="rounds down to zero"),
+    ],
+)
+def test_a_price_too_small_for_the_column_to_hold_is_refused(digits: str) -> None:
+    """Refused at the parser, so the pair fails over instead of the refresh failing.
+
+    A price of `0.0000000000005` stored at twelve places is a **zero**, and a zero price
+    values every holding of that asset at nothing inside a total flagged complete. That is
+    criterion 3's failure arriving through the column, and the column now refuses it -- but
+    refusing it only there means the refresh dies mid-transaction and the three pairs that
+    answered are rolled back with it.
+    """
+    with pytest.raises(ProviderResponseError, match=r"(?i)round it away to zero"):
+        require_price(digits, source=VENDOR)
+
+
+def test_the_smallest_storable_price_is_still_a_price() -> None:
+    """The boundary from the allowed side: one unit at the column's scale binds.
+
+    `0.000000000001` is the smallest price this application can represent, and it has to be
+    accepted -- a bound that refused it would refuse a legitimate value forever, which is
+    the harder failure to notice because it looks like a vendor problem.
+    """
+    assert require_price("0.000000000001", source=VENDOR) == Decimal("0.000000000001")
+    assert require_price("0.0000000000006", source=VENDOR) == Decimal("0.0000000000006")
+
+
+def test_both_ends_of_the_bound_are_refused_for_the_same_reason_in_the_same_vocabulary() -> None:
+    """Too large and too small are one rule with two ends, and both are a vendor error.
+
+    Asserted together because the temptation is to treat them differently -- an enormous
+    number looks like a broken vendor and a tiny one looks like a real price -- and they
+    have the identical consequence: a value this application cannot store, reaching a
+    `flush()` that will discard everything around it.
+    """
+    with pytest.raises(ProviderResponseError) as too_large:
+        require_price("1E+300", source=VENDOR)
+    with pytest.raises(ProviderResponseError) as too_small:
+        require_price("1E-300", source=VENDOR)
+
+    assert VENDOR in str(too_large.value)
+    assert VENDOR in str(too_small.value)
+    assert str(too_large.value) != str(too_small.value), (
+        "the two ends need different messages; an operator has to know which one it was"
+    )
