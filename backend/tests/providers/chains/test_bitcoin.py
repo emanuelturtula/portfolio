@@ -242,18 +242,27 @@ def test_every_single_character_substitution_of_one_vector_is_refused() -> None:
     Bech32 guarantees detection of up to four substitutions, so *every* single-character
     substitution must be refused, not merely the one somebody wrote down. A validator that
     passed the named corruption above and failed here would be one that checks a shape.
+
+    **The count is asserted as well as the survivors.** `assert survivors == []` is
+    satisfied by a sweep that generated nothing at all, and that is measured rather than
+    theoretical: making `corruptions_of` yield an empty sequence leaves this test green,
+    while the sixteen tests in `tests/domain/test_addresses.py` that pair their sweeps with
+    a count all fail. This file inherited the gap from #7 and its Kaspa counterpart now
+    carries the same line.
     """
     fake = EsploraFake()
     provider, _client = esplora_provider(fake)
+    candidates = list(corruptions_of(BIP173_TESTNET_P2WPKH, BECH32_CHARSET))
     survivors: list[tuple[int, str]] = []
 
-    for position, corrupted in corruptions_of(BIP173_TESTNET_P2WPKH, BECH32_CHARSET):
+    for position, corrupted in candidates:
         try:
             provider.validate_address(corrupted)
         except AddressInvalidError:
             continue
         survivors.append((position, corrupted))
 
+    assert len(candidates) > 1000, "the sweep generated almost nothing, so it proves nothing"
     assert survivors == []
 
 
