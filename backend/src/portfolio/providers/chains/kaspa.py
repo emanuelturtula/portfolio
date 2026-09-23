@@ -207,6 +207,33 @@ owner's holdings. That refusal is the first real evidence anyone will have, whic
 is written to carry the number.
 """
 
+BATCH_TOO_LARGE_STATUSES: Final[frozenset[int]] = frozenset(
+    {HTTPStatus.REQUEST_ENTITY_TOO_LARGE, HTTPStatus.UNPROCESSABLE_ENTITY}
+)
+"""The refusals that can mean "the batch was too large", and therefore the only ones
+`_read_batch` may answer with advice about `MAX_ADDRESSES_PER_CALL`.
+
+**This set exists because the advice was previously given for every refusal, and the
+realistic refusal is not a size problem at all.** The spec names this vendor's likely block
+as Cloudflare's 403. An operator whose base URL is behind one, reading three wallets, was
+told "a batch of 3 addresses was refused -- lower max_addresses_per_call", and would have
+edited a constant that was never wrong while nothing mentioned the block. A wrong remedy
+stated confidently is worse than no remedy, because it consumes the one hour somebody had.
+
+* **413 Request Entity Too Large** is the canonical answer to a body that is too big.
+* **422** is what this vendor documents, and its framework returns it for request-body
+  validation -- which is where a `maxItems` would be enforced if one were ever declared.
+
+**414 URI Too Long is deliberately absent**, though it is the third status the phrase
+"too large" brings to mind. This is a `POST` to `/addresses/balances`, a constant path with
+no query: the batch travels in the body, so no batch size can lengthen the URI. Including it
+would be an entry that cannot fire against this endpoint, and a branch that cannot fire is
+one no reader can check.
+
+Everything else -- 403, 401, 404, 400 -- still raises, still names the size of the batch
+that was in flight, and simply offers no theory about why.
+"""
+
 ADDRESS_BALANCE_PATH: Final = "/addresses/{address}/balance"
 BALANCES_PATH: Final = "/addresses/balances"
 HEALTH_PATH: Final = "/info/health"
@@ -769,24 +796,42 @@ class KaspaProvider:
         evidence actionable, and it is the only thing added: the contents are the owner's
         holdings.
 
-        **Only a refusal is wrapped.** A 5xx stays a `ProviderUnavailableError` untouched,
-        because an outage is not evidence that sixty-four is too large, and a 429 stays a
-        `ProviderRateLimitedError` for the same reason. Wrapping those would send an operator
-        to correct a constant that was never wrong.
+        **The size is named for every refusal; the advice is given for almost none.** That
+        split is a correction, and the sentence it replaces -- "only a refusal is wrapped"
+        -- was true and useless, because by `EndpointSet._failure_for` a refusal is
+        *everything* that is not a 429 and not a 5xx. So a 403, which is the block this
+        vendor's CDN actually returns and which the spec predicts by name, was reported as
+        "lower max_addresses_per_call". An operator behind a Cloudflare block would have
+        spent their afternoon editing a constant that was never wrong.
 
-        There is deliberately **no fallback to single reads.** A batch the server refuses is
-        a configured batch size that is too large, which is a value to correct rather than a
-        path to code around -- and a silent fallback would turn sixty-four requests' worth of
-        pacing into a number nobody chose, at a vendor whose limit is unpublished.
+        Now the advice is attached only for `BATCH_TOO_LARGE_STATUSES`. Every other refusal
+        still says how many addresses were in flight -- which is real context and costs
+        nothing -- and offers no theory about the cause. A 5xx and a 429 are not wrapped at
+        all: they leave as `ProviderUnavailableError` and `ProviderRateLimitedError`, since
+        an outage and a throttle are not evidence about a batch size either.
+
+        There is deliberately **no fallback to single reads.** A batch the server refuses
+        for being too large is a configured value to correct rather than a path to code
+        around -- and a silent fallback would turn one call into sixty-four at a vendor
+        whose rate limit is unpublished.
         """
         try:
             return await self._instances.post(
-                BALANCES_PATH, ADDRESS_BALANCES, start, json={ADDRESSES_FIELD: list(chunk)}
+                BALANCES_PATH,
+                ADDRESS_BALANCES,
+                start,
+                json={ADDRESSES_FIELD: list(chunk)},
+                # A balance read changes nothing at the vendor, so repeating it is safe.
+                # Stated here, at the one call site it applies to, because `EndpointSet` is
+                # what an exchange provider will reach for next and must not decide this.
+                idempotent=True,
             )
         except ProviderResponseError as refusal:
-            message = (
-                f"A batch of {len(chunk)} addresses was refused. {refusal} If that is this "
-                "server's ceiling on a batch, lower max_addresses_per_call: the OpenAPI "
-                "document declares no maximum, so the shipped value is a guess."
-            )
-            raise ProviderResponseError(message) from refusal
+            message = f"A batch of {len(chunk)} addresses was refused. {refusal}"
+            if refusal.status in BATCH_TOO_LARGE_STATUSES:
+                message += (
+                    " This status can mean the batch itself was too large: the OpenAPI "
+                    "document declares no maximum, so max_addresses_per_call is a guess "
+                    "and this is the evidence for correcting it."
+                )
+            raise ProviderResponseError(message, status=refusal.status) from refusal

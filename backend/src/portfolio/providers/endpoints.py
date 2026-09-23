@@ -134,12 +134,18 @@ class _Failure:
     impossible to express rather than merely unlikely.
 
     `cause` is `None` for a status-based failure, because there is no exception to chain:
-    the endpoint answered, it simply answered with a refusal.
+    the endpoint answered, it simply answered with a refusal. `status` is the mirror image
+    -- set for a status-based failure and `None` for a transport one -- and it is carried
+    onto the raised exception so that a caller can tell *which* refusal it caught without
+    reading the message. Kaspa's batch read is the caller that needs it: only a status
+    which can mean "the batch was too large" may be answered with advice about the batch
+    size, and a 403 from a CDN block must not be.
     """
 
     error: type[ProviderError]
     message: str
     cause: BaseException | None = None
+    status: int | None = None
 
 
 def configured_endpoints(candidates: Iterable[tuple[str, str]]) -> tuple[Endpoint, ...]:
@@ -249,7 +255,7 @@ class EndpointSet:
             ProviderUnavailableError: every endpoint was tried and the last did not answer
                 or failed with a 5xx -- and the same when none is configured.
         """
-        return await self._failover(path, label, start, payload=None)
+        return await self._failover(path, label, start, payload=None, idempotent=False)
 
     async def post(
         self,
@@ -258,17 +264,31 @@ class EndpointSet:
         start: int = 0,
         *,
         json: Mapping[str, object],
+        idempotent: bool,
     ) -> tuple[str, int]:
-        """`POST path` with a JSON body, as a read, from the first endpoint that answers.
+        """`POST path` with a JSON body, from the first endpoint that answers.
 
         For a vendor whose batch read is expressed as a `POST` -- Kaspa's
         `POST /addresses/balances` is the one this exists for. Identical failover to
         `read`; the difference is the method and two things that follow from it.
 
-        **The request declares itself idempotent**, through `IDEMPOTENT_EXTENSION`, so the
-        transport retries it on a transport error or a 429. That is per request and deny by
-        default; widening `RetryPolicy.retry_methods` to include `POST` would have made a
-        future exchange order retryable, because the policy is process-wide.
+        **`idempotent` is required and has no default, and that is the whole point of this
+        signature.** The argument this seam is built on is that retrying a `POST` is unsafe
+        by default: `RetryPolicy.retry_methods` is not widened to include `POST`, because
+        the policy lives on the process-wide transport and widening it would make an
+        exchange request that places an order retryable, where a retry after a transport
+        error can double a trade.
+
+        A shared helper that set `IDEMPOTENT_EXTENSION: True` for every caller would
+        reintroduce exactly that, one layer up and more quietly -- and **`EndpointSet` is
+        precisely what an exchange provider with a primary and a fallback will reach for.**
+        At that moment the failover loop would double-submit. It is harmless while Kaspa is
+        the only caller, which is the reason to fix it now rather than after the second one
+        arrives. A default of `False` would have been no better: it would put the decision
+        back in this file, silently, where the call site cannot see it.
+
+        So the answer is given once per call site, in a word a reviewer can read, and it is
+        impossible to omit.
 
         **The body is passed as `json=`, which makes it bytes rather than a stream**, and
         that is not a stylistic choice. `httpx` consumes a request stream on the first
@@ -283,6 +303,9 @@ class EndpointSet:
                 keyword is the whole point: it is what turns the body into bytes rather
                 than a stream, and a caller reading this signature should see which one it
                 is getting.
+            idempotent: whether repeating this exact request is safe. `True` only for a
+                request that changes nothing at the vendor -- a read expressed as a `POST`.
+                Never `True` for anything that places, cancels or transfers.
 
         Returns:
             The body and the index of the endpoint that produced it.
@@ -294,7 +317,7 @@ class EndpointSet:
             ProviderUnavailableError: every endpoint was tried and the last did not answer
                 or failed with a 5xx -- and the same when none is configured.
         """
-        return await self._failover(path, label, start, payload=json)
+        return await self._failover(path, label, start, payload=json, idempotent=idempotent)
 
     async def _failover(
         self,
@@ -303,18 +326,26 @@ class EndpointSet:
         start: int,
         *,
         payload: Mapping[str, object] | None,
+        idempotent: bool,
     ) -> tuple[str, int]:
         """The loop both public methods are: try each endpoint in turn, classify the last.
 
         One body rather than two, because two copies of this loop is the thing the module
         exists to prevent -- a rule corrected once in review is a rule that must have
         exactly one implementation.
+
+        `idempotent` is passed through rather than decided here. `read` says `False` and
+        means it: a `GET` is already retryable by `RetryPolicy.retry_methods`, so the
+        extension would add nothing and saying it anyway would make the one deliberate
+        opt-in look like boilerplate.
         """
         failure = self._nothing_configured()
         for index in range(start, len(self._endpoints)):
             endpoint = self._endpoints[index]
             try:
-                response = await self._request(endpoint, path, label, payload)
+                response = await self._request(
+                    endpoint, path, label, payload, idempotent=idempotent
+                )
             except httpx.TransportError as error:
                 failure = _Failure(
                     error=ProviderUnavailableError,
@@ -332,7 +363,7 @@ class EndpointSet:
                 return response.text, index
             failure = self._failure_for(response.status_code)
 
-        raise failure.error(failure.message) from failure.cause
+        raise failure.error(failure.message, status=failure.status) from failure.cause
 
     async def _request(
         self,
@@ -340,21 +371,23 @@ class EndpointSet:
         path: str,
         label: str,
         payload: Mapping[str, object] | None,
+        *,
+        idempotent: bool,
     ) -> httpx.Response:
-        """One request to one endpoint, labelled, and idempotent only when it is a `POST`.
+        """One request to one endpoint, labelled, and idempotent only if the caller said so.
 
-        A `GET` is already retryable by the shared policy, so it carries no idempotence
-        extension: saying it twice would make the extension look like decoration rather
-        than like the one deliberate opt-in it is.
+        The extension is set only when `idempotent` is true, rather than always with a
+        boolean value. A request that carries `IDEMPOTENT_EXTENSION: False` and one that
+        carries no such key are the same request to the transport -- `is True` is the test
+        -- and the absent key is the honest spelling of "this was not opted in".
         """
         url = endpoint.url(path)
         if payload is None:
             return await self._client.get(url, extensions={ENDPOINT_EXTENSION: label})
-        return await self._client.post(
-            url,
-            json=payload,
-            extensions={ENDPOINT_EXTENSION: label, IDEMPOTENT_EXTENSION: True},
-        )
+        extensions: dict[str, object] = {ENDPOINT_EXTENSION: label}
+        if idempotent:
+            extensions[IDEMPOTENT_EXTENSION] = True
+        return await self._client.post(url, json=payload, extensions=extensions)
 
     def _nothing_configured(self) -> _Failure:
         """What a read fails with when every base URL is blank.
@@ -394,6 +427,7 @@ class EndpointSet:
                 message=(
                     f"Every {self._vendor} instance was tried; the last one is throttling us."
                 ),
+                status=status,
             )
         if status >= HTTPStatus.INTERNAL_SERVER_ERROR:
             return _Failure(
@@ -402,6 +436,7 @@ class EndpointSet:
                     f"Every {self._vendor} instance was tried; the last one failed with "
                     f"HTTP {status}."
                 ),
+                status=status,
             )
         return _Failure(
             error=ProviderResponseError,
@@ -409,4 +444,5 @@ class EndpointSet:
                 f"Every {self._vendor} instance was tried; the last one refused the request "
                 f"with HTTP {status}."
             ),
+            status=status,
         )
