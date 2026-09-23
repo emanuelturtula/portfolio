@@ -175,6 +175,29 @@ vendor call. A direct-only check would pass that change.
 This is also a partial answer to #39, which asks what replaces the guarantee
 `allow_indirect_imports = True` gave up. It is not the whole answer and does not close it.
 
+**And the contract is what splits the service in two.** This spec originally put
+`refresh_prices()`, `lookup_price()` and `value_portfolio()` in one `services/prices.py`,
+which the implementer refused, correctly, for two reasons.
+
+The first: #11 will add a valuation endpoint, whose router imports the valuation service. In
+the single-module layout that service also imports `providers.prices`, so the contract fails
+on a change that is entirely legitimate -- the endpoint reads the table and never touches a
+vendor. A guard that fails on correct code is a guard somebody weakens, and weakening this one
+is the outcome the contract exists to prevent. `providers/http.py` already makes this argument
+about a control that renders every request `<unlabelled>`: a control which makes the system
+useless is one somebody removes.
+
+The second is sharper. In the single-module layout the `services.prices -> providers.prices`
+edge exists on day one, so **the contract can never newly fire for the case it was written
+for**. "Somebody adds 'just refresh it if it is stale' to the valuation service" would be
+indistinguishable from the status quo, because the import is already there. The guard would be
+present, green, and structurally incapable of catching its own stated scenario -- the vacuity
+the contract's comment describes as a temporary condition, made permanent by a layout.
+
+So `services/prices.py` is provider-free and `services/price_refresh.py` owns the vendor edge,
+which makes it the single module a reviewer has to read to answer "can a request reach a
+vendor". Its docstring says so, because the isolation is the guarantee.
+
 ### Layout
 
 | Path | Holds |
@@ -184,10 +207,13 @@ This is also a partial answer to #39, which asks what replaces the guarantee
 | `providers/prices/coinbase.py` | one call per pair; BTC only |
 | `providers/prices/kaspa.py` | KAS/USD only, currency assumed |
 | `providers/prices/coingecko.py` | keyed; skipped entirely when no key is configured |
+| `providers/http.py` | two labels added to `ENDPOINT_LABELS`, without which a price request logs `<unlabelled>` |
 | `providers/base.py` | `decode_json(..., parse_float=Decimal)` |
 | `db/models.py`, `db/migrations/versions/v0004_prices.py` | the table |
 | `repositories/prices.py` | upsert by pair, read all |
-| `services/prices.py` | `refresh_prices()`, `lookup_price()`, `value_portfolio()` |
+| `repositories/assets.py` | resolving an asset id from a symbol, which `prices.asset_id` needs |
+| `services/prices.py` | `lookup_price()`, `value_portfolio()`, `Price`, `PriceUnavailable`. **Imports no provider.** |
+| `services/price_refresh.py` | `refresh_prices()`. The only module in `services/` that may import `providers` |
 | `cli.py` | `refresh-prices`, so the budget can be measured before #10 automates it |
 | `backend/.importlinter` | the contract above |
 
