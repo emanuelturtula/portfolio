@@ -60,6 +60,7 @@ from portfolio.providers.chains import kaspa as kaspa_module
 from portfolio.providers.chains.kaspa import (
     ADDRESS_BALANCE_PATH,
     BALANCES_PATH,
+    BATCH_TOO_LARGE_STATUSES,
     CAPABILITIES,
     HEALTH_PATH,
     KASPA_DECIMALS,
@@ -140,6 +141,12 @@ THREE: Final[tuple[str, ...]] = ALL_FOUR[:3]
 
 #: Two of them, which is the smallest request that takes the batch endpoint.
 TWO: Final[tuple[str, ...]] = ALL_FOUR[:2]
+
+#: What a server sends for a batch it considers too large. Paired with `TWO` deliberately:
+#: `"2"` appears nowhere in `"413"`, so an assertion that the refusal names the batch size
+#: cannot be satisfied by the status code the failover message already carries.
+#: `test_a_refused_batch_names_its_size_and_no_address` pins that property of the pair.
+REFUSED_STATUS: Final = 413
 
 
 def balances_by_address(balances: Sequence[AddressBalance]) -> dict[str, AddressBalance]:
@@ -319,13 +326,21 @@ def test_every_single_character_substitution_of_one_vector_is_refused() -> None:
     Driven over the payload's own charset, because substituting a character from *outside*
     the alphabet is a weaker test: it can be rejected on the alphabet alone without a
     checksum ever being computed.
+
+    **The count is asserted as well as the survivors, and that is not belt and braces.**
+    `assert survivors == []` is satisfied by a sweep that generated nothing at all -- an
+    empty generator, a payload that came back empty, a charset constant that was emptied --
+    and this module's own docstring names assertions-satisfiable-by-emptiness as the defect
+    this project keeps re-finding. `tests/domain/test_addresses.py` already pairs its sweep
+    with a count for exactly this reason; this one was missing it.
     """
     fake = KaspaFake()
     provider, _client = kaspa_provider(fake)
     payload = KASPA_TESTNET_V0.split(":", 1)[1]
+    candidates = list(corruptions_of(payload, BECH32_CHARSET))
     survivors: list[tuple[int, str]] = []
 
-    for position, corrupted_payload in corruptions_of(payload, BECH32_CHARSET):
+    for position, corrupted_payload in candidates:
         corrupted = f"kaspatest:{corrupted_payload}"
         try:
             provider.validate_address(corrupted)
@@ -333,6 +348,7 @@ def test_every_single_character_substitution_of_one_vector_is_refused() -> None:
             continue
         survivors.append((position, corrupted))
 
+    assert len(candidates) > 1000, "the sweep generated almost nothing, so it proves nothing"
     assert survivors == []
 
 
@@ -1124,25 +1140,143 @@ async def test_a_refused_batch_names_its_size_and_no_address() -> None:
     Deliberately not a fallback to single reads: a batch the server refuses is a configured
     batch size that is too large, which is a value to correct rather than a path to code
     around.
+
+    **The assertion is the phrase, not the digit, and the fixture is chosen so the digit
+    could not stand in for it.** The first version of this test asserted `"3" in message`
+    against a batch of three answered `413` -- and the unwrapped failover message already
+    ends "refused the request with HTTP 413", which contains a `3`. Measured: deleting the
+    wrapper that adds the size entirely left the whole suite green. So the single assertion
+    protecting the mitigation the spec's Risks section leans on could not fail.
+
+    Two addresses now, because `"2"` appears nowhere in `"413"`, and the guard below pins
+    that property of the fixture so a later edit cannot quietly restore the overlap.
     """
     fake = KaspaFake(
-        primary=ScriptedInstance(Reply(status=413, body="Payload Too Large")),
-        fallback=ScriptedInstance(Reply(status=413, body="Payload Too Large")),
+        primary=ScriptedInstance(Reply(status=REFUSED_STATUS, body="Payload Too Large")),
+        fallback=ScriptedInstance(Reply(status=REFUSED_STATUS, body="Payload Too Large")),
     )
     provider, client = kaspa_provider(fake, max_attempts=1)
 
     async with client:
         with pytest.raises(ProviderResponseError) as caught:
-            await provider.fetch_balances(THREE)
+            await provider.fetch_balances(TWO)
 
     message = str(caught.value)
-    assert str(len(THREE)) in message, (
-        "a refused batch has to name the size that was refused; it is the only number an "
-        "operator can act on, and 64 is a guess"
+    assert str(len(TWO)) not in str(REFUSED_STATUS), (
+        "the batch size and the status share a digit again, so an assertion about the "
+        "size can be satisfied by the status code the failover message already carries"
     )
-    for address in THREE:
+    assert f"A batch of {len(TWO)} addresses" in message, (
+        "a refused batch has to name the size that was refused in words; it is the only "
+        "number an operator can act on, and 64 is a guess"
+    )
+    assert "max_addresses_per_call" in message, "the refusal has to name what to correct"
+    for address in TWO:
         assert address not in message
         assert address[:20] not in message
+
+
+@pytest.mark.parametrize("status", sorted(BATCH_TOO_LARGE_STATUSES))
+async def test_only_a_status_that_can_mean_too_large_carries_the_ceiling_advice(
+    status: int,
+) -> None:
+    """Both members of the set, driven, so neither is listed without being exercised.
+
+    A frozenset in the source is a claim; two tests over `sorted(...)` are what make it a
+    fact, and adding a third status without a behaviour would fail here rather than sit in
+    a constant nobody checked. `414` was deliberately left out of the set -- this is a
+    `POST` to a constant path with no query, so no batch size can lengthen the URI, and an
+    entry that cannot fire is a branch no test can reach.
+    """
+    fake = KaspaFake(
+        primary=ScriptedInstance(Reply(status=status, body="too large")),
+        fallback=ScriptedInstance(Reply(status=status, body="too large")),
+    )
+    provider, client = kaspa_provider(fake, max_attempts=1)
+
+    async with client:
+        with pytest.raises(ProviderResponseError) as caught:
+            await provider.fetch_balances(TWO)
+
+    message = str(caught.value)
+    assert f"A batch of {len(TWO)} addresses" in message
+    assert "max_addresses_per_call" in message
+
+
+async def test_a_block_is_not_reported_as_a_batch_that_was_too_large() -> None:
+    """A 403 is the refusal this vendor's CDN actually sends, and it is not a size problem.
+
+    `EndpointSet._failure_for` classifies everything that is not a 429 or a 5xx as a
+    `ProviderResponseError`, so a Cloudflare block arrives at the same `except` clause a
+    413 does. Advising on `max_addresses_per_call` for all of them meant an operator whose
+    base URL sits behind a block, reading three wallets, was told to lower a constant that
+    was never wrong -- while nothing anywhere mentioned the block.
+
+    **A wrong remedy stated confidently is worse than no remedy**, because it consumes the
+    one hour somebody had. The size is still named, because how many addresses were in
+    flight is real context and costs nothing; the theory about the cause is what is
+    withheld.
+    """
+    fake = KaspaFake(
+        primary=ScriptedInstance(Reply(status=403, body="blocked")),
+        fallback=ScriptedInstance(Reply(status=403, body="blocked")),
+    )
+    provider, client = kaspa_provider(fake, max_attempts=1)
+
+    async with client:
+        with pytest.raises(ProviderResponseError) as caught:
+            await provider.fetch_balances(TWO)
+
+    message = str(caught.value)
+    assert f"A batch of {len(TWO)} addresses" in message
+    assert "max_addresses_per_call" not in message, (
+        "a 403 is a block, not a batch that was too large; advising an operator to lower "
+        "the batch size sends them to edit a constant that was never wrong"
+    )
+    assert "too large" not in message
+    assert 403 not in BATCH_TOO_LARGE_STATUSES
+
+
+def test_the_statuses_that_can_mean_too_large_are_pinned() -> None:
+    """The set as a literal, because it decides which refusal gets a remedy attached.
+
+    Derived from nothing: `BATCH_TOO_LARGE_STATUSES == frozenset(BATCH_TOO_LARGE_STATUSES)`
+    is true of any set at all, including the one that put 403 back and reintroduced the
+    wrong advice. The exclusions matter as much as the members, so the three statuses a
+    reader would most plausibly add are asserted absent.
+    """
+    assert sorted(BATCH_TOO_LARGE_STATUSES) == [413, 422]
+    assert isinstance(BATCH_TOO_LARGE_STATUSES, frozenset)
+    for excluded in (403, 429, 500):
+        assert excluded not in BATCH_TOO_LARGE_STATUSES
+
+
+async def test_an_outage_is_not_reported_as_evidence_that_the_batch_is_too_large() -> None:
+    """Only a refusal is wrapped, and that boundary is the point of wrapping at all.
+
+    A 5xx is the vendor being broken and a 429 is our interval being too short. Neither is
+    evidence that sixty-four is too many, and a message telling an operator to lower
+    `max_addresses_per_call` would send them to correct a constant that was never wrong --
+    at exactly the moment the real cause is elsewhere.
+
+    Asserted as the exact type as well as the absent phrase, because
+    `ProviderRateLimitedError` is a subclass of `ProviderUnavailableError` and a caller
+    branching on the remedy reads the exact type.
+    """
+    for status, expected in ((503, ProviderUnavailableError), (429, ProviderRateLimitedError)):
+        fake = KaspaFake(
+            primary=ScriptedInstance(Reply(status=status)),
+            fallback=ScriptedInstance(Reply(status=status)),
+        )
+        provider, client = kaspa_provider(fake, max_attempts=1)
+
+        async with client:
+            with pytest.raises(expected) as caught:
+                await provider.fetch_balances(TWO)
+
+        assert type(caught.value) is expected
+        assert "A batch of" not in str(caught.value)
+        assert "max_addresses_per_call" not in str(caught.value)
 
 
 # --------------------------------------------------------------------------------------

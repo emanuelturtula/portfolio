@@ -210,6 +210,72 @@ async def test_an_exhausted_budget_on_one_host_does_not_pace_another() -> None:
     assert sleep.slept_ms == []
 
 
+async def test_a_shorter_reset_cannot_undo_a_longer_one_already_booked() -> None:
+    """`observe` only ever pushes the next slot **later**, never earlier.
+
+    A vendor under load sends a long reset and then, a moment later, a short one -- a
+    second response from a different node, a cached header, a proxy inventing a default.
+    Taking the second at face value would cancel most of a wait the first one earned, at
+    precisely the host that has just said it is struggling, which is how a soft throttle
+    becomes the ban the vendor documentation warns about.
+
+    It is the same rule `_response_delay_ms` already applies to `Retry-After` -- a server
+    may lengthen our wait and may not shorten it -- and it was the only one of the two
+    without a test. Measured: replacing the `max(...)` in `observe` with a plain assignment
+    left the whole suite green.
+
+    Thirty seconds against one, so the two readings are an order of magnitude apart and no
+    arithmetic coincidence can hide the difference.
+    """
+    clock = FakeClock()
+    sleep = RecordingSleep()
+    limiter = limiter_with(clock, sleep)
+
+    limiter.observe(TEST_HOST, RateLimitHint(limit=60, remaining=0, reset_ms=30_000))
+    limiter.observe(TEST_HOST, RateLimitHint(limit=60, remaining=0, reset_ms=1_000))
+    await limiter.acquire(TEST_HOST)
+
+    assert sleep.slept_ms == [30_000], (
+        "the shorter reset replaced the longer one, so a server can shorten a wait it has "
+        "already asked us to take"
+    )
+
+
+async def test_a_longer_reset_does_still_replace_a_shorter_one() -> None:
+    """The control. A limiter that ignored every hint after the first would pass the pair
+    above and would stop honouring a vendor that is getting worse rather than better.
+    """
+    clock = FakeClock()
+    sleep = RecordingSleep()
+    limiter = limiter_with(clock, sleep)
+
+    limiter.observe(TEST_HOST, RateLimitHint(limit=60, remaining=0, reset_ms=1_000))
+    limiter.observe(TEST_HOST, RateLimitHint(limit=60, remaining=0, reset_ms=30_000))
+    await limiter.acquire(TEST_HOST)
+
+    assert sleep.slept_ms == [30_000]
+
+
+async def test_a_reset_cannot_undo_a_wait_the_interval_has_already_imposed() -> None:
+    """The other half of "later, never earlier", against the limiter's own bookkeeping.
+
+    Two callers have already claimed slots, so the next one is booked two intervals out. A
+    hint whose reset lands *before* that must leave it alone -- otherwise a server's
+    generous header becomes a way to jump the queue the limiter is maintaining, and the
+    pacing this application chose is quietly overridden by the host being paced.
+    """
+    clock = FakeClock()
+    sleep = RecordingSleep()
+    limiter = limiter_with(clock, sleep)
+
+    await limiter.acquire(TEST_HOST)
+    await limiter.acquire(TEST_HOST)
+    limiter.observe(TEST_HOST, RateLimitHint(limit=60, remaining=0, reset_ms=100))
+    await limiter.acquire(TEST_HOST)
+
+    assert sleep.slept_ms == [INTERVAL_MS, 2 * INTERVAL_MS]
+
+
 async def test_a_reset_is_spent_once_and_does_not_become_the_hosts_new_interval() -> None:
     """The pause is a one-off instruction, not a new pace for the host forever.
 

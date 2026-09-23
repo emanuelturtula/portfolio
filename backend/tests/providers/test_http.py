@@ -545,6 +545,53 @@ async def test_a_post_without_the_extension_is_still_not_retried() -> None:
     assert sleep.slept_ms == []
 
 
+@pytest.mark.parametrize(
+    ("declared", "why"),
+    [
+        pytest.param("false", "a non-empty string, which is truthy", id="the string false"),
+        pytest.param("true", "the flag as a string, which is what a header would be", id="string"),
+        pytest.param(1, "an int, which is what a flag read out of JSON looks like", id="one"),
+        pytest.param(["yes"], "a non-empty list", id="a list"),
+        pytest.param(object(), "any object at all, which extensions permits", id="an object"),
+    ],
+)
+async def test_only_the_boolean_true_opts_a_post_into_being_retried(
+    declared: object, why: str
+) -> None:
+    """`is True`, not truthiness, and this is the row that proves the difference.
+
+    `request.extensions` is a plain mapping of **anything**, so the value here is whatever
+    a caller happened to put in it. Under a truthiness test every row below opts in -- and
+    the first is the one that shows why that is not a stylistic preference: `"false"` is a
+    non-empty string, so a provider that threaded a flag through as text would make a
+    request retryable by saying it is not.
+
+    Measured against the shipped transport: changing `is True` to `bool(...)` left the
+    entire suite green, because `test_an_explicit_false_does_not_opt_in_either` covers only
+    `False`, which is falsey under both readings. The claim the code, the spec and
+    `docs/providers.md` all make had no test until this one.
+
+    A single attempt is the assertion. The alternative -- a `POST` retried because somebody
+    passed the wrong kind of truthy -- is a duplicated request, and the request this
+    mechanism exists beside is an exchange order.
+    """
+    del why  # In the parameter id, where a failure can read it.
+    inner, bodies = body_recording_transport(503, 200)
+    sleep = RecordingSleep()
+    extensions: dict[str, object] = {
+        ENDPOINT_EXTENSION: ADDRESS_BALANCES,
+        IDEMPOTENT_EXTENSION: declared,
+    }
+    async with retrying_client(inner, sleep=sleep) as client:
+        response = await client.post(
+            f"{TEST_ORIGIN}/addresses/balances", json=BATCH_PAYLOAD, extensions=extensions
+        )
+
+    assert response.status_code == 503
+    assert len(bodies) == 1, f"{declared!r} opted the request in; only the boolean True may"
+    assert sleep.slept_ms == []
+
+
 async def test_an_explicit_false_does_not_opt_in_either() -> None:
     """`idempotent: False` is a request saying no, and it has to be heard as one.
 
@@ -675,6 +722,157 @@ async def test_an_exhausted_transport_error_propagates_rather_than_becoming_a_re
 
     assert isinstance(outcome, httpx.TransportError), outcome
     assert len(requests) == 3
+
+
+# --------------------------------------------------------------------------------------
+# Criterion 4 of #8, at the join: a `ratelimit-*` header reaching the limiter
+# --------------------------------------------------------------------------------------
+#
+# **This section exists because the criterion was proven in two halves and not at the
+# seam between them.** `parse_rate_limit` is tested pure in
+# `tests/providers/test_rate_limit_headers.py`, and `HostRateLimiter.observe` is tested by
+# direct call in `tests/providers/test_rate_limiter.py`. Both were green while nothing
+# anywhere drove a header through a `RetryingTransport` -- measured: deleting the four
+# lines in `handle_async_request` that call `observe(..., parse_rate_limit(...))` left the
+# whole suite passing.
+#
+# That is #6's lesson in a new costume. A codec and a consumer that are each correct and
+# never wired together is a feature that ships dead with every test green, and the only
+# assertion that can see it is one that starts at a response and ends at a sleep.
+#
+# Everything here is synthesised. Measured against the live Kaspa REST service on
+# 2026-09-23, neither endpoint sends a `ratelimit-*` or `x-ratelimit-*` header at all,
+# because the API sits behind Cloudflare. The criterion says "when present"; a self-hosted
+# instance with no CDN in front of it is the deployment this path is for.
+
+#: The limiter's ordinary spacing for these tests. Deliberately unlike every reset below,
+#: so "it waited the reset" and "it waited its own interval" can never be the same number.
+PACED_INTERVAL_MS: Final = 250
+
+
+def paced_client(
+    inner: httpx.MockTransport,
+    sleep: RecordingSleep,
+    *,
+    max_backoff_ms: int = 30_000,
+) -> httpx.AsyncClient:
+    """The real client, over a limiter that paces, with the clock and the sleep injected.
+
+    The limiter is a *real* `HostRateLimiter` rather than the open one the retry tests use,
+    because an interval of zero would make "the hint was honoured" and "nothing waited at
+    all" indistinguishable.
+    """
+    return retrying_client(
+        inner,
+        policy=fast_policy(max_backoff_ms=max_backoff_ms),
+        sleep=sleep,
+        limiter=HostRateLimiter(min_interval_ms=PACED_INTERVAL_MS, clock=FakeClock(), sleep=sleep),
+    )
+
+
+async def test_an_exhausted_budget_in_a_response_paces_the_next_request() -> None:
+    """The join, end to end: headers on a response become the next request's wait.
+
+    Two requests. The first is not delayed -- nothing is booked yet -- and its response
+    says the budget for this host is spent and will reset in two seconds. The second must
+    therefore wait **2000 ms and not the 250 ms interval**, which is the only pair of
+    numbers that can tell "the header was honoured" from "the limiter did what it always
+    does".
+
+    A 200 rather than a 429 on purpose: the transport reads these headers on *every*
+    response, because a rule that only applies to the failure path is a rule that arrives
+    after the throttling has already started.
+    """
+    inner, requests = scripted_transport(
+        (200, {"ratelimit-remaining": "0", "ratelimit-reset": "2"})
+    )
+    sleep = RecordingSleep()
+    async with paced_client(inner, sleep) as client:
+        await perform(client)
+        await perform(client)
+
+    assert len(requests) == 2
+    assert sleep.slept_ms == [2000], (
+        "the second request was paced by the limiter's own interval, so the response's "
+        "ratelimit headers never reached the limiter"
+    )
+
+
+async def test_a_budget_with_requests_left_does_not_slow_the_next_one() -> None:
+    """The control, and it is the case that actually happens on a server that sends these.
+
+    Every response from such a server carries the headers, so a transport that paused
+    whenever a hint arrived would run the whole sync at the vendor's advertised window
+    rather than at its own interval. Only `remaining: 0` is an instruction to wait.
+
+    Without this, a transport that ignored `remaining` entirely would pass the test above.
+    """
+    inner, requests = scripted_transport(
+        (200, {"ratelimit-remaining": "5", "ratelimit-reset": "2"})
+    )
+    sleep = RecordingSleep()
+    async with paced_client(inner, sleep) as client:
+        await perform(client)
+        await perform(client)
+
+    assert len(requests) == 2
+    assert sleep.slept_ms == [PACED_INTERVAL_MS]
+
+
+async def test_an_absurd_reset_cannot_stall_the_sync_at_the_join_either() -> None:
+    """The clamp reaches the wiring, not only the parser.
+
+    `parse_rate_limit` takes `cap_ms` as an argument, so a transport that passed no cap --
+    or passed the wrong one -- would honour a server asking us to wait a day, and the pure
+    tests in `test_rate_limit_headers.py` would all still pass. The assertion is the
+    policy's ceiling to the millisecond.
+    """
+    inner, _ = scripted_transport((200, {"ratelimit-remaining": "0", "ratelimit-reset": "86400"}))
+    sleep = RecordingSleep()
+    async with paced_client(inner, sleep, max_backoff_ms=1000) as client:
+        await perform(client)
+        await perform(client)
+
+    assert sleep.slept_ms == [1000]
+
+
+async def test_a_refusal_carrying_an_exhausted_budget_paces_the_next_request_too() -> None:
+    """A 403 is where a throttled vendor most plausibly says this, and it is not retried.
+
+    `observe` runs before the retry decision, so a response the policy will never retry
+    still contributes its headers. A transport that read them only on the retry path would
+    pass every test above -- all of which use a 200 the policy also does not retry, but
+    which takes the same early return -- and would ignore precisely the responses a
+    struggling server sends.
+    """
+    inner, requests = scripted_transport(
+        (403, {"ratelimit-remaining": "0", "ratelimit-reset": "3"})
+    )
+    sleep = RecordingSleep()
+    async with paced_client(inner, sleep) as client:
+        first = await perform(client)
+        await perform(client)
+
+    assert isinstance(first, httpx.Response), first
+    assert first.status_code == 403
+    assert len(requests) == 2
+    assert sleep.slept_ms == [3000]
+
+
+async def test_a_response_with_no_rate_limit_headers_changes_no_pacing() -> None:
+    """The other control: the production path, where no such header ever arrives.
+
+    `parse_rate_limit` returns `None` and `observe` does nothing with it, so the limiter
+    keeps its own interval. A transport that treated a missing header as an exhausted
+    budget would pause every Kaspa read for a reset nobody asked for.
+    """
+    inner, _ = scripted_transport((200, {"server": "cloudflare", "cf-cache-status": "DYNAMIC"}))
+    sleep = RecordingSleep()
+    async with paced_client(inner, sleep) as client:
+        await perform(client)
+        await perform(client)
+
+    assert sleep.slept_ms == [PACED_INTERVAL_MS]
 
 
 # --------------------------------------------------------------------------------------

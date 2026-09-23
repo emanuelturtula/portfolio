@@ -77,17 +77,25 @@ async def no_sleep(_milliseconds: int) -> None:
     return
 
 
-def client_over(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
+def client_over(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    max_attempts: int = 1,
+) -> httpx.AsyncClient:
     """The production client over a scripted transport, with every duration injected.
 
     `build_http_client` rather than an assembled transport, because that is what #10 hands
-    a provider and it is the wiring the failover composes with. One attempt, because this
-    file is about **which endpoint was asked**; how many times a single endpoint is retried
-    is `tests/providers/test_http.py`'s subject and is covered there.
+    a provider and it is the wiring the failover composes with. One attempt by default,
+    because this file is about **which endpoint was asked**; how many times a single
+    endpoint is retried is `tests/providers/test_http.py`'s subject and is covered there.
+
+    `max_attempts` is a parameter for exactly one pair of tests -- the ones that drive
+    `idempotent=True` and `idempotent=False` against the same script, where the retry count
+    *is* the observable difference and a budget of one would make the two indistinguishable.
     """
     return build_http_client(
         transport=httpx.MockTransport(handler),
-        policy=RetryPolicy(max_attempts=1, base_backoff_ms=0, max_backoff_ms=0),
+        policy=RetryPolicy(max_attempts=max_attempts, base_backoff_ms=0, max_backoff_ms=0),
         limiter=HostRateLimiter(min_interval_ms=0, clock=lambda: 0, sleep=no_sleep),
         jitter=lambda bound: bound,
         sleep=no_sleep,
@@ -524,7 +532,7 @@ async def test_a_post_read_sends_the_payload_as_a_json_body() -> None:
     payload: dict[str, Sequence[str]] = {"addresses": ["one", "two"]}
 
     async with client:
-        body, index = await endpoints.post(PATH, ADDRESS_BALANCES, 0, json=payload)
+        body, index = await endpoints.post(PATH, ADDRESS_BALANCES, 0, json=payload, idempotent=True)
 
     assert body == BODY
     assert index == 0
@@ -547,11 +555,79 @@ async def test_a_post_read_declares_itself_idempotent_at_the_call_site() -> None
     endpoints = endpoint_set(client, FIRST_URL, SECOND_URL)
 
     async with client:
-        await endpoints.post(PATH, ADDRESS_BALANCES, 0, json={"addresses": []})
+        await endpoints.post(PATH, ADDRESS_BALANCES, 0, json={"addresses": []}, idempotent=True)
 
     request = recorder.requests[0]
     assert request.extensions.get(IDEMPOTENT_EXTENSION) is True
     assert request.extensions.get(ENDPOINT_EXTENSION) == ADDRESS_BALANCES
+
+
+async def test_a_post_that_is_not_idempotent_carries_no_extension_at_all() -> None:
+    """The key is **absent**, not present and `False`, and the difference is the contract.
+
+    `RetryingTransport` tests `extensions.get(IDEMPOTENT_EXTENSION) is True`, so an absent
+    key and a `False` behave identically today -- which is exactly why the spelling has to
+    be pinned rather than left to whichever the implementation happened to pick. An absent
+    key is the honest statement: this request never opted in. A present `False` invites the
+    next reader to treat the key as a tri-state and write `if IDEMPOTENT_EXTENSION in
+    extensions`, at which point deny-by-default is gone and nothing in the transport
+    changed.
+
+    **This is the arm the `EndpointSet` seam exists for.** The helper used to set the
+    extension to `True` for every caller, which held deny-by-default at the transport and
+    undid it one layer up -- and `EndpointSet` is precisely what an exchange provider with
+    a primary and a fallback reaches for next. At that moment the failover loop would
+    double-submit an order after a transport error.
+    """
+    recorder = Recorder(BODY)
+    client = client_over(recorder)
+    endpoints = endpoint_set(client, FIRST_URL, SECOND_URL)
+
+    async with client:
+        await endpoints.post(PATH, ADDRESS_BALANCES, 0, json={"addresses": []}, idempotent=False)
+
+    request = recorder.requests[0]
+    assert IDEMPOTENT_EXTENSION not in request.extensions
+    assert request.extensions.get(ENDPOINT_EXTENSION) == ADDRESS_BALANCES
+
+
+async def test_a_post_that_is_not_idempotent_is_not_retried() -> None:
+    """The behaviour the spelling above buys, driven rather than inferred.
+
+    A 503 that a `GET` would have retried leaves a non-idempotent `POST` after a single
+    attempt. The count is the assertion, because the exception a caller sees is the same
+    either way -- and the difference between one attempt and three, for a request that
+    places an order, is the difference between one trade and three.
+    """
+    recorder = Recorder(503, 503)
+    client = client_over(recorder, max_attempts=3)
+    endpoints = endpoint_set(client, FIRST_URL, "")
+
+    async with client:
+        with pytest.raises(ProviderUnavailableError):
+            await endpoints.post(
+                PATH, ADDRESS_BALANCES, 0, json={"addresses": []}, idempotent=False
+            )
+
+    assert recorder.counts == {FIRST_HOST: 1, SECOND_HOST: 0}
+
+
+async def test_an_idempotent_post_is_retried_which_is_the_control() -> None:
+    """The control on the test above. A seam that never retried anything would pass it.
+
+    Same script, same endpoint, one word different at the call site: three attempts rather
+    than one. That word is the whole mechanism, and this pair is the only place in the
+    suite where both of its values are driven against the same transport.
+    """
+    recorder = Recorder(503, 503)
+    client = client_over(recorder, max_attempts=3)
+    endpoints = endpoint_set(client, FIRST_URL, "")
+
+    async with client:
+        with pytest.raises(ProviderUnavailableError):
+            await endpoints.post(PATH, ADDRESS_BALANCES, 0, json={"addresses": []}, idempotent=True)
+
+    assert recorder.counts == {FIRST_HOST: 3, SECOND_HOST: 0}
 
 
 async def test_a_post_read_fails_over_exactly_as_a_get_does() -> None:
@@ -566,7 +642,9 @@ async def test_a_post_read_fails_over_exactly_as_a_get_does() -> None:
     endpoints = endpoint_set(client, FIRST_URL, SECOND_URL)
 
     async with client:
-        body, index = await endpoints.post(PATH, ADDRESS_BALANCES, 0, json={"addresses": []})
+        body, index = await endpoints.post(
+            PATH, ADDRESS_BALANCES, 0, json={"addresses": []}, idempotent=True
+        )
 
     assert body == BODY
     assert index == 1
@@ -581,6 +659,6 @@ async def test_a_post_that_exhausts_every_endpoint_is_classified_the_same_way() 
 
     async with client:
         with pytest.raises(ProviderRateLimitedError):
-            await endpoints.post(PATH, ADDRESS_BALANCES, 0, json={"addresses": []})
+            await endpoints.post(PATH, ADDRESS_BALANCES, 0, json={"addresses": []}, idempotent=True)
 
     assert recorder.counts == {FIRST_HOST: 1, SECOND_HOST: 1}
