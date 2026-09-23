@@ -1,7 +1,7 @@
 # 009 — Cached price provider and fiat valuation
 
 Issue: #9
-Status: draft
+Status: done
 
 ## Problem
 
@@ -361,3 +361,80 @@ only if the measurement supports it against that standard.
   balance providers that merged this week. Their parsers refuse non-integers either way, and
   the existing suites are the control — but it is a shared decoder and the blast radius is
   every provider.
+
+## What this plan got wrong
+
+### "Never a zero" was false along a path this spec never asked about
+
+The spec quotes criterion 3 in full and builds the whole result type around it: a missing price
+is a reason, never a zero. It asked what happens when a price is **absent**. It never asked
+what happens when a price is **present and destroyed by the column**.
+
+`require_price` refuses `amount <= 0` -- and runs *before* the value is quantized.
+`NumericText` then rounded a positive price down to zero and normalised the result instead of
+refusing it, so a vendor sending `0.0000000000005` produced a stored `"0.000000000000"`, and
+`value_portfolio` reported that total with `complete=True`. Measured end to end against a real
+migrated database. Not reachable with today's four pairs, and the headline claim of the change
+was false anyway.
+
+**Three tests pinned it as intended behaviour** -- the repository's own over-precise round trip,
+a row of the banker's-rounding table, and the negative-zero normalisation case. Each was the
+column destroying an amount, written down as a rounding property, in a module whose entire
+purpose is that money is not destroyed.
+
+The rule this earns: **a guard placed before a transformation does not constrain that
+transformation's output.** Ask where a value is last *changed*, not where it is first checked.
+The guard now lives in `NumericText`, because a non-zero amount that quantizes to zero is a
+value the column destroyed, and that will be true of every money column this project adds.
+
+### The float hook was named precisely and was the wrong one by half
+
+The spec identified the hazard exactly -- a vendor sending a price as a JSON number, `json.loads`
+producing a `float` before any of our code runs -- and prescribed `parse_float=Decimal`.
+
+`NaN`, `Infinity` and `-Infinity` do not route through `parse_float`. They go through
+`parse_constant`, whose default returns a Python float, so the decoder written to keep floats
+out of `providers/` was still producing one, invisible to the AST ban because the source
+contains no float literal and no `float` name. A `NaN` price then compares false in every
+direction, so a "refuse a non-positive price" guard passes it, and a total containing it is
+`NaN` without a word.
+
+**When you configure a hook to close a hole, enumerate the other hooks the same library offers
+over the same data.** `json.loads` has three. The spec named one.
+
+### The layout and the contract were one decision written as two
+
+The Layout table put `refresh_prices`, `lookup_price` and `value_portfolio` in one module.
+The contract forbids `api.routers -> ... -> providers.prices` with indirect imports included.
+Together those mean #11's valuation endpoint fails the contract on its first line, for a change
+that never touches a vendor -- and, worse, that the contract could never *newly* fire for the
+case it was written for, because the offending edge would exist from the first commit.
+
+The implementer caught it before writing either. A contract without `allow_indirect_imports`
+constrains the module graph, so the graph has to be designed with the contract in hand; they
+are one decision. The split -- `services/prices.py` provider-free, `services/price_refresh.py`
+owning the vendor edge -- is what makes the contract able to fail, which is the only property
+that makes a contract worth having.
+
+### An enforcement claim in `CLAUDE.md` turned out to be one third true
+
+Rule 2 says money is never aggregated in SQL and names an AST test in
+`backend/tests/security/` as the enforcement. That test bans float literals and the name
+`float`. Nothing bans `func.sum`, `order_by` or a comparison against a money column.
+
+The gap was harmless while no money column existed. **This change shipped the first one**, and
+milestone 3 adds one per accounting table. A `SUM()` over a `TEXT` money column does not fail
+in SQLite -- it coerces each value to a float and returns a plausible wrong answer, which is
+the failure this project ranks above an error. Filed as #58; the diff itself is clean, checked
+by review rather than by a test, which is exactly the situation rule 2's own preamble warns
+about: a rule that only lives in a document is a rule that erodes.
+
+### A note on what did not go wrong
+
+Review mutated sixteen guards and every one was killed, so the suite was load-bearing before any
+of the findings above were written. All seven findings were about behaviour no test *covered*,
+not about tests that passed for the wrong reason -- which is a different and better place for a
+change to be than the previous three issues were at the same stage.
+
+The Bitcoin and Kaspa suites were the control for the shared-decoder change and stayed
+byte-identical through it, through seven review items and through two rounds of fixes.
