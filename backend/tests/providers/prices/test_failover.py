@@ -867,6 +867,234 @@ async def test_a_vanishing_price_from_one_source_still_falls_over_to_a_good_one(
 
 
 # --------------------------------------------------------------------------------------
+# A source whose quote the column could not store
+# --------------------------------------------------------------------------------------
+#
+# All four shipped sources build their quotes through `require_price`, so nothing reaches
+# this guard in the shipped configuration. It is the guard against the fifth source --
+# written by somebody who assembled a `PriceQuote` directly, which is exactly what a fake
+# in this file does and exactly what the next provider author will do first.
+#
+# Measured here before it was closed: an unstorable `Decimal` travelled to
+# `PriceRepository.upsert`, `NumericText` refused it, and the `ValueError` propagated out
+# of `refresh_prices` rolling back **three pairs that had already succeeded**. That is the
+# outcome this function's own docstring says must never happen, which is why the check
+# belongs on the vendor error path rather than in the transaction.
+#
+# The same shape as `_answers_only_what_was_asked`, deliberately: the whole response is
+# discarded and the source is passed over. `EVERY_SOURCE_FAILED` is the reason, and not a
+# new enum member -- the source answered, but with nothing usable, so from the pair's point
+# of view every eligible source failed to produce a price.
+
+
+@dataclass
+class BypassingSource(FakeSource):
+    """A source that assembles `PriceQuote` directly, without `require_price`.
+
+    Not a contrivance: it is what every fake in this suite does, and what a fifth source
+    would do on its first draft. The four real ones run `require_price` while parsing, and
+    this class is the shape of a source that does not -- which is the only way to reach the
+    loop's own check.
+    """
+
+    unstorable: dict[PricePair, Decimal] = field(default_factory=dict)
+
+    async def fetch(self, pairs: Sequence[PricePair]) -> Sequence[PriceQuote]:
+        answered = list(await super().fetch(pairs))
+        answered.extend(
+            PriceQuote(
+                asset_symbol=pair[0],
+                quote_currency=pair[1],
+                amount=amount,
+                source=self.name,
+            )
+            for pair, amount in self.unstorable.items()
+            if pair in pairs
+        )
+        return tuple(answered)
+
+
+#: One value for each arm of `require_price`, reached through a quote rather than through a
+#: parsed field. Together they say the loop re-runs the whole rule rather than a copy of the
+#: half somebody remembered.
+UNSTORABLE: Final[tuple[Decimal, ...]] = (
+    Decimal("1E+300"),
+    Decimal("5E-13"),
+    Decimal(0),
+    Decimal(-1),
+)
+
+
+@pytest.mark.parametrize("amount", UNSTORABLE, ids=lambda value: f"{value}")
+async def test_a_source_whose_price_the_column_cannot_hold_is_passed_over(
+    amount: Decimal,
+) -> None:
+    """Every arm of `require_price`, through a quote, and the pair still gets a price.
+
+    Four values: too large for the digits in front of the point, small enough to round away
+    to nothing, zero, and negative. Parametrised rather than written as one case because
+    the guard calls `require_price` itself instead of restating it -- and a guard that had
+    restated only the magnitude half would pass a single-case test and let a zero through,
+    which is the one value criterion 3 is quoted for.
+
+    The honest source behind it is what makes this a failover rather than a loss: the pair
+    is answered, by somebody else, and `unanswered` is empty.
+    """
+    bypassing = BypassingSource(
+        name="bypassing",
+        pairs=SUPPORTED_PAIRS,
+        unstorable={BTC_USD: amount},
+    )
+    honest = FakeSource(name="honest", pairs=SUPPORTED_PAIRS, answers={BTC_USD: ONE})
+
+    result = await fetch_prices([BTC_USD], [bypassing, honest])
+
+    assert [quote.source for quote in result.quotes] == ["honest"]
+    assert result.quotes[0].amount == ONE
+    assert result.unanswered == ()
+    assert bypassing.asked == [(BTC_USD,)], "it was asked; its answer was refused"
+
+
+async def test_a_bypassing_source_alone_leaves_the_pair_unanswered() -> None:
+    """Nothing behind it, so the pair comes back unanswered rather than carrying the value.
+
+    The assertion that matters is `quotes == ()`. A loop that kept the quote and let the
+    repository refuse it later would satisfy every assertion about `unanswered` and would
+    be the defect: the value reaches a `flush()` that rolls back whatever else succeeded.
+    """
+    bypassing = BypassingSource(
+        name="bypassing",
+        pairs=SUPPORTED_PAIRS,
+        unstorable={BTC_USD: Decimal("1E+300")},
+    )
+
+    result = await fetch_prices([BTC_USD], [bypassing])
+
+    assert result.quotes == ()
+    assert result.unanswered == (BTC_USD,)
+
+
+async def test_the_whole_response_is_discarded_and_not_merely_the_unstorable_quote() -> None:
+    """One bad amount costs the source both its pairs, the way a bad correlation does.
+
+    The same decision `_answers_only_what_was_asked` makes and for a weaker reason, so it
+    is worth stating: a source that produced one number the column cannot hold has shown
+    that whatever built its quotes is not running the rule every other source runs, and the
+    quote beside it came out of the same place.
+
+    Asserted with a good quote in the same response, so "discarded" means discarded rather
+    than "there was nothing else to keep".
+    """
+    bypassing = BypassingSource(
+        name="bypassing",
+        pairs=SUPPORTED_PAIRS,
+        answers={BTC_EUR: ONE},
+        unstorable={BTC_USD: Decimal("1E+300")},
+    )
+
+    result = await fetch_prices([BTC_USD, BTC_EUR], [bypassing])
+
+    assert result.quotes == ()
+    assert result.unanswered == (BTC_EUR, BTC_USD)
+
+
+async def test_a_storable_amount_from_the_same_kind_of_source_is_kept() -> None:
+    """The control, and without it every test above passes for "discard this fake".
+
+    `BypassingSource` is a distinct class that assembles quotes by hand, so a guard keyed
+    on anything about the source rather than about the amount would satisfy all three tests
+    above. Here the same class answers with an ordinary price and is believed.
+    """
+    bypassing = BypassingSource(
+        name="bypassing",
+        pairs=SUPPORTED_PAIRS,
+        unstorable={BTC_USD: Decimal("86000.10")},
+    )
+
+    result = await fetch_prices([BTC_USD], [bypassing])
+
+    assert [quote.source for quote in result.quotes] == ["bypassing"]
+    assert result.quotes[0].amount == Decimal("86000.10")
+    assert result.unanswered == ()
+
+
+async def test_a_bypassing_source_no_longer_costs_a_refresh_the_pairs_that_worked(
+    price_session: AsyncSession,
+) -> None:
+    """The measurement, asserted as the fixed behaviour rather than as the defect.
+
+    Before the guard: an honest pair and an unstorable one in the same refresh produced
+    `builtins.ValueError` out of `refresh_prices` and **zero** rows -- the good pair rolled
+    back with the bad one. After it: both pairs refreshed, nothing unavailable, two rows.
+
+    Both pairs, because the unstorable quote is answered by the honest source behind the
+    bypassing one; `test_a_bypassing_source_alone_through_a_refresh_writes_nothing` is the
+    case where nobody can answer it. The absence of an exception is asserted implicitly by
+    the test not raising, and explicitly by the row count -- a `ValueError` here would have
+    left the table empty, which is the assertion that would have failed before.
+    """
+    bypassing = BypassingSource(
+        name="bypassing",
+        pairs=SUPPORTED_PAIRS,
+        unstorable={BTC_USD: Decimal("1E+300")},
+    )
+    honest = FakeSource(
+        name="honest",
+        pairs=SUPPORTED_PAIRS,
+        answers={BTC_USD: ONE, BTC_EUR: TWO},
+    )
+    service = build_price_refresh_service(
+        price_session,
+        sources=(bypassing, honest),
+        clock=_fixed_clock,
+    )
+
+    report = await service.refresh_prices([BTC_USD, BTC_EUR])
+
+    assert [(line.asset_symbol, line.quote_currency) for line in report.refreshed] == [
+        (BTC, EUR),
+        (BTC, USD),
+    ]
+    assert report.unavailable == ()
+    assert {line.source for line in report.refreshed} == {"honest"}
+
+    price_session.expunge_all()
+    stored = (await price_session.scalars(select(AssetPrice))).all()
+
+    assert len(stored) == 2, "the pair that worked must survive the pair that did not"
+
+
+async def test_a_bypassing_source_alone_through_a_refresh_writes_nothing(
+    price_session: AsyncSession,
+) -> None:
+    """Nobody can answer the pair, so it is a reason and an empty table -- not a zero row.
+
+    `EVERY_SOURCE_FAILED` rather than a new enum member: the source answered, but with
+    nothing usable, so from the pair's point of view every eligible source failed to
+    produce a price. That reason sends an operator to look at the vendor, which is where
+    the problem is, and the enum stays at the spec's four members.
+    """
+    bypassing = BypassingSource(
+        name="bypassing",
+        pairs=SUPPORTED_PAIRS,
+        unstorable={BTC_USD: Decimal("5E-13")},
+    )
+    service = build_price_refresh_service(
+        price_session,
+        sources=(bypassing,),
+        clock=_fixed_clock,
+    )
+
+    report = await service.refresh_prices([BTC_USD])
+
+    assert report.refreshed == ()
+    assert [(line.asset_symbol, line.reason) for line in report.unavailable] == [
+        (BTC, PriceUnavailable.EVERY_SOURCE_FAILED)
+    ]
+    assert (await price_session.scalars(select(AssetPrice))).all() == []
+
+
+# --------------------------------------------------------------------------------------
 # Conformance, decided by mypy rather than by isinstance
 # --------------------------------------------------------------------------------------
 #
