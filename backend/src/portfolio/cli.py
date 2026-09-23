@@ -39,6 +39,7 @@ from portfolio.domain.passwords import (
     OWASP_MINIMUM_TIME_COST,
     PasswordPolicyError,
 )
+from portfolio.logging import configure_logging
 from portfolio.providers.http import build_http_client
 from portfolio.providers.prices.registry import price_sources
 from portfolio.services.auth import AuthError, LoginThrottle, build_auth_service
@@ -263,7 +264,17 @@ def refresh_prices(args: argparse.Namespace) -> int:
 
     emit(f"as of {report.as_of.isoformat()}")
     for entry in report.refreshed:
-        emit(f"{entry.asset_symbol}/{entry.quote_currency} {entry.amount} via {entry.source}")
+        # `format(..., "f")` rather than the default rendering, for the reason
+        # `NumericText` gives for using it on the way in: it is fixed-point always, never
+        # scientific notation, so the line is the column's own text and cannot become
+        # `8.6E+4` for some future value. The full scale is printed rather than trimmed --
+        # twelve places on every line is noise right up until it is the only thing showing
+        # that a price was rounded on the way in, which is the whole reason this prints the
+        # stored value rather than the vendor's.
+        emit(
+            f"{entry.asset_symbol}/{entry.quote_currency} "
+            f"{format(entry.amount, 'f')} via {entry.source}"
+        )
     for missing in report.unavailable:
         emit_error(f"{missing.asset_symbol}/{missing.quote_currency} unavailable: {missing.reason}")
 
@@ -321,6 +332,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Run a command, turning an expected failure into a message and an exit code."""
     args = build_parser().parse_args(argv)
+    # **Configured here, before any handler runs, for the same reason `create_app` does it
+    # first.** Without it structlog is unconfigured, and an unconfigured structlog does not
+    # stay quiet: it falls through to `PrintLoggerFactory` and the dev renderer, which
+    # writes every provider request line onto **stdout**, interleaved with a command's own
+    # report. Verified in a pristine process --
+    # `[debug ] provider_request status=200 target=https://api.kraken.com/asset_prices`.
+    #
+    # Three things follow from that and all three are wrong: an operator's transcript is
+    # not the one `docs/operations.md` shows, `PORTFOLIO_LOG_LEVEL` does nothing to a
+    # command, and production never gets the JSON renderer it configures. Latent for
+    # `create-user` and `hash-benchmark`, which make no network calls; `refresh-prices` is
+    # the first command with a provider behind it and so the first where it shows.
+    #
+    # `get_settings` is `lru_cache`d, so the handlers that read it again get this same
+    # object rather than a second parse.
+    configure_logging(get_settings())
     try:
         exit_code: int = args.handler(args)
     except (CommandError, PasswordPolicyError, AuthError, UnknownAssetError) as exc:

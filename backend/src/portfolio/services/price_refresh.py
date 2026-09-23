@@ -29,11 +29,27 @@ with `providers.prices.registry.price_sources`. So the service depends on the `P
 protocol and on the failover loop, and never on which vendors exist -- which is what lets a
 test drive the whole refresh with two fakes and no network.
 
-## One clock read per refresh
+## One clock read per refresh, taken *before* the first request
 
 `as_of` and `fetched_at` on every row written by one call come from the same read. Two reads
 would let two rows in one refresh disagree about when it happened, and staleness is computed
 from `as_of`.
+
+**So `as_of` is the instant the refresh started, not the instant each price was observed**,
+and the difference is real rather than theoretical: the shared limiter paces requests at one
+per second per host, so a refresh that fails over across three hosts stamps its rows several
+seconds before the answers actually arrived. It is bounded by how long a refresh can take,
+which is seconds, against a staleness threshold of an hour.
+
+Kept, because the error is in the safe direction and it buys something worth more than the
+seconds: **one instant for the whole refresh.** A per-quote timestamp would make two rows
+written by one call disagree about when that call happened, and the alternative that fixed
+both -- reading the clock again after the fetch -- would date a price *later* than it was
+observed, which makes a stale price look fresher than it is. Erring early is the only one of
+the three that cannot do that.
+
+None of this makes `as_of` a vendor's quote time. No vendor supplies one; see
+`providers/prices/base.py`. It is our clock, read at the start of our refresh.
 """
 
 from __future__ import annotations
@@ -53,7 +69,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from portfolio.providers.prices.base import PricePair, PriceSource
+    from portfolio.providers.prices.base import PricePair, PriceQuote, PriceSource
 
 __all__ = [
     "PriceRefreshService",
@@ -106,6 +122,11 @@ class RefreshedPair:
     reason the field exists on the report as well as in the column: an operator reading a
     refresh that took four seconds wants to see that Kraken was skipped, without querying
     the table.
+
+    **`amount` is the value the table holds, read back after the commit, not the value the
+    vendor sent.** `prices.amount` rounds to `PRICE_SCALE` places, so the two differ for a
+    price finer than that -- and a report that showed the vendor's number would disagree
+    with the row every later valuation reads, at the one moment somebody is watching.
     """
 
     asset_symbol: str
@@ -130,7 +151,11 @@ class UnavailablePair:
 
 @dataclass(frozen=True, slots=True)
 class RefreshReport:
-    """What one refresh did: what it stored, what it could not, and when it asked.
+    """What one refresh did: what it stored, what it could not, and when it began.
+
+    **`as_of` is the instant the refresh started**, not the instant any individual price
+    was observed, and it is the value written to both timestamp columns of every row the
+    call wrote. The module docstring has the argument for that.
 
     **A refresh that stored nothing is not an exception.** Every vendor being down is a
     real state the caller has to be able to report, and raising would throw away the pairs
@@ -197,6 +222,8 @@ class PriceRefreshService:
         4. **The quotes are written, then the transaction commits once.** One commit for
            the whole refresh, so a crash halfway leaves the previous prices intact rather
            than a cache that is half new and half old with nothing recording which is which.
+        5. **The rows are read back and the report is built from them**, so what it says was
+           stored is what was stored. See `RefreshedPair.amount`.
 
         Raises:
             UnknownAssetError: a quote arrived for a symbol with no row in `assets`. A
@@ -239,7 +266,7 @@ class PriceRefreshService:
         )
 
         assets = await self._assets.by_symbol()
-        refreshed: list[RefreshedPair] = []
+        written: list[tuple[int, PriceQuote]] = []
         for quote in fetched.quotes:
             asset = assets.get(quote.asset_symbol)
             if asset is None:
@@ -249,20 +276,42 @@ class PriceRefreshService:
                 quote_currency=quote.quote_currency,
                 amount=quote.amount,
                 source=quote.source,
-                # The same instant on both columns, from the one clock read above. They
-                # diverge the day a vendor supplies a quote time; none does today.
+                # The same instant on both columns, from the one clock read taken before
+                # the first request -- so this is when the refresh *started*, a few seconds
+                # earlier than the answer arrived. The module docstring says why that is
+                # the right way to be wrong. They diverge the day a vendor supplies a quote
+                # time; none does today.
                 as_of=as_of,
                 fetched_at=as_of,
             )
-            refreshed.append(
-                RefreshedPair(
-                    asset_symbol=quote.asset_symbol,
-                    quote_currency=quote.quote_currency,
-                    source=quote.source,
-                    amount=quote.amount,
-                )
-            )
+            written.append((asset.id, quote))
         await self._session.commit()
+
+        # **The report carries what the table holds, not what the vendor said**, and the
+        # two are not always the same number: `prices.amount` is `NumericText(12)`, so a
+        # price finer than twelve places is rounded on the way in. Reporting the quote
+        # would hand an operator a transcript that disagrees with the row a later valuation
+        # reads -- and it would make that rounding invisible at the one moment somebody is
+        # looking. `NumericText` now refuses a value that rounds away to nothing, so what
+        # remains is ordinary rounding, which is exactly the kind of thing worth showing
+        # rather than hiding.
+        #
+        # `expire_all` is what makes the read a read. The session's identity map already
+        # holds these rows, and the factory is built with `expire_on_commit=False`, so
+        # without it the query would hand back the same objects still carrying the
+        # unrounded `Decimal` that was assigned to them -- the in-memory value dressed up
+        # as a round trip, which is the verifier sharing state with its subject.
+        self._session.expire_all()
+        stored = {(row.asset_id, row.quote_currency): row for row in await self._prices.list_all()}
+        refreshed = [
+            RefreshedPair(
+                asset_symbol=quote.asset_symbol,
+                quote_currency=quote.quote_currency,
+                source=quote.source,
+                amount=stored[(asset_id, quote.quote_currency)].amount,
+            )
+            for asset_id, quote in written
+        ]
 
         return RefreshReport(
             as_of=as_of,
