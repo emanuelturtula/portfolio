@@ -645,6 +645,17 @@ numbers:
 - **A partial answer is normal.** `EndpointSet` treats one endpoint answering about half a
   request as a correlation bug; `fetch_prices` treats one source answering three pairs of
   four as the ordinary case and asks the next source for the fourth.
+- **An answer that is wrong rather than incomplete is discarded whole.** Two checks in the
+  loop, both applied to the response rather than trusted to the four parsers: a source that
+  answers about a pair nobody asked for has proved its correlation is broken, and a source
+  whose amount the `prices` column cannot hold has produced something no later layer can
+  store. Either way the source is passed over as though it had not answered, and the
+  outstanding pairs go to the next one. Each parser checks the same things for its own
+  document; the duplication is deliberate, because a rule enforced in four places is a rule
+  one of them can drop, and the fifth source nobody has written yet is the one that would.
+  The second check also keeps a value problem on the vendor's error path: without it an
+  unstorable amount reaches `NumericText`, and the `ValueError` rolls back every pair that
+  had already succeeded in the same refresh.
 - **No request path may reach one.** `backend/.importlinter`'s
   `prices-are-never-fetched-in-a-request` contract forbids any chain from
   `portfolio.api.routers` to `portfolio.providers.prices`, **without**
