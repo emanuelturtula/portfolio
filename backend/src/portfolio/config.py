@@ -207,6 +207,25 @@ class Settings(BaseSettings):
     # environment is a startup failure naming the three acceptable values.
     kaspa_network: Literal["mainnet", "testnet", "devnet"] = "mainnet"
 
+    # The one credential the price providers can take, and the only one of the four price
+    # sources that needs any. `SecretStr` for the reason `bootstrap_password` is one: the
+    # value stays out of reprs, tracebacks and model dumps. It is never persisted, never
+    # returned by an endpoint and never logged -- it travels as a request header on the
+    # one call that uses it and nowhere else.
+    #
+    # **`None` means the keyed source is not built at all, rather than built and skipped.**
+    # `providers.prices.base.price_sources` omits it from the tuple, so with no key there
+    # is no object holding a blank credential and no code path that could reach the
+    # vendor. Criterion 5 asks for "works with and without an API key"; absent is the only
+    # spelling of "without" that cannot be defeated by a later caller reaching past the
+    # check.
+    #
+    # Deliberately **not** validated by `_refuse_unsafe_configuration`. There is no shape
+    # a CoinGecko key has to have that this application knows, and a length or prefix rule
+    # invented here would refuse a valid key the day the vendor changes its format. A
+    # wrong key surfaces as a refusal from that one source, which the failover moves past.
+    coingecko_api_key: SecretStr | None = None
+
     @property
     def session_cookie_name(self) -> str:
         """`__Host-psid`, degrading to `psid` on the one configuration that cannot use it."""

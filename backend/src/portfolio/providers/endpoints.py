@@ -240,13 +240,40 @@ class EndpointSet:
         """
         return self._endpoints
 
-    async def read(self, path: str, label: str, start: int = 0) -> tuple[str, int]:
+    async def read(
+        self,
+        path: str,
+        label: str,
+        start: int = 0,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> tuple[str, int]:
         """`GET path` from the first endpoint that answers, starting at `start`.
 
         Returns the body and the index of the endpoint that produced it, which the caller
         carries into its next read as `start`. That is the whole of the sticky-failover
         mechanism: an endpoint that failed is never asked again within one call, and
         nothing has to remember to skip it.
+
+        **`headers` exists for one caller and carries one kind of value: a credential.**
+        The keyed price source authenticates with a request header, and the alternative
+        spellings are both worse. A key in the query string is the case `http.py` warns
+        about by name -- `strip_query` keeps it out of *this* application's log and does
+        nothing about the vendor's, any intermediary's, or a traceback that renders the
+        URL. Setting it on the shared `httpx.AsyncClient` instead would send one vendor's
+        credential to every host every provider talks to.
+
+        Per request and per call site, therefore, so the credential travels no further
+        than the one request that needs it. **Nothing here logs a header**, and nothing
+        may start to: the transport logs `request_target`, which renders a scheme, a host
+        and an endpoint label and never sees a header at all. That is the property this
+        argument depends on, and it is enforced in `http.py` rather than remembered here.
+
+        Args:
+            path: the path to read, beginning with a slash.
+            label: the endpoint label, a member of `ENDPOINT_LABELS`.
+            start: the index to begin at, which is sticky failover's whole state.
+            headers: request headers for this one call, or `None` for the client's own.
 
         Raises:
             ProviderRateLimitedError: every endpoint was tried and the last said 429.
@@ -255,7 +282,9 @@ class EndpointSet:
             ProviderUnavailableError: every endpoint was tried and the last did not answer
                 or failed with a 5xx -- and the same when none is configured.
         """
-        return await self._failover(path, label, start, payload=None, idempotent=False)
+        return await self._failover(
+            path, label, start, payload=None, idempotent=False, headers=headers
+        )
 
     async def post(
         self,
@@ -317,7 +346,9 @@ class EndpointSet:
             ProviderUnavailableError: every endpoint was tried and the last did not answer
                 or failed with a 5xx -- and the same when none is configured.
         """
-        return await self._failover(path, label, start, payload=json, idempotent=idempotent)
+        return await self._failover(
+            path, label, start, payload=json, idempotent=idempotent, headers=None
+        )
 
     async def _failover(
         self,
@@ -327,6 +358,7 @@ class EndpointSet:
         *,
         payload: Mapping[str, object] | None,
         idempotent: bool,
+        headers: Mapping[str, str] | None,
     ) -> tuple[str, int]:
         """The loop both public methods are: try each endpoint in turn, classify the last.
 
@@ -344,7 +376,7 @@ class EndpointSet:
             endpoint = self._endpoints[index]
             try:
                 response = await self._request(
-                    endpoint, path, label, payload, idempotent=idempotent
+                    endpoint, path, label, payload, idempotent=idempotent, headers=headers
                 )
             except httpx.TransportError as error:
                 failure = _Failure(
@@ -373,6 +405,7 @@ class EndpointSet:
         payload: Mapping[str, object] | None,
         *,
         idempotent: bool,
+        headers: Mapping[str, str] | None,
     ) -> httpx.Response:
         """One request to one endpoint, labelled, and idempotent only if the caller said so.
 
@@ -380,10 +413,17 @@ class EndpointSet:
         boolean value. A request that carries `IDEMPOTENT_EXTENSION: False` and one that
         carries no such key are the same request to the transport -- `is True` is the test
         -- and the absent key is the honest spelling of "this was not opted in".
+
+        `headers` is passed straight to `httpx` and is never inspected, never copied onto
+        the client and never logged. It may hold a credential; see `read`.
         """
         url = endpoint.url(path)
         if payload is None:
-            return await self._client.get(url, extensions={ENDPOINT_EXTENSION: label})
+            return await self._client.get(
+                url,
+                headers=dict(headers) if headers is not None else None,
+                extensions={ENDPOINT_EXTENSION: label},
+            )
         extensions: dict[str, object] = {ENDPOINT_EXTENSION: label}
         if idempotent:
             extensions[IDEMPOTENT_EXTENSION] = True
