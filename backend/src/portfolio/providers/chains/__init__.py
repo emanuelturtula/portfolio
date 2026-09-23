@@ -1,7 +1,8 @@
 """Every chain provider, imported here exactly once, on purpose.
 
-**Bitcoin is here; Kaspa is #8.** #6 landed the seam and #7 sent the first provider
-through it.
+**Bitcoin and Kaspa are both here.** #6 landed the seam, #7 sent the first provider
+through it, and #8 sent the second -- which is also when the failover loop moved out into
+`providers/endpoints.py`, so that the third chain really is a file rather than a refactor.
 
 A provider module registers itself by decorating its class with
 `@register_chain_provider(ChainKey.X)`, and a decorator only runs when its module is
@@ -29,4 +30,7 @@ it does not import a provider class by name, which is what keeps the set of chai
 runtime fact rather than something every call site has to know.
 """
 
-from portfolio.providers.chains import bitcoin  # noqa: F401 - imported for its registration
+from portfolio.providers.chains import (
+    bitcoin,  # noqa: F401 - imported for its registration
+    kaspa,  # noqa: F401 - imported for its registration
+)

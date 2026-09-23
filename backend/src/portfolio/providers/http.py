@@ -96,6 +96,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ADDRESS_BALANCE",
+    "ADDRESS_BALANCES",
     "BLOCK_TIP_HEIGHT",
     "DEFAULT_MIN_HOST_INTERVAL_MS",
     "DEFAULT_RETRY_POLICY",
@@ -104,14 +105,18 @@ __all__ = [
     "ENDPOINT_LABEL",
     "ENDPOINT_LABELS",
     "HTTP_ERROR_FLOOR",
+    "IDEMPOTENT_EXTENSION",
+    "NODE_HEALTH",
     "RETRYABLE_STATUSES",
     "UNLABELLED",
     "HostRateLimiter",
+    "RateLimitHint",
     "RetryPolicy",
     "RetryingTransport",
     "build_http_client",
     "host_key",
     "monotonic_ms",
+    "parse_rate_limit",
     "parse_retry_after",
     "request_target",
     "sleep_ms",
@@ -136,6 +141,40 @@ ENDPOINT_EXTENSION: Final = "endpoint"
 
 An extension rather than a header: a header would be sent to the vendor, and what we call
 an endpoint internally is nobody else's business.
+"""
+
+IDEMPOTENT_EXTENSION: Final = "idempotent"
+"""The `httpx` request extension a provider sets to declare one request safe to repeat.
+
+**Per request, deny by default, and deliberately not a wider `RetryPolicy.retry_methods`.**
+#6 anticipated Kaspa's batch balance read -- which is a `POST` -- and proposed that #8 opt
+in by adding `"POST"` to `retry_methods`. That is wrong now that the consequence is visible:
+the policy lives on the transport, the transport is process-wide by construction, and
+widening it would make **every** future `POST` retryable, including an exchange request that
+places an order, where a retry after a transport error can double a trade. One provider's
+convenience would silently become another's duplicate fill.
+
+So the opt-in travels with the one request it applies to, and it is visible at that call
+site:
+
+```python
+await client.post(
+    url,
+    json=payload,
+    extensions={ENDPOINT_EXTENSION: ADDRESS_BALANCES, IDEMPOTENT_EXTENSION: True},
+)
+```
+
+Compared with `is True` rather than for truthiness, for the same reason `request_target`
+checks membership rather than shape: `extensions` is a plain mapping of anything, so a
+stray `"false"`, a `1` or a non-empty list would otherwise opt a request in by accident.
+Saying yes has to be the literal `True`.
+
+**The body of such a request must be bytes, never a stream.** `httpx` consumes a request
+stream on the first attempt, so a retried streamed body replays as empty and the server
+answers about no addresses at all. `handle_async_request` calls `request.aread()` before
+the first attempt for exactly that reason, and a provider passes `json=` rather than
+`content=<an iterator>`.
 """
 
 UNLABELLED: Final = "<unlabelled>"
@@ -174,18 +213,40 @@ tidy-up fails there instead of quietly widening what may be added to the allowli
 ADDRESS_BALANCE: Final = "address_balance"
 """A read of one address's balance. Esplora's `GET /address/:address` is one of these."""
 
+ADDRESS_BALANCES: Final = "address_balances"
+"""A read of several addresses' balances in one call: Kaspa's `POST /addresses/balances`.
+
+Plural, one character from `ADDRESS_BALANCE`, and that is deliberate rather than careless.
+The two are the same *kind* of call and a log reader should see them as such; what differs
+is the number of addresses, which is precisely the fact the label may carry and the path
+may not.
+"""
+
 BLOCK_TIP_HEIGHT: Final = "block_tip_height"
 """A read of the chain tip's height, which is what a provider's `health()` asks for."""
 
-ENDPOINT_LABELS: Final[frozenset[str]] = frozenset({ADDRESS_BALANCE, BLOCK_TIP_HEIGHT})
+NODE_HEALTH: Final = "node_health"
+"""A read of an index's own health report: Kaspa's `GET /info/health`.
+
+Separate from `BLOCK_TIP_HEIGHT` because the two are not the same question. Esplora's tip
+height is a number a provider interprets; this endpoint is the vendor's own verdict on its
+nodes and its database, and it names neither a block nor an address.
+"""
+
+ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
+    {ADDRESS_BALANCE, ADDRESS_BALANCES, BLOCK_TIP_HEIGHT, NODE_HEALTH}
+)
 """Every label that may reach a log. Membership is the gate; the shape is not.
 
 **This is the completion #6 said belonged to #7.** Until a provider existed there was
 nothing to put in an allowlist, so `request_target` checked the label's *shape* and said
 so in its own docstring: a truncated address is lower-case, alphanumeric and under 32
 characters, so it passed the pattern and reached the log. Membership in a frozen set
-closes that, because a string that is not one of these two renders as `UNLABELLED` no
-matter how well it is shaped.
+closes that, because a string that is not a member renders as `UNLABELLED` no matter how
+well it is shaped.
+
+Two labels on #7; four since #8 added Kaspa's batch read and its health report. The set
+grows one deliberate line at a time, which is the whole mechanism.
 
 Same shape as `PUBLIC_API_PATHS`: adding an endpoint protects it, and saying more about
 one is a visible edit to a named constant rather than a value computed at a call site.
@@ -349,8 +410,8 @@ def request_target(request: httpx.Request) -> str:
     character bech32 address did not, only because of a length cap that was hygiene rather
     than a control.
 
-    Now anything that is not one of the two labels this release uses renders as
-    `UNLABELLED` regardless of how it is spelled:
+    Now anything that is not a member of `ENDPOINT_LABELS` renders as `UNLABELLED`
+    regardless of how it is spelled:
 
         'address_balance'              -> https://api.example/address_balance
         'tb1qw508d6qejxtdg'            -> https://api.example/<unlabelled>
@@ -482,6 +543,116 @@ def _http_date_ms(candidate: str, now: datetime) -> int | None:
 
 
 @dataclass(frozen=True, slots=True)
+class RateLimitHint:
+    """What a response said about our remaining budget at one host, once parsed.
+
+    Three fields because the IETF draft publishes a trio, but only two of them steer
+    anything: `HostRateLimiter.observe` reads `remaining` and `reset_ms` and ignores
+    `limit`. `limit` is carried because it is the one that says how large the budget was,
+    which is the number an operator needs when deciding whether our interval is wrong --
+    and because parsing it costs one line while inferring it later costs a guess.
+
+    Every field is `int | None`, and `None` means the header was absent or unusable rather
+    than zero. `remaining = 0` is a real statement -- "you have nothing left" -- and it is
+    the one this type exists to carry, so it must not be confusable with silence.
+
+    `reset_ms` is milliseconds, not the seconds the draft sends, because every duration in
+    this module is an integer number of milliseconds. It arrives already clamped: see
+    `parse_rate_limit`.
+    """
+
+    limit: int | None = None
+    remaining: int | None = None
+    reset_ms: int | None = None
+
+
+def parse_rate_limit(headers: httpx.Headers, *, cap_ms: int | None = None) -> RateLimitHint | None:
+    """The `ratelimit-*` trio as a hint, or `None` if the response said nothing usable.
+
+    Pure: no clock, no sleep, no state. `reset` is a *delay in seconds* by the IETF draft
+    rather than an instant, so nothing here has to read the wall clock -- which is what
+    stops an NTP step turning a two-second pause into an hour. The limiter adds it to its
+    own monotonic clock.
+
+    Two spellings are read: the draft's lower-case `ratelimit-limit`,
+    `ratelimit-remaining`, `ratelimit-reset`, and the older `x-ratelimit-*` prefix.
+    `httpx.Headers` matches case-insensitively, so those are two lookups per field rather
+    than four, and `X-RateLimit-Remaining` is found by the lower-case name.
+
+    **The draft spelling is preferred, and the fallthrough is on usability rather than on
+    presence.** The `x-` trio is consulted only when not one of the three draft fields
+    yielded a usable value -- absent and unparseable alike, since `_rate_limit_value`
+    reports both as `None`. Two consequences, and the second is the one a reader would
+    guess wrong:
+
+    * a server sending both trios does not get its two answers interleaved, because one
+      usable draft field is enough to settle the whole hint;
+    * a server whose draft headers are *all* junk -- `RateLimit-Limit: unlimited` and
+      nothing else readable -- still gets its legacy trio read, rather than being reported
+      as having said nothing. That is the better outcome and it is why the condition tests
+      the parsed values rather than `in headers`.
+
+    **Every value is clamped and every failure is ignored rather than raised**, for the
+    reason `parse_retry_after` already gives at length: a malformed header is not a reason
+    to fail a request that would otherwise succeed, and a server asking us to wait a day
+    must not be able to stall a sync for a day. A value that is not a run of ASCII digits
+    -- `"-5"`, `"1.5"`, `"soon"`, the Unicode digit `"٢"` that `str.isdigit` accepts and
+    `int` reads as two -- is treated as absent.
+
+    **Nothing in production exercises this, measured on 2026-09-23.** Neither
+    `GET /info/health` nor the Kaspa balance endpoint returns any `ratelimit-*` or
+    `x-ratelimit-*` header; what they return is `Server: cloudflare`, `cf-cache-status`
+    and `CF-RAY`. The realistic throttle from that vendor is therefore Cloudflare's own --
+    a 429 carrying `Retry-After`, which `parse_retry_after` has honoured since #6, or a
+    403, which #7's failover moves on from. #8's criterion 4 says these headers are
+    honoured *when present*, so the parser is built and the criterion is met; it is built
+    knowing it is unexercised, which is why it stays small and pure and says so here
+    rather than looking like tested production code. A self-hosted index without a CDN in
+    front of it is the deployment that would send them.
+
+    Args:
+        headers: the response headers, matched case-insensitively.
+        cap_ms: the ceiling to clamp `reset_ms` to, normally `RetryPolicy.max_backoff_ms`.
+            Omitted, the header is reported as it stands.
+
+    Returns:
+        A hint, or `None` when neither spelling carried a single usable field. `None` and
+        a hint whose fields are all `None` are the same statement and only the first is
+        produced, so a caller has one thing to test.
+    """
+    for prefix in ("ratelimit", "x-ratelimit"):
+        limit = _rate_limit_value(headers, f"{prefix}-limit")
+        remaining = _rate_limit_value(headers, f"{prefix}-remaining")
+        reset_seconds = _rate_limit_value(headers, f"{prefix}-reset")
+        if limit is None and remaining is None and reset_seconds is None:
+            continue
+        reset_ms = None if reset_seconds is None else reset_seconds * MILLISECONDS_PER_SECOND
+        if reset_ms is not None and cap_ms is not None:
+            reset_ms = min(reset_ms, cap_ms)
+        return RateLimitHint(limit=limit, remaining=remaining, reset_ms=reset_ms)
+    return None
+
+
+def _rate_limit_value(headers: httpx.Headers, name: str) -> int | None:
+    """One `ratelimit-*` field as a non-negative integer, or `None` if it says nothing.
+
+    `isascii() and isdigit()` rather than a `try: int(...)`, which is the same grammar
+    check `_delay_seconds_ms` makes and for the same two measured reasons: `"²".isdigit()`
+    is `True` and `int("²")` raises, while `"٢".isdigit()` is `True` and `int("٢")`
+    cheerfully returns 2. It also settles the signed and fractional spellings -- `"-1"`,
+    `"+1"` and `"1.5"` are none of them a run of digits, so all three are ignored, which
+    is what "a negative or non-numeric value is ignored" means in practice.
+    """
+    value = headers.get(name)
+    if value is None:
+        return None
+    candidate = value.strip()
+    if not candidate or not candidate.isascii() or not candidate.isdigit():
+        return None
+    return int(candidate)
+
+
+@dataclass(frozen=True, slots=True)
 class RetryPolicy:
     """How many times to try, how long to wait, and which requests are eligible.
 
@@ -489,11 +660,12 @@ class RetryPolicy:
     `RetryingTransport`, which keeps a policy comparable in a test and keeps the test
     seams in one place.
 
-    `retry_methods` defaults to the idempotent pair. **Kaspa's batch balance call is a
-    read expressed as `POST /addresses/balances`**, so #8 opts that provider in explicitly
-    -- one visible line in a diff, which is the house rule for making something less safe.
-    A `POST` is not retried by default because a transport error can arrive after the
-    server already applied the request, and this transport cannot know which.
+    `retry_methods` is the idempotent pair and **#8 deliberately did not widen it**. #6
+    anticipated Kaspa's batch balance read -- a read expressed as
+    `POST /addresses/balances` -- and proposed adding `"POST"` here. That would have made
+    every future `POST` retryable, this policy being process-wide, including an exchange
+    request that places an order. The opt-in is per request instead: see
+    `IDEMPOTENT_EXTENSION`.
     """
 
     max_attempts: int = 3
@@ -598,6 +770,36 @@ class HostRateLimiter:
         if wait_ms > 0:
             await self._sleep(wait_ms)
 
+    def observe(self, host: str, hint: RateLimitHint | None) -> None:
+        """Take a server's word for it when it says the budget for this host is spent.
+
+        Criterion 4 of #8. A `ratelimit-remaining` of zero is the one case where the
+        vendor knows something our interval does not, so the next request to that host
+        waits `reset` rather than the ordinary interval. Everything else is ignored: a
+        budget with requests left in it is not a reason to slow down, and `limit` alone
+        says nothing about when we may ask again.
+
+        **It only ever pushes the next slot later**, never earlier. `max` against whatever
+        is already booked means a hint cannot undo a wait the interval has imposed, or a
+        longer reset seen a moment ago, which is the same rule `_response_delay_ms` applies
+        to `Retry-After`: a server may lengthen our wait and may not shorten it.
+
+        **Synchronous, and deliberately not under the lock.** It has no `await` in it, so
+        under a single event loop it cannot be interleaved with `acquire`'s critical
+        section, and making it `async` would buy nothing while adding a suspension point to
+        the transport's response path. The residual is that a waiter which has already
+        claimed its slot keeps it -- one request may still go out inside the reset window,
+        and one is the right number to be wrong by for a header nothing sends yet.
+
+        `hint` may be `None`, which is what `parse_rate_limit` returns for a response that
+        said nothing, so the transport calls this unconditionally and has no branch of its
+        own to get wrong.
+        """
+        if hint is None or hint.remaining != 0 or hint.reset_ms is None:
+            return
+        resume_ms = self._clock() + hint.reset_ms
+        self._next_allowed_ms[host] = max(self._next_allowed_ms.get(host, resume_ms), resume_ms)
+
 
 class RetryingTransport(httpx.AsyncBaseTransport):
     """Wraps a transport with rate limiting, bounded retry and the logging contract.
@@ -676,13 +878,21 @@ class RetryingTransport(httpx.AsyncBaseTransport):
         something unhelpful" must not collapse into the same zero.
         """
         target = request_target(request)
-        retryable = request.method.upper() in self._policy.retry_methods
+        # Two ways in, and the second is per request. The method check is the standing
+        # policy; `IDEMPOTENT_EXTENSION` is one provider declaring one call safe to
+        # repeat, which is how Kaspa's `POST /addresses/balances` is retried without
+        # making a future exchange order retryable. `is True` rather than truthiness:
+        # `extensions` is a mapping of anything, and a stray `"false"` must not opt in.
+        retryable = (
+            request.method.upper() in self._policy.retry_methods
+            or request.extensions.get(IDEMPOTENT_EXTENSION) is True
+        )
         if retryable:
             # Materialise the body so a second attempt can replay it. A no-op for a GET
             # and for any request built from bytes, which is every request this
             # application makes today; it matters the moment a provider opts a streaming
-            # POST into `retry_methods`, because a consumed stream would otherwise make
-            # the retry send an empty body and the failure would look like a vendor bug.
+            # POST in, because a consumed stream would otherwise make the retry send an
+            # empty body and the failure would look like a vendor bug.
             await request.aread()
 
         attempt = 0
@@ -708,6 +918,15 @@ class RetryingTransport(httpx.AsyncBaseTransport):
                     reason=type(error).__name__,
                 )
                 continue
+
+            # Before any decision about this response, so that a 200 carrying an exhausted
+            # budget paces the *next* call just as a 429 would. The headers are read on
+            # every response for the same reason the limiter runs on every request: a rule
+            # that only applies to the failure path is a rule that arrives too late.
+            self._limiter.observe(
+                host_key(request.url),
+                parse_rate_limit(response.headers, cap_ms=self._policy.max_backoff_ms),
+            )
 
             if final or not retryable or response.status_code not in self._policy.retry_statuses:
                 self._log_outcome(target=target, attempt=attempt, status=response.status_code)

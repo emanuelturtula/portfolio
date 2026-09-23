@@ -179,6 +179,34 @@ class Settings(BaseSettings):
     # converts it to the domain enum, which is the layer allowed to know both.
     bitcoin_network: Literal["mainnet", "testnet", "regtest"] = "mainnet"
 
+    # The kaspa-rest-server instances the Kaspa provider reads, primary first. Same two
+    # scalars and the same blank-means-one-instance rule as the Esplora pair above.
+    #
+    # **The fallback ships blank, and that is a fact about the ecosystem rather than an
+    # omission.** Bitcoin has two independent public Esplora operators, which is what makes
+    # one a usable fallback for the other. There is one well-known public kaspa-rest-server
+    # and no second operator to name, so a default fallback would either be a second URL at
+    # the same host -- which `configured_endpoints` drops as a repeat, correctly, because a
+    # fallback onto the host that just refused us is worse than none -- or a hostname
+    # invented here. A self-hoster running their own index fills it in.
+    kaspa_api_url: str = "https://api.kaspa.org"
+    kaspa_api_fallback_url: str = ""
+
+    # A kaspa-rest-server instance serves exactly one network, and this one is not a guess:
+    # measured against the public instance on 2026-09-23, its own path validation is
+    # `^kaspa:[a-z0-9]{61,63}$` with the prefix as a literal, and a `kaspatest:` address is
+    # answered 422 quoting that rule. So the provider refuses a wrong-network address
+    # offline, before a URL is built out of it.
+    #
+    # The same measurement found that the vendor checks prefix, charset and length and
+    # **not the checksum**: a mistyped mainnet address matching that regex is accepted and
+    # answered with a balance of 0. Our offline validation is strictly stronger, which is
+    # now a measurement rather than a preference.
+    #
+    # A `Literal` rather than the `KaspaNetwork` enum itself, so that a typo in the
+    # environment is a startup failure naming the three acceptable values.
+    kaspa_network: Literal["mainnet", "testnet", "devnet"] = "mainnet"
+
     @property
     def session_cookie_name(self) -> str:
         """`__Host-psid`, degrading to `psid` on the one configuration that cannot use it."""
@@ -285,6 +313,8 @@ class Settings(BaseSettings):
         for name, url in (
             ("PORTFOLIO_BITCOIN_ESPLORA_URL", self.bitcoin_esplora_url),
             ("PORTFOLIO_BITCOIN_ESPLORA_FALLBACK_URL", self.bitcoin_esplora_fallback_url),
+            ("PORTFOLIO_KASPA_API_URL", self.kaspa_api_url),
+            ("PORTFOLIO_KASPA_API_FALLBACK_URL", self.kaspa_api_fallback_url),
         ):
             reason = provider_url_violation(url)
             if reason is not None:

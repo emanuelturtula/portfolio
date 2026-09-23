@@ -44,7 +44,27 @@ class ProviderError(Exception):
 
     A caller that only wants "the sync did not work" catches this one. A caller that has
     to decide whether retrying is worth anything catches a subclass.
+
+    **`status` carries the HTTP status that produced this failure, or `None`**, and it is
+    on the base class rather than on one subclass because every one of them can arise from
+    a status. It is `None` for a parse failure, for a transport failure, and for every
+    raise that never saw a response -- which is most of them.
+
+    It exists because a caller sometimes has to distinguish *which* refusal it caught, and
+    the only alternative is reading the message. A message is prose written for an
+    operator; branching on it couples behaviour to wording and breaks the day somebody
+    improves a sentence. The concrete case is Kaspa's batch read, which may only suggest
+    lowering the configured batch size for a status that can actually mean "too large" --
+    and must not say it for the 403 a CDN block returns.
+
+    The status is safe to carry and to render: it names no host, no path and no address,
+    which is exactly why `docs/providers.md` tells a provider to map failures by status
+    alone.
     """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        self.status = status
+        super().__init__(message)
 
 
 class ProviderUnavailableError(ProviderError):

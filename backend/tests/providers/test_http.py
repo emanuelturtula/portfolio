@@ -13,18 +13,22 @@ difference between "retried twice" and "not retried at all" is only visible from
 from __future__ import annotations
 
 import inspect
+import json
 import secrets
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import httpx
 import pytest
 
 from portfolio.providers import http as provider_http
 from portfolio.providers.http import (
+    ADDRESS_BALANCES,
     CONNECT_TIMEOUT_MS,
     DEFAULT_MIN_HOST_INTERVAL_MS,
     DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT,
+    ENDPOINT_EXTENSION,
+    IDEMPOTENT_EXTENSION,
     POOL_TIMEOUT_MS,
     READ_TIMEOUT_MS,
     RETRYABLE_STATUSES,
@@ -50,6 +54,9 @@ from tests.providers.harness import (
     top_of_range_jitter,
     zero_jitter,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 #: The four `httpx.Timeout` slots. All four, because `httpx.Timeout(10.0)` sets all four
 #: too -- so "a timeout is set" and "each of the four was decided" are different claims,
@@ -299,6 +306,362 @@ def test_the_retry_methods_default_to_the_idempotent_pair() -> None:
     assert RetryPolicy().retry_methods == frozenset({"GET", "HEAD"})
 
 
+# --------------------------------------------------------------------------------------
+# Criterion 10 of #8: a read expressed as a POST, retried without widening the policy
+# --------------------------------------------------------------------------------------
+#
+# Kaspa's batch balance call is `POST /addresses/balances`, which is a read. #6 anticipated
+# it and proposed that #8 opt in by widening `RetryPolicy.retry_methods`. That is wrong now
+# that the consequence is visible: the policy lives on the transport, the transport is
+# process-wide by construction, and widening it would make **every** future `POST`
+# retryable -- including an exchange request that places an order, where a retry after a
+# transport error can double a trade. One provider's convenience would silently become
+# another's duplicate.
+#
+# So the opt-in is per request, deny by default, and visible at the one call site it
+# applies to. Same shape as the endpoint label: the default says nothing, and saying more
+# is a deliberate edit.
+
+#: What a batch read actually carries, so the replay assertion is about a real payload
+#: rather than about an empty object that would compare equal to an empty replay.
+BATCH_PAYLOAD: Final[dict[str, list[str]]] = {"addresses": ["alpha", "beta", "gamma"]}
+
+
+def body_recording_transport(*statuses: int) -> tuple[httpx.MockTransport, list[bytes]]:
+    """A transport that snapshots the request body **at each attempt**.
+
+    The snapshot is the whole point and it cannot be taken from the recorded requests.
+    `httpx` hands the *same* `Request` object to the transport on every attempt, so
+    `requests[1].content == requests[0].content` is comparing an object with itself and is
+    true however badly the replay went. The bytes have to be copied out while the attempt
+    is in progress, which is what this does.
+    """
+    bodies: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(bytes(request.content))
+        status = statuses[min(len(bodies) - 1, len(statuses) - 1)]
+        return httpx.Response(status, json={"ok": True})
+
+    return httpx.MockTransport(handler), bodies
+
+
+async def post_batch(
+    client: httpx.AsyncClient, *, idempotent: bool | None = True
+) -> httpx.Response | BaseException:
+    """One batch-shaped `POST`, with or without the idempotence declaration."""
+    extensions: dict[str, object] = {ENDPOINT_EXTENSION: ADDRESS_BALANCES}
+    if idempotent is not None:
+        extensions[IDEMPOTENT_EXTENSION] = idempotent
+    try:
+        return await client.post(
+            f"{TEST_ORIGIN}/addresses/balances", json=BATCH_PAYLOAD, extensions=extensions
+        )
+    except BaseException as error:
+        # Returned rather than propagated, for the reason `perform` gives: a test can then
+        # assert on the number of attempts without also having to agree, in the same
+        # assertion, on what an exhausted retry produces.
+        return error
+
+
+async def test_a_retried_idempotent_post_sends_the_same_body_again() -> None:
+    """The assertion is on the **body of the second request**, and nothing weaker will do.
+
+    `httpx` consumes a request stream on the first attempt. A streamed body therefore
+    replays as empty, the server answers about **no addresses**, and `align_balances` reads
+    every requested address as missing -- which it turns into a zero, because an address
+    with no history holds nothing. So the balances come back *wrong rather than missing*,
+    and every other assertion in this suite still passes: the request count is right, the
+    retry happened, the result has the right length and the right addresses in the right
+    order, and every balance is a plausible zero.
+
+    Asserting that a retry happened is therefore not enough. This captures the bytes at
+    each attempt and asserts the second attempt carried the first attempt's payload.
+    """
+    inner, bodies = body_recording_transport(503, 200)
+    sleep = RecordingSleep()
+    async with retrying_client(inner, sleep=sleep) as client:
+        outcome = await post_batch(client)
+
+    assert isinstance(outcome, httpx.Response), outcome
+    assert outcome.status_code == 200
+    assert len(bodies) == 2, "the idempotent POST was not retried at all"
+    assert bodies[0], "the first attempt sent an empty body, so the replay proves nothing"
+    assert bodies[1] == bodies[0]
+    assert [json.loads(body) for body in bodies] == [BATCH_PAYLOAD, BATCH_PAYLOAD]
+
+
+async def test_a_transport_error_on_an_idempotent_post_replays_the_body_too() -> None:
+    """The arm a status-only test misses, and the one the stream bug actually lives in.
+
+    A 503 arrives as a response, so the request object is untouched; a transport error can
+    arrive after the stream has already been drained. Driving both is what separates "the
+    body survived a response" from "the body survives".
+    """
+    bodies: list[bytes] = []
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        bodies.append(bytes(request.content))
+        if attempts == 1:
+            raise httpx.ConnectError("refused")
+        return httpx.Response(200, json={"ok": True})
+
+    sleep = RecordingSleep()
+    async with retrying_client(httpx.MockTransport(handler), sleep=sleep) as client:
+        outcome = await post_batch(client)
+
+    assert isinstance(outcome, httpx.Response), outcome
+    assert [json.loads(body) for body in bodies] == [BATCH_PAYLOAD, BATCH_PAYLOAD]
+
+
+class StreamReadingTransport(httpx.AsyncBaseTransport):
+    """An inner transport that consumes `request.stream`, the way a real one does.
+
+    **`httpx.MockTransport` cannot see the hazard criterion 10 is about.** Its
+    `handle_async_request` calls `await request.aread()` before handing the request to its
+    handler, and `Request.aread` caches the bytes on the request *and replaces a
+    non-replayable stream with a `ByteStream`*. So under `MockTransport` a body that could
+    never have been replayed replays perfectly, and a test built on it would be green
+    whether or not `RetryingTransport` does the materialising itself.
+
+    This transport does the one thing a real one does -- iterate the stream and send it --
+    and nothing else. A stream that has already been drained therefore yields nothing here,
+    which is exactly what the server would receive.
+    """
+
+    def __init__(self, *statuses: int) -> None:
+        self._statuses = statuses
+        self.bodies: list[bytes] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        stream = request.stream
+        assert isinstance(stream, httpx.AsyncByteStream), "an async client sends an async stream"
+        self.bodies.append(b"".join([part async for part in stream]))
+        status = self._statuses[min(len(self.bodies) - 1, len(self._statuses) - 1)]
+        return httpx.Response(status, json={"ok": True})
+
+
+class OneShotStream:
+    """A request body that yields its bytes once and nothing at all afterwards.
+
+    **Not an async generator, and that is the whole reason it is written by hand.** `httpx`
+    wraps a generator in an `AsyncIteratorByteStream` that remembers it is one and raises
+    `StreamConsumed` on a second pass -- a loud failure, and therefore not the dangerous
+    case. Any other async iterable is wrapped without that flag, so re-iterating it simply
+    yields nothing and the request goes out with an **empty body**.
+
+    That is the failure criterion 10 exists for: the server answers about no addresses,
+    `align_balances` reads every requested address as absent and turns it into a zero, and
+    the sync reports a portfolio of empty wallets with the right length, the right
+    addresses, the right order and no error anywhere.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self._remaining = [payload]
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while self._remaining:
+            yield self._remaining.pop(0)
+
+
+async def test_a_streaming_body_is_materialised_so_the_retry_can_replay_it() -> None:
+    """The mechanism behind criterion 10, driven where a mock transport cannot reach.
+
+    `RetryingTransport` reads the body into bytes before its first attempt, which also
+    replaces a non-replayable stream with a replayable one. Without that, the second
+    attempt sends nothing -- silently, for the reason `OneShotStream` documents.
+
+    The Kaspa provider passes `json=`, so its own body is already bytes and would replay
+    without this. That is what makes this the test that keeps the materialisation honest:
+    it is the only one in the suite that fails if the transport stops doing it, until the
+    day somebody writes a provider that streams -- and that provider's author will not
+    know this rule exists.
+    """
+    payload = b'{"addresses": ["alpha", "beta"]}'
+    inner = StreamReadingTransport(503, 200)
+    sleep = RecordingSleep()
+    client = build_http_client(
+        transport=inner,
+        policy=fast_policy(),
+        limiter=HostRateLimiter(min_interval_ms=0, clock=FakeClock(), sleep=sleep),
+        jitter=zero_jitter()[0],
+        sleep=sleep,
+    )
+    async with client:
+        response = await client.post(
+            f"{TEST_ORIGIN}/addresses/balances",
+            content=OneShotStream(payload),
+            extensions={ENDPOINT_EXTENSION: ADDRESS_BALANCES, IDEMPOTENT_EXTENSION: True},
+        )
+
+    assert response.status_code == 200
+    assert inner.bodies == [payload, payload], (
+        "the retried attempt did not carry the first attempt's body, so the server was "
+        "asked about nothing and every balance would come back a plausible zero"
+    )
+
+
+async def test_the_stream_reading_transport_would_notice_a_drained_stream() -> None:
+    """The control on the test above, and it is not optional.
+
+    `StreamReadingTransport` and `OneShotStream` are the only things standing between
+    criterion 10 and a test that passes because `MockTransport` quietly repaired the
+    request. So the pair is driven with nothing materialising anything: the second read
+    must come back **empty**, silently, with no exception. If it raised instead, or if it
+    replayed, the test above would be green for a reason that has nothing to do with the
+    transport under test.
+    """
+    payload = b'{"addresses": ["alpha"]}'
+    inner = StreamReadingTransport(200, 200)
+    request = httpx.Request(
+        "POST", f"{TEST_ORIGIN}/addresses/balances", content=OneShotStream(payload)
+    )
+
+    await inner.handle_async_request(request)
+    await inner.handle_async_request(request)
+
+    assert inner.bodies == [payload, b""]
+
+
+async def test_a_post_without_the_extension_is_still_not_retried() -> None:
+    """Deny by default. The extension is the opt-in, and its absence is not a shrug.
+
+    A `POST` is not retried by default because a transport error can arrive after the
+    server already applied the request, and this transport cannot know which. The whole
+    value of the per-request opt-in is that it leaves that true for every request that did
+    not ask.
+    """
+    inner, bodies = body_recording_transport(503, 200)
+    sleep = RecordingSleep()
+    async with retrying_client(inner, sleep=sleep) as client:
+        outcome = await post_batch(client, idempotent=None)
+
+    assert isinstance(outcome, httpx.Response), outcome
+    assert outcome.status_code == 503
+    assert len(bodies) == 1
+    assert sleep.slept_ms == []
+
+
+@pytest.mark.parametrize(
+    ("declared", "why"),
+    [
+        pytest.param("false", "a non-empty string, which is truthy", id="the string false"),
+        pytest.param("true", "the flag as a string, which is what a header would be", id="string"),
+        pytest.param(1, "an int, which is what a flag read out of JSON looks like", id="one"),
+        pytest.param(["yes"], "a non-empty list", id="a list"),
+        pytest.param(object(), "any object at all, which extensions permits", id="an object"),
+    ],
+)
+async def test_only_the_boolean_true_opts_a_post_into_being_retried(
+    declared: object, why: str
+) -> None:
+    """`is True`, not truthiness, and this is the row that proves the difference.
+
+    `request.extensions` is a plain mapping of **anything**, so the value here is whatever
+    a caller happened to put in it. Under a truthiness test every row below opts in -- and
+    the first is the one that shows why that is not a stylistic preference: `"false"` is a
+    non-empty string, so a provider that threaded a flag through as text would make a
+    request retryable by saying it is not.
+
+    Measured against the shipped transport: changing `is True` to `bool(...)` left the
+    entire suite green, because `test_an_explicit_false_does_not_opt_in_either` covers only
+    `False`, which is falsey under both readings. The claim the code, the spec and
+    `docs/providers.md` all make had no test until this one.
+
+    A single attempt is the assertion. The alternative -- a `POST` retried because somebody
+    passed the wrong kind of truthy -- is a duplicated request, and the request this
+    mechanism exists beside is an exchange order.
+    """
+    del why  # In the parameter id, where a failure can read it.
+    inner, bodies = body_recording_transport(503, 200)
+    sleep = RecordingSleep()
+    extensions: dict[str, object] = {
+        ENDPOINT_EXTENSION: ADDRESS_BALANCES,
+        IDEMPOTENT_EXTENSION: declared,
+    }
+    async with retrying_client(inner, sleep=sleep) as client:
+        response = await client.post(
+            f"{TEST_ORIGIN}/addresses/balances", json=BATCH_PAYLOAD, extensions=extensions
+        )
+
+    assert response.status_code == 503
+    assert len(bodies) == 1, f"{declared!r} opted the request in; only the boolean True may"
+    assert sleep.slept_ms == []
+
+
+async def test_an_explicit_false_does_not_opt_in_either() -> None:
+    """`idempotent: False` is a request saying no, and it has to be heard as one.
+
+    The realistic version is a provider that computes the flag -- `idempotent=is_read` --
+    and gets `False` for a write. A transport that tested for the key's *presence* rather
+    than for its value would retry exactly the request that said not to, which is the
+    inverse of what the extension is for.
+    """
+    inner, bodies = body_recording_transport(503, 200)
+    sleep = RecordingSleep()
+    async with retrying_client(inner, sleep=sleep) as client:
+        outcome = await post_batch(client, idempotent=False)
+
+    assert isinstance(outcome, httpx.Response), outcome
+    assert outcome.status_code == 503
+    assert len(bodies) == 1
+
+
+async def test_one_idempotent_post_does_not_make_the_next_one_retryable() -> None:
+    """The opt-in is per request, not a flag the transport picks up and keeps.
+
+    The transport is process-wide by construction, so a flag stored on it would be exactly
+    the widening this design exists to avoid -- reached by accident instead of on purpose,
+    and invisible in a diff. Two requests on **one client**, because that is the only
+    arrangement in which the leak can happen.
+    """
+    inner, bodies = body_recording_transport(503)
+    sleep = RecordingSleep()
+    async with retrying_client(inner, sleep=sleep) as client:
+        await post_batch(client)
+        attempts_after_opted_in = len(bodies)
+        await post_batch(client, idempotent=None)
+
+    assert attempts_after_opted_in == 3, "the opted-in POST should have used the whole budget"
+    assert len(bodies) - attempts_after_opted_in == 1, (
+        "the second POST did not declare itself idempotent and was retried anyway, so the "
+        "opt-in leaked onto the transport that every provider shares"
+    )
+
+
+async def test_a_get_is_retried_without_needing_the_extension() -> None:
+    """The control. An implementation that required the extension for everything would
+    pass every test above and quietly stop retrying every read in the system.
+    """
+    inner, requests = scripted_transport(503, 200)
+    sleep = RecordingSleep()
+    async with retrying_client(inner, sleep=sleep) as client:
+        outcome = await perform(client)
+
+    assert isinstance(outcome, httpx.Response), outcome
+    assert len(requests) == 2
+
+
+def test_the_idempotence_extension_is_a_named_constant_and_the_policy_still_excludes_post() -> None:
+    """Both halves of criterion 10, pinned where a diff will show them.
+
+    The extension name is a constant rather than a string repeated at each call site, for
+    the same reason `ENDPOINT_EXTENSION` is: a typo produces a request that is silently not
+    retried, which looks exactly like a vendor that answered on the first attempt.
+
+    And `retry_methods` must still be the idempotent pair. The point of the per-request
+    opt-in is that the process-wide policy did **not** have to change; a change here would
+    mean #8 took the route #6 proposed and the spec rejected, and every future `POST` --
+    an exchange order included -- would become retryable.
+    """
+    assert IDEMPOTENT_EXTENSION == "idempotent"
+    assert "POST" not in DEFAULT_RETRY_POLICY.retry_methods
+    assert DEFAULT_RETRY_POLICY.retry_methods == frozenset({"GET", "HEAD"})
+
+
 @pytest.mark.parametrize("max_attempts", [1, 2, 3, 5])
 async def test_the_attempt_count_is_a_ceiling(max_attempts: int) -> None:
     """`max_attempts` is total attempts, not retries on top of one.
@@ -359,6 +722,157 @@ async def test_an_exhausted_transport_error_propagates_rather_than_becoming_a_re
 
     assert isinstance(outcome, httpx.TransportError), outcome
     assert len(requests) == 3
+
+
+# --------------------------------------------------------------------------------------
+# Criterion 4 of #8, at the join: a `ratelimit-*` header reaching the limiter
+# --------------------------------------------------------------------------------------
+#
+# **This section exists because the criterion was proven in two halves and not at the
+# seam between them.** `parse_rate_limit` is tested pure in
+# `tests/providers/test_rate_limit_headers.py`, and `HostRateLimiter.observe` is tested by
+# direct call in `tests/providers/test_rate_limiter.py`. Both were green while nothing
+# anywhere drove a header through a `RetryingTransport` -- measured: deleting the four
+# lines in `handle_async_request` that call `observe(..., parse_rate_limit(...))` left the
+# whole suite passing.
+#
+# That is #6's lesson in a new costume. A codec and a consumer that are each correct and
+# never wired together is a feature that ships dead with every test green, and the only
+# assertion that can see it is one that starts at a response and ends at a sleep.
+#
+# Everything here is synthesised. Measured against the live Kaspa REST service on
+# 2026-09-23, neither endpoint sends a `ratelimit-*` or `x-ratelimit-*` header at all,
+# because the API sits behind Cloudflare. The criterion says "when present"; a self-hosted
+# instance with no CDN in front of it is the deployment this path is for.
+
+#: The limiter's ordinary spacing for these tests. Deliberately unlike every reset below,
+#: so "it waited the reset" and "it waited its own interval" can never be the same number.
+PACED_INTERVAL_MS: Final = 250
+
+
+def paced_client(
+    inner: httpx.MockTransport,
+    sleep: RecordingSleep,
+    *,
+    max_backoff_ms: int = 30_000,
+) -> httpx.AsyncClient:
+    """The real client, over a limiter that paces, with the clock and the sleep injected.
+
+    The limiter is a *real* `HostRateLimiter` rather than the open one the retry tests use,
+    because an interval of zero would make "the hint was honoured" and "nothing waited at
+    all" indistinguishable.
+    """
+    return retrying_client(
+        inner,
+        policy=fast_policy(max_backoff_ms=max_backoff_ms),
+        sleep=sleep,
+        limiter=HostRateLimiter(min_interval_ms=PACED_INTERVAL_MS, clock=FakeClock(), sleep=sleep),
+    )
+
+
+async def test_an_exhausted_budget_in_a_response_paces_the_next_request() -> None:
+    """The join, end to end: headers on a response become the next request's wait.
+
+    Two requests. The first is not delayed -- nothing is booked yet -- and its response
+    says the budget for this host is spent and will reset in two seconds. The second must
+    therefore wait **2000 ms and not the 250 ms interval**, which is the only pair of
+    numbers that can tell "the header was honoured" from "the limiter did what it always
+    does".
+
+    A 200 rather than a 429 on purpose: the transport reads these headers on *every*
+    response, because a rule that only applies to the failure path is a rule that arrives
+    after the throttling has already started.
+    """
+    inner, requests = scripted_transport(
+        (200, {"ratelimit-remaining": "0", "ratelimit-reset": "2"})
+    )
+    sleep = RecordingSleep()
+    async with paced_client(inner, sleep) as client:
+        await perform(client)
+        await perform(client)
+
+    assert len(requests) == 2
+    assert sleep.slept_ms == [2000], (
+        "the second request was paced by the limiter's own interval, so the response's "
+        "ratelimit headers never reached the limiter"
+    )
+
+
+async def test_a_budget_with_requests_left_does_not_slow_the_next_one() -> None:
+    """The control, and it is the case that actually happens on a server that sends these.
+
+    Every response from such a server carries the headers, so a transport that paused
+    whenever a hint arrived would run the whole sync at the vendor's advertised window
+    rather than at its own interval. Only `remaining: 0` is an instruction to wait.
+
+    Without this, a transport that ignored `remaining` entirely would pass the test above.
+    """
+    inner, requests = scripted_transport(
+        (200, {"ratelimit-remaining": "5", "ratelimit-reset": "2"})
+    )
+    sleep = RecordingSleep()
+    async with paced_client(inner, sleep) as client:
+        await perform(client)
+        await perform(client)
+
+    assert len(requests) == 2
+    assert sleep.slept_ms == [PACED_INTERVAL_MS]
+
+
+async def test_an_absurd_reset_cannot_stall_the_sync_at_the_join_either() -> None:
+    """The clamp reaches the wiring, not only the parser.
+
+    `parse_rate_limit` takes `cap_ms` as an argument, so a transport that passed no cap --
+    or passed the wrong one -- would honour a server asking us to wait a day, and the pure
+    tests in `test_rate_limit_headers.py` would all still pass. The assertion is the
+    policy's ceiling to the millisecond.
+    """
+    inner, _ = scripted_transport((200, {"ratelimit-remaining": "0", "ratelimit-reset": "86400"}))
+    sleep = RecordingSleep()
+    async with paced_client(inner, sleep, max_backoff_ms=1000) as client:
+        await perform(client)
+        await perform(client)
+
+    assert sleep.slept_ms == [1000]
+
+
+async def test_a_refusal_carrying_an_exhausted_budget_paces_the_next_request_too() -> None:
+    """A 403 is where a throttled vendor most plausibly says this, and it is not retried.
+
+    `observe` runs before the retry decision, so a response the policy will never retry
+    still contributes its headers. A transport that read them only on the retry path would
+    pass every test above -- all of which use a 200 the policy also does not retry, but
+    which takes the same early return -- and would ignore precisely the responses a
+    struggling server sends.
+    """
+    inner, requests = scripted_transport(
+        (403, {"ratelimit-remaining": "0", "ratelimit-reset": "3"})
+    )
+    sleep = RecordingSleep()
+    async with paced_client(inner, sleep) as client:
+        first = await perform(client)
+        await perform(client)
+
+    assert isinstance(first, httpx.Response), first
+    assert first.status_code == 403
+    assert len(requests) == 2
+    assert sleep.slept_ms == [3000]
+
+
+async def test_a_response_with_no_rate_limit_headers_changes_no_pacing() -> None:
+    """The other control: the production path, where no such header ever arrives.
+
+    `parse_rate_limit` returns `None` and `observe` does nothing with it, so the limiter
+    keeps its own interval. A transport that treated a missing header as an exhausted
+    budget would pause every Kaspa read for a reset nobody asked for.
+    """
+    inner, _ = scripted_transport((200, {"server": "cloudflare", "cf-cache-status": "DYNAMIC"}))
+    sleep = RecordingSleep()
+    async with paced_client(inner, sleep) as client:
+        await perform(client)
+        await perform(client)
+
+    assert sleep.slept_ms == [PACED_INTERVAL_MS]
 
 
 # --------------------------------------------------------------------------------------

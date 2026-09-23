@@ -193,6 +193,11 @@ concurrency = ["thread", "greenlet"]
 # moved it at #6.
 #
 # The three misses are 0.16 points now. `providers/chains/bitcoin.py` contributes none.
+#
+# **99.5 held again at the Kaspa provider (#8)**, measured 99.86% over 2459 statements and
+# 460 branches. The same arithmetic as #7, against the same nine-unit standard: 0.36 points
+# of 2919 units is about ten and a half units of headroom, and 99.6 would cut that to seven
+# and a half. The base has to grow before the number can.
 fail_under = 99.5
 show_missing = true
 skip_covered = true

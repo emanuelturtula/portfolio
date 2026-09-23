@@ -135,6 +135,43 @@ def test_the_document_records_the_rate_limit_as_unpublished() -> None:
     assert "unpublished" in lowered or "publishes no" in lowered or "not published" in lowered
 
 
+def test_the_document_records_the_kaspa_limits_and_the_example_trap() -> None:
+    """Criterion 7 of #8: the undocumented limits, and the trap in the vendor's own document.
+
+    Four separate facts, and each is a different failure if it is missing.
+
+    **The batch ceiling is a guess.** The OpenAPI document declares `addresses` as an array
+    of strings with no `maxItems` and the operation description names no ceiling, confirmed
+    against the live document on 2026-09-22. A document that stated 64 flatly would turn a
+    guess into a fact, and the next person would size a request against it. The first real
+    evidence will be a refused batch in production.
+
+    **`ratelimit-*` does not appear at all**, measured against both endpoints on
+    2026-09-23: the API is behind Cloudflare, so the parser criterion 4 asks for is code
+    nothing in production exercises. Unexercised code that looks tested is how a green
+    suite lies, and the only thing that stops the next reader believing this path is
+    covered is a sentence saying it is not.
+
+    **The mainnet-examples trap.** The vendor's document uses real mainnet addresses as its
+    example values, and an example is the thing people copy. Copied into a fixture it fails
+    the secret scan; copied into a fixture that somehow passes, it is a rule 3 violation in
+    a public repository.
+
+    **And the dates**, because a vendor fact with no date is a fact nobody can tell has
+    expired.
+    """
+    text = document()
+    lowered = text.lower()
+
+    assert "maxitems" in lowered or "no documented limit" in lowered or "undocumented" in lowered
+    assert "64" in text, "the batch ceiling this release ships has to be findable"
+    assert "ratelimit" in lowered, "criterion 4's headers, and the fact they never arrive"
+    assert "cloudflare" in lowered, "the reason the headers never arrive"
+    assert "mainnet" in lowered, "the example trap is about mainnet addresses specifically"
+    assert "example" in lowered
+    assert "2026-09-23" in text, "the measurement that says the headers are absent is dated"
+
+
 def test_the_document_records_the_wrong_network_residual() -> None:
     """The failure nothing in this change can detect, written down where #8 will read it.
 
