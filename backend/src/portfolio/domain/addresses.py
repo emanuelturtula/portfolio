@@ -777,3 +777,100 @@ def bitcoin_network_of(canonical: str) -> BitcoinNetwork:
     if network is None:
         raise AddressInvalidError(AddressRejection.UNKNOWN_VERSION_BYTE)
     return network
+
+
+# ---------------------------------------------------------------------------------------
+# Which Kaspa network an address belongs to
+# ---------------------------------------------------------------------------------------
+#
+# The same question `bitcoin_network_of` answers, for the same caller: a Kaspa REST server
+# serves exactly one network, so an address from another one has to be refused before a URL
+# is built out of it. Measured against the public instance on 2026-09-23, the vendor's own
+# path validation hard-codes `^kaspa:[a-z0-9]{61,63}$` and answers 422 for anything else --
+# which confirms one instance, one network, rather than leaving it assumed.
+#
+# **Worth reading as a contrast rather than as a copy.** Bitcoin's answer is approximate:
+# `tb` is testnet3, testnet4 and signet alike, and the base58 testnet version bytes cover
+# regtest too, so `bitcoin_network_of` records a residual nothing can close. Kaspa has no
+# such collapse. `kaspa`, `kaspatest` and `kaspadev` are three distinct prefixes and each
+# one is folded into the 40-bit checksum, so the same payload checksums differently on each
+# network and the same string cannot be read as two of them. The check is exact here and
+# approximate there; a reader comparing the two functions deserves to be told which is
+# which.
+
+
+class KaspaNetwork(StrEnum):
+    """The Kaspa networks an address can belong to.
+
+    Three members, matching `KASPA_PREFIXES` exactly. `kaspasim` is a real prefix in
+    rusty-kaspa and is deliberately not one this application accepts -- a simulation
+    network holds nothing worth tracking -- so it is absent from both.
+    """
+
+    MAINNET = "mainnet"
+    TESTNET = "testnet"
+    DEVNET = "devnet"
+
+
+KASPA_NETWORK_BY_PREFIX: Final[Mapping[str, KaspaNetwork]] = {
+    "kaspa": KaspaNetwork.MAINNET,
+    "kaspatest": KaspaNetwork.TESTNET,
+    "kaspadev": KaspaNetwork.DEVNET,
+}
+"""The network prefix to its network, from the same `Prefix` enum as `KASPA_PREFIXES`.
+
+Total over `KASPA_PREFIXES` by construction, and a test asserts it: a prefix the codec
+accepts but this table does not know would make `kaspa_network_of` raise on an address that
+had just validated, which is the kind of contradiction that surfaces as a wallet nobody can
+read.
+
+A bijection, unlike `BITCOIN_NETWORK_BY_VERSION_BYTE`. That is a property of the chain
+rather than of this table, and it is why the Kaspa wrong-network check has no residual to
+record.
+"""
+
+
+def kaspa_network_of(canonical: str) -> KaspaNetwork:
+    """Which Kaspa network an address is on, offline, from the address alone.
+
+    **The checksum is verified again here rather than assumed**, by going through
+    `kaspa_decode` instead of partitioning on `":"`. That is what makes the function safe
+    on any string rather than only on one that has already validated, which matters because
+    the caller is a provider holding a value that came out of a database column.
+
+    It is also the difference between a refusal and a confident wrong answer. Kaspa folds
+    the prefix into the checksum, so a `kaspa:` payload reprinted under `kaspadev:` is not
+    a devnet address -- it is not an address at all. A function that read the prefix and
+    looked it up would answer `DEVNET` for it, and a provider configured for devnet would
+    then build a URL out of a string no Kaspa node would accept.
+
+    `kaspa_decode` lowercases first, so an uppercase rendering -- what a QR code or a
+    hardware wallet screen shows, and what the registry keeps in its `display` column --
+    reads as the network it spells rather than as an unknown prefix.
+
+    **A plain subscript, and there is deliberately no unknown-prefix arm**, which is where
+    this parts company with `bitcoin_network_of`. That function needs one: `bech32_decode`
+    accepts any well-formed human-readable part, so an hrp outside `BITCOIN_HRPS` reaches
+    its table and has to be refused there. `kaspa_decode` refuses a prefix outside
+    `KASPA_PREFIXES` before it returns, and `KASPA_NETWORK_BY_PREFIX` is total over that
+    set -- `tests/domain/test_kaspa_network.py::test_every_prefix_maps_to_its_network` is
+    what keeps it so. A guard here would therefore be a branch no test can reach and a
+    claim no reader can check, which this codebase has decided is worse than none.
+
+    The obligation that moves with it: a prefix added to `KASPA_PREFIXES` must be added to
+    the table in the same change. That is the failing test, not a `KeyError` in production.
+
+    Args:
+        canonical: the canonical form of a Kaspa address, as `ValidatedAddress` carries it.
+            An uppercase or already-validated string is accepted just the same.
+
+    Returns:
+        The network the address names.
+
+    Raises:
+        AddressInvalidError: the string is not a Kaspa address -- mixed case, no prefix, an
+            unknown prefix, a bad checksum, an unknown version byte, a payload of the wrong
+            length. As everywhere in this module, neither the message nor the arguments
+            contain the address.
+    """
+    return KASPA_NETWORK_BY_PREFIX[kaspa_decode(canonical).prefix]
