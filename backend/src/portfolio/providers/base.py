@@ -49,6 +49,7 @@ It costs nothing at runtime and it actually reads the signatures.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -68,6 +69,8 @@ __all__ = [
     "ProviderHealth",
     "align_balances",
     "chunk_addresses",
+    "decode_json",
+    "require_json_object",
 ]
 
 
@@ -440,3 +443,72 @@ def chunk_addresses(
     """
     size = capabilities.max_addresses_per_call
     return [tuple(addresses[start : start + size]) for start in range(0, len(addresses), size)]
+
+
+def decode_json(body: str | bytes) -> object:
+    """`json.loads`, with every failure it has translated into this package's vocabulary.
+
+    Shared because the catch clause is the interesting part and a second copy of it would
+    drift. #7 wrote it inside `chains/bitcoin.py`, review corrected the clause there, and
+    #8 needed the same boundary for a second vendor -- the same argument
+    `providers/endpoints.py` makes about the failover loop.
+
+    **`ValueError` and `RecursionError`, not `JSONDecodeError` and `UnicodeDecodeError`**,
+    and that is a correction rather than defensive breadth. Measured:
+
+    | Body | What `json.loads` raises |
+    |---|---|
+    | `not json` | `json.JSONDecodeError` |
+    | bytes that are not UTF-8 | `UnicodeDecodeError` |
+    | an integer of 5000 digits | `ValueError: Exceeds the limit (4300 digits)` |
+    | 5000 nested arrays | `RecursionError` |
+
+    The first two are `ValueError` subclasses, so naming `ValueError` subsumes them and
+    catches the integer-limit case that the narrower pair let escape untyped. The last one
+    is not a `ValueError` at all and has to be named. Both escaping arms reached every
+    parser in `chains/bitcoin.py`, which is to say they reached `health()`, whose contract
+    is that it never raises -- from a body a hostile or broken instance chooses freely.
+
+    `CPython` sets the digit limit and the recursion limit; neither is something this
+    application configures, and both are the kind of boundary a vendor can cross by
+    accident. "A malformed body raises a typed schema error rather than propagating a parse
+    error" is a criterion on both providers, and "parse error" is exactly what these two
+    were.
+
+    The message says the body did not parse and **never shows it**. A parser error that
+    quotes the offending text is the disclosure every parser in this package is written to
+    avoid: the text is a response body containing the owner's addresses.
+
+    Raises:
+        ProviderResponseError: the body is not JSON, or is JSON the decoder cannot finish.
+    """
+    try:
+        return json.loads(body)
+    except (ValueError, RecursionError) as error:
+        message = "The response body is not JSON."
+        raise ProviderResponseError(message) from error
+
+
+def require_json_object(body: str | bytes) -> Mapping[str, object]:
+    """The body as a JSON object, or a refusal naming what it was instead.
+
+    Status is decided before this is ever called -- see `EndpointSet`. A 502 carrying an
+    HTML error page is an unavailable upstream, not a schema error, and deciding that from
+    the body would file it under "needs a human" forever.
+
+    The message names the type and never the value, for the reason `decode_json` gives.
+    A provider whose endpoint documents an **array** rather than an object checks that
+    itself: there is one shape per endpoint, and a helper taking "which shape did you want"
+    as an argument would be a spelling of `isinstance` with a longer name.
+
+    Raises:
+        ProviderResponseError: the body is not JSON, or is not a JSON object.
+    """
+    document = decode_json(body)
+    if not isinstance(document, dict):
+        message = (
+            f"The response is a {type(document).__name__} rather than the JSON object "
+            "this endpoint documents."
+        )
+        raise ProviderResponseError(message)
+    return document
