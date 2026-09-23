@@ -85,13 +85,23 @@ class NumericText(TypeDecorator[Decimal]):
     raises rather than storing a rounded amount, because the digits that would be lost
     are the ones in front.
 
-    **The two over-precision rules here are deliberately different, and a reader meets
+    **The three over-precision rules here are deliberately different, and a reader meets
     them side by side.** Too many digits *after* the point is rounded away, because that
     is what declaring a scale means and what `DECIMAL(p, s)` does everywhere else. Too
     many digits *before* it is refused, because there is no rounding that preserves the
-    amount. `domain.money.to_base_units` refuses in both directions instead -- a chain
-    balance is exact and rounding one would report a holding the chain disagrees with --
-    so the same value can be legal in a column and rejected by a conversion.
+    amount. And a non-zero amount that rounds away **to zero** is refused as well, because
+    that is not rounding at all -- it is the amount being replaced by the one value nobody
+    downstream can recognise as wrong. `domain.money.to_base_units` refuses in both of the
+    first two directions instead -- a chain balance is exact and rounding one would report
+    a holding the chain disagrees with -- so the same value can be legal in a column and
+    rejected by a conversion.
+
+    **The two refusals word their messages differently, and that is a decision.** The
+    too-large one quotes the amount; the rounds-to-nothing one names only the scale. This
+    type holds a price today, which is public market data, and it will hold a *quantity*
+    eventually -- a balance, a fill -- and a quantity is the owner's holdings. The new
+    message is written to the rule the rest of this application already follows, and the
+    older one is left alone rather than changed under an unrelated issue.
 
     Text does not sort or sum numerically, and that is a feature, not a limitation to
     work around: `SUM()`, `ORDER BY` and `<` on this column would coerce it to a float in
@@ -149,8 +159,9 @@ class NumericText(TypeDecorator[Decimal]):
             # Exact by construction: an `int` has nothing after the decimal point to
             # lose. This is the one non-Decimal input worth accepting.
             value = Decimal(value)
+        candidate = require_amount(value, subject="NumericText")
         try:
-            amount = quantize(require_amount(value, subject="NumericText"), self.scale)
+            amount = quantize(candidate, self.scale)
         except InvalidOperation:
             # The bare `decimal.InvalidOperation: [<class 'decimal.InvalidOperation'>]`
             # names no value, no column and no reason, and SQLAlchemy wraps it in a
@@ -165,8 +176,36 @@ class NumericText(TypeDecorator[Decimal]):
             )
             raise ValueError(message) from None
         if amount.is_zero():
-            # Otherwise a column holds two spellings of the same amount: `-0.00` and
-            # `0.00` are equal as Decimals and different as the text SQLite compares.
+            if not candidate.is_zero():
+                # **A non-zero amount that rounds to nothing is destroyed, not rounded**,
+                # and this is the one over-precision case that must not be absorbed
+                # quietly. The two rules above it are survivable: digits lost *after* the
+                # point are digits the scale said were not worth keeping, and digits lost
+                # *before* it are refused outright. This case looks like the first and
+                # behaves like the second -- every significant digit is gone and what
+                # remains is a legal-looking zero.
+                #
+                # Zero is the worst possible replacement value, because it is believed. A
+                # price that rounds away values every holding of that asset at nothing,
+                # and the total computed from it is complete, confident and wrong -- there
+                # is no missing row for a valuation to notice and no reason for it to
+                # report. That is the exact failure `services/prices.py` is shaped around,
+                # arriving through the column instead of through an absent row.
+                #
+                # Refused here rather than in the prices repository because it is a
+                # property of the column: a fee, a fill or a cost basis added later meets
+                # the same boundary, and a guard living beside one caller protects one
+                # caller.
+                message = (
+                    f"NumericText cannot store an amount finer than its scale of "
+                    f"{self.scale}: the value is not zero and rounding it to "
+                    f"{self.scale} decimal places leaves nothing of it"
+                )
+                raise ValueError(message)
+            # A genuine zero, normalised. Otherwise a column holds two spellings of the
+            # same amount: `-0.00` and `0.00` are equal as Decimals and different as the
+            # text SQLite compares. `Decimal("0")` still binds, which a future money
+            # column that legitimately holds one depends on.
             amount = abs(amount)
         return format(amount, "f")
 
