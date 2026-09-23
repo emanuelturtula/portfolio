@@ -364,14 +364,27 @@ It fetches every supported pair once, writes what it got, and prints one line pe
 
 ```
 as of 2026-09-23T12:00:00+00:00
-BTC/EUR 79211.10000 via kraken
-BTC/USD 86123.40000 via kraken
-KAS/EUR 0.03888100 via kraken
-KAS/USD 0.04228645 via kraken
+BTC/EUR 79211.100000000000 via kraken
+BTC/USD 86123.400000000000 via kraken
+KAS/EUR 0.038881000000 via kraken
+KAS/USD 0.042286450000 via kraken
 ```
 
 `via <source>` is the source that **actually answered**, not the one that was asked first, so
 a line reading `via coinbase` is how you find out Kraken was down without reading a log.
+
+**The number is the one in the database, not the one the vendor sent**, printed at the
+column's full twelve decimal places. That is why every line has trailing zeros, and it is
+deliberate: the column rounds to twelve places, so a vendor sending more precision than that
+has some of it dropped on the way in, and the trailing zeros are how you can tell a price
+that was stored intact from one that was not. A transcript that showed the vendor's number
+would disagree with the row every later valuation reads.
+
+`as of` is the instant the refresh **began**, not the instant each price arrived: the clock
+is read once, before the first request, so every row of one refresh carries the same
+timestamp. A refresh that fails over across several hosts therefore stamps its rows a few
+seconds early — which is the safe direction, since it can only make a price look older than
+it is, never fresher.
 
 **Exit code 1 means the refresh was incomplete**, and the pairs it could not fetch are printed
 to stderr with a reason. A refresh that got three pairs out of four has not succeeded: the
@@ -474,3 +487,4 @@ report "unavailable" rather than a balance of zero.
 | A portfolio total looks too small | Check the incomplete flag: a total omits any holding it could not price, on purpose — section 10 |
 | Prices are all flagged stale | The last refresh is over an hour old. The price is still shown; it is the age that is being reported — section 10 |
 | KAS/EUR is the only pair that ever fails | Kraken is the only key-free source for it. CoinGecko is the only fallback — section 10 |
+| A pair reports `every_source_failed` while the vendor is plainly up | A vendor can be refused for what it *sent*: a price of zero or below, a non-finite number, or one too large or too small for the column. Failover treats that like any other refusal — section 10 |

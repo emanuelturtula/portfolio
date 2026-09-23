@@ -847,6 +847,30 @@ argument `ProviderUnavailableError` makes about a balance.
 could not price, and a `complete` flag. A portfolio silently showing 0 is worse than one
 showing an error, because it is believed.
 
+**That rule is enforced at the column as well as at the row**, because review found a path
+that defeated it. `require_price` refuses a price of zero or below, but it runs *before* the
+value is rounded to the column's twelve places — so a positive price under half of one unit
+in the last place was accepted, stored as `0.000000000000`, and produced a portfolio total of
+zero marked `complete`. No missing row for a valuation to notice, and no reason to report.
+
+Closed in two places, which is the shape worth copying:
+
+- **`NumericText` refuses a non-zero amount that rounds away to nothing.** That belongs to
+  the column, not to prices — a fee, a fill or a cost basis added later meets the same
+  boundary — and it is a `ValueError` beside the existing refusal for too many digits *before*
+  the point. A true zero still binds. The message names the scale and not the amount, because
+  this type will eventually hold a quantity and a quantity is the owner's holdings.
+- **`require_price` refuses a price outside what the column can store, in both directions.**
+  Too large by `MAX_PRICE_INTEGER_DIGITS`, or so fine that rounding it leaves zero. Doing it
+  here makes an implausible number an ordinary vendor error: the failover passes the source
+  over, the other pairs are kept, and the pair falls to the next source or becomes a reason.
+  Leaving it to the column would surface as a `ValueError` out of a repository — a traceback
+  from an operator's command, and a whole refresh lost to one bad number.
+
+The general rule: **a value a money column would silently transform is refused by the column,
+and a value a vendor should never have sent is refused by the parser.** The first protects
+every writer; the second keeps a vendor's mistake on the vendor's error path.
+
 ## Not done yet, and who owns it
 
 - **Lifespan wiring.** `build_http_client()` is process-wide by construction -- the rate

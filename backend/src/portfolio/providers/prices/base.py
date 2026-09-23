@@ -50,7 +50,7 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Final, Protocol
 
 from portfolio.db.models import PRICE_SCALE
-from portfolio.domain.money import MONEY_PRECISION
+from portfolio.domain.money import MONEY_PRECISION, quantize
 from portfolio.providers.errors import ProviderError, ProviderResponseError
 
 if TYPE_CHECKING:
@@ -393,11 +393,12 @@ def require_price(value: object, *, source: str) -> Decimal:
     reason `domain/money.py` gives -- `True` would become a price of 1.
 
     Refused: a zero or negative price, which is not a price and would value a holding at
-    nothing; a price with more integer digits than `MAX_PRICE_INTEGER_DIGITS`, which this
-    application cannot store and which must fail as a vendor error rather than inside a
-    database flush; a non-finite `Decimal`; and anything else at all, including a `float`, which
-    cannot arrive through `decode_json` but could from a parser that built one some other
-    way.
+    nothing; a price outside what the column can store, in **either** direction -- more
+    integer digits than `MAX_PRICE_INTEGER_DIGITS`, or so fine that rounding it to
+    `PRICE_SCALE` places leaves zero -- both of which must fail as a vendor error rather
+    than inside a database flush; a non-finite `Decimal`; and anything else at all,
+    including a `float`, which cannot arrive through `decode_json` but could from a parser
+    that built one some other way.
 
     **The non-finite arm is reached through a JSON *string*, not through a JSON number**,
     and that is worth knowing before somebody deletes it as unreachable. `decode_json`
@@ -462,6 +463,30 @@ def require_price(value: object, *, source: str) -> Decimal:
         message = (
             f"The {source} price has more than {MAX_PRICE_INTEGER_DIGITS} digits before "
             "the decimal point, which is more than this application can represent."
+        )
+        raise ProviderResponseError(message)
+    if quantize(amount, PRICE_SCALE).is_zero():
+        # **The other end of the same bound, and the one that matters more.** A price too
+        # large to store is obviously not a price; a price too *small* to store looks
+        # perfectly reasonable -- positive, finite, a handful of digits -- and becomes zero
+        # on the way into the column. `NumericText` refuses that for every money column,
+        # which is where the guarantee belongs, but a refusal there reaches this path as a
+        # `ValueError` out of a repository: a traceback from an operator's command, and a
+        # whole refresh lost because one vendor sent one implausible number.
+        #
+        # Refused here instead, so it is a vendor error like any other: the source is
+        # passed over, the other pairs are kept, and this one falls to the next source or
+        # becomes a reason. `NumericText` stays the backstop for every writer that is not
+        # a price provider.
+        #
+        # The test is `quantize(...).is_zero()` and not a comparison against an exponent,
+        # because the boundary is decided by rounding rather than by magnitude: at scale
+        # 12, `5E-13` rounds to zero and `6E-13` rounds to `1E-12`. `domain.money.quantize`
+        # is the one definition of how money rounds and is the same call `NumericText`
+        # makes, so the two cannot disagree about where the edge is.
+        message = (
+            f"The {source} price is smaller than the {PRICE_SCALE} decimal places this "
+            "application stores, so storing it would round it away to zero."
         )
         raise ProviderResponseError(message)
     return amount
