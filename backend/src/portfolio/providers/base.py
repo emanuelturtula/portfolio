@@ -508,14 +508,56 @@ def decode_json(body: str | bytes) -> object:
     rendering a balance with a decimal point is refused exactly as before, with the type
     in the message reading `Decimal` instead of `float`.
 
+    ## `parse_float` alone leaves a hole, and `parse_constant` is the rest of it
+
+    **Measured, because it is not what the argument name suggests.** `json.loads` routes
+    the three bare tokens `NaN`, `Infinity` and `-Infinity` through `parse_constant`, not
+    through `parse_float`, and its default hands back a Python `float`:
+
+    ```
+    json.loads('{"p": NaN}', parse_float=Decimal)["p"]  -> nan   (a float)
+    json.loads('{"p": 1.5}', parse_float=Decimal)["p"]  -> Decimal("1.5")
+    ```
+
+    So a vendor sending `{"price": Infinity}` would have put a `float` inside `providers/`
+    through the very decoder that exists to stop that -- invisible to the AST ban, which
+    reads source and would find no literal and no name. The individual price and balance
+    parsers do refuse it, each by demanding a type it is not, but relying on that means the
+    guarantee is "every parser remembered" rather than "the decoder does not produce one".
+
+    `parse_constant` therefore refuses outright. **None of the three is valid JSON**: RFC
+    8259 admits no non-finite number, so this is Python's extension being turned off rather
+    than a vendor's legitimate output being rejected. The refusal is typed and says which
+    token, which is a fixed word from a closed set of three and discloses nothing.
+
     Raises:
-        ProviderResponseError: the body is not JSON, or is JSON the decoder cannot finish.
+        ProviderResponseError: the body is not JSON, is JSON the decoder cannot finish, or
+            carries one of JSON's three non-finite extensions.
     """
     try:
-        return json.loads(body, parse_float=Decimal)
+        return json.loads(body, parse_float=Decimal, parse_constant=_refuse_json_constant)
     except (ValueError, RecursionError) as error:
         message = "The response body is not JSON."
         raise ProviderResponseError(message) from error
+
+
+def _refuse_json_constant(token: str) -> object:
+    """Refuse `NaN`, `Infinity` and `-Infinity`, which `parse_float` never sees.
+
+    Raised rather than returned, and **deliberately not a `ValueError`**:
+    `ProviderResponseError` travels out through `json.loads` and past `decode_json`'s own
+    `except (ValueError, RecursionError)` untouched, so the caller gets a message naming
+    the token instead of the generic "not JSON" that every malformed body produces. A
+    `ValueError` here would be caught by that clause and the reason would be lost.
+
+    Returning a sentinel instead would push the decision back into every parser, which is
+    the arrangement this function exists to replace.
+    """
+    message = (
+        f"The response body carries the JSON extension {token}, which is not a number "
+        "and is not valid JSON."
+    )
+    raise ProviderResponseError(message)
 
 
 def require_json_object(body: str | bytes) -> Mapping[str, object]:

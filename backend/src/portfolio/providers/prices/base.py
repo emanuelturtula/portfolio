@@ -324,11 +324,17 @@ def require_price(value: object, *, source: str) -> Decimal:
     nothing after the point to lose. A `bool` is refused although it is an `int`, for the
     reason `domain/money.py` gives -- `True` would become a price of 1.
 
-    Refused: a non-finite `Decimal`, so a vendor sending `NaN` or `Infinity` (which
-    `json.loads` accepts by default) cannot store one; a zero or negative price, which is
-    not a price and would value a holding at nothing; and anything else at all, including
-    a `float`, which cannot arrive through `decode_json` but can arrive from a parser that
-    built one some other way.
+    Refused: a zero or negative price, which is not a price and would value a holding at
+    nothing; a non-finite `Decimal`; and anything else at all, including a `float`, which
+    cannot arrive through `decode_json` but could from a parser that built one some other
+    way.
+
+    **The non-finite arm is reached through a JSON *string*, not through a JSON number**,
+    and that is worth knowing before somebody deletes it as unreachable. `decode_json`
+    refuses the bare tokens `NaN` and `Infinity` at the decoder, so `{"price": NaN}` never
+    gets this far. But `{"price": "NaN"}` is an ordinary JSON string, which is the shape
+    Kraken and Coinbase use for every price they send, and `Decimal("NaN")` constructs
+    perfectly happily. A NaN in a money column compares false against itself forever.
 
     The message names the source and the type and **never the value**. A price is public
     market data rather than the owner's holdings, so the value is not a disclosure -- but a
