@@ -270,8 +270,25 @@ addresses at all and the sync reports zeros rather than an error. That failure p
 assertion about exception types and is only visible in the *bytes of the second request*,
 which is what `tests/providers/test_http.py` asserts.
 
-In practice a provider does not write that call at all -- `EndpointSet.post` does, and it
-sets both extensions.
+In practice a provider does not write that call at all -- `EndpointSet.post` does. **But it
+takes `idempotent: bool` as a required keyword with no default, and that is not ceremony.**
+
+A shared helper that set `IDEMPOTENT_EXTENSION: True` for every caller would reintroduce
+precisely the hazard the paragraph above rejects, one layer up and more quietly. Deny by
+default would hold at the transport and be undone by the only `POST` helper anyone uses --
+and `EndpointSet` is exactly what an exchange provider with a primary and a fallback will
+reach for, at which point the failover loop double-submits an order after a transport error.
+
+A default of `False` would not have been better: it would put the decision back in the
+shared module, silently, where the call site cannot see it. Required and unspelled-able is
+what keeps the answer next to the request it describes:
+
+```python
+await self._instances.post(BALANCES_PATH, ADDRESS_BALANCES, start, json=body, idempotent=True)
+```
+
+Say `True` only for a request that changes nothing at the vendor. Never for anything that
+places, cancels or transfers.
 
 ## Logging: label the endpoint, never the path
 
@@ -444,10 +461,31 @@ constant. **The first real evidence will be a refused batch in production**, whi
 the refusal names *the size of the batch* and never its contents: the size is the number an
 operator can act on, and the contents are the owner's holdings.
 
-There is deliberately **no fallback from a refused batch to single reads**. A batch the
-server refuses is a configured batch size that is too large, which is a value to correct
-rather than a path to code around -- and a silent fallback would turn one call into sixty-four
-at a vendor whose rate limit is unpublished.
+**A refusal does not imply a size problem, and saying so was a real defect.** The provider
+first attached "lower `max_addresses_per_call`" to every `ProviderResponseError` out of the
+failover loop -- which, by `EndpointSet._failure_for`, is *everything that is not a 429 and
+not a 5xx*. The realistic refusal for this vendor is none of those things: it is the 403 a
+CDN returns for a blocked host, and the spec predicts it by name. An operator behind one
+would have been told, by the error and by `docs/operations.md` alike, to correct a constant
+that was never wrong.
+
+So the advice is attached only for `BATCH_TOO_LARGE_STATUSES` -- 413, and the 422 this
+vendor documents, which is what its framework returns for request-body validation. Every
+other refusal still names the size, because how many addresses were in flight is real
+context, and offers no theory about the cause. **414 is deliberately not in that set**: the
+batch travels in a `POST` body to a constant path, so no batch size can lengthen the URI,
+and an entry that cannot fire is a branch no reader can check.
+
+The general rule a new provider should take from this: **a helpful remedy attached to the
+wrong condition is worse than no remedy**, because it spends the one hour somebody had.
+Attach advice to the statuses that can actually produce the condition, and let the rest
+carry facts only. `ProviderError.status` exists so that this can be decided on the status
+rather than by reading a message written for an operator.
+
+There is deliberately **no fallback from a refused batch to single reads**. A batch refused
+for being too large is a configured value to correct rather than a path to code around --
+and a silent fallback would turn one call into sixty-four at a vendor whose rate limit is
+unpublished.
 
 ### The trap: the Kaspa OpenAPI document's examples are real mainnet addresses
 

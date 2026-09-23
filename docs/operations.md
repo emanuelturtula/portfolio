@@ -305,9 +305,16 @@ never leaves the process.
 **Reads are batched, and there is one number in that which is a guess.** More than one
 address is read in a single `POST`, up to 64 addresses per call. The vendor's API
 documentation declares no maximum and names no ceiling anywhere, so 64 is a value chosen to
-be comfortably small rather than one anybody verified. If a server ever refuses a batch, the
-error says how many addresses were in it — that number is the evidence, and the fix is to
-lower the limit in `backend/src/portfolio/providers/chains/kaspa.py`, not to retry.
+be comfortably small rather than one anybody verified.
+
+If a server ever refuses a batch, the error says how many addresses were in it. **It only
+suggests lowering the limit when the status can actually mean "too large"** — a 413 or the
+422 this vendor documents. For any other refusal it names the size and stops there, because
+the refusal you are most likely to meet is not about the batch at all: a 403 from a CDN or
+firewall in front of the host, a 401 from an auth proxy, a 404 from a base URL with a typo
+in it. Read the status in the message before you change anything. When the message *does*
+say the batch may have been too large, the fix is to lower the limit in
+`backend/src/portfolio/providers/chains/kaspa.py` — not to retry.
 
 **The health check is stricter than the vendor's own, deliberately.** It requires the index
 database to be synced *and* at least one backing node that is both synced and UTXO-indexed.
@@ -343,6 +350,7 @@ you want to pay.
 | Reading many Bitcoin addresses takes a minute | Working as intended: one request per second per host — section 8 |
 | Container never becomes healthy after setting the Kaspa URLs | One of them has no scheme, no host, or a scheme other than `http`/`https` — the startup log names which — section 9 |
 | A Kaspa wallet reports "the address is on a different network" | `PORTFOLIO_KASPA_NETWORK` does not match the address's prefix — section 9 |
-| A Kaspa read fails with "a batch of N addresses was refused" | The server's batch ceiling is below 64. Lower `MAX_ADDRESSES_PER_CALL` — section 9 |
+| "A batch of N addresses was refused… this status can mean the batch itself was too large" | The server's batch ceiling is below 64. Lower `MAX_ADDRESSES_PER_CALL` — section 9 |
+| "A batch of N addresses was refused" with **no** sentence about the batch being too large | **Not a batch-size problem.** Read the HTTP status in the same message: 403 is usually a CDN or firewall block on the host, 401 an auth proxy in front of it, 404 a wrong base URL — section 9 |
 | Kaspa health says "no node is synced and UTXO-indexed" | The upstream's nodes cannot answer a balance query, whatever a ping says — section 9 |
 | A Kaspa balance shows its pending amount as unknown | Working as intended: this chain exposes no mempool figure — section 9 |
