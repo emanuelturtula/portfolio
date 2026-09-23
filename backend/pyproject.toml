@@ -198,7 +198,18 @@ concurrency = ["thread", "greenlet"]
 # 460 branches. The same arithmetic as #7, against the same nine-unit standard: 0.36 points
 # of 2919 units is about ten and a half units of headroom, and 99.6 would cut that to seven
 # and a half. The base has to grow before the number can.
-fail_under = 99.5
+#
+# **99.5 -> 99.6 with the price provider (#9)**, measured 99.89% over 3084 statements and 556
+# branches. The base grew, so the number moves: 0.39 points of 3640 units is about fourteen
+# units of headroom, and 99.6 leaves about ten and a half -- still above the nine-unit
+# standard, where 99.7 would leave under seven and is correctly out of reach. This is the
+# first ratchet since #6, and it is the same arithmetic that held the floor twice; what
+# changed is the denominator, not the argument.
+#
+# The three remaining misses are still the same three, now 0.11 points. The whole of
+# `providers/prices/`, the prices repository, both services and the new migration are fully
+# covered.
+fail_under = 99.6
 show_missing = true
 skip_covered = true
 exclude_also = [
