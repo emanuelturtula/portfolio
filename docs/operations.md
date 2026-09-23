@@ -374,11 +374,14 @@ KAS/USD 0.042286450000 via kraken
 a line reading `via coinbase` is how you find out Kraken was down without reading a log.
 
 **The number is the one in the database, not the one the vendor sent**, printed at the
-column's full twelve decimal places. That is why every line has trailing zeros, and it is
-deliberate: the column rounds to twelve places, so a vendor sending more precision than that
-has some of it dropped on the way in, and the trailing zeros are how you can tell a price
-that was stored intact from one that was not. A transcript that showed the vendor's number
-would disagree with the row every later valuation reads.
+column's full twelve decimal places. A transcript showing the vendor's number would disagree
+with the row every later valuation reads.
+
+The trailing zeros are padding and carry no information on their own — every line gets twelve
+places whatever the vendor sent. What the full scale is for is that it shows you **where the
+column's precision ends**, so you can compare a line against the vendor's own page and see
+whether anything was dropped: `0.042286450000` next to a quoted `0.0422864500004` tells you
+the thirteenth place is gone, where a trimmed `0.04228645` would look like a clean price.
 
 `as of` is the instant the refresh **began**, not the instant each price arrived: the clock
 is read once, before the first request, so every row of one refresh carries the same

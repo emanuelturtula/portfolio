@@ -267,10 +267,17 @@ def refresh_prices(args: argparse.Namespace) -> int:
         # `format(..., "f")` rather than the default rendering, for the reason
         # `NumericText` gives for using it on the way in: it is fixed-point always, never
         # scientific notation, so the line is the column's own text and cannot become
-        # `8.6E+4` for some future value. The full scale is printed rather than trimmed --
-        # twelve places on every line is noise right up until it is the only thing showing
-        # that a price was rounded on the way in, which is the whole reason this prints the
-        # stored value rather than the vendor's.
+        # `8.6E+4` for some future value.
+        #
+        # The full scale is printed rather than trimmed, and **not** because the trailing
+        # zeros show that nothing was rounded -- they cannot, since `format` pads
+        # unconditionally and `86000.1` and `86000.10000` both render identically here.
+        # What full scale buys is that it shows the reader *where the column's precision
+        # ends*, so a price the column truncated is legible against the vendor's own
+        # figure: an operator comparing `0.042286450000` against `0.0422864500004` on the
+        # vendor's page can see the thirteenth place is gone, where a trimmed `0.04228645`
+        # would look like a clean vendor price. Worth the noise; the earlier justification
+        # for the same decision was wrong and is recorded here so it is not re-derived.
         emit(
             f"{entry.asset_symbol}/{entry.quote_currency} "
             f"{format(entry.amount, 'f')} via {entry.source}"

@@ -316,6 +316,24 @@ async def fetch_prices(
             # failed reaches an operator as a `source` column naming whoever did answer,
             # or as a reason when nobody did.
             continue
+        if not _every_price_is_storable(quotes, source.name):
+            # **The same treatment, for a source that produced a number the column cannot
+            # hold.** All four sources build their quotes through `require_price`, so
+            # nothing reaches this in the shipped configuration -- it is the guard against
+            # the fifth source, written by somebody who assembled a `PriceQuote` directly.
+            #
+            # Without it that `Decimal` travels to `PriceRepository.upsert`, where
+            # `NumericText` refuses it and the `ValueError` propagates out of
+            # `refresh_prices`, rolling back **every pair that had already succeeded**.
+            # That is the outcome this function's own docstring says must never happen, and
+            # it is the reason the check is here rather than left to the repository: a
+            # value problem belongs on the vendor's error path, where failover can absorb
+            # it, not on the transaction's.
+            #
+            # Measured by tester-9 before it was closed: three good pairs available, one
+            # unstorable quote, `builtins.ValueError` out of the service and zero rows
+            # written.
+            continue
         if not _answers_only_what_was_asked(quotes, wanted):
             # **The whole response is discarded, not just the extra quote**, and the
             # outstanding pairs go to the next source as though this one had not answered.
@@ -367,6 +385,30 @@ def _answers_only_what_was_asked(
     """
     asked = set(wanted)
     return all(quote.pair in asked for quote in quotes)
+
+
+def _every_price_is_storable(quotes: Sequence[PriceQuote], source_name: str) -> bool:
+    """Whether every quote carries an amount the `prices` column can actually hold.
+
+    **`require_price` again, applied to the quote rather than to the field it was parsed
+    from**, and it is the same call rather than a second copy of the rule -- so "storable"
+    cannot come to mean two things. All four sources already run it while parsing, and this
+    is the loop refusing to depend on that, exactly as `_answers_only_what_was_asked`
+    refuses to depend on four parsers checking their own correlation.
+
+    It re-runs a `quantize` per quote on the healthy path, which is four quantizes per
+    refresh. That is not a cost worth reasoning about against one vendor request an hour.
+
+    Returns `False` rather than raising, for the reason its sibling does: the caller is a
+    loop whose one rule is that a source which does not answer usably moves us to the next
+    one, and this must not abort a fetch that has already obtained other pairs.
+    """
+    for quote in quotes:
+        try:
+            require_price(quote.amount, source=source_name)
+        except ProviderResponseError:
+            return False
+    return True
 
 
 def require_price(value: object, *, source: str) -> Decimal:
