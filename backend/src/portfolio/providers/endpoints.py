@@ -418,16 +418,25 @@ class EndpointSet:
         the client and never logged. It may hold a credential; see `read`.
         """
         url = endpoint.url(path)
+        # Materialised once and passed to whichever verb runs. `httpx` treats `None` as
+        # "the client's own headers", which is what every caller but the keyed price source
+        # wants. Applied to **both** branches rather than only to the `GET` one: `post` is
+        # the only caller that passes `headers=None` today, and a parameter silently
+        # dropped on one path is a credential silently dropped on the day somebody adds a
+        # keyed `POST`.
+        request_headers = dict(headers) if headers is not None else None
         if payload is None:
             return await self._client.get(
                 url,
-                headers=dict(headers) if headers is not None else None,
+                headers=request_headers,
                 extensions={ENDPOINT_EXTENSION: label},
             )
         extensions: dict[str, object] = {ENDPOINT_EXTENSION: label}
         if idempotent:
             extensions[IDEMPOTENT_EXTENSION] = True
-        return await self._client.post(url, json=payload, extensions=extensions)
+        return await self._client.post(
+            url, json=payload, headers=request_headers, extensions=extensions
+        )
 
     def _nothing_configured(self) -> _Failure:
         """What a read fails with when every base URL is blank.
