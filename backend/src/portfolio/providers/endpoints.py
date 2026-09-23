@@ -226,12 +226,13 @@ class EndpointSet:
         A provider's health check is the thing that surfaces a misconfiguration failover
         would otherwise hide, and it needs the positions to say which one answered. The
         tuple is immutable, so exposing it cannot let a caller reorder the failover.
+
+        There is deliberately no `__len__` on this class. A caller that wants a count has
+        `len(endpoints)` on the tuple, and a convenience method nothing calls is a line no
+        test covers and a claim no reader can check -- the rule this package already
+        applies to an `except` clause that cannot fire.
         """
         return self._endpoints
-
-    def __len__(self) -> int:
-        """How many endpoints are configured. Zero is a legitimate configuration."""
-        return len(self._endpoints)
 
     async def read(self, path: str, label: str, start: int = 0) -> tuple[str, int]:
         """`GET path` from the first endpoint that answers, starting at `start`.
