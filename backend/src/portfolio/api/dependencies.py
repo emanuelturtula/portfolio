@@ -31,7 +31,9 @@ from portfolio.services.auth import (
     Principal,
     build_auth_service,
 )
+from portfolio.services.balances import BalanceService, build_balance_service
 from portfolio.services.password_hasher import PasswordHasher
+from portfolio.services.sync_coordinator import SyncCoordinator
 from portfolio.services.wallets import WalletService, build_wallet_service
 
 if TYPE_CHECKING:
@@ -100,6 +102,46 @@ async def get_wallet_service(request: Request) -> AsyncIterator[WalletService]:
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
     async with sessionmaker() as session:
         yield build_wallet_service(session)
+
+
+async def get_balance_service(request: Request) -> AsyncIterator[BalanceService]:
+    """Open a session for this request, hand the router a service, then close it.
+
+    The same shape as `get_wallet_service`, and read-only: every method on `BalanceService`
+    reads, so the session is never committed here and closing it on the way out discards
+    nothing.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_balance_service(session)
+
+
+def get_sync_coordinator(request: Request) -> SyncCoordinator:
+    """The process-wide sync coordinator, which the lifespan installed.
+
+    **Not a service built per request, and that is the whole point.** A manual sync joins the
+    run already in flight rather than starting a second one, so the coordinator has to
+    outlive any single request -- and so does the run, which is why it opens its own session
+    rather than borrowing the one a dependency would close on the way out.
+
+    It lives on `app.state` rather than in a module global for the reason the engine does:
+    the test suite routinely builds two applications in one process, and a global would make
+    a sync started by one of them joinable from the other.
+
+    Raises:
+        RuntimeError: the application was built but its lifespan never ran, so there is no
+            coordinator. Not reachable from a served request -- the same lifespan opens the
+            database this endpoint's session comes from -- and a clear failure is better than
+            an `AttributeError` two frames away from the cause.
+    """
+    coordinator = getattr(request.app.state, "sync_coordinator", None)
+    if not isinstance(coordinator, SyncCoordinator):
+        message = (
+            "No sync coordinator is installed: the application's lifespan has not run. "
+            "Balance sync is wired up in `portfolio.main.lifespan`."
+        )
+        raise RuntimeError(message)
+    return coordinator
 
 
 def get_principal(request: Request) -> Principal:

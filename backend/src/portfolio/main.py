@@ -16,7 +16,7 @@ from portfolio import __version__
 from portfolio.api.dependencies import auth_service_for, install_auth_runtime
 from portfolio.api.errors import register_exception_handlers
 from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware
-from portfolio.api.routers import auth, health, wallets
+from portfolio.api.routers import auth, balances, health, wallets
 from portfolio.config import get_settings
 from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import (
@@ -25,28 +25,58 @@ from portfolio.db.engine import (
     ensure_database_directory,
 )
 from portfolio.logging import configure_logging
+
+# Imported for its side effect: each module in `providers.chains` registers its provider
+# class by decorator, and a decorator only runs when its module is imported. The registry
+# deliberately does not discover them -- see `providers/registry.py` -- so this is the one
+# line that makes `get_chain_provider` able to answer for any chain at all.
+from portfolio.providers import chains as _registered_chain_providers  # noqa: F401
+from portfolio.providers.http import build_http_client
+from portfolio.providers.registry import get_chain_provider
+from portfolio.repositories.sync_runs import SyncRunRepository
+from portfolio.services.balance_sync import build_balance_sync_service
+from portfolio.services.scheduler import build_balance_scheduler
+from portfolio.services.sync_coordinator import SyncCoordinator
 from portfolio.web.spa import mount_spa
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from datetime import datetime
+
+    import httpx
 
     from portfolio.config import Settings
+    from portfolio.repositories.sync_runs import SyncRunSummary, SyncTrigger
     from portfolio.services.password_hasher import PasswordHasher
+    from portfolio.services.scheduler import BalanceSyncScheduler
+    from portfolio.services.sync_coordinator import SyncRunner
 
 _logger = structlog.get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Bring the database up to date, then own the engine for the process's lifetime.
+    """Bring the database up to date, then own everything with a lifetime for the process.
 
     The migration runs in a worker thread because Alembic's async `env.py` calls
     `asyncio.run`, which raises `RuntimeError` when a loop is already running in the
     calling thread -- and by the time a lifespan runs, one always is.
 
-    The engine and the session factory are published on `app.state` rather than held in a
-    module global so that two applications in one process (which is exactly what the test
-    suite builds) do not share a pool.
+    Four things are owned here and all four are closed here: the engine, the shared
+    `httpx.AsyncClient`, the sync coordinator and the scheduler. The client is the wiring
+    #6 through #9 each deferred to this issue -- it is process-wide *by construction*,
+    because the per-host rate limiter's state lives on its transport, so a second one would
+    silently halve the interval it claims to enforce.
+
+    Everything is published on `app.state` rather than held in a module global so that two
+    applications in one process -- which is exactly what the test suite builds -- do not
+    share a pool, a client or a run in flight.
+
+    **The orphan sweep runs before the scheduler starts and again after it stops.** A
+    `sync_runs` row is written at `running` before the first provider call, so a process
+    killed mid-sync leaves one behind; without the sweep a crashed run and a live run are the
+    same row. Doing it at shutdown too is what records a run that outlived the grace period,
+    and doing it there rather than inside the cancelled task is what makes it reliable.
     """
     settings = get_settings()
     ensure_database_directory(settings.database_url)
@@ -55,12 +85,118 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = create_database_engine(settings.database_url)
     app.state.db_engine = engine
     app.state.db_sessionmaker = create_session_factory(engine)
+    client = build_http_client()
+    app.state.http_client = client
+    coordinator: SyncCoordinator | None = None
+    scheduler: BalanceSyncScheduler | None = None
     try:
         await bootstrap_owner(app, settings)
         await warm_password_hasher(app)
+        await sweep_interrupted_runs(app)
+        coordinator = SyncCoordinator(balance_sync_runner(app, client))
+        app.state.sync_coordinator = coordinator
+        scheduler = start_balance_scheduler(app, settings, coordinator)
+        app.state.balance_scheduler = scheduler
+        if scheduler is not None:
+            await scheduler.start()
         yield
     finally:
+        # Ordered, and the order is the content. The scheduler stops first so that no new
+        # tick can start; the run already in flight then gets its grace period; the sweep
+        # records whatever did not finish; and only then are the client and the engine taken
+        # away, because a sync still running would need both.
+        if scheduler is not None:
+            await scheduler.stop()
+        if coordinator is not None:
+            await coordinator.drain(
+                grace_seconds=max(0, settings.balance_sync_shutdown_grace_seconds)
+            )
+        await sweep_interrupted_runs(app)
+        await client.aclose()
         await engine.dispose()
+
+
+def balance_sync_runner(app: FastAPI, client: httpx.AsyncClient) -> SyncRunner:
+    """Build the closure the coordinator runs: a session per run, over the shared client.
+
+    **A run must not share the session of whatever asked for it.** A manual sync is joined
+    rather than refused, so a run outlives the request that started it, and a session closed
+    by a request dependency on the way out would be pulled out from under the work. Opening
+    one here means the run's unit of work begins and ends with the run.
+
+    `provider_for` is a lambda over `get_chain_provider` rather than the registry itself,
+    which is what keeps `httpx` out of `services/` while the sync is the one thing in this
+    application that actually causes network traffic. An unregistered chain raises
+    `UnknownChainError` out of that call, which the sync records against that chain alone.
+    """
+
+    async def run(trigger: SyncTrigger) -> SyncRunSummary:
+        sessionmaker = app.state.db_sessionmaker
+        async with sessionmaker() as session:
+            service = build_balance_sync_service(
+                session,
+                provider_for=lambda chain_key: get_chain_provider(chain_key, client),
+            )
+            return await service.sync(trigger)
+
+    return run
+
+
+def start_balance_scheduler(
+    app: FastAPI,
+    settings: Settings,
+    coordinator: SyncCoordinator,
+) -> BalanceSyncScheduler | None:
+    """Build the scheduler, or `None` when the operator has switched it off.
+
+    `PORTFOLIO_BALANCE_SYNC_ENABLED=false` disables **the loop and nothing else**:
+    `POST /api/balances/sync` still works, because the manual trigger is the tool an operator
+    debugging a vendor is reaching for, and taking it away with the same switch would be the
+    opposite of what the switch is for.
+
+    Returned rather than started, so that the caller's `finally` can be written against the
+    same variable it will have to stop.
+    """
+    if not settings.balance_sync_enabled:
+        _logger.info("balance_sync_scheduler_disabled")
+        return None
+    return build_balance_scheduler(
+        settings,
+        coordinator=coordinator,
+        latest_finished_at=lambda: latest_finished_run(app),
+    )
+
+
+async def latest_finished_run(app: FastAPI) -> datetime | None:
+    """When the newest finished sync ended, over a session of its own.
+
+    The scheduler's startup condition: a fresh deployment syncs immediately rather than
+    leaving the dashboard blank for a whole interval, and a crash-looping container does not
+    hit two public indexes on every restart.
+    """
+    sessionmaker = app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        return await SyncRunRepository(session).latest_finished_at()
+
+
+async def sweep_interrupted_runs(app: FastAPI) -> None:
+    """Mark every run still at `running` as `interrupted`, and say so if there were any.
+
+    **Never raises.** At startup a failure here would stop an otherwise healthy application
+    over bookkeeping; at shutdown it would mask whatever was already going wrong and leave
+    the engine undisposed. Either way the next startup sweeps again, so the cost of skipping
+    one is a row that stays `running` for an interval rather than data.
+    """
+    try:
+        sessionmaker = app.state.db_sessionmaker
+        async with sessionmaker() as session:
+            swept = await SyncRunRepository(session).sweep_interrupted()
+            await session.commit()
+    except Exception:
+        _logger.exception("balance_sync_orphan_sweep_failed")
+        return
+    if swept:
+        _logger.warning("balance_sync_runs_marked_interrupted", runs=swept)
 
 
 async def warm_password_hasher(app: FastAPI) -> None:
@@ -145,6 +281,10 @@ def create_app() -> FastAPI:
     app.include_router(health.router, prefix=API_PREFIX)
     app.include_router(auth.router, prefix=API_PREFIX)
     app.include_router(wallets.router, prefix=API_PREFIX)
+    # After `wallets`, and it does not matter: the balance router declares its own full
+    # paths -- `/wallets/{wallet_id}/balances` among them -- and none of them collides with
+    # a wallet route. Only the SPA mount below is order-sensitive.
+    app.include_router(balances.router, prefix=API_PREFIX)
 
     # Mounted last and at the root: it matches every path, so any route registered
     # after it would be unreachable.

@@ -40,12 +40,19 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+# Re-exported at runtime, not imported for an annotation only: `SyncTrigger` is the
+# vocabulary of this module's own `sync()` parameter, and `api/routers/balances.py` has
+# to name a member to call it. A router may not import `portfolio.repositories` directly
+# -- `thin-routers` says so and it is right -- so the service that takes the value is
+# where a caller should get it from.
+from portfolio.repositories.sync_runs import SyncTrigger
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
-    from portfolio.repositories.sync_runs import SyncRunSummary, SyncTrigger
+    from portfolio.repositories.sync_runs import SyncRunSummary
 
-__all__ = ["SyncCoordinator", "SyncOutcome", "SyncRunner"]
+__all__ = ["SyncCoordinator", "SyncOutcome", "SyncRunner", "SyncTrigger"]
 
 _logger = structlog.get_logger(__name__)
 

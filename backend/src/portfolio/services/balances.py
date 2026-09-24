@@ -49,7 +49,14 @@ from typing import TYPE_CHECKING, Final
 from portfolio.domain.chains import ChainKey
 from portfolio.domain.money import from_base_units
 from portfolio.repositories.balances import BalanceRepository
-from portfolio.repositories.sync_runs import SyncRunRepository
+from portfolio.repositories.sync_runs import (
+    ChainOutcome,
+    SyncErrorKind,
+    SyncRunRepository,
+    SyncRunStatus,
+    SyncRunSummary,
+    SyncTrigger,
+)
 from portfolio.repositories.wallets import WalletRepository
 from portfolio.services.prices import Holding, Price, build_price_service
 from portfolio.services.wallets import WalletNotFoundError
@@ -60,7 +67,6 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from portfolio.db.models import BalanceSnapshot, Wallet
-    from portfolio.repositories.sync_runs import SyncRunSummary
     from portfolio.services.auth import Principal
     from portfolio.services.prices import PriceService, UnpricedHolding
 
@@ -70,13 +76,26 @@ __all__ = [
     "MAX_HISTORY_LIMIT",
     "MAX_RUNS_LIMIT",
     "BalanceService",
+    "ChainOutcome",
     "CurrentBalances",
     "SnapshotView",
+    "SyncErrorKind",
+    "SyncRunStatus",
+    "SyncRunSummary",
+    "SyncTrigger",
     "WalletBalance",
     "WalletHistory",
     "build_balance_service",
     "utc_now",
 ]
+"""`ChainOutcome`, `SyncRunSummary` and the three enums are **re-exported**, not defined here.
+
+They belong to `repositories/sync_runs.py`, one layer down, for the reason that module
+explains. They are named again here because `list_runs` returns them and because
+`api/schemas/balances.py` has to render them: a router and its schemas may not import
+`portfolio.repositories` directly -- `thin-routers` forbids it -- so the service that
+produces a value is where the API layer should get its type from.
+"""
 
 DEFAULT_HISTORY_LIMIT: Final = 500
 MAX_HISTORY_LIMIT: Final = 1000
