@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError, StatementError
 
 from portfolio.db.models import BalanceSnapshot
@@ -143,43 +143,70 @@ class BalanceRepository:
         *,
         wallet_id: int,
         since: datetime | None,
+        after: tuple[datetime, int] | None,
         limit: int,
     ) -> list[BalanceSnapshot]:
-        """One wallet's readings, always oldest first. **Which `limit` rows depends on `since`.**
+        """One wallet's readings, always oldest first. **Which `limit` rows depends on the ask.**
 
-        Two windows, and the asymmetry is deliberate rather than an oversight -- a reader who
-        assumes one rule for both will read this as a bug, so it is written down twice, here
-        and at the endpoint:
+        Three windows, and the asymmetry is deliberate rather than an oversight -- a reader
+        who assumes one rule for all three will read this as a bug, so it is written down at
+        each layer:
 
-        | Call | Rows |
+        | Asked with | Rows |
         |---|---|
-        | `since` given | the **first** `limit` at or after it -- a forward cursor |
-        | `since` omitted | the **most recent** `limit`, reversed back to oldest-first |
+        | neither | the **most recent** `limit`, reversed back to oldest-first |
+        | `since` | the **first** `limit` at or after it -- the first page of a walk forward |
+        | `after` | the **first** `limit` strictly after `(observed_at, id)` -- every later page |
 
         **The default has to be the recent end.** The only consumer is a chart, and the
         oldest five hundred readings of a wallet that has been watched for a year are the
-        wrong five hundred: they render a picture of last January and stop. The literal
-        reading of "oldest first, limit 500" produced exactly that.
+        wrong five hundred: they render a picture of last January and stop.
 
-        **With `since` it has to be the other end**, because that is what makes the pair a
-        cursor at all: a client reads a window, takes the last `observed_at` it saw, and asks
-        again from there. Returning the newest rows for a `since` would make paging forward
-        impossible -- every page would be the same last page.
+        **A walk forward needs the pair, not the instant.** The first version of this method
+        documented "take the last `observed_at` you saw and ask again with it as `since`",
+        and that cursor never advances: `since` is inclusive and has no tie-break, so a page
+        of one row returned the same row forever, and any page whose last rows shared an
+        instant with the next page's first rows repeated them. `after` is a keyset: rows
+        strictly after `(observed_at, id)` in `(observed_at, id)` order. Snapshots are
+        append-only, so `id` is insertion order and the pair is a total order over one
+        wallet's history -- which is what makes "strictly after" mean something.
 
-        `since` is inclusive, so paging with the last `observed_at` seen re-reads one row
-        rather than risking a gap. Ties are broken by `id`, which is insertion order, so two
-        readings stamped at the same instant come back in the order they were written rather
-        than in whatever order the storage engine felt like.
+        The keyset is spelled as `observed_at > t OR (observed_at = t AND id > i)` rather than
+        as a row-value comparison. SQLite has supported row values since 3.15, but this form
+        says what it means to a reader who has not memorised that, and it is the one every
+        other database accepts too.
+
+        **Equality on `observed_at` is exact**, which the keyset depends on. The cursor's
+        instant was read out of this column and is bound back through the same `UtcDateTime`,
+        so it renders to the same fixed-width text the row holds. A cursor whose instant had
+        been through a float, or had lost its microseconds, would compare unequal and skip
+        the rows it shares an instant with -- which is why the API encodes it from
+        `isoformat()` and nothing coarser.
+
+        `since` and `after` together is a caller's mistake; the service refuses the pair, and
+        this method gives `after` precedence rather than inventing a combination.
 
         The descending arm reverses in Python rather than asking SQL for the rows twice.
-        `limit` is at most `MAX_HISTORY_LIMIT`, so the list being reversed is bounded by the
-        page size and not by the table.
+        `limit` is bounded by the page size, so the list being reversed is bounded too.
 
-        The comparison and both orderings are done in SQL; the module docstring says why that
-        is safe here and is not safe for a money column.
+        The comparisons and all three orderings are done in SQL; the module docstring says
+        why that is safe here and is not safe for a money column.
         """
         statement = select(BalanceSnapshot).where(BalanceSnapshot.wallet_id == wallet_id)
-        if since is None:
+        if after is not None:
+            instant, snapshot_id = after
+            statement = statement.where(
+                or_(
+                    BalanceSnapshot.observed_at > instant,
+                    and_(
+                        BalanceSnapshot.observed_at == instant,
+                        BalanceSnapshot.id > snapshot_id,
+                    ),
+                )
+            )
+        elif since is not None:
+            statement = statement.where(BalanceSnapshot.observed_at >= since)
+        else:
             newest = await self._session.scalars(
                 statement.order_by(
                     BalanceSnapshot.observed_at.desc(), BalanceSnapshot.id.desc()
@@ -187,9 +214,7 @@ class BalanceRepository:
             )
             return list(reversed(list(newest)))
         rows = await self._session.scalars(
-            statement.where(BalanceSnapshot.observed_at >= since)
-            .order_by(BalanceSnapshot.observed_at, BalanceSnapshot.id)
-            .limit(limit)
+            statement.order_by(BalanceSnapshot.observed_at, BalanceSnapshot.id).limit(limit)
         )
         return list(rows)
 

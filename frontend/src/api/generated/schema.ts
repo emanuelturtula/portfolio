@@ -253,11 +253,23 @@ export interface paths {
          * One wallet's balance history, oldest first
          * @description Return one wallet's readings, oldest first, for charting.
          *
-         *     **The latest window by default, a forward cursor from `since`.** Both come back
-         *     oldest-first, and the asymmetry is the kind a reader assumes is a bug, so it is stated
-         *     here as well as at the repository: a chart wants the recent end, and a client paging
-         *     through a year wants the rows after the last one it saw. Asking for the oldest `limit`
-         *     readings of a wallet watched since January is not a request anything makes.
+         *     **The latest window by default, a forward walk from `since`, continued by `cursor`.**
+         *     All three come back oldest-first, and the asymmetry is the kind a reader assumes is a
+         *     bug, so it is stated here as well as at the repository:
+         *
+         *     | Query | Readings | `next_cursor` |
+         *     |---|---|---|
+         *     | neither | the latest `limit` | always `null` |
+         *     | `since` | the first `limit` at or after it | set when more follow |
+         *     | `cursor` | the first `limit` strictly after it | set when more follow |
+         *
+         *     A chart wants the recent end; a client charting a year starts at `since` and follows
+         *     `next_cursor` until it is `null`. With `limit` capped at 1000 and a reading every fifteen
+         *     minutes, one page holds about ten days, so that walk is the ordinary case rather than an
+         *     edge. `since` alone cannot continue it: it is inclusive and has no tie-break, so paging
+         *     with the last instant seen repeats rows and, at `limit=1`, never advances at all.
+         *
+         *     `cursor` together with `since`, or a cursor this endpoint did not issue, is a 422.
          *
          *     An archived wallet still answers: its history is the reason archiving is a timestamp
          *     rather than a delete. A wallet that is not the caller's is a `404`, the same answer a
@@ -309,18 +321,18 @@ export interface components {
          * CurrentBalancesResponse
          * @description What the portfolio holds now and what it is worth.
          *
-         *     **`total` is the sum of what could be priced and is not the answer on its own.** Read
+         *     **`total` is the sum of what could be valued and is not the answer on its own.** Read
          *     without `complete` it silently omits a holding, which is indistinguishable from a number
-         *     that includes it. Every renderer has to look at `complete`; `unpriced` says what is
-         *     missing.
+         *     that includes it. Every renderer has to look at `complete`, and two lists say what is
+         *     missing: `unpriced` has quantities nothing could value, `unread` has wallets whose
+         *     quantity nobody knows yet. `complete` is true only when both are empty.
          */
         CurrentBalancesResponse: {
             /** As Of */
             as_of: string | null;
             /** Complete */
             complete: boolean;
-            /** Quote Currency */
-            quote_currency: string;
+            quote_currency: components["schemas"]["QuoteCurrency"];
             /**
              * Total
              * @example 1234.56789012
@@ -328,6 +340,8 @@ export interface components {
             total: string;
             /** Unpriced */
             unpriced: components["schemas"]["UnpricedHoldingResponse"][];
+            /** Unread */
+            unread: components["schemas"]["UnreadWalletResponse"][];
             /** Wallets */
             wallets: components["schemas"]["WalletBalanceResponse"][];
         };
@@ -424,6 +438,21 @@ export interface components {
          * @enum {string}
          */
         PriceUnavailable: "never_fetched" | "every_source_failed" | "unsupported_pair" | "no_source_configured";
+        /**
+         * QuoteCurrency
+         * @description A currency holdings may be valued in. The member is its own wire form.
+         *
+         *     **Case-sensitive, and deliberately.** ISO 4217 codes are upper case, `prices` stores them
+         *     upper case, and an enumeration in the OpenAPI document means the generated client can
+         *     only send one of these two strings. Accepting `eur` as well would be a second spelling
+         *     the database never holds, normalised in a router that is supposed to only parse.
+         *
+         *     **Neither is ever derived from the other.** Valuing a EUR portfolio from a USD price and
+         *     a cross rate would put a second vendor's error into every number with nothing saying so;
+         *     a holding with only a USD price is unpriced in EUR, which is #9's contract.
+         * @enum {string}
+         */
+        QuoteCurrency: "EUR" | "USD";
         /**
          * SessionResponse
          * @description Who the caller is. Deliberately the only thing a session read discloses.
@@ -606,6 +635,22 @@ export interface components {
             quantity: string;
             reason: components["schemas"]["PriceUnavailable"];
         };
+        /**
+         * UnreadWalletResponse
+         * @description An active wallet no successful run has ever read, so it is missing from `total`.
+         *
+         *     The address is deliberately not here: a client matches `wallet_id` against the wallet
+         *     list it already has, and every field this endpoint adds is one more place an address
+         *     could reach a log.
+         */
+        UnreadWalletResponse: {
+            /** Asset Symbol */
+            asset_symbol: string;
+            /** Chain Key */
+            chain_key: string;
+            /** Wallet Id */
+            wallet_id: number;
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -663,14 +708,21 @@ export interface components {
         };
         /**
          * WalletHistoryResponse
-         * @description One wallet's readings, oldest first.
+         * @description One wallet's readings, oldest first, and where the next page starts if there is one.
          *
          *     `decimals` is `null` for a wallet that has never been read: the exponent is a property
          *     of the readings, and there are none.
+         *
+         *     `next_cursor` is non-null exactly when more readings exist forward at the moment of the
+         *     request; pass it back as `cursor` to get them. It is always `null` for the default,
+         *     latest window -- nothing exists forward of the newest reading -- and on the last page of
+         *     a walk forward, which is how a client knows to stop.
          */
         WalletHistoryResponse: {
             /** Decimals */
             decimals: number | null;
+            /** Next Cursor */
+            next_cursor: string | null;
             /** Snapshots */
             snapshots: components["schemas"]["SnapshotResponse"][];
             /** Wallet Id */
@@ -842,8 +894,8 @@ export interface operations {
     readCurrentBalances: {
         parameters: {
             query?: {
-                /** @description The fiat currency to value holdings in, for example EUR. */
-                quote_currency?: string;
+                /** @description The fiat currency to value holdings in. Case-sensitive; anything but the supported codes is refused rather than valued at nothing. */
+                quote_currency?: components["schemas"]["QuoteCurrency"];
             };
             header?: never;
             path?: never;
@@ -1075,9 +1127,11 @@ export interface operations {
     readWalletBalanceHistory: {
         parameters: {
             query?: {
-                /** @description Only readings at or after this instant, and page forward from it. Omitted, the latest `limit` readings are returned instead. Must carry a timezone offset; a naive timestamp is refused rather than assumed to be UTC. */
+                /** @description Start a walk forward: the first `limit` readings at or after this instant. Must carry a timezone offset; a naive timestamp is refused rather than assumed to be UTC. May not be combined with `cursor`. */
                 since?: string | null;
-                /** @description How many readings to return: the latest that many, or that many counting forward from `since`. */
+                /** @description Continue a walk forward: pass the previous page's `next_cursor` to get the readings strictly after it. Opaque. May not be combined with `since`. */
+                cursor?: string | null;
+                /** @description How many readings to return: the latest that many by default, or that many counting forward from `since` or `cursor`. */
                 limit?: number;
             };
             header?: never;

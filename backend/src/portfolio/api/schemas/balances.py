@@ -34,6 +34,7 @@ allowed to say which.
 
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Final
 
@@ -46,7 +47,13 @@ from portfolio.api.schemas.money import MoneyStr
 # the service rather than from `repositories/sync_runs.py`, where they are defined: the
 # API layer may not import `portfolio.repositories`, and the service that produces a
 # value is where its type belongs to a caller.
-from portfolio.services.balances import SyncErrorKind, SyncRunStatus, SyncTrigger
+from portfolio.services.balances import (
+    HistoryCursor,
+    QuoteCurrency,
+    SyncErrorKind,
+    SyncRunStatus,
+    SyncTrigger,
+)
 from portfolio.services.prices import PriceUnavailable
 
 if TYPE_CHECKING:
@@ -55,13 +62,14 @@ if TYPE_CHECKING:
         CurrentBalances,
         SnapshotView,
         SyncRunSummary,
+        UnreadWallet,
         WalletBalance,
         WalletHistory,
     )
     from portfolio.services.prices import Price, UnpricedHolding
     from portfolio.services.sync_coordinator import SyncOutcome
 
-DEFAULT_QUOTE_CURRENCY: Final = "EUR"
+DEFAULT_QUOTE_CURRENCY: Final = QuoteCurrency.EUR
 """What `GET /api/balances/current` values in when the caller does not say.
 
 **The spec shows this field in the response body and never says where it comes from**, so
@@ -69,11 +77,47 @@ it is a query parameter with a default rather than a setting: a setting would be
 with one right value per deployment, and this is a question a client may reasonably ask
 differently on two renders. EUR because that is the currency the spec's own example uses.
 
-The value is passed through to the price service unchanged. A currency nothing has been
-quoted in prices nothing and every holding comes back unpriced with a reason, which is the
-honest answer and needs no enumeration maintained here -- `prices.quote_currency`'s `CHECK`
-is where the set of storable currencies is decided.
+**The parameter is a `QuoteCurrency`, so anything else is a 422.** It used to be passed
+through unchecked, on the theory that an unknown currency would honestly come back with
+every holding unpriced. It came back as `reason: never_fetched`, which sends an operator to
+check whether the refresh has run when the real cause is that nothing will ever price that
+currency. `domain/currencies.py` says why the set lives there rather than being imported
+from the price package.
 """
+
+MAX_CURSOR_LENGTH: Final = 128
+"""The longest cursor the history endpoint will try to decode.
+
+A real one is under eighty characters: an ISO-8601 instant with microseconds and an offset,
+a separator and at most nineteen digits, base64-encoded. The bound is there so that decoding
+is never the expensive part of refusing a request.
+"""
+
+_CURSOR_SEPARATOR: Final = "|"
+_MAX_SNAPSHOT_ID: Final = 2**63 - 1
+"""SQLite's `INTEGER` ceiling. A cursor claiming a larger id is refused as malformed rather than
+reaching the driver, where binding it raises `OverflowError` -- a 500 out of a query string."""
+
+_NAIVE_TIMESTAMP: Final = (
+    "a timestamp must carry a timezone offset, for example "
+    "2026-09-24T00:00:00Z or 2026-09-24T02:00:00+02:00"
+)
+
+
+def _in_utc(value: datetime) -> datetime:
+    """The same instant in UTC, refusing one that UTC cannot represent.
+
+    **`astimezone(UTC)` raises `OverflowError`, not `ValueError`, and Pydantic only turns the
+    second into a 422.** `0001-01-01T00:00:00+01:00` is an hour before the first instant a
+    `datetime` can hold, and `9999-12-31T23:59:59-01:00` is an hour after the last; both
+    parse, both carry an offset, and both reached a client as a 500. Re-raised as the error
+    type the validation machinery actually handles.
+    """
+    try:
+        return value.astimezone(UTC)
+    except OverflowError:
+        message = "the timestamp is outside the range of instants that can be represented in UTC"
+        raise ValueError(message) from None
 
 
 def _require_aware(value: datetime) -> datetime:
@@ -86,12 +130,71 @@ def _require_aware(value: datetime) -> datetime:
     an hour of history a chart quietly omits.
     """
     if value.tzinfo is None or value.utcoffset() is None:
-        message = (
-            "a timestamp must carry a timezone offset, for example "
-            "2026-09-24T00:00:00Z or 2026-09-24T02:00:00+02:00"
-        )
-        raise ValueError(message)
-    return value.astimezone(UTC)
+        raise ValueError(_NAIVE_TIMESTAMP)
+    return _in_utc(value)
+
+
+def encode_cursor(cursor: HistoryCursor) -> str:
+    """The opaque wire form of a history cursor.
+
+    URL-safe base64, unpadded, of `<observed_at isoformat>|<snapshot id>`. **Opaque by
+    convention rather than by cryptography**: nothing here is secret -- it is the position of
+    a row the client has just been shown -- and a client that decodes it learns an instant
+    and an integer. It is encoded so that nothing is tempted to build one by hand, which is
+    the failure that would couple a client to this layout.
+
+    `isoformat()` because it keeps the microseconds, and the keyset compares `observed_at`
+    for *equality*: a coarser rendering would make the cursor unequal to its own row and
+    skip every reading sharing that instant.
+    """
+    raw = f"{cursor.observed_at.isoformat()}{_CURSOR_SEPARATOR}{cursor.snapshot_id}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_cursor(value: str) -> HistoryCursor:
+    """Read a cursor back, refusing anything `encode_cursor` could not have produced.
+
+    **Every failure is a `ValueError`, and that is the whole contract.** A malformed cursor
+    must be a 422, and each of the ways one can be malformed raises something different out
+    of the standard library -- `binascii.Error` for a character outside the alphabet,
+    `UnicodeDecodeError` for bytes that are not text, `ValueError` from `fromisoformat`,
+    `OverflowError` from an extreme offset. The first two are already `ValueError`
+    subclasses; the last is not, and it is the one `_in_utc` converts.
+
+    Checked beyond parsing, because parsing alone accepts values that would fail later and
+    worse: a naive instant, which `UtcDateTime` refuses at bind time with a 500; an id that
+    is not a run of ASCII digits (`int` accepts `"٢"` and `" 7"`); and an id past SQLite's
+    `INTEGER` range, which the driver refuses with an `OverflowError`.
+
+    The message never echoes the cursor. It carries no address, but a message built from
+    input is the habit that eventually carries one.
+
+    Raises:
+        ValueError: the value is not a cursor this endpoint issued.
+    """
+    malformed = "the cursor is not one this endpoint issued"
+    padded = value + "=" * (-len(value) % 4)
+    try:
+        text = base64.b64decode(padded, altchars=b"-_", validate=True).decode("utf-8")
+    except ValueError:
+        raise ValueError(malformed) from None
+    parts = text.split(_CURSOR_SEPARATOR)
+    # Two parts, an instant and an id, and nothing else.
+    if len(parts) != 2:
+        raise ValueError(malformed)
+    instant_text, id_text = parts
+    if not id_text.isascii() or not id_text.isdigit():
+        raise ValueError(malformed)
+    snapshot_id = int(id_text)
+    if not 1 <= snapshot_id <= _MAX_SNAPSHOT_ID:
+        raise ValueError(malformed)
+    try:
+        instant = datetime.fromisoformat(instant_text)
+    except ValueError:
+        raise ValueError(malformed) from None
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ValueError(malformed)
+    return HistoryCursor(observed_at=_in_utc(instant), snapshot_id=snapshot_id)
 
 
 AwareDatetime = Annotated[datetime, AfterValidator(_require_aware)]
@@ -196,21 +299,45 @@ class UnpricedHoldingResponse(BaseModel):
         )
 
 
+class UnreadWalletResponse(BaseModel):
+    """An active wallet no successful run has ever read, so it is missing from `total`.
+
+    The address is deliberately not here: a client matches `wallet_id` against the wallet
+    list it already has, and every field this endpoint adds is one more place an address
+    could reach a log.
+    """
+
+    wallet_id: int
+    chain_key: str
+    asset_symbol: str
+
+    @classmethod
+    def of(cls, wallet: UnreadWallet) -> UnreadWalletResponse:
+        """Render a service view."""
+        return cls(
+            wallet_id=wallet.wallet_id,
+            chain_key=wallet.chain_key,
+            asset_symbol=wallet.asset_symbol,
+        )
+
+
 class CurrentBalancesResponse(BaseModel):
     """What the portfolio holds now and what it is worth.
 
-    **`total` is the sum of what could be priced and is not the answer on its own.** Read
+    **`total` is the sum of what could be valued and is not the answer on its own.** Read
     without `complete` it silently omits a holding, which is indistinguishable from a number
-    that includes it. Every renderer has to look at `complete`; `unpriced` says what is
-    missing.
+    that includes it. Every renderer has to look at `complete`, and two lists say what is
+    missing: `unpriced` has quantities nothing could value, `unread` has wallets whose
+    quantity nobody knows yet. `complete` is true only when both are empty.
     """
 
-    quote_currency: str
+    quote_currency: QuoteCurrency
     total: MoneyStr
     complete: bool
     as_of: datetime | None
     wallets: list[WalletBalanceResponse]
     unpriced: list[UnpricedHoldingResponse]
+    unread: list[UnreadWalletResponse]
 
     @classmethod
     def of(cls, view: CurrentBalances) -> CurrentBalancesResponse:
@@ -222,6 +349,7 @@ class CurrentBalancesResponse(BaseModel):
             as_of=view.as_of,
             wallets=[WalletBalanceResponse.of(wallet) for wallet in view.wallets],
             unpriced=[UnpricedHoldingResponse.of(holding) for holding in view.unpriced],
+            unread=[UnreadWalletResponse.of(wallet) for wallet in view.unread],
         )
 
 
@@ -247,23 +375,32 @@ class SnapshotResponse(BaseModel):
 
 
 class WalletHistoryResponse(BaseModel):
-    """One wallet's readings, oldest first.
+    """One wallet's readings, oldest first, and where the next page starts if there is one.
 
     `decimals` is `null` for a wallet that has never been read: the exponent is a property
     of the readings, and there are none.
+
+    `next_cursor` is non-null exactly when more readings exist forward at the moment of the
+    request; pass it back as `cursor` to get them. It is always `null` for the default,
+    latest window -- nothing exists forward of the newest reading -- and on the last page of
+    a walk forward, which is how a client knows to stop.
     """
 
     wallet_id: int
     decimals: int | None
     snapshots: list[SnapshotResponse]
+    next_cursor: str | None
 
     @classmethod
     def of(cls, history: WalletHistory) -> WalletHistoryResponse:
-        """Render a service view."""
+        """Render a service view, encoding the cursor into its opaque wire form."""
         return cls(
             wallet_id=history.wallet_id,
             decimals=history.decimals,
             snapshots=[SnapshotResponse.of(snapshot) for snapshot in history.snapshots],
+            next_cursor=(
+                None if history.next_cursor is None else encode_cursor(history.next_cursor)
+            ),
         )
 
 

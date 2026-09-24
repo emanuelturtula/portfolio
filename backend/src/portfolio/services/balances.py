@@ -47,6 +47,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
 from portfolio.domain.chains import ChainKey
+from portfolio.domain.currencies import QuoteCurrency
 from portfolio.domain.money import from_base_units
 from portfolio.repositories.balances import BalanceRepository
 from portfolio.repositories.sync_runs import (
@@ -78,17 +79,21 @@ __all__ = [
     "BalanceService",
     "ChainOutcome",
     "CurrentBalances",
+    "HistoryCursor",
+    "QuoteCurrency",
     "SnapshotView",
     "SyncErrorKind",
     "SyncRunStatus",
     "SyncRunSummary",
     "SyncTrigger",
+    "UnreadWallet",
     "WalletBalance",
     "WalletHistory",
     "build_balance_service",
     "utc_now",
 ]
-"""`ChainOutcome`, `SyncRunSummary` and the three enums are **re-exported**, not defined here.
+"""`ChainOutcome`, `SyncRunSummary`, the three run enums and `QuoteCurrency` are **re-exported**,
+not defined here.
 
 They belong to `repositories/sync_runs.py`, one layer down, for the reason that module
 explains. They are named again here because `list_runs` returns them and because
@@ -146,12 +151,41 @@ class WalletBalance:
 
 
 @dataclass(frozen=True, slots=True)
+class UnreadWallet:
+    """An active wallet no successful run has ever read, so it is absent from the total.
+
+    **The counterpart of `UnpricedHolding`, one step earlier.** A holding can be missing from
+    a total because its asset has no price, or because nobody knows its quantity; the first
+    has had a name since #9 and this is the second. Without it the endpoint answered
+    `complete: true` over a total that silently left a wallet out -- the omission this whole
+    module exists to refuse, arriving through a missing reading instead of a missing price.
+
+    Three realistic ways to get here, none of them rare: the wallet was added after the last
+    sync; its chain has failed on every run since the first deploy; its address is refused on
+    every tick, which is what `address_rejected` in the run log will be saying.
+
+    **A wallet with an old snapshot is not unread.** Its `observed_at` already says how old
+    the reading is, and a stale number that is labelled stale is information; this list is for
+    the wallets with no number at all.
+
+    No address, for the reason every view in this module omits one: the owner matches a
+    `wallet_id` against the wallet list, where the addresses already are.
+    """
+
+    wallet_id: int
+    chain_key: str
+    asset_symbol: str
+
+
+@dataclass(frozen=True, slots=True)
 class CurrentBalances:
     """What the portfolio is worth now, what it could not value, and how old the reading is.
 
     **`total` read without `complete` is a number that silently omits a holding**, which is
     indistinguishable from a number that includes it. Every renderer has to look at
-    `complete`, and `unpriced` is there so that what it says can be specific.
+    `complete`. Two lists say what the total is missing, and they are the two ways a holding
+    can go missing: `unpriced` has quantities nothing could value, `unread` has wallets whose
+    quantity nobody knows.
 
     `as_of` is the newest `observed_at` among the wallets that have one, and `None` when none
     does. It is the *newest* rather than the oldest deliberately: it answers "when was this
@@ -159,12 +193,24 @@ class CurrentBalances:
     has been failing since Tuesday.
     """
 
-    quote_currency: str
+    quote_currency: QuoteCurrency
     total: Decimal
-    complete: bool
     as_of: datetime | None
     wallets: tuple[WalletBalance, ...]
     unpriced: tuple[UnpricedHolding, ...]
+    unread: tuple[UnreadWallet, ...]
+
+    @property
+    def complete(self) -> bool:
+        """Whether the total accounts for every active wallet. Derived, never stored.
+
+        A property for the reason `PortfolioValue.complete` is one: a stored copy is a
+        second source of truth that can disagree with the tuples it was derived from, and
+        the disagreement would be in the direction of calling a partial total whole. It used
+        to be a stored copy of the *price* half alone, which is how an unread wallet came to
+        be reported as complete.
+        """
+        return not self.unpriced and not self.unread
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,19 +231,52 @@ class SnapshotView:
 
 
 @dataclass(frozen=True, slots=True)
+class HistoryCursor:
+    """Where a forward page of one wallet's history ended: an instant and a row id.
+
+    **Both halves are needed, and the second is the one that was missing.** Paging by
+    `observed_at` alone -- "take the last timestamp you saw and ask again from there" -- is
+    what the history endpoint first documented, and it never advances: `since` is inclusive,
+    so `limit=1` returned the same row forever, and any page whose last rows share an instant
+    with the next page's first rows repeats them. The id breaks the tie. Readings are
+    append-only, so `id` is insertion order and `(observed_at, id)` is a total order over one
+    wallet's history.
+
+    A frozen pair rather than a string: the opaque wire form is the API layer's business
+    (`api/schemas/balances.py` encodes and decodes it), and a service that parsed strings
+    would be a second place a malformed cursor could get in.
+
+    It carries a timestamp and an integer and nothing else -- no wallet id, no address, no
+    amount -- so handing one to a client discloses only the position of a row it has just
+    been shown.
+    """
+
+    observed_at: datetime
+    snapshot_id: int
+
+
+@dataclass(frozen=True, slots=True)
 class WalletHistory:
-    """One wallet's readings, oldest first: the latest window, or a page from `since`.
+    """One wallet's readings, oldest first, and where the next page starts if there is one.
 
     `decimals` is `None` for a wallet that has never been read, because the exponent is a
     property of the *readings* and there are none. It is deliberately not filled in from
     `assets`: the whole reason the column is on the snapshot is that an asset row can be
     edited, and answering this question from `assets` would reintroduce exactly the
     reinterpretation the column exists to prevent.
+
+    **`next_cursor` is non-`None` exactly when more rows exist forward at the moment of the
+    query.** It is computed by asking for one row more than the page holds, so it is a fact
+    rather than a guess, and it is `None` on the last page -- which is what lets a client stop.
+    It is always `None` for the latest window: nothing exists forward of the newest reading,
+    and a cursor there would be a "more" signal with nothing behind it. A client polling for
+    new readings asks for the latest window again.
     """
 
     wallet_id: int
     decimals: int | None
     snapshots: tuple[SnapshotView, ...]
+    next_cursor: HistoryCursor | None
 
 
 class BalanceService:
@@ -225,7 +304,7 @@ class BalanceService:
         self,
         principal: Principal,
         *,
-        quote_currency: str,
+        quote_currency: QuoteCurrency,
     ) -> CurrentBalances:
         """Every active wallet's latest reading, valued in one currency.
 
@@ -259,10 +338,18 @@ class BalanceService:
         return CurrentBalances(
             quote_currency=quote_currency,
             total=total,
-            complete=portfolio.complete,
             as_of=max(observations) if observations else None,
             wallets=tuple(rows),
             unpriced=portfolio.unpriced,
+            unread=tuple(
+                UnreadWallet(
+                    wallet_id=wallet.id,
+                    chain_key=wallet.chain_key,
+                    asset_symbol=ChainKey(wallet.chain_key).asset_symbol,
+                )
+                for wallet in wallets
+                if wallet.id not in latest
+            ),
         )
 
     async def wallet_history(
@@ -271,34 +358,58 @@ class BalanceService:
         wallet_id: int,
         *,
         since: datetime | None = None,
+        after: HistoryCursor | None = None,
         limit: int = DEFAULT_HISTORY_LIMIT,
     ) -> WalletHistory:
-        """One wallet's readings, oldest first, from `since` onwards.
+        """One wallet's readings, oldest first: the latest window, or a page forward.
 
         **An archived wallet still answers.** Its history is the reason archiving is a
         timestamp and not a delete, and refusing to show it would make retiring an address
         destroy the record of what it held.
 
-        **Which `limit` readings you get depends on `since`, and the rows are oldest-first
-        either way.** Without one you get the *latest* window, because the only consumer is a
-        chart and the oldest five hundred readings of a year-old wallet are the wrong five
-        hundred. With one you get the *first* `limit` at or after it, because that is what
-        makes the pair a forward cursor: read a window, take the last `observed_at` you saw,
-        ask again from there. `BalanceRepository.history` carries the full argument.
+        **Three ways to ask, and the rows are oldest-first in all three:**
+
+        | Asked with | Rows | `next_cursor` |
+        |---|---|---|
+        | neither | the latest `limit` | always `None` |
+        | `since` | the first `limit` at or after it | set when more follow |
+        | `after` | the first `limit` strictly after it | set when more follow |
+
+        The default is the recent end because the only consumer is a chart, and the oldest
+        five hundred readings of a year-old wallet are the wrong five hundred. `since` starts
+        a walk forward from an instant; `after` continues it from the last row the previous
+        page returned. `BalanceRepository.history` carries the full argument.
 
         Raises:
             WalletNotFoundError: no wallet with that id belongs to the caller. Scoped by
                 `user_id`, so somebody else's wallet is indistinguishable from one that does
                 not exist -- the only answer that does not confirm the id.
+            ValueError: both `since` and `after` were given. They are two answers to "where
+                does this page start" and there is no rule that combines them honestly; the
+                request schema refuses the pair with a 422 before it gets here, and this is
+                the same refusal for a caller that did not come through the schema.
         """
+        if since is not None and after is not None:
+            message = "A history page starts at `since` or after a cursor, not both."
+            raise ValueError(message)
         wallet = await self._wallets.get_for_user(principal.user_id, wallet_id)
         if wallet is None:
             raise WalletNotFoundError
+        page_size = _clamped(limit, MAX_HISTORY_LIMIT)
+        forward = since is not None or after is not None
+        # One row beyond the page when walking forward, and only then: it is how the page
+        # knows whether another exists, without a second query or a count.
         rows = await self._balances.history(
             wallet_id=wallet_id,
             since=since,
-            limit=_clamped(limit, MAX_HISTORY_LIMIT),
+            after=None if after is None else (after.observed_at, after.snapshot_id),
+            limit=page_size + 1 if forward else page_size,
         )
+        next_cursor: HistoryCursor | None = None
+        if forward and len(rows) > page_size:
+            rows = rows[:page_size]
+            last = rows[-1]
+            next_cursor = HistoryCursor(observed_at=last.observed_at, snapshot_id=last.id)
         return WalletHistory(
             wallet_id=wallet_id,
             # From the newest row in the page rather than the oldest: if an exponent ever
@@ -314,6 +425,7 @@ class BalanceService:
                 )
                 for row in rows
             ),
+            next_cursor=next_cursor,
         )
 
     async def list_runs(self, *, limit: int = DEFAULT_RUNS_LIMIT) -> tuple[SyncRunSummary, ...]:

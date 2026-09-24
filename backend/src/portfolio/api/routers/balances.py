@@ -29,20 +29,24 @@ actually checks.
 
 from __future__ import annotations
 
+from datetime import datetime  # noqa: TC003 - FastAPI reads the annotation at runtime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.exceptions import RequestValidationError
 
 from portfolio.api.dependencies import get_balance_service, get_principal, get_sync_coordinator
 from portfolio.api.errors import NotFoundError
 from portfolio.api.schemas.balances import (
     DEFAULT_QUOTE_CURRENCY,
+    MAX_CURSOR_LENGTH,
     AwareDatetime,
     CurrentBalancesResponse,
     SyncRunListResponse,
     SyncRunResponse,
     SyncTriggeredResponse,
     WalletHistoryResponse,
+    decode_cursor,
 )
 from portfolio.services.auth import Principal
 from portfolio.services.balances import (
@@ -51,6 +55,8 @@ from portfolio.services.balances import (
     MAX_HISTORY_LIMIT,
     MAX_RUNS_LIMIT,
     BalanceService,
+    HistoryCursor,
+    QuoteCurrency,
 )
 from portfolio.services.sync_coordinator import SyncCoordinator, SyncTrigger
 from portfolio.services.wallets import WalletNotFoundError
@@ -62,23 +68,34 @@ CurrentPrincipal = Annotated[Principal, Depends(get_principal)]
 CurrentBalanceService = Annotated[BalanceService, Depends(get_balance_service)]
 CurrentSyncCoordinator = Annotated[SyncCoordinator, Depends(get_sync_coordinator)]
 
-QuoteCurrency = Annotated[
-    str,
+ValuationCurrency = Annotated[
+    QuoteCurrency,
     Query(
-        min_length=3,
-        max_length=3,
-        description="The fiat currency to value holdings in, for example EUR.",
+        description=(
+            "The fiat currency to value holdings in. Case-sensitive; anything but the "
+            "supported codes is refused rather than valued at nothing."
+        ),
     ),
 ]
 Since = Annotated[
     AwareDatetime | None,
     Query(
         description=(
-            "Only readings at or after this instant, and page forward from it. "
-            "Omitted, the latest `limit` readings are returned instead. "
+            "Start a walk forward: the first `limit` readings at or after this instant. "
             "Must carry a timezone offset; a naive timestamp is refused rather than "
-            "assumed to be UTC."
+            "assumed to be UTC. May not be combined with `cursor`."
         )
+    ),
+]
+Cursor = Annotated[
+    str | None,
+    Query(
+        min_length=1,
+        max_length=MAX_CURSOR_LENGTH,
+        description=(
+            "Continue a walk forward: pass the previous page's `next_cursor` to get the "
+            "readings strictly after it. Opaque. May not be combined with `since`."
+        ),
     ),
 ]
 HistoryLimit = Annotated[
@@ -87,11 +104,46 @@ HistoryLimit = Annotated[
         ge=1,
         le=MAX_HISTORY_LIMIT,
         description=(
-            "How many readings to return: the latest that many, or that many counting "
-            "forward from `since`."
+            "How many readings to return: the latest that many by default, or that many "
+            "counting forward from `since` or `cursor`."
         ),
     ),
 ]
+
+CURSOR_FIELD_LOCATION = ("query", "cursor")
+"""Where a refused cursor is reported, including a cursor sent together with `since`: the
+cursor is the parameter that carries the page position, so it is the one that is wrong."""
+
+
+def _cursor_rejected(message: str) -> RequestValidationError:
+    """A refused cursor as the field-level 422 every other query parameter produces.
+
+    The same shape `routers/wallets.py` builds for a rejected address, so a client handles one
+    problem document. The message is fixed text and never echoes the cursor.
+    """
+    return RequestValidationError(
+        [{"loc": CURSOR_FIELD_LOCATION, "msg": message, "type": "value_error"}]
+    )
+
+
+def _history_start(since: datetime | None, cursor: str | None) -> HistoryCursor | None:
+    """Parse where a history page starts, refusing a malformed cursor or a contradictory pair.
+
+    Parsing, which is what a router is for: the rule about what the three windows *mean*
+    lives in the service and the repository. This decides only whether the query string
+    said something coherent.
+    """
+    if cursor is None:
+        return None
+    if since is not None:
+        message = "`cursor` continues a walk that `since` started; send one or the other"
+        raise _cursor_rejected(message)
+    try:
+        return decode_cursor(cursor)
+    except ValueError as exc:
+        raise _cursor_rejected(str(exc)) from exc
+
+
 RunsLimit = Annotated[
     int,
     Query(ge=1, le=MAX_RUNS_LIMIT, description="How many runs to return, newest first."),
@@ -136,7 +188,7 @@ async def sync_balances(
 async def read_current_balances(
     principal: CurrentPrincipal,
     service: CurrentBalanceService,
-    quote_currency: QuoteCurrency = DEFAULT_QUOTE_CURRENCY,
+    quote_currency: ValuationCurrency = DEFAULT_QUOTE_CURRENCY,
 ) -> CurrentBalancesResponse:
     """Return every active wallet's latest balance and what it is worth.
 
@@ -144,7 +196,7 @@ async def read_current_balances(
     covered comes back with nulls rather than zeros, and a holding with no price is named in
     `unpriced` rather than valued at nothing.
     """
-    view = await service.current_balances(principal, quote_currency=quote_currency.upper())
+    view = await service.current_balances(principal, quote_currency=quote_currency)
     return CurrentBalancesResponse.of(view)
 
 
@@ -159,22 +211,38 @@ async def read_wallet_balance_history(
     principal: CurrentPrincipal,
     service: CurrentBalanceService,
     since: Since = None,
+    cursor: Cursor = None,
     limit: HistoryLimit = DEFAULT_HISTORY_LIMIT,
 ) -> WalletHistoryResponse:
     """Return one wallet's readings, oldest first, for charting.
 
-    **The latest window by default, a forward cursor from `since`.** Both come back
-    oldest-first, and the asymmetry is the kind a reader assumes is a bug, so it is stated
-    here as well as at the repository: a chart wants the recent end, and a client paging
-    through a year wants the rows after the last one it saw. Asking for the oldest `limit`
-    readings of a wallet watched since January is not a request anything makes.
+    **The latest window by default, a forward walk from `since`, continued by `cursor`.**
+    All three come back oldest-first, and the asymmetry is the kind a reader assumes is a
+    bug, so it is stated here as well as at the repository:
+
+    | Query | Readings | `next_cursor` |
+    |---|---|---|
+    | neither | the latest `limit` | always `null` |
+    | `since` | the first `limit` at or after it | set when more follow |
+    | `cursor` | the first `limit` strictly after it | set when more follow |
+
+    A chart wants the recent end; a client charting a year starts at `since` and follows
+    `next_cursor` until it is `null`. With `limit` capped at 1000 and a reading every fifteen
+    minutes, one page holds about ten days, so that walk is the ordinary case rather than an
+    edge. `since` alone cannot continue it: it is inclusive and has no tie-break, so paging
+    with the last instant seen repeats rows and, at `limit=1`, never advances at all.
+
+    `cursor` together with `since`, or a cursor this endpoint did not issue, is a 422.
 
     An archived wallet still answers: its history is the reason archiving is a timestamp
     rather than a delete. A wallet that is not the caller's is a `404`, the same answer a
     wallet that does not exist gets, because any other status would confirm the id.
     """
+    after = _history_start(since, cursor)
     try:
-        history = await service.wallet_history(principal, wallet_id, since=since, limit=limit)
+        history = await service.wallet_history(
+            principal, wallet_id, since=since, after=after, limit=limit
+        )
     except WalletNotFoundError as exc:
         raise NotFoundError(str(exc)) from exc
     return WalletHistoryResponse.of(history)
