@@ -143,8 +143,8 @@ class BalanceRepository:
         *,
         wallet_id: int,
         since: datetime | None,
-        after: tuple[datetime, int] | None,
         limit: int,
+        after: tuple[datetime, int] | None = None,
     ) -> list[BalanceSnapshot]:
         """One wallet's readings, always oldest first. **Which `limit` rows depends on the ask.**
 
@@ -185,6 +185,10 @@ class BalanceRepository:
 
         `since` and `after` together is a caller's mistake; the service refuses the pair, and
         this method gives `after` precedence rather than inventing a combination.
+
+        `after` defaults to `None` where `since` has no default, and the asymmetry is only
+        history: `after` arrived with keyset pagination, and every call written before it is
+        still a correct call that means what it meant.
 
         The descending arm reverses in Python rather than asking SQL for the rows twice.
         `limit` is bounded by the page size, so the list being reversed is bounded too.
