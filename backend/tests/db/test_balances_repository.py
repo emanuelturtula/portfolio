@@ -35,7 +35,7 @@ import pytest
 from sqlalchemy import inspect, select, text
 
 from portfolio.db.engine import create_session_factory
-from portfolio.db.models import _BALANCE_SNAPSHOT_CONFIRMED_CHECK, BalanceSnapshot
+from portfolio.db.models import BalanceSnapshot
 from portfolio.domain.chains import ChainKey
 from portfolio.domain.money import from_base_units
 from portfolio.repositories.balances import BalanceRepository, SnapshotConstraintError
@@ -745,28 +745,6 @@ async def test_history_is_scoped_to_one_wallet(
 # --------------------------------------------------------------------------------------
 # What is on disk, read back through a second, unconfigured connection
 # --------------------------------------------------------------------------------------
-
-
-def test_the_check_constraint_matches_the_model(
-    migrated_database_url: str,
-    sync_engine: Engine,
-) -> None:
-    """Autogenerate has no check-constraint comparator, so the drift test cannot see this.
-
-    The same hazard `_ASSET_KIND_CHECK` documents: editing the constant without writing the
-    matching migration passes ruff, mypy, the layering contract and the drift check, and
-    then fails on the Pi with `CHECK constraint failed: ck_balance_snapshots_confirmed`.
-    """
-    del migrated_database_url  # Ordering only: the schema has to exist before reflection.
-    reflected = {
-        str(constraint["name"]): str(constraint["sqltext"])
-        for constraint in inspect(sync_engine).get_check_constraints("balance_snapshots")
-    }
-
-    assert set(reflected) == {"ck_balance_snapshots_confirmed"}
-    assert " ".join(reflected["ck_balance_snapshots_confirmed"].split()) == " ".join(
-        _BALANCE_SNAPSHOT_CONFIRMED_CHECK.split()
-    )
 
 
 def test_the_base_unit_columns_are_integers_on_disk(

@@ -42,7 +42,17 @@ from portfolio.db.alembic_config import (
     upgrade_to_head,
 )
 from portfolio.db.base import NAMING_CONVENTION
-from portfolio.db.models import _ASSET_KIND_CHECK, Asset, metadata
+from portfolio.db.models import (
+    _ASSET_KIND_CHECK,
+    _BALANCE_SNAPSHOT_CONFIRMED_CHECK,
+    _SYNC_RUN_CHAIN_ERROR_KIND_CHECK,
+    _SYNC_RUN_CHAIN_STATUS_CHECK,
+    _SYNC_RUN_STATUS_CHECK,
+    _SYNC_RUN_TRIGGER_CHECK,
+    _WALLET_CHAIN_KEY_CHECK,
+    Asset,
+    metadata,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -122,9 +132,9 @@ EXPECTED_CONSTRAINT_NAMES = {
         "fk_prices_asset_id_assets",
     },
     # #10. Every CHECK here is invisible to the drift check, exactly as `ck_assets_kind`
-    # is; `tests/db/test_sync_runs_repository.py` and `tests/db/test_balances_repository.py`
-    # compare each one's text against the model's constant and exercise it with a real
-    # insert. What this map adds is that the constraints exist *and are named*, which is
+    # is; `test_the_new_check_constraints_match_the_models` below compares each one's
+    # text against the model's constant, and the repository suites exercise each with a
+    # real insert. What this map adds is that the constraints exist *and are named*, which is
     # what a batch rebuild needs in order to re-create them at all.
     "sync_runs": {
         "pk_sync_runs",
@@ -538,6 +548,50 @@ def test_the_kind_check_constraint_matches_the_model(
 
     assert set(reflected) == {"ck_assets_kind"}
     assert normalise_sql(reflected["ck_assets_kind"]) == normalise_sql(_ASSET_KIND_CHECK)
+
+
+def test_the_new_check_constraints_match_the_models(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Every `CHECK` #10 adds, reflected off a migrated file and compared with its constant.
+
+    The same hazard `test_the_kind_check_constraint_matches_the_model` documents, six times
+    over: autogenerate has no check-constraint comparator, so editing one of these constants
+    without editing `v0005_balances.py` passes ruff, mypy, the layering contract *and* the
+    drift check, and then fails on the Pi with `CHECK constraint failed`.
+
+    `sync_run_chains.chain_key` reuses `_WALLET_CHAIN_KEY_CHECK` -- one constant for one fact
+    -- and the reuse is asserted rather than assumed, because a second copy of the chain list
+    is exactly how the two tables would come to admit different chains. The inserts that
+    prove each constraint actually refuses what it should are in
+    `tests/db/test_sync_runs_repository.py` and `tests/db/test_balances_repository.py`.
+    """
+    upgrade_to_head(database_url)
+    inspector = inspect(sync_engine)
+    expected = {
+        "sync_runs": {
+            "ck_sync_runs_trigger": _SYNC_RUN_TRIGGER_CHECK,
+            "ck_sync_runs_status": _SYNC_RUN_STATUS_CHECK,
+        },
+        "sync_run_chains": {
+            "ck_sync_run_chains_chain_key": _WALLET_CHAIN_KEY_CHECK,
+            "ck_sync_run_chains_status": _SYNC_RUN_CHAIN_STATUS_CHECK,
+            "ck_sync_run_chains_error_kind": _SYNC_RUN_CHAIN_ERROR_KIND_CHECK,
+        },
+        "balance_snapshots": {
+            "ck_balance_snapshots_confirmed": _BALANCE_SNAPSHOT_CONFIRMED_CHECK,
+        },
+    }
+
+    for table, constraints in expected.items():
+        reflected = {
+            str(found["name"]): normalise_sql(str(found["sqltext"]))
+            for found in inspector.get_check_constraints(table)
+        }
+        assert set(reflected) == set(constraints), table
+        for name, sql in constraints.items():
+            assert reflected[name] == normalise_sql(sql), f"{table}.{name}"
 
 
 def test_the_check_constraint_comparison_discriminates() -> None:

@@ -251,7 +251,7 @@ async def test_the_interval_it_sleeps_is_the_configured_minutes_in_seconds() -> 
     assert SECONDS_PER_MINUTE == 60
 
 
-def test_the_intervals_come_from_settings_and_are_the_documented_defaults() -> None:
+def test_the_interval_comes_from_settings() -> None:
     """Fifteen minutes for balances, sixty for prices, read off `Settings`.
 
     Read rather than written, so a changed default fails here instead of silently
@@ -292,7 +292,7 @@ async def test_the_name_reaches_the_property_and_the_task() -> None:
 # --------------------------------------------------------------------------------------
 
 
-async def test_a_fresh_database_runs_at_startup() -> None:
+async def test_a_fresh_database_syncs_at_startup() -> None:
     """Nothing has ever run, so the first tick is now rather than in fifteen minutes.
 
     Sleeping first is the obvious loop and it leaves a fresh deployment blank for a quarter

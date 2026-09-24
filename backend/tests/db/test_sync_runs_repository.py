@@ -23,16 +23,11 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from sqlalchemy import inspect, select, text
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from portfolio.db.engine import create_session_factory
 from portfolio.db.models import (
-    _SYNC_RUN_CHAIN_ERROR_KIND_CHECK,
-    _SYNC_RUN_CHAIN_STATUS_CHECK,
-    _SYNC_RUN_STATUS_CHECK,
-    _SYNC_RUN_TRIGGER_CHECK,
-    _WALLET_CHAIN_KEY_CHECK,
     SyncRun,
 )
 from portfolio.repositories.sync_runs import (
@@ -47,7 +42,6 @@ from tests.balance_harness import sqlite_timestamp
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from sqlalchemy import Engine
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 STARTED_AT: Final = datetime(2026, 9, 24, 0, 0, tzinfo=UTC)
@@ -732,75 +726,3 @@ async def test_a_chain_is_only_ever_success_or_failed(
 
     with pytest.raises(IntegrityError):
         await insert_chain_with(session, run_id, status=status)
-
-
-# --------------------------------------------------------------------------------------
-# Reflection, in the idiom `tests/db/test_migrations.py` already uses
-# --------------------------------------------------------------------------------------
-
-
-def normalise(expression: str) -> str:
-    """Collapse runs of whitespace and nothing else; see `test_migrations.py`."""
-    return " ".join(expression.split())
-
-
-def test_the_new_check_constraints_match_the_models(
-    migrated_database_url: str,
-    sync_engine: Engine,
-) -> None:
-    """Every `CHECK` #10 adds, compared off the migrated file against the model's constant.
-
-    Alembic's autogenerate has no check-constraint comparator, so the drift test in
-    `test_migrations.py` is blind to all five of these. Editing one of the constants without
-    editing `v0005_balances.py` passes ruff, mypy, the layering contract and the drift check,
-    and then fails on the Pi with `CHECK constraint failed`.
-
-    `sync_run_chains.chain_key` reuses `_WALLET_CHAIN_KEY_CHECK` -- one constant for one
-    fact -- and that reuse is asserted rather than assumed, because a second copy of the
-    chain list is exactly how the two tables would come to admit different chains.
-    """
-    del migrated_database_url  # Ordering only: the schema has to exist before reflection.
-    inspector = inspect(sync_engine)
-    expected = {
-        "sync_runs": {
-            "ck_sync_runs_trigger": _SYNC_RUN_TRIGGER_CHECK,
-            "ck_sync_runs_status": _SYNC_RUN_STATUS_CHECK,
-        },
-        "sync_run_chains": {
-            "ck_sync_run_chains_chain_key": _WALLET_CHAIN_KEY_CHECK,
-            "ck_sync_run_chains_status": _SYNC_RUN_CHAIN_STATUS_CHECK,
-            "ck_sync_run_chains_error_kind": _SYNC_RUN_CHAIN_ERROR_KIND_CHECK,
-        },
-    }
-
-    for table, constraints in expected.items():
-        reflected = {
-            str(found["name"]): normalise(str(found["sqltext"]))
-            for found in inspector.get_check_constraints(table)
-        }
-        assert set(reflected) == set(constraints), table
-        for name, text_of in constraints.items():
-            assert reflected[name] == normalise(text_of), f"{table}.{name}"
-
-
-def test_the_started_at_index_is_in_the_migrated_schema(
-    migrated_database_url: str,
-    sync_engine: Engine,
-) -> None:
-    """The index an operator's run history is read through, named as the spec writes it."""
-    del migrated_database_url
-    indexes = {
-        index["name"]: list(index["column_names"])
-        for index in inspect(sync_engine).get_indexes("sync_runs")
-    }
-
-    assert indexes == {"ix_sync_runs_started_at": ["started_at"]}
-
-
-def test_the_constraint_comparison_discriminates() -> None:
-    """Whitespace is normalised; content is not. Without this the comparison is hollow."""
-    assert normalise("status  IN\n ('success', 'failed')") == normalise(
-        _SYNC_RUN_CHAIN_STATUS_CHECK
-    )
-    assert normalise("status IN ('success')") != normalise(_SYNC_RUN_CHAIN_STATUS_CHECK)
-    assert normalise("trigger IN ('scheduled', 'manual')") != normalise(_SYNC_RUN_TRIGGER_CHECK)

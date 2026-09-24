@@ -243,7 +243,7 @@ async def until(condition: Callable[[], bool]) -> None:
         await asyncio.sleep(0)
 
 
-async def test_the_http_client_is_built_and_closed_with_the_application(
+async def test_the_http_client_is_closed_on_shutdown(
     lifespan_database: Path,
 ) -> None:
     """The wiring #6 through #9 each deferred to #10, and the half that gets forgotten.
