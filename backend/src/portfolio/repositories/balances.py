@@ -145,26 +145,51 @@ class BalanceRepository:
         since: datetime | None,
         limit: int,
     ) -> list[BalanceSnapshot]:
-        """One wallet's readings, oldest first, from `since` onwards, at most `limit` of them.
+        """One wallet's readings, always oldest first. **Which `limit` rows depends on `since`.**
 
-        **`limit` takes the first rows after `since`, not the most recent ones**, which is
-        what makes the pair a forward-paging cursor: a client reads a window, takes the last
-        `observed_at` it saw, and asks again from there. A caller that wants the recent end
-        passes a `since`.
+        Two windows, and the asymmetry is deliberate rather than an oversight -- a reader who
+        assumes one rule for both will read this as a bug, so it is written down twice, here
+        and at the endpoint:
+
+        | Call | Rows |
+        |---|---|
+        | `since` given | the **first** `limit` at or after it -- a forward cursor |
+        | `since` omitted | the **most recent** `limit`, reversed back to oldest-first |
+
+        **The default has to be the recent end.** The only consumer is a chart, and the
+        oldest five hundred readings of a wallet that has been watched for a year are the
+        wrong five hundred: they render a picture of last January and stop. The literal
+        reading of "oldest first, limit 500" produced exactly that.
+
+        **With `since` it has to be the other end**, because that is what makes the pair a
+        cursor at all: a client reads a window, takes the last `observed_at` it saw, and asks
+        again from there. Returning the newest rows for a `since` would make paging forward
+        impossible -- every page would be the same last page.
 
         `since` is inclusive, so paging with the last `observed_at` seen re-reads one row
         rather than risking a gap. Ties are broken by `id`, which is insertion order, so two
         readings stamped at the same instant come back in the order they were written rather
         than in whatever order the storage engine felt like.
 
-        The comparison and the ordering are done in SQL; the module docstring says why that
+        The descending arm reverses in Python rather than asking SQL for the rows twice.
+        `limit` is at most `MAX_HISTORY_LIMIT`, so the list being reversed is bounded by the
+        page size and not by the table.
+
+        The comparison and both orderings are done in SQL; the module docstring says why that
         is safe here and is not safe for a money column.
         """
         statement = select(BalanceSnapshot).where(BalanceSnapshot.wallet_id == wallet_id)
-        if since is not None:
-            statement = statement.where(BalanceSnapshot.observed_at >= since)
+        if since is None:
+            newest = await self._session.scalars(
+                statement.order_by(
+                    BalanceSnapshot.observed_at.desc(), BalanceSnapshot.id.desc()
+                ).limit(limit)
+            )
+            return list(reversed(list(newest)))
         rows = await self._session.scalars(
-            statement.order_by(BalanceSnapshot.observed_at, BalanceSnapshot.id).limit(limit)
+            statement.where(BalanceSnapshot.observed_at >= since)
+            .order_by(BalanceSnapshot.observed_at, BalanceSnapshot.id)
+            .limit(limit)
         )
         return list(rows)
 

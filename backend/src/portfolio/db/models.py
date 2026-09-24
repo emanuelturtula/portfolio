@@ -87,13 +87,16 @@ _SYNC_RUN_STATUS_CHECK: Final = (
 # per-address case that would make a chain itself partial.
 _SYNC_RUN_CHAIN_STATUS_CHECK: Final = "status IN ('success', 'failed')"
 
-# Whose fault a chain's failure was. The first four are `providers/errors.py`'s vocabulary
-# and mean the vendor failed; `internal` means we did, and it exists so that a parser bug
-# is never reported as an outage at the chain. Nullable, because a chain that succeeded has
-# no error to name.
+# Whose fault a chain's failure was, and three different parties can be. The first four are
+# `providers/errors.py`'s vocabulary and mean the vendor failed; `address_rejected` means the
+# owner configured an address this chain will not accept -- most plausibly one from another
+# network, which registration does not check; `internal` means we did, and it exists so that
+# a parser bug is never reported as an outage at the chain. Nullable, because a chain that
+# succeeded has no error to name.
 _SYNC_RUN_CHAIN_ERROR_KIND_CHECK: Final = (
     "error_kind IS NULL OR "
-    "error_kind IN ('unavailable', 'rate_limited', 'response', 'unknown_chain', 'internal')"
+    "error_kind IN ('unavailable', 'rate_limited', 'response', 'unknown_chain', "
+    "'address_rejected', 'internal')"
 )
 
 # A confirmed balance is a count of base units the chain has already accepted, so it cannot

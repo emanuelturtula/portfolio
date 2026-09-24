@@ -74,8 +74,10 @@ Since = Annotated[
     AwareDatetime | None,
     Query(
         description=(
-            "Only readings at or after this instant. Must carry a timezone offset; "
-            "a naive timestamp is refused rather than assumed to be UTC."
+            "Only readings at or after this instant, and page forward from it. "
+            "Omitted, the latest `limit` readings are returned instead. "
+            "Must carry a timezone offset; a naive timestamp is refused rather than "
+            "assumed to be UTC."
         )
     ),
 ]
@@ -84,7 +86,10 @@ HistoryLimit = Annotated[
     Query(
         ge=1,
         le=MAX_HISTORY_LIMIT,
-        description="How many readings to return, counting forward from `since`.",
+        description=(
+            "How many readings to return: the latest that many, or that many counting "
+            "forward from `since`."
+        ),
     ),
 ]
 RunsLimit = Annotated[
@@ -157,6 +162,12 @@ async def read_wallet_balance_history(
     limit: HistoryLimit = DEFAULT_HISTORY_LIMIT,
 ) -> WalletHistoryResponse:
     """Return one wallet's readings, oldest first, for charting.
+
+    **The latest window by default, a forward cursor from `since`.** Both come back
+    oldest-first, and the asymmetry is the kind a reader assumes is a bug, so it is stated
+    here as well as at the repository: a chart wants the recent end, and a client paging
+    through a year wants the rows after the last one it saw. Asking for the oldest `limit`
+    readings of a wallet watched since January is not a request anything makes.
 
     An archived wallet still answers: its history is the reason archiving is a timestamp
     rather than a delete. A wallet that is not the caller's is a `404`, the same answer a

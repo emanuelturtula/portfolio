@@ -14,23 +14,35 @@ Wallets are grouped by `chain_key` and each group is one coroutine under `asynci
 not used, and that is a decision rather than an omission: it would also absorb
 `CancelledError` and turn a shutdown into a chain recorded as having failed.
 
-Two catch clauses, deliberately not one:
+Three catch clauses, deliberately not one, because **three different parties can be at
+fault** and collapsing them is how one of them gets blamed for another's mistake:
 
 * a `ProviderError` is recorded with **the vendor's own kind** -- `unavailable`,
   `rate_limited`, `response`, `unknown_chain` -- because that is what #6's vocabulary is
   for, and a caller has to be able to tell a broken vendor from a bad answer;
+* an `AddressInvalidError` is **`address_rejected`**, and it is the *owner's* configuration
+  rather than anyone's failure. A provider validates every address before it builds a URL,
+  and registration does not check the network, so a mainnet address configured against a
+  testnet index is refused here on every tick forever. No traceback: there is nothing to
+  debug;
 * **anything else is `internal`**, with the traceback logged. Our bug, and recording it as
   "Kaspa is unavailable" is how a code defect gets read as a vendor outage for months.
 
 Catching only `ProviderError` and letting a `TypeError` fail the run was the alternative,
 and it loses good Bitcoin data to a Kaspa parser bug -- the exact outcome the issue refuses.
+The third clause is a correction: it used to fall into `internal`, which reported a user's
+configuration as a defect in this application and wrote a traceback for it four times an
+hour.
 
-**`detail` is written differently for the two clauses, and the asymmetry is a disclosure
+**`detail` is written differently in each clause, and the asymmetry is a disclosure
 control.** A `ProviderError`'s message is rendered in full, because every provider in this
-application is written never to quote a body, a URL or an address into one. An arbitrary
-exception has made no such promise: `KeyError` renders its key, and a key here would be an
-address. So the internal clause records the exception's **type name and nothing else**, and
-the message reaches the log rather than the database and the response body.
+application is written never to quote a body, a URL or an address into one. An
+`AddressInvalidError` carries an `AddressRejection` member and a fixed sentence per member,
+not one of which interpolates anything, so the reason and a count of the wallets that lost
+their read are recorded and the address is not. An arbitrary exception has made no such
+promise: `KeyError` renders its key, and a key here would be an address -- so the internal
+clause records the exception's **type name and nothing else**, and the message reaches the
+log rather than the database and the response body.
 
 ## The database is touched before the gather and after it, never inside it
 
@@ -67,6 +79,7 @@ from typing import TYPE_CHECKING, Final
 
 import structlog
 
+from portfolio.domain.addresses import AddressInvalidError
 from portfolio.providers.errors import (
     ProviderError,
     ProviderRateLimitedError,
@@ -150,8 +163,11 @@ def error_kind_of(error: ProviderError) -> SyncErrorKind:
     is right.** The four subclasses are the vendor verdicts this application knows how to
     report; a fifth added without a line here is our omission, not a vendor's outage, and
     filing it under a vendor's name is exactly the confusion `INTERNAL` exists to prevent.
-    The `CHECK` on `sync_run_chains.error_kind` admits five values, so an unmapped error has
+    The `CHECK` on `sync_run_chains.error_kind` admits a closed set, so an unmapped error has
     to become one of them regardless -- this chooses the one that points at us.
+
+    `ADDRESS_REJECTED` is deliberately **not** reachable from here. It is not a provider
+    failure at all, and `_read_chain` catches `AddressInvalidError` in its own clause.
     """
     for error_type, kind in _PROVIDER_ERROR_KINDS:
         if isinstance(error, error_type):
@@ -329,6 +345,45 @@ class BalanceSyncService:
             addresses = tuple(dict.fromkeys(wallet.address_canonical for wallet in wallets))
             balances = await provider.fetch_balances(addresses)
             readings = _fan_out(balances, wallets, observed_at)
+        except AddressInvalidError as error:
+            # **A third clause, and neither of the other two would have been right.** A
+            # provider validates every address before it builds a URL, so a row the wallet
+            # registry accepted can still be refused here -- most plausibly by the network
+            # check, which registration does not perform: a mainnet address under
+            # `PORTFOLIO_BITCOIN_NETWORK=testnet` is refused on every tick, forever.
+            #
+            # That is the owner's configuration, not a vendor outage and not our bug.
+            # Recording it as `internal` filed a user's mistake under "a defect in this
+            # application" and wrote a traceback for it every fifteen minutes, which is the
+            # failure the `internal` kind exists to prevent, pointed the other way.
+            #
+            # **No traceback**, deliberately: there is nothing to debug, and the frame that
+            # raised has the address in scope. `AddressRejection` is a closed set of fixed
+            # words and `REJECTION_MESSAGES` is a fixed sentence per member -- not one of
+            # them interpolates anything -- so the reason is safe to record and to serve
+            # where the address is not. The count says how much of the chain was lost; which
+            # wallet is a question the owner answers from the registry, where the addresses
+            # already are.
+            _logger.warning(
+                "balance_sync_chain_address_rejected",
+                chain_key=chain_key,
+                reason=error.reason.value,
+                wallets=len(wallets),
+            )
+            return _ChainRead(
+                outcome=ChainOutcome(
+                    chain_key=chain_key,
+                    status=SyncRunStatus.FAILED,
+                    wallets_read=0,
+                    error_kind=SyncErrorKind.ADDRESS_REJECTED,
+                    detail=(
+                        f"{len(wallets)} wallet(s) on this chain were not read: an address "
+                        f"was refused before any request was made ({error.reason.value}). "
+                        f"{error.message}"
+                    ),
+                ),
+                readings=(),
+            )
         except ProviderError as error:
             kind = error_kind_of(error)
             _logger.warning(

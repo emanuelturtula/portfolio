@@ -95,7 +95,7 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "error_kind IS NULL OR "
             "error_kind IN ('unavailable', 'rate_limited', 'response', 'unknown_chain', "
-            "'internal')",
+            "'address_rejected', 'internal')",
             name=op.f("ck_sync_run_chains_error_kind"),
         ),
         sa.ForeignKeyConstraint(

@@ -253,6 +253,12 @@ export interface paths {
          * One wallet's balance history, oldest first
          * @description Return one wallet's readings, oldest first, for charting.
          *
+         *     **The latest window by default, a forward cursor from `since`.** Both come back
+         *     oldest-first, and the asymmetry is the kind a reader assumes is a bug, so it is stated
+         *     here as well as at the repository: a chart wants the recent end, and a client paging
+         *     through a year wants the rows after the last one it saw. Asking for the oldest `limit`
+         *     readings of a wallet watched since January is not a request anything makes.
+         *
          *     An archived wallet still answers: its history is the reason archiving is a timestamp
          *     rather than a delete. A wallet that is not the caller's is a `404`, the same answer a
          *     wallet that does not exist gets, because any other status would confirm the id.
@@ -455,18 +461,26 @@ export interface components {
          * SyncErrorKind
          * @description Whose fault a chain's failure was, as a value an operator can act on.
          *
-         *     The first four are `providers/errors.py`'s vocabulary carried through unchanged: the
-         *     vendor was unreachable, throttled us, answered with something unusable, or there is no
-         *     provider registered for that chain at all.
+         *     Six members and **three different parties are to blame**, which is the whole reason this
+         *     is an enumeration rather than a string.
          *
-         *     **`INTERNAL` is the one that is not about a vendor, and it is the reason this is an
-         *     enumeration rather than a string.** An exception from our own code recorded as
-         *     "unavailable" tells the owner their chain is down, on every sync, for as long as the
-         *     defect survives -- and nothing anywhere mentions the traceback. Keeping it separate is
-         *     what makes a parser bug look like a parser bug.
+         *     The first four are `providers/errors.py`'s vocabulary carried through unchanged and all
+         *     mean *the vendor*: unreachable, throttling us, answering with something unusable, or --
+         *     for `UNKNOWN_CHAIN` -- not being wired up at all.
+         *
+         *     `ADDRESS_REJECTED` means *the owner*. A provider validates an address before it builds a
+         *     URL, and registration does not check the network, so a mainnet address configured against
+         *     a testnet index is refused on every tick forever. Filing that under `INTERNAL` reported a
+         *     configuration mistake as a defect in this application, with a traceback each time; filing
+         *     it under a vendor kind would have told the owner their chain was down. It is neither.
+         *
+         *     `INTERNAL` means *us*. An exception from our own code recorded as "unavailable" tells the
+         *     owner their chain is down, on every sync, for as long as the defect survives -- and
+         *     nothing anywhere mentions the traceback. Keeping it separate is what makes a parser bug
+         *     look like a parser bug.
          * @enum {string}
          */
-        SyncErrorKind: "unavailable" | "rate_limited" | "response" | "unknown_chain" | "internal";
+        SyncErrorKind: "unavailable" | "rate_limited" | "response" | "unknown_chain" | "address_rejected" | "internal";
         /**
          * SyncRunListResponse
          * @description The run log, wrapped in an object rather than returned as a bare array.
@@ -1061,9 +1075,9 @@ export interface operations {
     readWalletBalanceHistory: {
         parameters: {
             query?: {
-                /** @description Only readings at or after this instant. Must carry a timezone offset; a naive timestamp is refused rather than assumed to be UTC. */
+                /** @description Only readings at or after this instant, and page forward from it. Omitted, the latest `limit` readings are returned instead. Must carry a timezone offset; a naive timestamp is refused rather than assumed to be UTC. */
                 since?: string | null;
-                /** @description How many readings to return, counting forward from `since`. */
+                /** @description How many readings to return: the latest that many, or that many counting forward from `since`. */
                 limit?: number;
             };
             header?: never;

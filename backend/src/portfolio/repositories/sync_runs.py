@@ -95,21 +95,30 @@ class SyncRunStatus(StrEnum):
 class SyncErrorKind(StrEnum):
     """Whose fault a chain's failure was, as a value an operator can act on.
 
-    The first four are `providers/errors.py`'s vocabulary carried through unchanged: the
-    vendor was unreachable, throttled us, answered with something unusable, or there is no
-    provider registered for that chain at all.
+    Six members and **three different parties are to blame**, which is the whole reason this
+    is an enumeration rather than a string.
 
-    **`INTERNAL` is the one that is not about a vendor, and it is the reason this is an
-    enumeration rather than a string.** An exception from our own code recorded as
-    "unavailable" tells the owner their chain is down, on every sync, for as long as the
-    defect survives -- and nothing anywhere mentions the traceback. Keeping it separate is
-    what makes a parser bug look like a parser bug.
+    The first four are `providers/errors.py`'s vocabulary carried through unchanged and all
+    mean *the vendor*: unreachable, throttling us, answering with something unusable, or --
+    for `UNKNOWN_CHAIN` -- not being wired up at all.
+
+    `ADDRESS_REJECTED` means *the owner*. A provider validates an address before it builds a
+    URL, and registration does not check the network, so a mainnet address configured against
+    a testnet index is refused on every tick forever. Filing that under `INTERNAL` reported a
+    configuration mistake as a defect in this application, with a traceback each time; filing
+    it under a vendor kind would have told the owner their chain was down. It is neither.
+
+    `INTERNAL` means *us*. An exception from our own code recorded as "unavailable" tells the
+    owner their chain is down, on every sync, for as long as the defect survives -- and
+    nothing anywhere mentions the traceback. Keeping it separate is what makes a parser bug
+    look like a parser bug.
     """
 
     UNAVAILABLE = "unavailable"
     RATE_LIMITED = "rate_limited"
     RESPONSE = "response"
     UNKNOWN_CHAIN = "unknown_chain"
+    ADDRESS_REJECTED = "address_rejected"
     INTERNAL = "internal"
 
 

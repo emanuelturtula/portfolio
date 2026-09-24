@@ -186,7 +186,7 @@ class SnapshotView:
 
 @dataclass(frozen=True, slots=True)
 class WalletHistory:
-    """One wallet's readings, oldest first.
+    """One wallet's readings, oldest first: the latest window, or a page from `since`.
 
     `decimals` is `None` for a wallet that has never been read, because the exponent is a
     property of the *readings* and there are none. It is deliberately not filled in from
@@ -279,8 +279,12 @@ class BalanceService:
         timestamp and not a delete, and refusing to show it would make retiring an address
         destroy the record of what it held.
 
-        `limit` takes the *first* rows at or after `since`, which makes the pair a forward
-        cursor: read a window, take the last `observed_at` you saw, ask again from there.
+        **Which `limit` readings you get depends on `since`, and the rows are oldest-first
+        either way.** Without one you get the *latest* window, because the only consumer is a
+        chart and the oldest five hundred readings of a year-old wallet are the wrong five
+        hundred. With one you get the *first* `limit` at or after it, because that is what
+        makes the pair a forward cursor: read a window, take the last `observed_at` you saw,
+        ask again from there. `BalanceRepository.history` carries the full argument.
 
         Raises:
             WalletNotFoundError: no wallet with that id belongs to the caller. Scoped by
