@@ -14,6 +14,7 @@ address that happens to sort first.
 from __future__ import annotations
 
 import json
+import sys
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
@@ -799,22 +800,103 @@ def test_a_json_integer_is_still_an_int_and_not_a_decimal() -> None:
     assert decoded["nothing"] is None
 
 
-def test_the_decoder_still_refuses_the_bodies_it_refused_before() -> None:
+#: The deepest nesting worth building before concluding that this interpreter has no limit
+#: to find. Reached by doubling, so the cost of a high ceiling is one more probe.
+DEEPEST_NESTING_PROBED: Final = 1 << 17
+
+
+def _longer_than_this_build_will_convert() -> str:
+    """A JSON integer with more digits than CPython will turn into an `int`.
+
+    The limit defaults to 4300, but `PYTHONINTMAXSTRDIGITS` and `-X int_max_str_digits` set
+    it per process, so it is read rather than written down -- the same reason as the
+    recursion limit below, arrived at by the same failure.
+    """
+    limit = sys.get_int_max_str_digits()
+    if limit == 0:
+        message = "This interpreter has no integer string conversion limit to exceed."
+        raise RuntimeError(message)
+    return "1" * (limit + 1)
+
+
+def _nested_past_what_this_build_will_follow() -> str:
+    """A JSON array nested deeper than this interpreter's scanner will follow.
+
+    The depth that stops `json` is a CPython *build* constant -- `Py_C_RECURSION_LIMIT`,
+    which `sys.setrecursionlimit` does not move -- and it is not the same everywhere.
+    Measured: this build gives up at 2998 and the `ubuntu-24.04` runner follows 5000 arrays
+    without complaint. A hard-coded 5000 is therefore deep enough on one machine and
+    shallow enough on another, which is precisely how it passed here and failed in CI.
+
+    Probed with a bare `json.loads`: `decode_json`'s hooks change how a number is built,
+    not which scanner runs, so the limit measured here is the one it will meet.
+
+    Raises rather than returning a body this interpreter parses. A fixture that quietly
+    stops provoking the failure it is named after is worse than a missing test, because
+    everything downstream still reports as covered.
+    """
+    depth = 1024
+    while depth <= DEEPEST_NESTING_PROBED:
+        body = "[" * depth + "]" * depth
+        try:
+            json.loads(body)
+        except RecursionError:
+            return body
+        depth *= 2
+    message = (
+        f"No array nested up to {DEEPEST_NESTING_PROBED} deep made this interpreter's JSON "
+        "scanner give up, so the RecursionError arm cannot be exercised on this build."
+    )
+    raise RuntimeError(message)
+
+
+#: The two bodies `json` refuses for reasons of its own rather than for their syntax. Both
+#: are measured rather than written down, because both limits belong to the interpreter and
+#: neither is the same on every machine that runs this suite.
+TOO_MANY_DIGITS: Final = _longer_than_this_build_will_convert()
+NESTED_TOO_DEEP: Final = _nested_past_what_this_build_will_follow()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("not json", id="not JSON at all: JSONDecodeError"),
+        pytest.param(b"\xff\xfe not utf-8", id="not UTF-8: UnicodeDecodeError"),
+        pytest.param(TOO_MANY_DIGITS, id="past the integer digit limit: ValueError"),
+        pytest.param(NESTED_TOO_DEEP, id="past the scanner's depth: RecursionError"),
+    ],
+)
+def test_the_decoder_still_refuses_the_bodies_it_refused_before(body: str | bytes) -> None:
     """The regression control on a shared decoder that two shipped providers go through.
 
     `parse_float=` changes how a number is built and must change nothing about which bodies
-    are rejected. All four arms in `decode_json`'s own table, in one place, because the
-    risk this change carries is not that it fails loudly -- it is that it quietly widens or
-    narrows the catch clause that #7's review put there.
+    are rejected. All four arms in `decode_json`'s own table, because the risk this change
+    carries is not that it fails loudly -- it is that it quietly widens or narrows the
+    catch clause that #7's review put there.
+
+    Parametrized rather than looped. As a loop this reported `DID NOT RAISE` against the
+    `with` line and nothing else: four bodies, one of them no longer refused, and no way to
+    tell which without reasoning about interpreter internals. A case that can fail should
+    say which case it was.
     """
-    for body in (
-        "not json",
-        b"\xff\xfe not utf-8",
-        "1" * 5000,  # over CPython's 4300-digit integer limit: a ValueError, not a JSON one
-        "[" * 5000 + "]" * 5000,  # RecursionError, which is not a ValueError at all
-    ):
-        with pytest.raises(ProviderResponseError):
-            decode_json(body)
+    with pytest.raises(ProviderResponseError):
+        decode_json(body)
+
+
+def test_the_deeply_nested_body_is_refused_for_the_reason_it_claims() -> None:
+    """The fourth arm above is the one that can pass without exercising what it names.
+
+    A body nested less deeply than the scanner will follow parses into a *list*, and every
+    shipped parser then refuses that list for being a list. So a provider-level test can
+    feed in nested arrays, assert the typed refusal, pass on every platform, and never once
+    reach `RecursionError` -- which is what the two chain suites have been doing on Linux
+    since #7, with `id="5000 nested arrays: RecursionError"` on the case.
+
+    The arm is only worth something if the body reaches the recursion limit, so that is
+    asserted here directly rather than inferred from a typed error further downstream.
+    """
+    with pytest.raises(RecursionError):
+        json.loads(NESTED_TOO_DEEP)
 
 
 def test_a_refusal_never_quotes_the_body_that_caused_it() -> None:

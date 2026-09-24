@@ -463,8 +463,8 @@ def decode_json(body: str | bytes) -> object:
     |---|---|
     | `not json` | `json.JSONDecodeError` |
     | bytes that are not UTF-8 | `UnicodeDecodeError` |
-    | an integer of 5000 digits | `ValueError: Exceeds the limit (4300 digits)` |
-    | 5000 nested arrays | `RecursionError` |
+    | an integer past the digit limit | `ValueError: Exceeds the limit (4300 digits)` |
+    | arrays nested past the scanner's depth | `RecursionError` |
 
     The first two are `ValueError` subclasses, so naming `ValueError` subsumes them and
     catches the integer-limit case that the narrower pair let escape untyped. The last one
@@ -474,9 +474,16 @@ def decode_json(body: str | bytes) -> object:
 
     `CPython` sets the digit limit and the recursion limit; neither is something this
     application configures, and both are the kind of boundary a vendor can cross by
-    accident. "A malformed body raises a typed schema error rather than propagating a parse
-    error" is a criterion on both providers, and "parse error" is exactly what these two
-    were.
+    accident. **Neither depth is a number to write down.** The digit limit is per process
+    (`PYTHONINTMAXSTRDIGITS`), and the nesting limit is `Py_C_RECURSION_LIMIT`, a build
+    constant `sys.setrecursionlimit` does not move: measured at 2998 arrays on a Windows
+    build and past 5000 on `ubuntu-24.04`, which is the platform this deploys to. So the
+    same body that trips this arm on a developer's machine parses cleanly on the Pi and is
+    refused one layer later for not being an object -- a difference invisible in a green
+    suite, and the reason the fixtures for this arm probe the interpreter instead.
+
+    "A malformed body raises a typed schema error rather than propagating a parse error" is
+    a criterion on both providers, and "parse error" is exactly what these two were.
 
     The message says the body did not parse and **never shows it**. A parser error that
     quotes the offending text is the disclosure every parser in this package is written to
