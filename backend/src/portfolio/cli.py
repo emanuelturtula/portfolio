@@ -244,11 +244,12 @@ async def run_price_refresh(settings: Settings) -> RefreshReport:
 def refresh_prices(args: argparse.Namespace) -> int:
     """`refresh-prices`: fetch every supported pair once, store it, and say what happened.
 
-    **This is still the only thing that fills the price cache.** It was written so the call
-    budget could be measured before anything automated it -- run it by hand, count the
-    `asset_prices` lines in the log, and the number in `docs/providers.md` stops being
-    arithmetic and becomes an observation. #10 scheduled balances and not prices, so until
-    that gap is closed this command is also how a deployment gets any prices at all.
+    **No longer the only thing that fills the price cache**, and it is still worth having.
+    It was written so the call budget could be measured before anything automated it -- run
+    it by hand, count the `asset_prices` lines in the log, and the number in
+    `docs/providers.md` stops being arithmetic and becomes an observation. #10 added the
+    scheduler; this stays as the way to force a refresh now rather than waiting out an hour,
+    and as the one that prints the prices instead of logging a count.
 
     **An incomplete refresh is exit code 1 and still prints everything it did.** A command
     that succeeded at three pairs out of four has not succeeded: a scheduler reading only
@@ -331,7 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     refresh = commands.add_parser(
         "refresh-prices",
-        help="fetch every supported pair once and store it (prices are still not scheduled)",
+        help="fetch every supported pair once and store it now, without waiting for the timer",
     )
     refresh.set_defaults(handler=refresh_prices)
 

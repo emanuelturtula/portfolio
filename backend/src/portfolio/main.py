@@ -32,11 +32,14 @@ from portfolio.logging import configure_logging
 # line that makes `get_chain_provider` able to answer for any chain at all.
 from portfolio.providers import chains as _registered_chain_providers  # noqa: F401
 from portfolio.providers.http import build_http_client
+from portfolio.providers.prices.registry import price_sources
 from portfolio.providers.registry import get_chain_provider
+from portfolio.repositories.prices import PriceRepository
 from portfolio.repositories.sync_runs import SyncRunRepository
 from portfolio.services.balance_sync import build_balance_sync_service
-from portfolio.services.scheduler import build_balance_scheduler
-from portfolio.services.sync_coordinator import SyncCoordinator
+from portfolio.services.price_refresh import build_price_refresh_service
+from portfolio.services.scheduler import IntervalScheduler
+from portfolio.services.sync_coordinator import SyncCoordinator, SyncTrigger
 from portfolio.web.spa import mount_spa
 
 if TYPE_CHECKING:
@@ -46,9 +49,9 @@ if TYPE_CHECKING:
     import httpx
 
     from portfolio.config import Settings
-    from portfolio.repositories.sync_runs import SyncRunSummary, SyncTrigger
+    from portfolio.repositories.sync_runs import SyncRunSummary
     from portfolio.services.password_hasher import PasswordHasher
-    from portfolio.services.scheduler import BalanceSyncScheduler
+    from portfolio.services.price_refresh import RefreshReport
     from portfolio.services.sync_coordinator import SyncRunner
 
 _logger = structlog.get_logger(__name__)
@@ -62,11 +65,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     `asyncio.run`, which raises `RuntimeError` when a loop is already running in the
     calling thread -- and by the time a lifespan runs, one always is.
 
-    Four things are owned here and all four are closed here: the engine, the shared
-    `httpx.AsyncClient`, the sync coordinator and the scheduler. The client is the wiring
-    #6 through #9 each deferred to this issue -- it is process-wide *by construction*,
-    because the per-host rate limiter's state lives on its transport, so a second one would
-    silently halve the interval it claims to enforce.
+    Five things are owned here and all five are shut down here: the engine, the shared
+    `httpx.AsyncClient`, the sync coordinator, and the two timers -- the balance sync and the
+    price refresh. The client is the wiring #6 through #9 each deferred to this issue; it is
+    process-wide *by construction*, because the per-host rate limiter's state lives on its
+    transport, so a second one would silently halve the interval it claims to enforce.
+
+    **The two timers are separate tasks on separate intervals with separate switches**, and
+    that separation is the isolation: neither can stop the other, because they share nothing
+    but a class. They answer to different vendors on different schedules -- chain indexes
+    that ban you for asking too often, against market-data APIs where one call covers every
+    configured pair -- and one switch for both would mean an operator waiting out a chain
+    outage also stopped valuing the balances they already had.
 
     Everything is published on `app.state` rather than held in a module global so that two
     applications in one process -- which is exactly what the test suite builds -- do not
@@ -88,24 +98,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     client = build_http_client()
     app.state.http_client = client
     coordinator: SyncCoordinator | None = None
-    scheduler: BalanceSyncScheduler | None = None
+    schedulers: list[IntervalScheduler] = []
     try:
         await bootstrap_owner(app, settings)
         await warm_password_hasher(app)
         await sweep_interrupted_runs(app)
         coordinator = SyncCoordinator(balance_sync_runner(app, client))
         app.state.sync_coordinator = coordinator
-        scheduler = start_balance_scheduler(app, settings, coordinator)
-        app.state.balance_scheduler = scheduler
-        if scheduler is not None:
+        app.state.balance_scheduler = balance_scheduler_for(app, settings, coordinator)
+        app.state.price_scheduler = price_scheduler_for(app, settings, client)
+        # Two timers, two tasks, sharing nothing but a class. That is what makes "a failed
+        # price refresh does not stop the balance sync" structural rather than a promise.
+        schedulers = [
+            timer
+            for timer in (app.state.balance_scheduler, app.state.price_scheduler)
+            if timer is not None
+        ]
+        for scheduler in schedulers:
             await scheduler.start()
         yield
     finally:
-        # Ordered, and the order is the content. The scheduler stops first so that no new
-        # tick can start; the run already in flight then gets its grace period; the sweep
-        # records whatever did not finish; and only then are the client and the engine taken
-        # away, because a sync still running would need both.
-        if scheduler is not None:
+        # Ordered, and the order is the content. Both timers stop first so that no new tick
+        # can start; the sync already in flight then gets its grace period; the sweep records
+        # whatever did not finish; and only then are the client and the engine taken away,
+        # because a sync still running would need both.
+        for scheduler in reversed(schedulers):
             await scheduler.stop()
         if coordinator is not None:
             await coordinator.drain(
@@ -142,29 +159,124 @@ def balance_sync_runner(app: FastAPI, client: httpx.AsyncClient) -> SyncRunner:
     return run
 
 
-def start_balance_scheduler(
+def balance_scheduler_for(
     app: FastAPI,
     settings: Settings,
     coordinator: SyncCoordinator,
-) -> BalanceSyncScheduler | None:
-    """Build the scheduler, or `None` when the operator has switched it off.
+) -> IntervalScheduler | None:
+    """Build the balance timer, or `None` when the operator has switched it off.
 
     `PORTFOLIO_BALANCE_SYNC_ENABLED=false` disables **the loop and nothing else**:
     `POST /api/balances/sync` still works, because the manual trigger is the tool an operator
     debugging a vendor is reaching for, and taking it away with the same switch would be the
     opposite of what the switch is for.
 
+    The tick goes through the coordinator rather than straight to the sync, which is what
+    makes criterion 6 hold from both directions: a tick arriving while a manual refresh is
+    still in flight joins it instead of piling a second run on a public index.
+
+    `at_startup` becomes the run's recorded `trigger`. That distinction is the whole reason
+    `ScheduledRun` carries the flag -- `startup` is the run an operator is looking at when
+    they ask whether the deploy worked.
+
     Returned rather than started, so that the caller's `finally` can be written against the
-    same variable it will have to stop.
+    same list it will have to stop.
     """
     if not settings.balance_sync_enabled:
-        _logger.info("balance_sync_scheduler_disabled")
+        _logger.info("scheduler_disabled", scheduler="balance-sync")
         return None
-    return build_balance_scheduler(
-        settings,
-        coordinator=coordinator,
-        latest_finished_at=lambda: latest_finished_run(app),
+
+    async def run(at_startup: bool) -> None:
+        await coordinator.sync(SyncTrigger.STARTUP if at_startup else SyncTrigger.SCHEDULED)
+
+    return IntervalScheduler(
+        name="balance-sync",
+        interval_minutes=settings.balance_sync_interval_minutes,
+        last_run_at=lambda: latest_finished_run(app),
+        run=run,
     )
+
+
+def price_scheduler_for(
+    app: FastAPI,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> IntervalScheduler | None:
+    """Build the price timer, or `None` when the operator has switched it off.
+
+    **This is the caller `services/price_refresh.py` was written without.** #9 shipped
+    `refresh_prices()` with no caller in the running application so the call budget could be
+    measured by hand first, and `docs/providers.md` recorded the scheduling as #10's. Without
+    it a deployed instance reads balances every fifteen minutes and reports every one of them
+    `unpriced / never_fetched` forever, which is the flagship endpoint of the dashboard
+    returning a zero total on a working install.
+
+    `price_sources` is called **here, in the composition root**, and the built sources are
+    handed to the service -- the same shape `cli.run_price_refresh` uses, and what keeps
+    `services/price_refresh.py` dependent on the `PriceSource` protocol rather than on which
+    vendors exist. Built once rather than per tick, because which vendors exist is a
+    process-wide decision like the client itself.
+
+    Its own switch and its own interval rather than sharing the balance pair: the two answer
+    to different vendors, and an operator waiting out a chain outage should not also stop
+    valuing the balances they already have.
+    """
+    if not settings.price_refresh_enabled:
+        _logger.info("scheduler_disabled", scheduler="price-refresh")
+        return None
+    sources = price_sources(client, settings=settings)
+
+    async def run(at_startup: bool) -> None:
+        del at_startup  # A refresh is the same work whenever it happens; nothing records it.
+        sessionmaker = app.state.db_sessionmaker
+        async with sessionmaker() as session:
+            service = build_price_refresh_service(session, sources=sources)
+            report = await service.refresh_prices()
+        _report_price_refresh(report)
+
+    return IntervalScheduler(
+        name="price-refresh",
+        interval_minutes=settings.price_refresh_interval_minutes,
+        last_run_at=lambda: latest_price_refresh(app),
+        run=run,
+    )
+
+
+def _report_price_refresh(report: RefreshReport) -> None:
+    """Log what one refresh did. **Counts and pairs, never an amount.**
+
+    A price is public market data and `cli.refresh-prices` prints it, because printing it is
+    the point of running that command by hand. A scheduled refresh is different: nobody is
+    reading its output, it happens every hour forever, and a log line carrying a number
+    invites the habit of putting values in logs -- which is one careless edit away from a log
+    line carrying a *quantity*, and a quantity is the owner's holdings.
+
+    Warning when anything went unpriced, because that is the line an operator should see;
+    `every_source_failed` is the one of the four reasons that means "go and look at a vendor".
+    """
+    unavailable = tuple(
+        f"{entry.asset_symbol}/{entry.quote_currency}" for entry in report.unavailable
+    )
+    if unavailable:
+        _logger.warning(
+            "price_refresh_incomplete",
+            refreshed=len(report.refreshed),
+            unavailable=unavailable,
+        )
+        return
+    _logger.info("price_refresh_finished", refreshed=len(report.refreshed))
+
+
+async def latest_price_refresh(app: FastAPI) -> datetime | None:
+    """When the newest price row was written, over a session of its own.
+
+    The price timer's startup condition, and the counterpart of `latest_finished_run`. A
+    fresh deployment prices its holdings immediately rather than showing `never_fetched` for
+    an hour; a crash-looping container does not call four market-data APIs on every restart.
+    """
+    sessionmaker = app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        return await PriceRepository(session).latest_fetched_at()
 
 
 async def latest_finished_run(app: FastAPI) -> datetime | None:

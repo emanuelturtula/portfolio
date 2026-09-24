@@ -15,19 +15,27 @@ stale" inside `value_portfolio` -- is precisely the one that turns every dashboa
 into four vendor calls. It would also turn the contract red, which is the point of writing
 it without `allow_indirect_imports`.
 
-## Still no scheduler, and that is now a gap rather than a deferral
+## Two callers, and neither of them is in a request path
 
-#9 delivered `refresh_prices()` as a service with **no caller in the running application**
-and a CLI entry point beside it, so the call budget could be measured by hand before
-anything automated it. #10 was to own the scheduling; what #10 actually scheduled was
-**balances**, because that is the scope its issue set.
+#9 delivered `refresh_prices()` with **no caller in the running application** and a CLI
+entry point beside it, so the call budget could be measured by hand before anything
+automated it. That measurement has been made, and #10 added the second caller:
 
-So this is still called only by `portfolio refresh-prices`, and the consequence is visible
-to a user rather than only to a maintainer: on a fresh deployment `GET /api/balances/current`
-reports every holding under `unpriced` with `reason: never_fetched` until an operator runs
-the command. `services/scheduler.py` is generic over what it ticks and the shared HTTP client
-is now open for the life of the process, so the missing piece is a caller rather than a
-design. `docs/providers.md` records it as outstanding with no owner yet.
+* `portfolio refresh-prices`, still, for an operator who wants one now;
+* `main.price_scheduler_for`, an `IntervalScheduler` on
+  `PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES` -- sixty by default, which is what
+  `services.prices.STALE_AFTER` is written against.
+
+**Neither is a request.** `backend/.importlinter`'s `prices-are-never-fetched-in-a-request`
+contract forbids any chain from `portfolio.api.routers` to `portfolio.providers.prices` with
+no `allow_indirect_imports`, and a scheduler task is not a router: `main.py` is the
+composition root and nothing under `api/routers` imports it. So this module remains the
+single place a reviewer has to look to answer "can a request reach a price vendor", and the
+answer is still no, mechanically.
+
+The scheduler was the missing piece rather than a missing design. Without it a deployment
+read balances every fifteen minutes and reported every one of them `unpriced` with
+`reason: never_fetched` forever -- a zero total on the dashboard of a working install.
 
 ## The sources are handed in, never imported by the caller's caller
 

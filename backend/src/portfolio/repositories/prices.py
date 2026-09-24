@@ -87,6 +87,27 @@ class PriceRepository:
         )
         return list(result)
 
+    async def latest_fetched_at(self) -> datetime | None:
+        """When the most recent refresh wrote a row, or `None` if none ever has.
+
+        What the price scheduler's startup condition reads: a fresh deployment prices its
+        holdings immediately rather than showing every one of them `never_fetched` for an
+        hour, and a crash-looping container does not call four market-data APIs on every
+        restart.
+
+        **Maxed in Python, and there is no `MAX()` in this module at all.** `fetched_at` is a
+        `UtcDateTime` rather than money, so an aggregate over it would not be the corruption
+        the rule is about -- but the table has four rows, and "no method here aggregates,
+        orders or compares money" is a property a reader checks by looking for aggregates and
+        finding none. One exception for a safe column is how the next one gets added for an
+        unsafe one.
+
+        `list_all` orders by `asset_id`, an `INTEGER`, so nothing about this read touches
+        `amount`.
+        """
+        rows = await self.list_all()
+        return max((row.fetched_at for row in rows), default=None)
+
     async def upsert(
         self,
         *,

@@ -75,11 +75,14 @@ __all__ = [
 STALE_AFTER: Final = timedelta(hours=1)
 """How old an observation may be before a price is flagged stale.
 
-One hour, chosen to match a price refresh interval that **still does not exist**: #10
-scheduled balances and not prices, so today this is a threshold against a refresh somebody
-runs by hand. The reasoning stands for the day one is scheduled -- a price that has missed
-exactly one refresh is the first worth flagging, and anything shorter would mark every price
-stale in the minutes before the next run.
+One hour, matching `PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES`, whose default is sixty: a
+price that has missed exactly one refresh is the first one worth flagging, and anything
+shorter would mark every price stale in the minutes before the next run.
+
+**The two numbers are a pair**, and `config.py` says so beside the setting. Lengthening the
+interval without lengthening this marks every price stale most of the time; shortening this
+without shortening the interval does the same. Neither is wrong on its own, which is exactly
+why the relationship is written down in both places.
 
 **The threshold is not an expiry.** A stale price is still returned, with its age visible,
 because the last known price is better information than no price at all -- the same argument

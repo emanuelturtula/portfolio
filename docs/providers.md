@@ -847,9 +847,9 @@ to every row at once. `repositories/prices.py` has no method that totals, sorts 
 compares one; the valuation service loads the rows and sums them in Python.
 
 **Staleness is computed at read time from an injected clock and is never stored.**
-`STALE_AFTER` is one hour. That was chosen to match a price refresh interval that **has still
-not been scheduled** -- #10 scheduled balances, not prices -- so today it is a threshold
-against a refresh somebody runs by hand. A stored
+`STALE_AFTER` is one hour, matching `PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES`, whose default
+is sixty. The two are a pair: lengthening one without the other marks every price stale most
+of the time. A stored
 `is_stale` boolean would be wrong one second after it was written and would need a background
 job whose only purpose was to keep a derived field true. A stale price is still returned, with
 its age visible: the last known price is better information than none, which is the same
@@ -901,10 +901,10 @@ lifespan passes `lambda key: get_chain_provider(key, client)`. `main.py` imports
 `portfolio.providers.chains` for its registration side effect, which is the one line that
 makes the registry able to answer at all.
 
-Two things reach a provider, and both go through `SyncCoordinator`:
+Two things reach a **chain** provider, and both go through `SyncCoordinator`:
 
-- **the scheduler**, every `PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES` minutes, plus once at
-  startup when the newest finished run is older than one interval;
+- **the balance timer**, every `PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES` minutes, plus once
+  at startup when the newest finished run is older than one interval;
 - **`POST /api/balances/sync`**, which is a request path calling a vendor *on purpose* --
   the owner asked for the read and is waiting for it. That is the deliberate asymmetry with
   prices, where `prices-are-never-fetched-in-a-request` forbids the same thing.
@@ -912,6 +912,19 @@ Two things reach a provider, and both go through `SyncCoordinator`:
 A second caller does not start a second run. It attaches to the one in flight and gets that
 run's summary with `joined: true`, so a double-clicked refresh button costs no extra requests
 at a public index.
+
+One thing reaches a **price** source: the price timer, every
+`PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES` minutes -- sixty by default, matching
+`STALE_AFTER` -- plus once at startup when the newest `prices.fetched_at` is older than one
+interval. `portfolio refresh-prices` is the same work on demand. There is no coordinator and
+no join, because there is no endpoint that can ask for one: nothing in a request path may
+reach a price vendor, which is the contract.
+
+**Two timers, two tasks, two switches, and no shared state.** `services/scheduler.py` is
+generic over what it ticks -- it takes "when did this last happen" and "do it" -- so the two
+are instances rather than loops, and neither can stop the other. They are separate because
+they answer to different vendors: chain indexes that ban you for asking too often, against
+market-data APIs where the primary answers every configured pair in one call.
 
 ### The per-address cache is the snapshot table
 
@@ -928,15 +941,6 @@ it by returning a stale number that looks exactly like a fresh one, which is the
 
 ## Not done yet, and who owns it
 
-- **Nothing schedules a price refresh.** #9 shipped `refresh_prices()` with no caller in the
-  running application and a `portfolio refresh-prices` command beside it; #10 scheduled
-  **balances** and not prices, because that is what the issue and its spec asked for. The
-  consequence is real and is worth stating rather than discovering: on a fresh deployment
-  `GET /api/balances/current` returns every holding under `unpriced` with
-  `reason: never_fetched` until somebody runs the command by hand. The pieces are all in
-  place -- the scheduler takes a coordinator and an interval, and the client it would need is
-  now open for the life of the process -- so this is a small change with an owner to be
-  assigned, not a design question.
 - **Tuning settings.** Every number in the first table above is still a module constant.
   Promoting one to a `PORTFOLIO_PROVIDER_*` setting is a change an operator's measurement
   should drive, not a guess made before anything has ever made a request.
