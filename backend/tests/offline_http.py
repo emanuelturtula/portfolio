@@ -30,6 +30,20 @@ The message names the host and nothing else. A chain provider puts the address i
 path -- Esplora's is `/address/{address}` -- and an assertion message is a string that ends up
 in CI output, so the rule every other message in this application follows applies here too.
 
+## Why it records as well as raises
+
+Raising is not enough on its own, and the review that found this measured it. The
+exception is an `AssertionError`, which is an `Exception`, and two places in the application
+catch `Exception` on purpose: `IntervalScheduler._tick`, so a failed tick does not kill the
+schedule, and the sync's internal clause, so a bug in one chain does not cost another its
+data. A vendor call made from either is refused, the refusal is caught and logged, and the
+test that caused it passes.
+
+So every refusal is also **recorded** -- the host, never the path -- and an autouse fixture in
+`tests/conftest.py` fails any test that leaves a record behind. The raise is what stops the
+request; the record is what makes it impossible to swallow. A test that makes a request on
+purpose takes the record with `take_offline_attempts()` and asserts on it.
+
 ## What it is not
 
 The builder is still `build_http_client`, with the retrying transport, the rate limiter
@@ -68,8 +82,25 @@ class ReachedAVendorError(AssertionError):
     """A request left the application in a suite that promised it never would."""
 
 
+OFFLINE_ATTEMPTS: Final[list[str]] = []
+"""The host of every request the offline client refused since the last check.
+
+Module-level because the client is built by the application, deep inside a lifespan, where
+no fixture can hand it an object. The autouse fixture in `tests/conftest.py` empties it
+before each test and fails the test if anything is left in it afterwards.
+"""
+
+
+def take_offline_attempts() -> list[str]:
+    """Return the hosts recorded so far and forget them, for a test that expected them."""
+    taken = list(OFFLINE_ATTEMPTS)
+    OFFLINE_ATTEMPTS.clear()
+    return taken
+
+
 def refuse_every_request(request: httpx.Request) -> httpx.Response:
-    """The transport's handler: every request is a failed test, naming only the host."""
+    """The transport's handler: record the host, then refuse. Never the path."""
+    OFFLINE_ATTEMPTS.append(request.url.host)
     message = (
         f"a request to {request.url.host!r} reached the offline HTTP client. Nothing in this "
         "suite may talk to a vendor; stub the provider or the price source above the client."

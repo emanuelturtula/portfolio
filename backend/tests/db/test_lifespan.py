@@ -41,6 +41,7 @@ from tests.balance_harness import (
 )
 from tests.offline_http import (
     ReachedAVendorError,
+    take_offline_attempts,
     the_real_http_client,
     use_an_offline_http_client,
 )
@@ -304,6 +305,7 @@ async def test_the_suite_runs_the_lifespan_on_a_client_that_refuses_every_reques
 
     assert "an-index.invalid" in str(caught.value)
     assert DEFAULT_BITCOIN_ADDRESS not in str(caught.value)
+    assert take_offline_attempts() == ["an-index.invalid"], "recorded once, host only"
 
 
 async def test_the_sync_coordinator_is_published_for_the_router(

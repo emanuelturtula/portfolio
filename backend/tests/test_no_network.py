@@ -32,18 +32,25 @@ and it says much less about why, which is why both are here.
 
 from __future__ import annotations
 
+import asyncio
 import socket
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
+from structlog.testing import capture_logs
 
 from portfolio.config import Settings, get_settings
 from portfolio.main import create_app
 from tests.address_vectors import BIP173_TESTNET_P2WPKH
 from tests.auth.conftest import apply_auth_environment
-from tests.offline_http import ReachedAVendorError, the_real_http_client
+from tests.offline_http import (
+    ReachedAVendorError,
+    take_offline_attempts,
+    the_real_http_client,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     from fastapi import FastAPI
@@ -65,14 +72,41 @@ LOOPBACK: Final = frozenset({"127.0.0.1", "::1", "localhost", "", None})
 
 
 def _host_of(address: object) -> object:
-    """The host out of whatever shape a socket call was handed it in."""
-    if isinstance(address, tuple) and address:
-        return address[0]
-    return address
+    """The host out of whatever shape a socket call was handed it in.
+
+    `asyncio` hands `getaddrinfo` the host as IDNA-encoded **bytes**, so a real vendor call
+    arrives as `b'...'`; decoded here so the record reads as a hostname rather than as the
+    repr of one.
+    """
+    host = address[0] if isinstance(address, tuple) and address else address
+    if isinstance(host, bytes):
+        return host.decode("ascii", errors="replace")
+    return host
+
+
+class SocketAttempts:
+    """Every host the guard refused during one test, recorded as well as raised.
+
+    Raising alone was measured not to be enough: `ReachedTheNetworkError` is an
+    `AssertionError`, which is an `Exception`, and `IntervalScheduler._tick` catches
+    `Exception` on purpose. With a timer switched on and the real client, the guard fired,
+    `scheduler_tick_failed` was logged, and the test passed. The record is what the fixture's
+    teardown checks, so a refusal something swallowed still fails the test that caused it.
+    Hosts only: a path is where a chain provider puts an address.
+    """
+
+    def __init__(self) -> None:
+        self.hosts: list[str] = []
+
+    def take(self) -> list[str]:
+        """The hosts recorded so far, forgotten, for a test that expected them."""
+        taken = list(self.hosts)
+        self.hosts.clear()
+        return taken
 
 
 @pytest.fixture
-def no_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
+def no_sockets(monkeypatch: pytest.MonkeyPatch) -> Iterator[SocketAttempts]:
     """Make any connection to anything but the loopback an immediate, readable failure.
 
     `getaddrinfo` and `connect` are the two chokepoints: every client in this process --
@@ -85,7 +119,10 @@ def no_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
     is by definition not the loopback, so the resolver check is the one doing the work.
     """
 
+    attempts = SocketAttempts()
+
     def refuse(what: str, target: object) -> None:
+        attempts.hosts.append(str(_host_of(target)))
         message = (
             f"the test suite tried to {what} {target!r}. Nothing here may talk to a vendor: "
             "see this module's docstring"
@@ -96,7 +133,7 @@ def no_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
     real_connect = socket.socket.connect
 
     def guarded_getaddrinfo(host: Any, *arguments: Any, **keywords: Any) -> Any:
-        if host not in LOOPBACK:
+        if _host_of(host) not in LOOPBACK:
             refuse("resolve", host)
         return real_getaddrinfo(host, *arguments, **keywords)
 
@@ -107,6 +144,11 @@ def no_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
     monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    yield attempts
+    leftover = attempts.take()
+    assert leftover == [], (
+        f"the socket guard refused {leftover!r} during this test and something caught it"
+    )
 
 
 def test_the_shared_environment_leaves_no_schedule_running(
@@ -150,7 +192,7 @@ def test_the_production_default_is_the_opposite_and_that_is_why_this_exists(
 async def test_entering_the_lifespan_opens_no_socket(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    no_sockets: None,
+    no_sockets: SocketAttempts,
 ) -> None:
     """A real startup and shutdown, with every outbound connection blocked.
 
@@ -163,8 +205,15 @@ async def test_entering_the_lifespan_opens_no_socket(
     ask about and would pass this even with the schedule on. The stronger claim is the one
     in `tests/db/test_lifespan.py`, which registers a wallet and stubs the registry; this is
     the floor under every other suite rather than a test of the sync.
+
+    **What makes it able to fail.** Both timers are off in this environment, so on its own
+    this could only ever pass; two things change that. The guard's teardown fails the test
+    if any connection was refused, even one something caught -- which
+    `test_a_vendor_call_a_timer_swallows_still_fails_the_test` proves is real. And the two
+    timers are asserted to be absent rather than merely idle, which is what fails if either
+    one starts ignoring its switch: a timer that exists but has not ticked yet would
+    otherwise leave nothing for the guard to see before the lifespan exits.
     """
-    del no_sockets  # Ordering only: the fixture is the whole point of the test.
     apply_auth_environment(monkeypatch, tmp_path)
     # The shared environment installs an offline client that could never open a socket,
     # which would make this test pass by construction. The real builder is put back, and
@@ -175,8 +224,63 @@ async def test_entering_the_lifespan_opens_no_socket(
         async with app.router.lifespan_context(app):
             assert built == [app.state.http_client], "the real client, built once"
             assert app.state.http_client.is_closed is False
+            assert app.state.balance_scheduler is None, "the balance timer ignored its switch"
+            assert app.state.price_scheduler is None, "the price timer ignored its switch"
     finally:
         get_settings.cache_clear()
+
+    assert no_sockets.hosts == [], "no connection was attempted, caught or not"
+
+
+async def until(condition: Callable[[], bool]) -> None:
+    """Yield to the loop until `condition` holds. Bounded by the caller's `wait_for`.
+
+    A real sleep rather than a bare checkpoint, unlike its namesake in `test_lifespan.py`:
+    what is being waited for here happens in the resolver's worker thread, and a loop that
+    only ever checkpoints would spin without giving that thread's result a chance to land.
+    """
+    while not condition():  # noqa: ASYNC110
+        await asyncio.sleep(0.01)
+
+
+async def test_a_vendor_call_a_timer_swallows_still_fails_the_test(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_sockets: SocketAttempts,
+) -> None:
+    """The control the test above depends on: a swallowed vendor call is still seen.
+
+    The price timer is switched on and the real client is used, so the startup refresh
+    really does try to resolve a vendor. The guard refuses it, the refusal propagates up to
+    `IntervalScheduler._tick`, and `_tick` catches it and logs `scheduler_tick_failed` --
+    correctly: a failed tick must not end the schedule. The lifespan then exits cleanly.
+
+    That is exactly the sequence that let the old version of the guard pass while a vendor
+    was being called. What this asserts is that the record saw it anyway, so the teardown
+    would have failed the test. The record is taken here, because in this test it is
+    expected; the hosts are deliberately not asserted by name, so that no vendor hostname has
+    to be written into the repository to prove the point.
+    """
+    apply_auth_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "true")
+    get_settings.cache_clear()
+    the_real_http_client(monkeypatch)
+    try:
+        app = create_app()
+        with capture_logs() as captured:
+            async with app.router.lifespan_context(app):
+                await asyncio.wait_for(
+                    until(
+                        lambda: any(entry["event"] == "scheduler_tick_failed" for entry in captured)
+                    ),
+                    timeout=10,
+                )
+    finally:
+        get_settings.cache_clear()
+
+    assert no_sockets.take() != [], "the guard saw the vendor call the timer swallowed"
+    failed_ticks = [entry for entry in captured if entry["event"] == "scheduler_tick_failed"]
+    assert failed_ticks[0]["scheduler"] == "price-refresh", "and it was the tick that hid it"
 
 
 async def test_the_shared_fixtures_give_the_application_a_client_that_refuses(
@@ -195,9 +299,10 @@ async def test_the_shared_fixtures_give_the_application_a_client_that_refuses(
 
     assert "an-index.invalid" in str(caught.value)
     assert BIP173_TESTNET_P2WPKH not in str(caught.value)
+    assert take_offline_attempts() == ["an-index.invalid"], "recorded once, host only"
 
 
-async def test_the_socket_guard_can_actually_fail(no_sockets: None) -> None:
+async def test_the_socket_guard_can_actually_fail(no_sockets: SocketAttempts) -> None:
     """The falsification control: a guard that blocked nothing would pass the test above.
 
     Driven against the resolver and against a connection to a documentation address, so both
@@ -205,9 +310,9 @@ async def test_the_socket_guard_can_actually_fail(no_sockets: None) -> None:
     so neither is a real host and rule 3 is untouched -- and the loopback is checked to still
     work, because a guard that refused everything would break the event loop rather than the
     thing it is aimed at.
-    """
-    del no_sockets
 
+    Both refusals are recorded, by host and nothing else, and the loopback lookup is not.
+    """
     with pytest.raises(ReachedTheNetworkError):
         socket.getaddrinfo("a-host-that-is-never-resolved.invalid", 443)
 
@@ -217,3 +322,4 @@ async def test_the_socket_guard_can_actually_fail(no_sockets: None) -> None:
     # The loopback is deliberately still reachable, and it has to be: this test runs inside
     # an event loop that built itself a socket pair over it.
     assert socket.getaddrinfo("127.0.0.1", 0)
+    assert no_sockets.take() == ["a-host-that-is-never-resolved.invalid", "192.0.2.1"]
