@@ -35,7 +35,8 @@ at a public index -- is the one this class exists to prevent.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -82,6 +83,25 @@ class SyncOutcome:
     joined: bool
 
 
+@dataclass(slots=True)
+class _RunInFlight:
+    """One run's task and how many callers are still waiting to be handed its outcome.
+
+    **Per run, not per coordinator**, and that is the point of the class. A task is `done()`
+    the moment it finishes, before its done-callbacks run, so a new `sync()` can start the
+    next run in the gap between the two. A single counter on the coordinator would then be
+    read by the *old* run's callback after the *new* run had incremented it, and a failure
+    nobody was waiting for would go unlogged because somebody was waiting for something
+    else.
+
+    Mutable, deliberately: `waiting` is the one thing here that changes, and it changes only
+    on the event loop's thread.
+    """
+
+    task: asyncio.Task[SyncRunSummary]
+    waiting: int = field(default=0)
+
+
 class SyncCoordinator:
     """Holds the run in flight, if there is one, and hands it to whoever asks next.
 
@@ -94,12 +114,12 @@ class SyncCoordinator:
     def __init__(self, runner: SyncRunner) -> None:
         self._runner = runner
         self._lock = asyncio.Lock()
-        self._task: asyncio.Task[SyncRunSummary] | None = None
+        self._current: _RunInFlight | None = None
 
     @property
     def in_flight(self) -> bool:
         """Whether a run is happening right now. For the lifespan's shutdown, and for a test."""
-        return self._task is not None and not self._task.done()
+        return self._current is not None and not self._current.task.done()
 
     async def sync(self, trigger: SyncTrigger) -> SyncOutcome:
         """Start a run, or attach to the one already going, and return its summary.
@@ -109,25 +129,35 @@ class SyncCoordinator:
         scheduled run that a manual click attached to is still a scheduled run, and
         relabelling it would make the run log say something that did not happen.
 
+        **This method logs nothing about a failure**, and that is the division of labour
+        rather than an omission: a caller that receives the exception reports it -- the
+        scheduler's `_tick`, or the application's unhandled-exception handler for a request.
+        The coordinator reports only a failure that no caller is left to receive; see
+        `_report_unobserved_failure`.
+
         Raises:
             Whatever the runner raises. Both the starter and every joiner see it, which is
             correct: they were all waiting on the same piece of work.
         """
         async with self._lock:
-            existing = self._task
-            if existing is not None and not existing.done():
-                task, joined = existing, True
+            current = self._current
+            if current is not None and not current.task.done():
+                joined = True
             else:
                 task = asyncio.create_task(self._runner(trigger), name="balance-sync")
-                # Retrieving the result is normally the awaiting caller's job. This is for
-                # the case where there is no such caller any more: a browser that
-                # disconnected leaves the shield intact and the task unobserved, and an
-                # unobserved failure would otherwise surface as asyncio's own "exception was
-                # never retrieved" warning at garbage-collection time, detached from the run.
-                task.add_done_callback(_report_unobserved_failure)
-                self._task = task
+                current = _RunInFlight(task=task)
+                task.add_done_callback(partial(_report_unobserved_failure, current))
+                self._current = current
                 joined = False
-        summary = await asyncio.shield(task)
+            current.waiting += 1
+        try:
+            summary = await asyncio.shield(current.task)
+        except asyncio.CancelledError:
+            # This caller stopped waiting -- a browser disconnected, the scheduler was
+            # stopped -- and the shield left the run going. It will not receive the outcome,
+            # so it no longer counts towards the callers that will report a failure.
+            current.waiting -= 1
+            raise
         return SyncOutcome(summary=summary, joined=joined)
 
     async def drain(self, *, grace_seconds: int) -> bool:
@@ -145,9 +175,9 @@ class SyncCoordinator:
             it finished, a failed run included. `False` if the grace period expired and the
             run was cancelled, which is what leaves a row for the sweep.
         """
-        task = self._task
-        if task is None or task.done():
+        if self._current is None or self._current.task.done():
             return True
+        task = self._current.task
         try:
             # Shielded again: `wait_for` cancels what it is waiting on when it times out,
             # and what it must cancel is this wait, not the run -- the run is cancelled
@@ -162,22 +192,45 @@ class SyncCoordinator:
             await asyncio.wait({task})
             return False
         except Exception:
-            # The run ended by failing, which is still "not in flight any more". The runner's
-            # own caller logged it; there is nothing for shutdown to add and nothing to
-            # sweep, because the run recorded its own outcome.
+            # The run ended by failing, which is still "not in flight any more". This wait
+            # is not one of the callers that reports a failure -- by the time shutdown
+            # drains, the scheduler has been stopped and its wait cancelled -- so if nobody
+            # else was waiting, `_report_unobserved_failure` has logged it with the
+            # traceback. Nothing to add here and nothing to sweep: the run's own row was
+            # either closed out by the run or will be swept by the lifespan.
             _logger.debug("balance_sync_failed_before_shutdown")
             return True
         return True
 
 
-def _report_unobserved_failure(task: asyncio.Task[SyncRunSummary]) -> None:
-    """Retrieve a failed run's exception so that it is logged here rather than by asyncio.
+def _report_unobserved_failure(
+    run: _RunInFlight,
+    task: asyncio.Task[SyncRunSummary],
+) -> None:
+    """Log a failed run **only if no caller is still waiting to receive the failure**.
 
-    Only reached when nothing awaited the task -- a disconnected browser, in practice. A
-    cancelled task has no exception to retrieve and is not a failure worth a line: it is the
-    shutdown path doing exactly what it says it does.
+    A done-callback runs on *every* completion, not only on an unobserved one, and the first
+    version of this function logged unconditionally while its docstring claimed otherwise --
+    so a failed scheduled run produced two tracebacks, one from here and one from the
+    scheduler's `_tick`, which received the same exception a moment later. Now the callback
+    reads the run's waiter count and stays silent when somebody is there to report it.
+
+    What "nobody is waiting" covers, in practice: a manual sync whose browser disconnected,
+    and a run that fails while shutdown drains it, after the scheduler's wait was cancelled.
+    Either way the failure would otherwise reach no log at all -- `asyncio.shield` retrieves
+    the task's exception when it resolves the outer future, so asyncio's own "exception was
+    never retrieved" warning does not fire either.
+
+    **One residual, stated rather than hidden.** If the last waiter is cancelled in the same
+    event-loop iteration in which the run fails, this callback can see it still counted,
+    stay silent, and the cancelled caller never receives the exception. Closing that would
+    need the callback to defer its decision past the waiter's wake-up, which is ordering the
+    event loop does not promise, and the window it would close is a single iteration.
+
+    A cancelled task has no exception to retrieve and is not a failure worth a line: it is
+    the shutdown path doing exactly what it says it does.
     """
-    if task.cancelled():
+    if task.cancelled() or run.waiting > 0:
         return
     error = task.exception()
     if error is not None:
