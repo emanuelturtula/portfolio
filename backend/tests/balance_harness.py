@@ -41,7 +41,7 @@ the schema.
 
 from __future__ import annotations
 
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 
 from sqlalchemy import text
@@ -56,10 +56,10 @@ from portfolio.providers.base import (
 )
 from portfolio.providers.errors import UnknownChainError
 from portfolio.providers.registry import CHAIN_PROVIDERS
+from tests.address_vectors import BIP173_TESTNET_P2WPKH, KASPA_TESTNET_V0
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
-    from datetime import datetime
 
     import httpx
     import pytest
@@ -80,6 +80,13 @@ MAX_SAFE_INTEGER: Final = 9007199254740991
 #: Three hundred times `MAX_SAFE_INTEGER`, so a value that went through a double comes back
 #: with different digits rather than merely a different type.
 KASPA_SUPPLY_SOMPI: Final = 2_870_000_000_000_000_000
+
+#: The one address per chain a test uses when it does not care which. Aliased rather than
+#: used directly so that a suite reading `plant_wallets()` with no arguments can see what it
+#: got without going to `tests/address_vectors.py` -- and so that the default is one
+#: decision rather than one per call site.
+DEFAULT_BITCOIN_ADDRESS: Final = BIP173_TESTNET_P2WPKH
+DEFAULT_KASPA_ADDRESS: Final = KASPA_TESTNET_V0
 
 
 class StubChainProvider:
@@ -236,6 +243,112 @@ SNAPSHOTS_SQL: Final = (
     "SELECT id, wallet_id, sync_run_id, confirmed, pending, decimals, observed_at "
     "FROM balance_snapshots ORDER BY id"
 )
+
+
+#: The instant every hand-written `users` and `wallets` row is stamped with. Fixed, because
+#: nothing in these suites compares a wallet's age to anything.
+FIXTURE_CREATED_AT: Final = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+async def insert_user(session: AsyncSession, username: str = "owner") -> int:
+    """A `users` row, for the foreign key a wallet needs. The hash is not a hash.
+
+    Nothing here verifies a password, and a real Argon2id digest in a fixture would cost a
+    quarter of a second per test for a column no assertion reads.
+    """
+    result = await session.execute(
+        text(
+            "INSERT INTO users (username, password_hash, created_at) "
+            "VALUES (:username, 'not-a-hash', :created_at) RETURNING id"
+        ),
+        {"username": username, "created_at": sqlite_timestamp(FIXTURE_CREATED_AT)},
+    )
+    user_id: int = result.scalar_one()
+    await session.commit()
+    return user_id
+
+
+async def insert_wallet(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    chain_key: ChainKey,
+    address: str,
+    label: str | None = None,
+    archived: bool = False,
+) -> int:
+    """A `wallets` row written directly, because these suites are below the router.
+
+    The address goes in as both the canonical and the display form. Every caller passes a
+    vector out of `tests/address_vectors.py` whose two forms are identical, and the one
+    vector where they differ -- the uppercase bech32 rendering -- is `tests/api/`'s
+    business rather than the sync service's.
+    """
+    result = await session.execute(
+        text(
+            "INSERT INTO wallets (user_id, chain_key, address_canonical, address_display, "
+            "label, archived_at, created_at, updated_at) "
+            "VALUES (:user_id, :chain_key, :address, :address, :label, :archived_at, "
+            ":now, :now) RETURNING id"
+        ),
+        {
+            "user_id": user_id,
+            "chain_key": chain_key.value,
+            "address": address,
+            "label": label,
+            "archived_at": sqlite_timestamp(FIXTURE_CREATED_AT) if archived else None,
+            "now": sqlite_timestamp(FIXTURE_CREATED_AT),
+        },
+    )
+    wallet_id: int = result.scalar_one()
+    await session.commit()
+    return wallet_id
+
+
+class Wallets:
+    """The wallet ids a test planted, by chain, so an assertion can name one."""
+
+    def __init__(self) -> None:
+        self.bitcoin: list[int] = []
+        self.kaspa: list[int] = []
+
+    @property
+    def total(self) -> int:
+        return len(self.bitcoin) + len(self.kaspa)
+
+
+async def plant_wallets(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    bitcoin: Sequence[str] = (DEFAULT_BITCOIN_ADDRESS,),
+    kaspa: Sequence[str] = (DEFAULT_KASPA_ADDRESS,),
+    archived: Sequence[str] = (),
+) -> Wallets:
+    """Rows in `wallets`, written directly. The registry's own rules are #5's tests."""
+    planted = Wallets()
+    async with factory() as session:
+        user_id = await insert_user(session)
+        for address in bitcoin:
+            planted.bitcoin.append(
+                await insert_wallet(
+                    session,
+                    user_id=user_id,
+                    chain_key=ChainKey.BITCOIN,
+                    address=address,
+                    archived=address in archived,
+                )
+            )
+        for address in kaspa:
+            planted.kaspa.append(
+                await insert_wallet(
+                    session,
+                    user_id=user_id,
+                    chain_key=ChainKey.KASPA,
+                    address=address,
+                    archived=address in archived,
+                )
+            )
+    return planted
 
 
 async def rows_of(session: AsyncSession, sql: str) -> list[dict[str, Any]]:

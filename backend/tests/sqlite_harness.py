@@ -36,16 +36,22 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
-    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 @asynccontextmanager
-async def migrated_session(
+async def migrated_sessionmaker(
     directory: Path,
     *,
     name: str = "test.db",
-) -> AsyncIterator[AsyncSession]:
-    """A session from the application's own factory, over a file migrated to head.
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """The application's own session **factory**, over a file migrated to head.
+
+    The factory rather than one session, because #10 brought a question the earlier suites
+    never had to ask: *what had been committed at the moment the provider was called?* A
+    second session opened from this factory takes a second connection out of the pool, so
+    it sees what the first one committed and nothing it merely staged -- which is the only
+    way to tell a row that is on disk from a row that is pending in an identity map.
 
     The engine is the application's own -- pragmas, foreign keys and `hide_parameters`
     included -- because a test against a differently configured engine is a test of a
@@ -55,8 +61,22 @@ async def migrated_session(
     await to_thread.run_sync(upgrade_to_head, url)
     engine = create_database_engine(url)
     try:
-        factory = create_session_factory(engine)
-        async with factory() as opened:
-            yield opened
+        yield create_session_factory(engine)
     finally:
         await engine.dispose()
+
+
+@asynccontextmanager
+async def migrated_session(
+    directory: Path,
+    *,
+    name: str = "test.db",
+) -> AsyncIterator[AsyncSession]:
+    """One session over a freshly migrated, file-backed database.
+
+    Written in terms of `migrated_sessionmaker` rather than beside it, so the three
+    decisions this module exists to hold -- a real file, the migrations, the application's
+    own engine -- stay in one place however a suite wants them served.
+    """
+    async with migrated_sessionmaker(directory, name=name) as factory, factory() as opened:
+        yield opened
