@@ -5,7 +5,8 @@ a request: the providers existed and had no caller, so a test could not accident
 vendor. Now the lifespan starts a scheduler whose first tick happens *at startup* -- because
 a database created a moment ago has no finished run to suppress it -- and every suite that
 enters the real lifespan with a wallet registered would send that wallet's address to
-`mempool.space` and `api.kaspa.org`, and its price pairs to Kraken.
+the two public chain indexes the providers default to, and its price pairs to the
+key-free price vendor.
 
 Two things would be wrong at once, and the second is worse than the first:
 

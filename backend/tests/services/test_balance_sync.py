@@ -47,6 +47,7 @@ import pytest
 from portfolio.domain.addresses import AddressInvalidError, AddressRejection
 from portfolio.domain.chains import ChainKey
 from portfolio.providers.errors import (
+    DuplicateProviderError,
     ProviderError,
     ProviderRateLimitedError,
     ProviderResponseError,
@@ -81,7 +82,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from portfolio.providers.base import ChainProvider
+    from portfolio.providers.base import AddressBalance, ChainProvider
     from portfolio.repositories.sync_runs import ChainOutcome, SyncRunSummary
 
 STARTED_AT: Final = datetime(2026, 9, 24, 0, 0, 0, tzinfo=UTC)
@@ -985,3 +986,102 @@ async def test_the_three_clauses_are_three(
             SyncErrorKind.INTERNAL.value,
         }
     )
+
+
+# --------------------------------------------------------------------------------------
+# The two provider failures the vocabulary does not name
+# --------------------------------------------------------------------------------------
+
+
+class UnmappedVendorError(ProviderError):
+    """A `ProviderError` subclass added after the mapping was written, as one will be."""
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        UnmappedVendorError("a new failure a provider learned to raise"),
+        DuplicateProviderError("kaspa"),
+    ],
+    ids=["a subclass added later", "duplicate registration"],
+)
+async def test_a_provider_error_nobody_mapped_is_recorded_as_internal(
+    sessions: async_sessionmaker[AsyncSession],
+    failure: ProviderError,
+) -> None:
+    """The fall-through in the mapping points at us, and it has to point somewhere.
+
+    The `CHECK` on `error_kind` admits a closed set, so a provider error with no entry in
+    the mapping still has to become one of them. It becomes `internal`, because the missing
+    entry is our omission -- a subclass somebody added to `providers/errors.py` without
+    teaching the sync what it means. Filing it under a vendor kind would be a guess, and a
+    guess is how "Kaspa is unavailable" comes to describe a mapping bug.
+
+    `DuplicateProviderError` is the real, shipping instance of the case: a `ProviderError`
+    the mapping deliberately omits, because it is raised at import and never by a read.
+    """
+    await plant_wallets(sessions, bitcoin=(), kaspa=(KASPA_TESTNET_V0,))
+    kaspa = StubChainProvider(ChainKey.KASPA, raises=failure)
+
+    await run_sync(sessions, {ChainKey.KASPA: kaspa})
+
+    rows = await sync_run_chains(sessions)
+    assert [row["error_kind"] for row in rows] == [SyncErrorKind.INTERNAL]
+    assert kaspa.calls != [], "the provider was really reached, so this is its error"
+
+
+class ShortChangingProvider(StubChainProvider):
+    """A provider that breaks its contract: it answers about fewer addresses than it was asked.
+
+    It bypasses `align_balances`, which is the only way to produce this -- every real
+    provider builds its answer through that function precisely so it cannot. What is under
+    test is the sync's own refusal to trust a result it cannot match to its request, which
+    is the second line of defence and the one a future provider written carelessly would
+    meet first.
+    """
+
+    async def fetch_balances(self, addresses: Sequence[str]) -> Sequence[AddressBalance]:
+        answered = await super().fetch_balances(addresses)
+        return tuple(answered)[:-1]
+
+
+async def test_a_provider_that_answers_about_fewer_addresses_fails_its_chain_as_a_response(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    """An answer that cannot be matched to the request writes nothing for that chain.
+
+    Not a partial write of the addresses that *did* come back: a response that dropped one
+    address is a response whose correlation cannot be trusted for the others either -- the
+    argument `align_balances` makes about an unrequested address, one layer up. So the
+    whole chain fails, as `response`, because the vendor answered and the answer was
+    unusable.
+
+    The detail says how many were missing and never which: the addresses are the owner's
+    holdings and the column is served by an endpoint. Bitcoin in the same run is the
+    isolation half, as everywhere else in this module.
+    """
+    planted = await plant_wallets(
+        sessions,
+        bitcoin=(BIP173_TESTNET_P2WPKH,),
+        kaspa=(KASPA_TESTNET_V0, KASPA_TESTNET_V1_KEY),
+    )
+    providers = {
+        ChainKey.BITCOIN: StubChainProvider(ChainKey.BITCOIN, {BIP173_TESTNET_P2WPKH: BTC_UNITS}),
+        ChainKey.KASPA: ShortChangingProvider(
+            ChainKey.KASPA, {KASPA_TESTNET_V0: KAS_UNITS, KASPA_TESTNET_V1_KEY: KAS_UNITS}
+        ),
+    }
+
+    summary = await run_sync(sessions, providers)
+
+    rows = {row["chain_key"]: row for row in await sync_run_chains(sessions)}
+    assert rows["kaspa"]["status"] == "failed"
+    assert rows["kaspa"]["error_kind"] == SyncErrorKind.RESPONSE
+    detail = str(rows["kaspa"]["detail"])
+    assert "1" in detail, "the detail says how many were missing"
+    assert KASPA_TESTNET_V0 not in detail
+    assert KASPA_TESTNET_V1_KEY not in detail
+    assert {row["wallet_id"] for row in await snapshots(sessions)} == set(planted.bitcoin), (
+        "neither Kaspa wallet is written, not even the one that did come back"
+    )
+    assert summary.status == SyncRunStatus.PARTIAL

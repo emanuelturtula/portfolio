@@ -20,6 +20,7 @@ import pytest
 from anyio import Path as AsyncPath
 from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from structlog.testing import capture_logs
 
 from portfolio.config import get_settings
 from portfolio.db.engine import create_database_engine, create_session_factory
@@ -630,3 +631,71 @@ async def test_a_failing_price_refresh_does_not_stop_the_balance_sync(
     assert [row["status"] for row in runs] == ["success"], (
         "the balance sync finished regardless of what the price vendor did"
     )
+
+
+async def test_a_startup_that_fails_early_still_closes_what_it_opened(
+    lifespan_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lifespan that fails before the coordinator exists still releases the client and engine.
+
+    The failure is planted in the first step after the client is built, so the `finally`
+    runs with no coordinator and no scheduler -- the branch where "drain the run in flight"
+    has nothing to drain and must not try. The original exception has to be the one that
+    comes out: a teardown that raised on the way down would bury the only error that says
+    why the container did not start.
+    """
+    del lifespan_database
+
+    async def refuse_to_bootstrap(*arguments: object) -> None:
+        del arguments
+        message = "the owner could not be created"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr("portfolio.main.bootstrap_owner", refuse_to_bootstrap)
+    app = create_app()
+
+    with pytest.raises(RuntimeError, match="the owner could not be created"):
+        async with app.router.lifespan_context(app):
+            pytest.fail("the lifespan must not have started")
+
+    assert app.state.http_client.is_closed is True
+    assert getattr(app.state, "sync_coordinator", None) is None
+
+
+class PartialPriceSource(FakePriceSource):
+    """A source that answers every pair except one, so a refresh is incomplete."""
+
+    async def fetch(self, pairs: Sequence[PricePair]) -> Sequence[PriceQuote]:
+        answered = await super().fetch(pairs)
+        return tuple(quote for quote in answered if quote.pair != ("KAS", "EUR"))
+
+
+async def test_an_incomplete_price_refresh_is_a_warning_naming_pairs_and_never_amounts(
+    priced_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The line an operator should see, and what it must not carry.
+
+    A refresh that could not price a pair is a warning, because it is what leaves a holding
+    `unpriced` on the dashboard. It names the pair, which is public, and counts the rest.
+    **It never carries an amount**: nobody reads a scheduled refresh's output, it runs every
+    hour forever, and a log line carrying a number is one careless edit from a log line
+    carrying a quantity -- which is the owner's holdings. The fake answers `1000.00` for
+    every pair precisely so that the absence of that string is a meaningful assertion.
+    """
+    await bring_the_schema_up(priced_lifespan)
+    source = PartialPriceSource()
+    stub_price_sources(monkeypatch, source)
+    app = create_app()
+
+    with capture_logs() as captured:
+        async with app.router.lifespan_context(app):
+            await wait_for_prices(priced_lifespan, count=len(SUPPORTED_PAIRS) - 1)
+
+    incomplete = [entry for entry in captured if entry["event"] == "price_refresh_incomplete"]
+    assert len(incomplete) == 1
+    assert incomplete[0]["log_level"] == "warning"
+    assert incomplete[0]["unavailable"] == ("KAS/EUR",)
+    assert incomplete[0]["refreshed"] == len(SUPPORTED_PAIRS) - 1
+    assert "1000" not in repr(incomplete[0]), "a price must never reach a log line"

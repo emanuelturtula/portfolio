@@ -406,3 +406,30 @@ def test_the_outcome_carries_exactly_the_summary_and_the_joined_flag() -> None:
     can tell them apart.
     """
     assert set(SyncOutcome.__dataclass_fields__) == {"summary", "joined"}
+
+
+async def test_a_run_that_fails_inside_the_grace_counts_as_drained() -> None:
+    """A run that ended by failing is no longer in flight, and shutdown may proceed.
+
+    The distinction `drain` exists to report is "did the run end", not "did it succeed". A
+    run that failed during the grace period recorded its own outcome on the way out, so
+    there is nothing for the shutdown sweep to mark `interrupted` -- and reporting it as not
+    drained would send the lifespan looking for an orphan that does not exist.
+    """
+    runner = Runner(gated=True, raises=RuntimeError("the database went away"))
+    coordinator = SyncCoordinator(runner)
+    running = asyncio.create_task(coordinator.sync(SyncTrigger.SCHEDULED))
+    await wait_for(runner.started.wait())
+
+    async def release() -> None:
+        await asyncio.sleep(0)
+        runner.gate.set()
+
+    releasing = asyncio.create_task(release())
+    drained = await wait_for(coordinator.drain(grace_seconds=DEADLOCK_TIMEOUT))
+    await releasing
+
+    assert drained is True
+    assert in_flight(coordinator) is False
+    with pytest.raises(RuntimeError):
+        await wait_for(running)

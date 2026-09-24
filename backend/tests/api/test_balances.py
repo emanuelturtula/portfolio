@@ -37,8 +37,11 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
+from fastapi import FastAPI
 from sqlalchemy import text
+from starlette.requests import Request
 
+from portfolio.api.dependencies import get_sync_coordinator
 from portfolio.api.errors import PROBLEM_CONTENT_TYPE
 from portfolio.config import get_settings
 from portfolio.domain.chains import ChainKey
@@ -1280,3 +1283,19 @@ async def test_the_history_is_ordered_by_time_and_not_by_amount(
         order != by_time
         for order in (by_insertion, sorted(by_insertion), sorted(by_insertion, reverse=True))
     ), "the fixture must discriminate between the orderings"
+
+
+def test_the_coordinator_dependency_refuses_an_application_whose_lifespan_never_ran() -> None:
+    """A clear failure at the dependency, rather than an `AttributeError` two frames away.
+
+    Not reachable from a served request -- the same lifespan that installs the coordinator
+    opens the database the request's session comes from -- which is why it is driven here
+    with a bare application and a hand-built scope. What it guards against is a test, or a
+    future entry point, that builds the application and serves it without running the
+    lifespan: the message names the lifespan, which is the one thing to go and read.
+    """
+    bare = FastAPI()
+    request = Request({"type": "http", "app": bare, "method": "POST", "path": SYNC, "headers": []})
+
+    with pytest.raises(RuntimeError, match="lifespan"):
+        get_sync_coordinator(request)

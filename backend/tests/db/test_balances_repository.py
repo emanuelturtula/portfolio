@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 from sqlalchemy import inspect, select, text
+from sqlalchemy.exc import OperationalError
 
 from portfolio.db.engine import create_session_factory
 from portfolio.db.models import BalanceSnapshot
@@ -834,3 +835,36 @@ def test_the_history_index_is_in_the_migrated_schema(
 
     assert "ix_balance_snapshots_wallet_observed" in indexes
     assert indexes["ix_balance_snapshots_wallet_observed"] == ["wallet_id", "observed_at"]
+
+
+async def test_a_real_database_failure_is_left_as_itself(
+    session: AsyncSession,
+    repository: BalanceRepository,
+    wallet_id: int,
+    run_id: int,
+) -> None:
+    """Only a refusal about *the row* is translated; a database that is not answering is not.
+
+    `_flush` turns a constraint refusal into `SnapshotConstraintError` and unwraps a value
+    the column type refused, because both are statements about the data and both have an
+    account a caller can act on. A missing table is neither -- it is a deployment that did
+    not migrate, or a file that is not the database it should be -- and dressing it up as a
+    constraint refusal would send somebody looking at a wallet id for a problem with the
+    disk. So it arrives as the driver's own error, which is what the sync's `internal`
+    clause then records.
+    """
+    await session.execute(text("DROP TABLE balance_snapshots"))
+    await session.commit()
+
+    with pytest.raises(OperationalError) as caught:
+        await repository.record(
+            wallet_id=wallet_id,
+            sync_run_id=run_id,
+            confirmed=TEN_COINS,
+            pending=None,
+            decimals=BITCOIN_DECIMALS,
+            observed_at=NOON,
+        )
+
+    assert not isinstance(caught.value, SnapshotConstraintError)
+    assert "balance_snapshots" in str(caught.value.orig)

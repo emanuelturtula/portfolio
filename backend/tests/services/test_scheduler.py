@@ -498,3 +498,40 @@ async def test_stopping_a_scheduler_that_never_started_is_harmless() -> None:
     await scheduler.stop()
 
     assert scheduler.running is False
+
+
+@pytest.mark.parametrize(
+    ("age", "due"),
+    [(timedelta(minutes=1), False), (timedelta(minutes=30), True)],
+    ids=["a minute old", "half an hour old"],
+)
+async def test_the_default_clock_is_the_real_one_and_is_timezone_aware(
+    age: timedelta,
+    due: bool,
+) -> None:
+    """With no clock injected, the startup condition is measured against the real UTC time.
+
+    Every other test here injects a clock, which leaves the one production actually uses
+    unexercised. What would go wrong with it is specific: a naive `datetime.now()` compared
+    with the aware timestamp the database hands back raises `TypeError`, which
+    `_due_at_startup` would catch and log as a failed startup check -- so the container would
+    quietly never sync at startup, on every deploy, with a traceback nobody reads.
+
+    Both answers are asserted, so this is a statement about the comparison rather than about
+    the condition happening to come out one way.
+    """
+    sleep = PacedSleep()
+    run = RecordingRun()
+    scheduler = IntervalScheduler(
+        name=BALANCE_SYNC,
+        interval_minutes=DEFAULT_BALANCE_INTERVAL_MINUTES,
+        last_run_at=last_run_at(datetime.now(UTC) - age),
+        run=run,
+        sleep=sleep,
+    )
+
+    await scheduler.start()
+    await sleep.reached()
+    await scheduler.stop()
+
+    assert run.ticks == ([True] if due else [])
