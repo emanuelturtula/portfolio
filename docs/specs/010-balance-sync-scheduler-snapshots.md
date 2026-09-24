@@ -1,7 +1,7 @@
 # 010 — Balance sync service, scheduler and snapshot history
 
 Issue: #10
-Status: draft
+Status: implementing
 
 ## Problem
 
@@ -187,6 +187,11 @@ has a fixed *scale* and a variable number of integer digits, so `"9"` sorts afte
 The rule is about variable-width digits, not about `TEXT`, and a test pins the ordering
 against values that would expose it.
 
+The fixed width is a property of the *writer*, not of the column: a value written by hand
+without microseconds sorts before the same instant written through `UtcDateTime`. Every
+write in the application goes through the type, and a test pins that the fixtures use the
+writer's format too, so the argument holds where it is used and is stated as conditional.
+
 "Latest snapshot per wallet" is nonetheless resolved by `MAX(id)`, an `INTEGER`: snapshots
 are append-only, so identity order is insertion order, and it needs no argument about
 collation at all.
@@ -248,6 +253,9 @@ this field carries the same discipline.
 
 ### `GET /api/balances/current`
 
+Query: `quote_currency` (`EUR` or `USD`, default `EUR`). The first draft showed the field in
+the response and never said where it came from.
+
 Response `200`:
 
 ```json
@@ -271,7 +279,7 @@ Response `200`:
       "observed_at": "2026-09-24T00:00:03Z"
     }
   ],
-  "unpriced": [{"asset_symbol": "KAS", "quantity": "10.00000000", "reason": "no_price"}]
+  "unpriced": [{"asset_symbol": "KAS", "quantity": "10.00000000", "reason": "never_fetched"}]
 }
 ```
 
@@ -329,7 +337,7 @@ CREATE TABLE sync_run_chains (
     chain_key TEXT NOT NULL,          -- CHECK: the ChainKey members
     status TEXT NOT NULL,             -- CHECK: 'success' | 'failed'
     wallets_read INTEGER NOT NULL,
-    error_kind TEXT,                  -- CHECK: NULL | 'unavailable' | 'rate_limited' | 'response' | 'unknown_chain' | 'internal'
+    error_kind TEXT,                  -- CHECK: NULL | 'unavailable' | 'rate_limited' | 'response' | 'unknown_chain' | 'address_rejected' | 'internal'
     detail TEXT,
     UNIQUE (sync_run_id, chain_key)
 );
@@ -365,6 +373,12 @@ compares the constraint off a migrated database against the model's constant.
 | `PORTFOLIO_BALANCE_SYNC_ENABLED` | `true` | an operator debugging a vendor needs an off switch that is not a code edit |
 | `PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES` | `15` | the issue's default |
 | `PORTFOLIO_BALANCE_SYNC_SHUTDOWN_GRACE_SECONDS` | `10` | how long shutdown waits for a run in flight before recording it interrupted |
+| `PORTFOLIO_PRICE_REFRESH_ENABLED` | `true` | the price timer's own switch, so the two can be turned off and tested apart |
+| `PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES` | `60` | paired with `STALE_AFTER`; changing one alone marks every price stale most of the time |
+
+**`PORTFOLIO_BALANCE_SYNC_ENABLED=false` switches off the loop and nothing else.**
+`POST /api/balances/sync` still works: the manual trigger is what an operator debugging a
+vendor reaches for, and one switch taking both away would defeat its purpose.
 
 The interval is validated `>= 1` in `_refuse_unsafe_configuration`: zero or a negative value
 is a loop with no sleep against a public API that documents a ban as the consequence.
@@ -408,14 +422,16 @@ Two readings the issue leaves open, resolved here rather than silently:
 | 2 | manual endpoint | `tests/api/test_balances.py::test_a_manual_sync_returns_the_run_summary`, `::test_the_sync_endpoint_requires_a_session` |
 | 3 | **isolation** | `tests/services/test_balance_sync.py::test_one_chain_failing_leaves_the_other_chains_snapshots_written`, `::test_a_provider_error_is_recorded_with_its_kind`, `::test_an_internal_error_is_recorded_as_internal_and_not_as_a_vendor_outage` |
 | 4 | the run row | `tests/services/test_balance_sync.py::test_a_run_row_exists_before_any_provider_is_called`, `::test_counts_and_timing_are_written_when_the_run_ends`, `::test_duration_comes_from_the_monotonic_clock_not_the_wall_clock` |
-| 4 | orphans | `tests/services/test_scheduler.py::test_a_running_row_from_a_dead_process_is_swept_to_interrupted` |
-| 5 | lifespan | `tests/db/test_lifespan.py::test_the_scheduler_starts_and_stops_with_the_application`, `::test_the_http_client_is_closed_on_shutdown`, `::test_shutdown_waits_for_a_run_in_flight_then_records_it_interrupted`, `::test_the_scheduler_is_not_started_when_disabled` |
+| 4 | orphans | `tests/db/test_sync_runs_repository.py::test_a_running_row_from_a_dead_process_is_swept_to_interrupted`, `tests/db/test_lifespan.py::test_a_running_row_from_a_dead_process_is_swept_at_startup` (the scheduler never touches the table, so the first draft's placement in `test_scheduler.py` named a module that cannot own it) |
+| 5 | lifespan | `tests/db/test_lifespan.py::test_the_scheduler_starts_and_stops_with_the_application`, `::test_the_http_client_is_closed_on_shutdown`, `::test_shutdown_waits_for_a_run_in_flight`, `::test_a_run_that_outlasts_the_grace_is_recorded_as_interrupted` (one run cannot both finish within the grace and be recorded interrupted, so the draft's single name was two tests), `::test_the_scheduler_is_not_started_when_disabled` |
 | 6 | one run at a time | `tests/services/test_sync_coordinator.py::test_a_second_caller_joins_rather_than_starting_a_second_run`, `::test_the_joined_caller_sees_the_running_trigger_not_its_own`, `::test_a_cancelled_request_does_not_cancel_the_run` |
 | 7 | current | `tests/api/test_balances.py::test_current_balances_are_valued_against_the_price_cache`, `::test_an_unpriced_asset_makes_the_total_incomplete`, `::test_a_wallet_with_no_snapshot_reports_null_rather_than_zero` |
 | 7 | history | `tests/api/test_balances.py::test_wallet_history_is_oldest_first`, `::test_another_users_wallet_is_a_404`, `::test_an_archived_wallet_still_answers_with_its_history` |
 | 8 | charting query | `tests/api/test_balances.py::test_since_filters_the_history`, `::test_limit_is_bounded`, `tests/db/test_balances_repository.py::test_ordering_is_chronological_across_a_digit_boundary` |
 | — | wire format | `tests/api/test_balances.py::test_base_units_cross_the_wire_as_strings`, `::test_a_kaspa_balance_past_the_javascript_safe_integer_survives_the_round_trip` |
 | — | layering | `tests/test_import_contracts.py::test_the_shipped_contract_reports_a_router_reaching_prices_through_a_service (already present; asserted still red on a planted edge and green on the real tree)` |
+| — | price refresh | `tests/db/test_lifespan.py::test_the_price_refresh_is_scheduled_and_actually_fills_the_cache` (rows in `prices`, not a scheduler object), `::test_a_failing_price_refresh_does_not_stop_the_balance_sync` |
+| — | no network | `tests/test_no_network.py` (DNS and outbound connections blocked around a real lifespan, with a control proving the block fires) |
 | — | symbol duplication | `tests/domain/test_chains.py::test_every_chain_symbol_matches_the_price_packages_constant` |
 | — | schema drift | `tests/db/test_migrations.py::test_the_new_check_constraints_match_the_models` |
 | — | auth by default | `tests/auth/test_route_contract.py` walks every registered route and covers all four new paths with no edit |
