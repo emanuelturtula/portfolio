@@ -652,17 +652,30 @@ async def insert_chain_with(
 
 @pytest.mark.parametrize(
     "error_kind",
-    [None, "unavailable", "rate_limited", "response", "unknown_chain", "internal"],
+    [
+        None,
+        "unavailable",
+        "rate_limited",
+        "response",
+        "unknown_chain",
+        # The owner's mistake, added to the vocabulary after implementation found that a
+        # wrong-network wallet was being filed as a defect in this application.
+        "address_rejected",
+        "internal",
+    ],
 )
 async def test_the_error_kind_check_admits_null_and_each_member(
     session: AsyncSession,
     repository: SyncRunRepository,
     error_kind: str | None,
 ) -> None:
-    """The five kinds plus `NULL`, which is what a chain that succeeded carries.
+    """The six kinds plus `NULL`, which is what a chain that succeeded carries.
 
-    `internal` is on the list and that is the point of the column: our own bug has a name
-    that is not a vendor's, so a `TypeError` can never be filed as an outage.
+    Three groups, and the split is the whole reason the column exists: four of them name a
+    vendor, `address_rejected` names the owner, and `internal` names us. A `TypeError` filed
+    as an outage and a wrong-network wallet filed as a defect are the same mistake in
+    opposite directions, and both are invisible until somebody reads a status page for a
+    vendor that was fine.
     """
     run_id = await open_and_commit(session, repository)
 

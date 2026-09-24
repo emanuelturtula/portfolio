@@ -1212,3 +1212,32 @@ async def test_an_unpriced_wallet_carries_a_null_value_and_a_null_price(
     assert line["price"] is None
     assert payload["complete"] is False
     assert Decimal(payload["total"]) == 0
+
+
+async def test_the_default_window_is_the_latest_readings_not_the_oldest(
+    signed_in_api_client: AsyncClient,
+    wallet_with_history: tuple[int, list[int]],
+) -> None:
+    """Criterion 8 at the endpoint: a bare `limit` is the recent end of the history.
+
+    The first implementation returned the *first* `limit` rows and was overruled, for the
+    only consumer there is: a chart of a year-old wallet asking for 500 points wants the
+    last 500, not the 500 from the week it was registered. A client that wants the old end
+    passes `since`, and that half is asserted beside this one so the two selections cannot
+    be confused for each other.
+
+    Both windows are ordered oldest first, which is the x-axis and is not what is under test
+    here -- `test_wallet_history_is_oldest_first` owns that.
+    """
+    wallet, expected = wallet_with_history
+
+    latest = await history(signed_in_api_client, wallet, limit=2)
+    from_the_start = await history(
+        signed_in_api_client, wallet, limit=2, since=FIRST_SEEN.isoformat()
+    )
+
+    assert [int(row["confirmed"]) for row in latest["snapshots"]] == expected[-2:]
+    assert [int(row["confirmed"]) for row in from_the_start["snapshots"]] == expected[:2]
+    assert latest["snapshots"] != from_the_start["snapshots"], (
+        "the two windows have to differ, or this proves nothing about the selection"
+    )

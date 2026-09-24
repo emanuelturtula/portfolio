@@ -562,6 +562,18 @@ ADDRESS_HANDLING_MODULES: Final = (
     SOURCE_ROOT / "services" / "wallets.py",
     SOURCE_ROOT / "api" / "routers" / "wallets.py",
     SOURCE_ROOT / "api" / "schemas" / "wallets.py",
+    # #10. These are the first modules that handle an address *and* produce something an
+    # endpoint serves. `services/balance_sync.py` is the one that matters: it catches three
+    # kinds of failure from a provider that was just handed every address on a chain, and
+    # the exception it is holding is the object in the process most likely to be carrying
+    # one -- a `KeyError` raised while correlating a balance has an address for its `str()`.
+    SOURCE_ROOT / "repositories" / "balances.py",
+    SOURCE_ROOT / "repositories" / "sync_runs.py",
+    SOURCE_ROOT / "services" / "balance_sync.py",
+    SOURCE_ROOT / "services" / "balances.py",
+    SOURCE_ROOT / "services" / "scheduler.py",
+    SOURCE_ROOT / "api" / "routers" / "balances.py",
+    SOURCE_ROOT / "api" / "schemas" / "balances.py",
 )
 
 #: Names that would carry an address into a log call's keyword arguments.

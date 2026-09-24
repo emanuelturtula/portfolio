@@ -97,6 +97,14 @@ def test_the_walk_actually_finds_the_routes(auth_app: FastAPI) -> None:
     assert ("POST", "/api/wallets") in routes
     assert ("PATCH", "/api/wallets/{wallet_id}") in routes
     assert ("DELETE", "/api/wallets/{wallet_id}") in routes
+    # #10's four. None of them is in `PUBLIC_API_PATHS`, so adding them protected them --
+    # which is rule 8 working and is the reason this file needed no other edit. They are
+    # named here anyway, so that the 401 sweep below visibly covers the endpoints that read
+    # and write the owner's balances rather than covering them by accident.
+    assert ("POST", "/api/balances/sync") in routes
+    assert ("GET", "/api/balances/current") in routes
+    assert ("GET", "/api/balances/runs") in routes
+    assert ("GET", "/api/wallets/{wallet_id}/balances") in routes
     # FastAPI's own documentation endpoints are routes like any other, and are covered.
     assert ("GET", "/api/openapi.json") in routes
     assert ("GET", "/api/docs") in routes

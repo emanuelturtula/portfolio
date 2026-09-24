@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 
+from portfolio.domain.addresses import AddressInvalidError, AddressRejection
 from portfolio.domain.chains import ChainKey
 from portfolio.providers.errors import (
     ProviderError,
@@ -874,3 +875,113 @@ async def test_the_address_really_is_in_the_exception_this_guards_against(
 
     assert BIP173_TESTNET_P2WPKH in str(leaking)
     assert BIP173_TESTNET_P2WPKH not in type(leaking).__name__
+
+
+# --------------------------------------------------------------------------------------
+# The third catch clause: the owner's mistake is neither the vendor's nor ours
+# --------------------------------------------------------------------------------------
+
+
+async def test_a_rejected_address_is_its_own_kind_and_not_internal(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    """A wrong-network wallet is a configuration mistake, and `internal` is the wrong file for it.
+
+    The case is real rather than contrived: the wallet registry validates an address against
+    the chain's codec and **not** against the configured network, so a mainnet address under
+    `PORTFOLIO_BITCOIN_NETWORK=testnet` is accepted at registration and refused by the
+    provider on every tick afterwards. Filed as `internal` that is a traceback every fifteen
+    minutes, forever, for a defect that does not exist -- which is the failure the `internal`
+    kind exists to prevent, pointed the other way.
+
+    Asserted against `internal` explicitly as well as for its own member, because the two
+    catch clauses being three is the whole content of this change.
+    """
+    planted = await plant_wallets(sessions)
+    bitcoin = StubChainProvider(ChainKey.BITCOIN, {BIP173_TESTNET_P2WPKH: BTC_UNITS})
+    kaspa = StubChainProvider(
+        ChainKey.KASPA,
+        raises=AddressInvalidError(AddressRejection.WRONG_NETWORK),
+    )
+
+    summary = await run_sync(sessions, {ChainKey.BITCOIN: bitcoin, ChainKey.KASPA: kaspa})
+
+    rows = {row["chain_key"]: row for row in await sync_run_chains(sessions)}
+    assert rows["kaspa"]["error_kind"] == SyncErrorKind.ADDRESS_REJECTED
+    assert rows["kaspa"]["error_kind"] != SyncErrorKind.INTERNAL
+    assert rows["kaspa"]["error_kind"] != SyncErrorKind.RESPONSE, (
+        "the vendor answered nothing; there is no response to blame"
+    )
+    # Isolated like every other failure: the owner's mistake on one chain costs that chain.
+    assert {row["wallet_id"] for row in await snapshots(sessions)} == set(planted.bitcoin)
+    assert summary.status == SyncRunStatus.PARTIAL
+
+
+async def test_a_rejected_address_never_reaches_the_detail_column(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    """`detail` is served by an endpoint, so the reason may travel and the address may not.
+
+    `AddressRejection` is a closed set of fixed words and each member's message is a fixed
+    sentence that interpolates nothing, which is what makes the reason safe to record. The
+    address is in scope in the frame that raised and must stay there: it is the owner's
+    holdings, and this column ends up in a response body and in an operations view.
+    """
+    await plant_wallets(sessions, bitcoin=(), kaspa=(KASPA_TESTNET_V0,))
+    kaspa = StubChainProvider(
+        ChainKey.KASPA,
+        raises=AddressInvalidError(AddressRejection.WRONG_NETWORK),
+    )
+
+    await run_sync(sessions, {ChainKey.KASPA: kaspa})
+
+    detail = str((await sync_run_chains(sessions))[0]["detail"])
+    assert KASPA_TESTNET_V0 not in detail
+    assert detail != ""
+    assert AddressRejection.WRONG_NETWORK.value in detail or "network" in detail.lower(), (
+        "the reason has to survive, or an operator has nothing to act on"
+    )
+
+
+async def test_the_three_clauses_are_three(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    """One run, three failures, three different kinds. The control for all of the above.
+
+    Each of the three tests that names one kind passes for an implementation that records
+    *everything* as that kind. Only driving all three through one service and asserting the
+    rows differ pins the distinction rather than one side of it. A third chain is not
+    available, so the vendor and the rejection are driven together here and the internal
+    clause is proven distinct from both by the pair of assertions at the end.
+    """
+    await plant_wallets(sessions)
+    vendor_down = {
+        ChainKey.BITCOIN: StubChainProvider(
+            ChainKey.BITCOIN, raises=ProviderUnavailableError("their outage")
+        ),
+        ChainKey.KASPA: StubChainProvider(
+            ChainKey.KASPA, raises=AddressInvalidError(AddressRejection.WRONG_NETWORK)
+        ),
+    }
+    our_bug = {
+        ChainKey.BITCOIN: StubChainProvider(ChainKey.BITCOIN, raises=ValueError("our own bug")),
+        ChainKey.KASPA: StubChainProvider(
+            ChainKey.KASPA, raises=AddressInvalidError(AddressRejection.WRONG_NETWORK)
+        ),
+    }
+
+    await run_sync(sessions, vendor_down)
+    await run_sync(sessions, our_bug)
+
+    kinds = {
+        (row["sync_run_id"], row["chain_key"]): row["error_kind"]
+        for row in await sync_run_chains(sessions)
+    }
+    recorded = sorted({str(kind) for kind in kinds.values()})
+    assert recorded == sorted(
+        {
+            SyncErrorKind.UNAVAILABLE.value,
+            SyncErrorKind.ADDRESS_REJECTED.value,
+            SyncErrorKind.INTERNAL.value,
+        }
+    )
