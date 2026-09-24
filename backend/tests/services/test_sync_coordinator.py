@@ -96,6 +96,17 @@ async def wait_for[T](awaitable: Awaitable[T]) -> T:
     return await asyncio.wait_for(awaitable, timeout=DEADLOCK_TIMEOUT)
 
 
+def in_flight(coordinator: SyncCoordinator) -> bool:
+    """Read the flag afresh, through a call `mypy` cannot narrow.
+
+    Written inline, `assert coordinator.in_flight is False` narrows the property to
+    `Literal[False]` for the rest of the function, and the later `is True` then reads as
+    unreachable -- which it is not: an `await` in between is exactly what changes it. A call
+    returns a plain `bool` every time, which is the truth about a property that moves.
+    """
+    return coordinator.in_flight
+
+
 # --------------------------------------------------------------------------------------
 # One run at a time
 # --------------------------------------------------------------------------------------
@@ -144,8 +155,9 @@ async def test_the_joined_caller_sees_the_running_trigger_not_its_own() -> None:
     _first, second = await wait_for(asyncio.gather(scheduled, manual))
 
     assert second.joined is True
+    # Equality with the running trigger is the whole claim: `SyncTrigger` is an enum, so it
+    # also rules out `MANUAL`, which is the caller's own and the one that would be wrong.
     assert second.summary.trigger == SyncTrigger.SCHEDULED
-    assert second.summary.trigger != SyncTrigger.MANUAL
 
 
 async def test_a_third_caller_joins_the_same_run_as_the_second() -> None:
@@ -217,13 +229,13 @@ async def test_in_flight_is_true_only_while_a_run_is_running() -> None:
     runner = Runner(gated=True)
     coordinator = SyncCoordinator(runner)
 
-    assert coordinator.in_flight is False
+    assert in_flight(coordinator) is False
     running = asyncio.create_task(coordinator.sync(SyncTrigger.SCHEDULED))
     await wait_for(runner.started.wait())
-    assert coordinator.in_flight is True
+    assert in_flight(coordinator) is True
     runner.gate.set()
     await wait_for(running)
-    assert coordinator.in_flight is False
+    assert in_flight(coordinator) is False
 
 
 # --------------------------------------------------------------------------------------

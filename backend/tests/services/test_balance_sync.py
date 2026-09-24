@@ -76,7 +76,7 @@ from tests.balance_harness import (
 from tests.sqlite_harness import migrated_sessionmaker
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
     from pathlib import Path
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -500,7 +500,7 @@ async def test_the_chains_are_read_concurrently_rather_than_one_after_the_other(
     await plant_wallets(sessions)
     arrived = {ChainKey.BITCOIN: asyncio.Event(), ChainKey.KASPA: asyncio.Event()}
 
-    def rendezvous(mine: ChainKey, theirs: ChainKey) -> Callable[[Sequence[str]], object]:
+    def rendezvous(mine: ChainKey, theirs: ChainKey) -> Callable[[Sequence[str]], Awaitable[None]]:
         async def wait(addresses: Sequence[str]) -> None:
             del addresses
             arrived[mine].set()

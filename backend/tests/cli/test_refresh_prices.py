@@ -107,8 +107,9 @@ def with_vendors(monkeypatch: pytest.MonkeyPatch, fake: PriceFake) -> None:
 #: A regex rather than a `startswith` or an index, and that is the whole of what this
 #: module got wrong the first time. `lines[0].startswith("as of ")` asserts that the
 #: command's first line is the command's -- which is true only while nothing else has
-#: written to stdout, and `tests/security/conftest.py`'s teardown calls
-#: `structlog.reset_defaults()`, leaving structlog printing into the same captured stream.
+#: written to stdout. At the time, `tests/security/conftest.py`'s teardown called
+#: `structlog.reset_defaults()`, leaving structlog printing into the same captured stream;
+#: that teardown now restores instead (`tests/logging_harness.py`), but the lesson stands.
 #: The suite was green because `tests/cli` sorts before `tests/security`, which is not a
 #: fact about this application.
 #:
@@ -282,8 +283,9 @@ def test_the_output_is_found_even_when_something_else_wrote_to_stdout_first(
 
     A foreign line is written to stdout **before** the command runs, which is exactly the
     condition that made the original assertions fail: `tests/security/conftest.py`'s
-    teardown calls `structlog.reset_defaults()`, and structlog then prints into the stream
-    `capsys` has replaced. The suite was green only because `tests/cli` sorts before
+    teardown used to call `structlog.reset_defaults()`, after which structlog printed into
+    the stream `capsys` had replaced. That teardown now restores rather than resets, and
+    this test is kept regardless: the suite was green only because `tests/cli` sorts before
     `tests/security`, and collection order is not a property of this application.
 
     It is also the realistic production condition rather than a testing artefact. This

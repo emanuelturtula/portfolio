@@ -19,11 +19,9 @@ these tests read.
 from __future__ import annotations
 
 import json
-import logging
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
-import structlog
 
 from portfolio.config import Settings
 from portfolio.domain.passwords import (
@@ -31,6 +29,7 @@ from portfolio.domain.passwords import (
     OWASP_MINIMUM_TIME_COST,
 )
 from portfolio.logging import configure_logging
+from tests.logging_harness import preserved_logging
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -97,16 +96,17 @@ def assert_carried_something(written: str, *, marker: str) -> None:
 
 @pytest.fixture
 def restored_logging() -> Iterator[None]:
-    """Undo the global logging configuration these tests install."""
-    root = logging.getLogger()
-    handlers = root.handlers[:]
-    level = root.level
-    try:
+    """Undo the global logging configuration these tests install -- by restoring it.
+
+    This used to call `structlog.reset_defaults()`, which does not restore anything: it
+    installs structlog's own defaults, whose renderer walks every local of every frame in a
+    traceback. The first test here therefore switched the rest of the session to it, and the
+    suite hung when #10's sync logged an exception with SQLAlchemy objects in scope.
+    `tests/logging_harness.py` has the full account and `tests/test_logging_harness.py`
+    drives this fixture's teardown to prove it puts back what it found.
+    """
+    with preserved_logging():
         yield
-    finally:
-        structlog.reset_defaults()
-        root.handlers[:] = handlers
-        root.setLevel(level)
 
 
 @pytest.fixture

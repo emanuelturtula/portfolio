@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from sqlalchemy.pool import ConnectionPoolEntry
 
     from portfolio.providers.prices.base import PricePair
+    from portfolio.services.scheduler import IntervalScheduler
 
 EXPECTED_SEED_SYMBOLS = ["BTC", "KAS", "USDT"]
 
@@ -218,6 +219,15 @@ async def runs_in(database: Path) -> list[dict[str, object]]:
         return await rows_of(session, SYNC_RUNS_SQL)
 
 
+def is_running(scheduler: IntervalScheduler) -> bool:
+    """Read `running` afresh, through a call `mypy` cannot narrow across the lifespan's exit.
+
+    Inline, the first `is True` narrows the property to a literal and the later `is False`
+    reads as unreachable -- which it is not: leaving the lifespan is what changes it.
+    """
+    return scheduler.running
+
+
 async def until(condition: Callable[[], bool]) -> None:
     """Yield to the loop until `condition` holds. Bounded by the caller's `wait_for`.
 
@@ -307,11 +317,11 @@ async def test_the_scheduler_starts_and_stops_with_the_application(
     async with app.router.lifespan_context(app):
         scheduler = app.state.balance_scheduler
         assert scheduler is not None
-        assert scheduler.running is True
+        assert is_running(scheduler) is True
         # Let the startup tick get through the coordinator and the provider.
         await asyncio.wait_for(until(lambda: bool(provider.calls)), timeout=5)
 
-    assert scheduler.running is False
+    assert is_running(scheduler) is False
     assert registry.created == ["bitcoin"]
     runs = await runs_in(scheduled_lifespan)
     assert [row["trigger"] for row in runs] == ["startup"]

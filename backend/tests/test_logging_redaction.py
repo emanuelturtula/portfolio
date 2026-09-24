@@ -7,7 +7,6 @@ string that entered the log never appears in what was written out.
 from __future__ import annotations
 
 import json
-import logging
 from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
@@ -15,6 +14,7 @@ import structlog
 
 from portfolio.config import Settings
 from portfolio.logging import REDACTED, configure_logging, is_sensitive_key, redact_sensitive
+from tests.logging_harness import preserved_logging
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -25,16 +25,13 @@ CANARY_VALUE = "canary-value-that-must-never-be-logged"
 
 @pytest.fixture
 def restore_logging() -> Iterator[None]:
-    """Undo the global logging configuration these tests install."""
-    root = logging.getLogger()
-    handlers = root.handlers[:]
-    level = root.level
-    try:
+    """Undo the global logging configuration these tests install -- by restoring it.
+
+    Not `structlog.reset_defaults()`, which this used to call and which installs structlog's
+    defaults rather than what was there before; see `tests/logging_harness.py`.
+    """
+    with preserved_logging():
         yield
-    finally:
-        structlog.reset_defaults()
-        root.handlers[:] = handlers
-        root.setLevel(level)
 
 
 def redact(event: dict[str, Any]) -> dict[str, Any]:

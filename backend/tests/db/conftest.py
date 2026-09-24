@@ -16,16 +16,15 @@ when a loop is already running in the calling thread.
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import pytest
-import structlog
 from anyio import to_thread
 from sqlalchemy import create_engine
 
 from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import create_database_engine
+from tests.logging_harness import preserved_logging
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -37,22 +36,20 @@ if TYPE_CHECKING:
 
 @pytest.fixture
 def restored_logging() -> Iterator[None]:
-    """Undo anything a test does to the global logging configuration.
+    """Undo anything a test does to the global logging configuration -- by restoring it.
 
     Two tests here reconfigure it deliberately -- one reads `alembic.ini`, whose
     `fileConfig` section installs its own handlers, and one renders a real log record to
     assert a value is absent from it. Leaving either installed would silently change
     logging for every test that runs afterwards, the redaction suite included.
+
+    It used to tear down with `structlog.reset_defaults()`, which is not a restore: it
+    installs structlog's defaults, and their renderer prints the locals of every frame in a
+    traceback. `tests/logging_harness.py` has the account, and
+    `tests/test_logging_harness.py` drives this teardown to prove it.
     """
-    root = logging.getLogger()
-    handlers = root.handlers[:]
-    level = root.level
-    try:
+    with preserved_logging():
         yield
-    finally:
-        structlog.reset_defaults()
-        root.handlers[:] = handlers
-        root.setLevel(level)
 
 
 @pytest.fixture
