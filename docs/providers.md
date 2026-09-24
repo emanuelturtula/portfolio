@@ -849,7 +849,15 @@ compares one; the valuation service loads the rows and sums them in Python.
 **Staleness is computed at read time from an injected clock and is never stored.**
 `STALE_AFTER` is one hour, matching `PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES`, whose default
 is sixty. The two are a pair: lengthening one without the other marks every price stale most
-of the time. A stored
+of the time.
+
+**A known, accepted consequence of the pair:** because `as_of` is stamped at the start of a
+refresh, every price reads stale for as long as one refresh takes, once an hour -- seconds,
+paced by the limiter. It errs toward "stale", the direction #9's `as_of` argument chose, and
+closing it would need a threshold longer than the interval, which would let a missed refresh
+go unflagged. Recorded at `STALE_AFTER` as well, so it is not re-discovered as a bug.
+
+A stored
 `is_stale` boolean would be wrong one second after it was written and would need a background
 job whose only purpose was to keep a derived field true. A stale price is still returned, with
 its age visible: the last known price is better information than none, which is the same
@@ -904,7 +912,9 @@ makes the registry able to answer at all.
 Two things reach a **chain** provider, and both go through `SyncCoordinator`:
 
 - **the balance timer**, every `PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES` minutes, plus once
-  at startup when the newest finished run is older than one interval;
+  at startup when the newest run **of any status** started more than one interval ago --
+  attempts rather than successes, so a crash loop that never finishes a sync still cannot
+  start one per restart;
 - **`POST /api/balances/sync`**, which is a request path calling a vendor *on purpose* --
   the owner asked for the read and is waiting for it. That is the deliberate asymmetry with
   prices, where `prices-are-never-fetched-in-a-request` forbids the same thing.
@@ -916,7 +926,14 @@ at a public index.
 One thing reaches a **price** source: the price timer, every
 `PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES` minutes -- sixty by default, matching
 `STALE_AFTER` -- plus once at startup when the newest `prices.fetched_at` is older than one
-interval. `portfolio refresh-prices` is the same work on demand. There is no coordinator and
+interval. That one counts successes, because there is no record of a price attempt: while
+every source fails, a crash loop costs one price request per restart. `portfolio
+refresh-prices` is the same work on demand.
+
+**Neither timer sleeps a whole interval after a restart that found nothing due.** It sleeps
+what is left, rounded up to a whole second, so a deploy resumes the schedule rather than
+pushing it back -- the first version pushed it back, and every deploy left prices stale for
+most of an hour. There is no coordinator and
 no join, because there is no endpoint that can ask for one: nothing in a request path may
 reach a price vendor, which is the contract.
 

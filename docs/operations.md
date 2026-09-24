@@ -358,10 +358,22 @@ after an hour, so a price that has missed exactly one refresh is the first worth
 **The two are a pair.** Lengthening the interval without lengthening the staleness threshold
 marks every price stale most of the time, for no reason an operator can see.
 
-A run at startup happens only if the newest `prices.fetched_at` is older than one interval,
-for the same two reasons section 11 gives: a fresh deployment should not show every holding
-unpriced for an hour, and a crash-looping container should not call four market-data APIs on
-every restart.
+A refresh at startup happens only if the newest `prices.fetched_at` is older than one
+interval, for the same two reasons section 11 gives: a fresh deployment should not show every
+holding unpriced for an hour, and a crash-looping container should not call four market-data
+APIs on every restart. **When it is not due, the timer sleeps what is left of the interval,
+not a whole one** — so a deploy at 12:50 after a 12:00 refresh refreshes again at 13:00, and
+does not leave every price stale until 13:50.
+
+**One residual, bounded.** Unlike the balance timer, this one counts *successes*: a refresh
+writes rows only for what it fetched, and there is no record of an attempt. So while every
+price source is failing, a crash-looping container costs one price request per restart. The
+first refresh that succeeds writes rows and suppresses the next one.
+
+**Prices read stale for a few seconds each hour, and that is accepted.** The interval equals
+the staleness threshold and `as_of` is stamped when a refresh *starts*, so the previous price
+is an hour and a few seconds old by the time the next one lands. It errs toward "stale", never
+toward "fresh"; see `STALE_AFTER` in `services/prices.py`.
 
 The command below is still worth having — it forces a refresh now rather than waiting out
 the interval, and it prints the prices where the scheduler logs a count.
@@ -494,10 +506,20 @@ does not also stop valuing the balances they already have. They answer to differ
 chain indexes that ban you for asking too often, against market-data APIs where the primary
 answers every configured pair in a single call.
 
-**A run at startup happens only if the newest finished run is older than one interval.**
-Sleeping first would leave a fresh deployment blank for fifteen minutes, which is exactly when
-somebody is watching; running unconditionally would let a crash-looping container hit two
-public indexes on every restart. The condition costs one query and answers both.
+**At most one sync per interval, across restarts.** That is the property, stated exactly,
+and three rules produce it:
+
+- A sync runs at startup only if the newest run **of any status** started more than one
+  interval ago. Attempts count, not successes: a container that dies faster than one sync
+  takes — thirty Bitcoin wallets is thirty seconds at one request a second — leaves an
+  `interrupted` run behind, and that run still asked two public indexes something.
+- When a sync is not due at startup, the first wait is **what is left of the interval**,
+  rounded up to a whole second, not a whole interval. A deploy does not push the schedule back.
+- After that, one sync every `PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES`.
+
+Sleeping unconditionally at startup would leave a fresh deployment blank for fifteen minutes,
+which is exactly when somebody is watching; running unconditionally would let a crash-looping
+container hit two public indexes on every restart. One query answers both.
 
 ### Reading the run log
 
@@ -543,13 +565,40 @@ Pressing it twice does not start two runs: the second call attaches to the one a
 and returns that run's summary with `"joined": true`. That is also what happens when you
 trigger one while the timer's own run is in progress.
 
+### Reading the total, and what it is missing
+
+`GET /api/balances/current?quote_currency=EUR` (or `USD`; anything else, lower-case included,
+is a 422). **Read `complete` before you read `total`.** It is true only when nothing is missing,
+and two lists say what is:
+
+| List | What is missing | Usual cause |
+|---|---|---|
+| `unpriced` | an asset nothing could price | no price refresh yet, or every source failing — section 10 |
+| `unread` | a wallet no run has ever read | added since the last sync, its chain failing, or `address_rejected` |
+
+A wallet with an old reading is not `unread`; its `observed_at` says how old the number is.
+
+### Paging through a wallet's history
+
+`GET /api/wallets/<id>/balances` returns the **latest** `limit` readings by default. To walk a
+longer stretch, start with `since=<instant with offset>` and follow `next_cursor`, passing it
+back as `cursor`, until it is `null`. One page holds at most 1000 readings, which is about ten
+days at the default interval, so a year is a walk of several pages. `cursor` and `since`
+together is a 422, and so is a cursor the endpoint did not issue.
+
 ### When a run is interrupted
 
 A `sync_runs` row is written at `running` **before the first request to any chain**, so a
-process that is killed mid-sync leaves evidence. Startup and shutdown both sweep any surviving
-`running` row to `interrupted`, leaving `finished_at` and `duration_ms` null — the run has no
-honest end time, and stamping the sweep's own clock on it would record a duration that is
+process that is killed mid-sync leaves evidence. Any surviving `running` row is swept to
+`interrupted` at startup, at shutdown, **and at the start of every run** — so a run whose
+close-out failed is corrected within one interval rather than at the next restart, which on
+a host that stays up can be weeks. `finished_at` and `duration_ms` are left null: the run has
+no honest end time, and stamping the sweep's own clock on it would record a duration that is
 mostly however long the container was down.
+
+The sweep at the start of a run is safe because only one run happens at a time in the process
+and there is one process. **Do not run a sync from a second process while the server is up** —
+a future command that did would sweep the server's live run.
 
 Snapshots are committed per chain as the run goes, so an interrupted run keeps whatever it had
 already read.
@@ -586,6 +635,10 @@ already read.
 | A run says `partial` every time, one chain always failing | Read that chain's `error_kind`. The first four mean the vendor; `internal` means our bug and there is a traceback in the container log — section 11 |
 | Runs pile up as `interrupted` | Each one was cut off by a restart or a deploy. If it is every run, the sync is outliving `PORTFOLIO_BALANCE_SYNC_SHUTDOWN_GRACE_SECONDS` — section 11 |
 | Clicking refresh twice returns the same `run_id` | Working as intended: the second caller joins the run in flight rather than starting a second one — section 11 |
+| `complete` is false and `unpriced` is empty | A wallet is listed under `unread`: no run has read it yet — section 11 |
+| `quote_currency` returns 422 | Only `EUR` and `USD`, upper case — section 11 |
+| A redeploy did not trigger a sync | Working as intended: the last attempt was less than one interval ago, and the timer resumes the schedule it had — section 11 |
+| Prices flicker to stale for a few seconds on the hour | Accepted: the interval equals the staleness threshold — section 10 |
 | `refresh-prices` exits 1 and names a pair as `every_source_failed` | Every eligible source refused or did not answer. Check connectivity, then the vendors — section 10 |
 | `refresh-prices` exits 1 with `unsupported_pair` | The pair is not one this application prices. Nothing was asked — section 10 |
 | A portfolio total looks too small | Check the incomplete flag: a total omits any holding it could not price, on purpose — section 10 |

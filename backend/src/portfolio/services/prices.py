@@ -84,6 +84,15 @@ interval without lengthening this marks every price stale most of the time; shor
 without shortening the interval does the same. Neither is wrong on its own, which is exactly
 why the relationship is written down in both places.
 
+**A known, accepted property of the pair: every price reads stale for a few seconds each
+hour.** The interval equals this threshold, and `as_of` is stamped at the *start* of a
+refresh, so by the time the next refresh has fetched and committed, the previous `as_of` is
+an hour and a few seconds old. The window is bounded by how long one refresh takes -- seconds,
+paced by the per-host limiter -- and it errs towards "stale", which is the direction #9's
+`as_of` argument already chose: a price may be flagged a little early, never a little late.
+Closing it would mean a threshold longer than the interval, which would let a price that
+missed a refresh go unflagged for however long the difference is. Left as it is, deliberately.
+
 **The threshold is not an expiry.** A stale price is still returned, with its age visible,
 because the last known price is better information than no price at all -- the same argument
 `ProviderUnavailableError` makes about keeping a previous balance. Refusing to return it
