@@ -1241,3 +1241,42 @@ async def test_the_default_window_is_the_latest_readings_not_the_oldest(
     assert latest["snapshots"] != from_the_start["snapshots"], (
         "the two windows have to differ, or this proves nothing about the selection"
     )
+
+
+async def test_the_history_is_ordered_by_time_and_not_by_amount(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """End to end, with a balance that falls: the series is the chart's x-axis, not its y.
+
+    The other history tests here use balances that rise over time, so a read path that
+    ordered by amount -- in SQL, or by re-sorting in the service -- passed all of them. This
+    one's readings are chosen so that time order, insertion order and both amount orders are
+    four different lists, and the last assertion checks that the fixture still has that
+    property rather than trusting that it does.
+    """
+    wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    readings = [
+        (THIRD_SEEN, 1_000_000_000),
+        (FIRST_SEEN, 1_100_000_000),
+        (SECOND_SEEN, 900_000_000),
+    ]
+    for observed_at, confirmed in readings:
+        run_id = await insert_run(api_sessionmaker, started_at=observed_at)
+        await insert_snapshot(
+            api_sessionmaker,
+            wallet_id=wallet,
+            run_id=run_id,
+            confirmed=confirmed,
+            observed_at=observed_at,
+        )
+
+    payload = await history(signed_in_api_client, wallet)
+
+    by_time = [1_100_000_000, 900_000_000, 1_000_000_000]
+    assert [int(row["confirmed"]) for row in payload["snapshots"]] == by_time
+    by_insertion = [confirmed for _observed_at, confirmed in readings]
+    assert all(
+        order != by_time
+        for order in (by_insertion, sorted(by_insertion), sorted(by_insertion, reverse=True))
+    ), "the fixture must discriminate between the orderings"

@@ -585,6 +585,55 @@ async def test_history_is_oldest_first(
     assert [row.observed_at for row in rows] == [BEFORE_MIDNIGHT, AFTER_MIDNIGHT, NOON]
 
 
+#: One wallet's readings, as `(observed_at, confirmed)`, chosen so that **four candidate
+#: orderings all disagree**: by time it is 11, 9, 10 coins; inserted in the order below it
+#: is 10, 11, 9; by amount it is 9, 10, 11 or 11, 10, 9. Every other history fixture here
+#: rises over time, which makes "ordered by time" and "ordered by amount" the same list --
+#: so a query that sorted by `confirmed` passed every ordering test this suite had.
+DISAGREEING_READINGS: Final = (
+    (NOON, TEN_COINS),
+    (BEFORE_MIDNIGHT, ELEVEN_COINS),
+    (AFTER_MIDNIGHT, NINE_COINS),
+)
+BY_TIME: Final = [ELEVEN_COINS, NINE_COINS, TEN_COINS]
+
+
+async def test_history_is_ordered_by_time_and_not_by_amount_or_insertion(
+    session: AsyncSession,
+    repository: BalanceRepository,
+    wallet_id: int,
+) -> None:
+    """The ordering claim, made with readings whose amounts fall as well as rise.
+
+    Found by auditing this suite for tests that would pass with the behaviour removed: the
+    other history tests all use balances that grow over time, so `ORDER BY confirmed` -- or
+    `ORDER BY id`, since two of them insert in time order -- satisfied them. A balance that
+    goes down is the ordinary case for a wallet anybody spends from.
+
+    The two assertions after the result are the control. They check the fixture, not the
+    code: if a later edit made the readings monotonic again, this would fail there, rather
+    than go on passing for the same reason the old tests did.
+    """
+    for observed_at, confirmed in DISAGREEING_READINGS:
+        run = await insert_run(session, started_at=observed_at)
+        await repository.record(
+            wallet_id=wallet_id,
+            sync_run_id=run,
+            confirmed=confirmed,
+            pending=None,
+            decimals=BITCOIN_DECIMALS,
+            observed_at=observed_at,
+        )
+    await session.commit()
+
+    rows = await repository.history(wallet_id=wallet_id, since=None, limit=100)
+
+    assert [row.confirmed for row in rows] == BY_TIME
+    by_insertion = [confirmed for _observed_at, confirmed in DISAGREEING_READINGS]
+    wrong_orders = (by_insertion, sorted(by_insertion), sorted(by_insertion, reverse=True))
+    assert all(order != BY_TIME for order in wrong_orders), "the fixture must discriminate"
+
+
 async def test_ordering_is_chronological_across_a_digit_boundary(
     session: AsyncSession,
     repository: BalanceRepository,
