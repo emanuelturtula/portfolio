@@ -68,6 +68,31 @@ class WalletRepository:
         result = await self._session.scalars(statement.order_by(Wallet.id))
         return list(result)
 
+    async def list_all_active(self) -> list[Wallet]:
+        """Every active wallet in the database, whoever owns it, oldest first.
+
+        **The one query in this module that is not scoped by `user_id`, and the exception
+        is deliberate rather than an oversight of the rule above.** The balance sync has no
+        principal: it is a scheduled background read, and the tick that runs it was started
+        by a clock rather than by a request. Scoping it would mean either inventing an
+        owner to attribute the run to, or reading one account's wallets on a schedule and
+        leaving the others unread with nothing saying so.
+
+        The name says so out loud -- `list_all_active` rather than another `list_for_*`
+        overload -- because the failure this guards against is somebody reaching for it from
+        a request path, where it would return another account's rows. Nothing in `api/`
+        calls it; `services/balance_sync.py` is its only caller, and that module has no
+        principal parameter to be careless with.
+
+        Archived wallets are excluded: an address the owner retired is one they asked us to
+        stop reading, and `archived_at` records when that happened precisely so the history
+        already recorded survives the retirement.
+        """
+        result = await self._session.scalars(
+            select(Wallet).where(Wallet.archived_at.is_(None)).order_by(Wallet.id)
+        )
+        return list(result)
+
     async def get_for_user(self, user_id: int, wallet_id: int) -> Wallet | None:
         """One wallet by id, provided it belongs to this account. Archived rows included."""
         found: Wallet | None = await self._session.scalar(
