@@ -48,6 +48,36 @@ EXPECTED_NAMES = {
         "ck_prices_quote_currency",
         "fk_prices_asset_id_assets",
     },
+    # #10. Exactly two indexes across the three tables, which is what the spec's DDL
+    # enumerates and what the absences below are pinning. Neither `sync_run_id` is indexed:
+    # `uq_sync_run_chains_run_chain` already leads with that column, and nothing queries
+    # snapshots by run -- the two reads are the primary key and `ix_..._wallet_observed`.
+    "sync_runs": {
+        "pk_sync_runs",
+        "ck_sync_runs_trigger",
+        "ck_sync_runs_status",
+        "ix_sync_runs_started_at",
+    },
+    "sync_run_chains": {
+        "pk_sync_run_chains",
+        "uq_sync_run_chains_run_chain",
+        "ck_sync_run_chains_chain_key",
+        "ck_sync_run_chains_status",
+        "ck_sync_run_chains_error_kind",
+        "fk_sync_run_chains_sync_run_id_sync_runs",
+    },
+    # `uq_balance_snapshots_wallet_run` is named explicitly for the reason
+    # `uq_wallets_user_chain_address` is: the convention would render
+    # `uq_balance_snapshots_wallet_id_sync_run_id`, and this is the name that appears in the
+    # `IntegrityError` a run writing one wallet twice produces.
+    "balance_snapshots": {
+        "pk_balance_snapshots",
+        "uq_balance_snapshots_wallet_run",
+        "ck_balance_snapshots_confirmed",
+        "fk_balance_snapshots_wallet_id_wallets",
+        "fk_balance_snapshots_sync_run_id_sync_runs",
+        "ix_balance_snapshots_wallet_observed",
+    },
 }
 
 

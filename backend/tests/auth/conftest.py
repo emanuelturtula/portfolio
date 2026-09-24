@@ -80,6 +80,21 @@ def apply_auth_environment(
     monkeypatch.setenv("PORTFOLIO_ARGON2_TIME_COST", "1")
     monkeypatch.setenv("PORTFOLIO_ARGON2_MEMORY_COST", "64")
     monkeypatch.setenv("PORTFOLIO_ARGON2_PARALLELISM", "1")
+    # **The balance schedule is off in every suite built on this environment, and it has to
+    # be.** #10's lifespan starts the scheduler by default, and its startup condition is
+    # "sync now unless the newest finished run is younger than one interval" -- which is
+    # always true of a database created seconds ago. So every test that enters the real
+    # lifespan would perform a sync, and every test that registers a wallet inside it would
+    # send that wallet's address to a real public index over the real network.
+    #
+    # Two things would then be wrong at once: the suite would depend on somebody else's
+    # uptime, and it would put a testnet address this repository publishes into a third
+    # party's request log. Turning the loop off is the fix; the manual endpoint is
+    # unaffected, which `tests/api/test_balances.py` asserts by name rather than assuming.
+    #
+    # The two suites that are *about* the scheduler set this back to "true" explicitly, so
+    # that what they exercise reads as a decision rather than as inherited state.
+    monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     if bootstrap is None:
         monkeypatch.delenv("PORTFOLIO_BOOTSTRAP_PASSWORD", raising=False)
     else:

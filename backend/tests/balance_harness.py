@@ -76,10 +76,15 @@ CHAIN_DECIMALS: Final[Mapping[ChainKey, int]] = {ChainKey.BITCOIN: 8, ChainKey.K
 #: it is a constant here rather than a literal buried in one assertion.
 MAX_SAFE_INTEGER: Final = 9007199254740991
 
-#: 2.87e18 sompi -- the whole KAS supply in base units, from the spec's own calculation.
-#: Three hundred times `MAX_SAFE_INTEGER`, so a value that went through a double comes back
-#: with different digits rather than merely a different type.
-KASPA_SUPPLY_SOMPI: Final = 2_870_000_000_000_000_000
+#: 2.87e18 sompi -- the whole KAS supply in base units, from the spec's own calculation --
+#: **plus 123**, and those three digits are the point.
+#:
+#: A round 2.87e18 is past `MAX_SAFE_INTEGER` by a factor of three hundred and is still
+#: exactly representable as a double, because its binary expansion ends in enough zeros. A
+#: fixture built on it would satisfy "the number survived `JSON.parse`" for a body that
+#: `JSON.parse` does not damage, and would say nothing at all about the failure the spec
+#: measured. The low digits are the ones a double loses, so the fixture has to have some.
+KASPA_SUPPLY_SOMPI: Final = 2_870_000_000_000_000_123
 
 #: The one address per chain a test uses when it does not care which. Aliased rather than
 #: used directly so that a suite reading `plant_wallets()` with no arguments can see what it

@@ -819,3 +819,58 @@ async def test_no_message_on_a_chain_row_contains_an_address(
     details = " ".join(str(row["detail"]) for row in await sync_run_chains(sessions))
     assert BIP173_TESTNET_P2WPKH not in details
     assert KASPA_TESTNET_V0 not in details
+
+
+async def test_an_internal_failure_records_the_exception_type_and_never_its_message(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    """The `internal` clause records `type(error).__name__` and not `str(error)`, on purpose.
+
+    This is the one place where the two catch clauses have to differ in more than the kind
+    they write. A `ProviderError`'s message is safe to record: `providers/errors.py` is
+    written so that none of them ever quotes an address, a URL or a response body, and the
+    message is the most useful thing an operator can be given. **An arbitrary exception has
+    no such guarantee.** The realistic one is a `KeyError` raised while correlating a
+    balance to the address it belongs to, whose `str()` *is* the address -- and `detail` is
+    a column served by `GET /api/balances/runs`, so recording it would publish the owner's
+    holdings through an endpoint built to report an outage.
+
+    Driven with exactly that exception, carrying exactly that address. The Kaspa half is the
+    control: a provider failure in the same run keeps its whole message, so this is a
+    statement about the distinction rather than about `detail` being empty.
+    """
+    await plant_wallets(sessions)
+    providers = {
+        ChainKey.BITCOIN: StubChainProvider(
+            ChainKey.BITCOIN, raises=KeyError(BIP173_TESTNET_P2WPKH)
+        ),
+        ChainKey.KASPA: StubChainProvider(
+            ChainKey.KASPA, raises=ProviderUnavailableError("no configured endpoint answered")
+        ),
+    }
+
+    await run_sync(sessions, providers)
+
+    rows = {row["chain_key"]: row for row in await sync_run_chains(sessions)}
+    assert rows["bitcoin"]["error_kind"] == SyncErrorKind.INTERNAL
+    assert rows["bitcoin"]["detail"] == "KeyError"
+    assert BIP173_TESTNET_P2WPKH not in str(rows["bitcoin"]["detail"])
+    assert rows["kaspa"]["detail"] == "no configured endpoint answered", (
+        "a provider's own message is safe to record and is the useful half"
+    )
+
+
+async def test_the_address_really_is_in_the_exception_this_guards_against(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    """The falsification control: without it the test above proves nothing.
+
+    If `str(KeyError(address))` did not contain the address, "the detail does not contain
+    the address" would be true of any implementation at all, including one that recorded
+    `str(error)` verbatim. It does contain it -- in quotes, which is why the comparison is
+    a substring one -- so the guard has something to guard against.
+    """
+    leaking = KeyError(BIP173_TESTNET_P2WPKH)
+
+    assert BIP173_TESTNET_P2WPKH in str(leaking)
+    assert BIP173_TESTNET_P2WPKH not in type(leaking).__name__

@@ -363,14 +363,19 @@ def test_a_negative_amount_that_is_not_zero_keeps_its_sign() -> None:
 # --------------------------------------------------------------------------------------
 
 
-def test_the_shipped_application_gained_no_money_operation(app: FastAPI) -> None:
-    """No endpoint returns money yet, so no operation may carry an `Amount`.
+def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -> None:
+    """The path set, pinned, so that a new operation is a deliberate line in a diff.
 
-    `app` is the real application from the suite-wide conftest. The path set is pinned so
-    that a new operation is a deliberate line in a diff -- when it changes, the OpenAPI
-    drift job is about to fail too and `frontend/src/api/generated/schema.ts` needs
-    regenerating. The authentication endpoints (#3) are listed here for that reason; none
-    of them carries a monetary value, which is what this test actually asserts.
+    When this changes, the OpenAPI drift job is about to fail too and
+    `frontend/src/api/generated/schema.ts` needs regenerating -- which is the whole reason
+    the set is written out rather than counted.
+
+    #10 is the change the older wording of this test was waiting for: "reading a balance is
+    #6 to #8, and that is the change that will have to introduce `Amount` and argue for it
+    here". It did not introduce `Amount` -- the balance schemas declare their own string
+    fields -- so the argument moved to
+    `test_every_monetary_field_in_the_schema_is_declared_a_string`, which asserts the
+    property that mattered instead of the absence of one class.
     """
     schema: dict[str, Any] = app.openapi()
 
@@ -380,10 +385,74 @@ def test_the_shipped_application_gained_no_money_operation(app: FastAPI) -> None
         "/api/auth/logout",
         "/api/auth/session",
         "/api/auth/password",
-        # The wallet registry (#5). It records which addresses to read balances from and
-        # carries no monetary field of any kind -- reading a balance is #6 to #8, and that
-        # is the change that will have to introduce `Amount` and argue for it here.
+        # The wallet registry (#5): which addresses balances are read from.
         "/api/wallets",
         "/api/wallets/{wallet_id}",
+        # Balance sync, the valued read and the history (#10). The first operations in this
+        # application that carry money and on-chain quantities across the wire.
+        "/api/balances/sync",
+        "/api/balances/current",
+        "/api/balances/runs",
+        "/api/wallets/{wallet_id}/balances",
     }
-    assert "Amount" not in schema.get("components", {}).get("schemas", {})
+
+
+#: Property names that carry a monetary amount or an on-chain base-unit count. Both must be
+#: JSON strings and for two different reasons -- rule 2 for the first group, and
+#: `Number.MAX_SAFE_INTEGER` for the second -- which is why they are asserted together here
+#: and argued apart in `tests/api/test_balances.py`.
+MONEY_PROPERTIES: Final = frozenset(
+    {"total", "value", "quantity", "amount", "confirmed", "pending"}
+)
+
+
+def declared_types(schema: dict[str, Any]) -> set[str]:
+    """The JSON types a property may take, flattening the `anyOf` a nullable field becomes."""
+    if "anyOf" in schema:
+        return {str(option.get("type")) for option in schema["anyOf"]}
+    return {str(schema.get("type"))}
+
+
+def test_every_monetary_field_in_the_schema_is_declared_a_string(app: FastAPI) -> None:
+    """Rule 2 at the generated client, over every schema rather than a named few.
+
+    The frontend's `no-restricted-globals` rule bans `parseFloat`, `parseInt` and `Number()`
+    on money, and that ban only means something if the generated TypeScript declares these
+    fields as `string`. A field typed `number` there compiles perfectly and is already
+    inexact by the time any code runs.
+
+    Walked rather than listed, because a test naming today's fields would keep passing when
+    somebody adds tomorrow's -- and tomorrow's is the one that arrives as a number. `null`
+    is allowed alongside `string`: an unvalued holding and a chain that cannot answer the
+    mempool question are absences, not zeros.
+    """
+    schemas: dict[str, Any] = app.openapi().get("components", {}).get("schemas", {})
+    offences = [
+        f"{name}.{field}: {sorted(declared_types(definition))}"
+        for name, schema in schemas.items()
+        for field, definition in schema.get("properties", {}).items()
+        if field in MONEY_PROPERTIES and not declared_types(definition) <= {"string", "null"}
+    ]
+    seen = {
+        field
+        for schema in schemas.values()
+        for field in schema.get("properties", {})
+        if field in MONEY_PROPERTIES
+    }
+
+    assert offences == []
+    # The walk has to have found something, or an application with no money in it at all
+    # would satisfy the assertion above.
+    assert seen >= {"total", "value", "quantity", "amount", "confirmed", "pending"}
+
+
+def test_the_money_field_walk_can_actually_fail() -> None:
+    """The control: a property typed `number` under a money name has to be reported.
+
+    Without it, a typo in `MONEY_PROPERTIES` or a `declared_types` that returned the empty
+    set would make the test above pass over a document full of floats.
+    """
+    assert declared_types({"type": "string"}) == {"string"}
+    assert declared_types({"anyOf": [{"type": "string"}, {"type": "null"}]}) == {"string", "null"}
+    assert declared_types({"type": "number"}) == {"number"}
+    assert not declared_types({"type": "number"}) <= {"string", "null"}

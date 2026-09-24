@@ -14,11 +14,12 @@ each for a stated reason:
 
 ## The scheduler is off in this suite, deliberately, and that is a claim about the flag
 
-`PORTFOLIO_BALANCE_SYNC_ENABLED=false`. The reason is determinism: with it on, a fresh
-database has no finished run, so the lifespan starts one at startup -- and a manual `POST`
-arriving while that run is in flight **joins** it by design, returning `joined: true` and
-the startup run's zero counts. Every assertion about a manual run's counts would then be a
-race with the scheduler task.
+`tests/auth/conftest.py` sets `PORTFOLIO_BALANCE_SYNC_ENABLED=false` for every suite that
+enters the real lifespan, and its comment gives the network reason. There is a second
+reason here: with the loop on, a fresh database has no finished run, so startup begins one
+-- and a manual `POST` arriving while that run is in flight **joins** it by design,
+returning `joined: true` and the startup run's zero counts. Every assertion about a manual
+run would be a race with a background task.
 
 That makes this suite's basis an assertion in its own right, and it is named rather than
 buried: `test_a_manual_sync_answers_even_though_the_scheduler_is_disabled`. The setting
@@ -36,13 +37,11 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
-from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
 from portfolio.api.errors import PROBLEM_CONTENT_TYPE
 from portfolio.config import get_settings
 from portfolio.domain.chains import ChainKey
-from portfolio.main import create_app
 from portfolio.providers.errors import ProviderRateLimitedError, ProviderUnavailableError
 from portfolio.services.prices import PriceUnavailable
 from tests.address_vectors import (
@@ -52,8 +51,7 @@ from tests.address_vectors import (
     KASPA_TESTNET_V0,
     KASPA_TESTNET_V1_KEY,
 )
-from tests.auth.conftest import BASE_URL as SECURE_BASE_URL
-from tests.auth.conftest import JSON_HEADERS, apply_auth_environment, sign_in
+from tests.auth.conftest import JSON_HEADERS
 from tests.balance_harness import (
     KASPA_SUPPLY_SOMPI,
     MAX_SAFE_INTEGER,
@@ -65,10 +63,7 @@ from tests.balance_harness import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
-    from pathlib import Path
-
-    from fastapi import FastAPI
+    from httpx import AsyncClient
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 SYNC: Final = "/api/balances/sync"
@@ -101,54 +96,6 @@ PRICE_SOURCE: Final = "a-vendor"
 FIRST_SEEN: Final = datetime(2026, 9, 9, 23, 59, 59, 999999, tzinfo=UTC)
 SECOND_SEEN: Final = datetime(2026, 9, 10, 0, 0, 0, 1, tzinfo=UTC)
 THIRD_SEEN: Final = datetime(2026, 9, 10, 12, 0, 0, tzinfo=UTC)
-
-
-# --------------------------------------------------------------------------------------
-# The environment, and why it is not the shared one
-# --------------------------------------------------------------------------------------
-
-
-@pytest.fixture
-def balances_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """The shared API environment with the scheduler switched off. See the module docstring."""
-    database_path = apply_auth_environment(monkeypatch, tmp_path)
-    monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
-    get_settings.cache_clear()
-    try:
-        yield database_path
-    finally:
-        get_settings.cache_clear()
-
-
-@pytest.fixture
-async def balances_app(balances_environment: Path) -> AsyncIterator[FastAPI]:
-    """The real application through its real lifespan, with no scheduler behind it."""
-    del balances_environment  # Ordering only: the environment is read while the app builds.
-    built = create_app()
-    async with built.router.lifespan_context(built):
-        yield built
-
-
-@pytest.fixture
-def balances_sessionmaker(balances_app: FastAPI) -> async_sessionmaker[AsyncSession]:
-    """The application's own session factory, for reading the rows it wrote."""
-    factory: async_sessionmaker[AsyncSession] = balances_app.state.db_sessionmaker
-    return factory
-
-
-@pytest.fixture
-async def balances_client(balances_app: FastAPI) -> AsyncIterator[AsyncClient]:
-    """A client that talks to the application in process, with a cookie jar."""
-    transport = ASGITransport(app=balances_app)
-    async with AsyncClient(transport=transport, base_url=SECURE_BASE_URL) as opened:
-        yield opened
-
-
-@pytest.fixture
-async def signed_in(balances_client: AsyncClient) -> AsyncClient:
-    """A client holding a valid session cookie for the bootstrapped owner."""
-    await sign_in(balances_client)
-    return balances_client
 
 
 # --------------------------------------------------------------------------------------
@@ -303,8 +250,8 @@ async def history(client: AsyncClient, wallet_id: int, **params: Any) -> dict[st
 
 
 async def test_a_manual_sync_returns_the_run_summary(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Criterion 2, end to end: two chains read, one summary back, and rows behind it.
@@ -315,13 +262,15 @@ async def test_a_manual_sync_returns_the_run_summary(
     built by the same call that wrote the rows, so a summary agreeing with itself would
     prove nothing about what survived the transaction.
     """
-    bitcoin_wallet = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    kaspa_wallet = await create_wallet(signed_in, KASPA_TESTNET_V0, chain_key=KASPA, label="hot")
+    bitcoin_wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    kaspa_wallet = await create_wallet(
+        signed_in_api_client, KASPA_TESTNET_V0, chain_key=KASPA, label="hot"
+    )
     bitcoin = StubChainProvider(ChainKey.BITCOIN, {BIP173_TESTNET_P2WPKH: BTC_UNITS})
     kaspa = StubChainProvider(ChainKey.KASPA, {KASPA_TESTNET_V0: KAS_UNITS})
     registry = stub_chain_providers(monkeypatch, {ChainKey.BITCOIN: bitcoin, ChainKey.KASPA: kaspa})
 
-    response = await signed_in.post(SYNC, headers=JSON_HEADERS)
+    response = await signed_in_api_client.post(SYNC, headers=JSON_HEADERS)
 
     assert response.status_code == 200, response.text
     summary = response.json()
@@ -360,7 +309,7 @@ async def test_a_manual_sync_returns_the_run_summary(
     assert bitcoin.calls == [(BIP173_TESTNET_P2WPKH,)]
     assert kaspa.calls == [(KASPA_TESTNET_V0,)]
 
-    stored = await snapshots(balances_sessionmaker)
+    stored = await snapshots(api_sessionmaker)
     assert {(row["wallet_id"], row["confirmed"]) for row in stored} == {
         (bitcoin_wallet, BTC_UNITS),
         (kaspa_wallet, KAS_UNITS),
@@ -369,7 +318,7 @@ async def test_a_manual_sync_returns_the_run_summary(
 
 
 async def test_a_manual_sync_answers_even_though_the_scheduler_is_disabled(
-    signed_in: AsyncClient,
+    signed_in_api_client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`PORTFOLIO_BALANCE_SYNC_ENABLED=false` stops the schedule, not the button.
@@ -381,28 +330,28 @@ async def test_a_manual_sync_answers_even_though_the_scheduler_is_disabled(
     contract gives this endpoint no refusal to return if it could not.
     """
     assert get_settings().balance_sync_enabled is False
-    await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
+    await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
     stub_chain_providers(
         monkeypatch,
         {ChainKey.BITCOIN: StubChainProvider(ChainKey.BITCOIN, {BIP173_TESTNET_P2WPKH: BTC_UNITS})},
     )
 
-    response = await signed_in.post(SYNC, headers=JSON_HEADERS)
+    response = await signed_in_api_client.post(SYNC, headers=JSON_HEADERS)
 
     assert response.status_code == 200, response.text
 
 
-async def test_the_sync_endpoint_requires_a_session(balances_client: AsyncClient) -> None:
+async def test_the_sync_endpoint_requires_a_session(api_client: AsyncClient) -> None:
     """Rule 8 at the one endpoint that costs a vendor a request. No cookie, no read."""
-    response = await balances_client.post(SYNC, headers=JSON_HEADERS)
+    response = await api_client.post(SYNC, headers=JSON_HEADERS)
 
     assert response.status_code == 401
     assert response.headers["content-type"].startswith(PROBLEM_CONTENT_TYPE)
 
 
 async def test_a_sync_with_no_wallets_is_a_success_with_zero_counts(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The empty page, which is what every fresh deployment's first run looks like.
@@ -413,7 +362,7 @@ async def test_a_sync_with_no_wallets_is_a_success_with_zero_counts(
     """
     registry = stub_chain_providers(monkeypatch, {})
 
-    response = await signed_in.post(SYNC, headers=JSON_HEADERS)
+    response = await signed_in_api_client.post(SYNC, headers=JSON_HEADERS)
 
     assert response.status_code == 200, response.text
     summary = response.json()
@@ -425,11 +374,11 @@ async def test_a_sync_with_no_wallets_is_a_success_with_zero_counts(
     )
     assert summary["chains"] == []
     assert registry.created == [], "no wallets means no provider is built at all"
-    assert len(await sync_runs(balances_sessionmaker)) == 1, "criterion 4: the row is still written"
+    assert len(await sync_runs(api_sessionmaker)) == 1, "criterion 4: the row is still written"
 
 
 async def test_an_archived_wallet_is_not_read(
-    signed_in: AsyncClient,
+    signed_in_api_client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Archiving is what stops a wallet costing a vendor a request every fifteen minutes.
@@ -438,16 +387,18 @@ async def test_an_archived_wallet_is_not_read(
     and its history stay, and the address is never asked about again. A sync that still
     read it would make archiving a display preference rather than a decision.
     """
-    live = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    retired = await create_wallet(signed_in, BIP350_TESTNET_V1, label="retired")
-    assert (await signed_in.delete(f"{WALLETS}/{retired}", headers=JSON_HEADERS)).status_code == 204
+    live = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    retired = await create_wallet(signed_in_api_client, BIP350_TESTNET_V1, label="retired")
+    assert (
+        await signed_in_api_client.delete(f"{WALLETS}/{retired}", headers=JSON_HEADERS)
+    ).status_code == 204
     bitcoin = StubChainProvider(
         ChainKey.BITCOIN,
         {BIP173_TESTNET_P2WPKH: BTC_UNITS, BIP350_TESTNET_V1: 1},
     )
     stub_chain_providers(monkeypatch, {ChainKey.BITCOIN: bitcoin})
 
-    summary = (await signed_in.post(SYNC, headers=JSON_HEADERS)).json()
+    summary = (await signed_in_api_client.post(SYNC, headers=JSON_HEADERS)).json()
 
     assert summary["wallets_total"] == 1
     assert bitcoin.calls == [(BIP173_TESTNET_P2WPKH,)], "the archived address must not be asked"
@@ -460,7 +411,7 @@ async def test_an_archived_wallet_is_not_read(
 
 
 async def test_the_runs_endpoint_reports_the_run_newest_first(
-    signed_in: AsyncClient,
+    signed_in_api_client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Criterion 4 without opening the database, which is what makes it observable.
@@ -468,16 +419,16 @@ async def test_the_runs_endpoint_reports_the_run_newest_first(
     Two runs, so "newest first" is a statement rather than a coincidence of one row, and
     the chain rows are asserted to travel with their own run instead of being pooled.
     """
-    await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
+    await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
     stub_chain_providers(
         monkeypatch,
         {ChainKey.BITCOIN: StubChainProvider(ChainKey.BITCOIN, {BIP173_TESTNET_P2WPKH: BTC_UNITS})},
     )
-    first = (await signed_in.post(SYNC, headers=JSON_HEADERS)).json()
-    second = (await signed_in.post(SYNC, headers=JSON_HEADERS)).json()
+    first = (await signed_in_api_client.post(SYNC, headers=JSON_HEADERS)).json()
+    second = (await signed_in_api_client.post(SYNC, headers=JSON_HEADERS)).json()
     assert first["run_id"] != second["run_id"], "a second call must start a second run"
 
-    response = await signed_in.get(RUNS)
+    response = await signed_in_api_client.get(RUNS)
 
     assert response.status_code == 200, response.text
     payload = response.json()
@@ -489,16 +440,16 @@ async def test_the_runs_endpoint_reports_the_run_newest_first(
     )
 
 
-async def test_the_runs_limit_is_bounded_at_both_ends(signed_in: AsyncClient) -> None:
+async def test_the_runs_limit_is_bounded_at_both_ends(signed_in_api_client: AsyncClient) -> None:
     """`limit` is 1..200. Outside that it is a 422, not a clamp nobody was told about."""
-    assert (await signed_in.get(RUNS, params={"limit": 0})).status_code == 422
-    assert (await signed_in.get(RUNS, params={"limit": 201})).status_code == 422
-    assert (await signed_in.get(RUNS, params={"limit": 1})).status_code == 200
-    assert (await signed_in.get(RUNS, params={"limit": 200})).status_code == 200
+    assert (await signed_in_api_client.get(RUNS, params={"limit": 0})).status_code == 422
+    assert (await signed_in_api_client.get(RUNS, params={"limit": 201})).status_code == 422
+    assert (await signed_in_api_client.get(RUNS, params={"limit": 1})).status_code == 200
+    assert (await signed_in_api_client.get(RUNS, params={"limit": 200})).status_code == 200
 
 
 async def test_a_failed_chain_reaches_the_runs_endpoint_with_its_kind(
-    signed_in: AsyncClient,
+    signed_in_api_client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The kind and the detail survive the round trip to the operator who has to act on it.
@@ -509,8 +460,8 @@ async def test_a_failed_chain_reaches_the_runs_endpoint_with_its_kind(
     the address -- `providers/errors.py` promises that and this is the endpoint where the
     promise is cashed.
     """
-    await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    await create_wallet(signed_in, KASPA_TESTNET_V0, chain_key=KASPA, label="hot")
+    await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    await create_wallet(signed_in_api_client, KASPA_TESTNET_V0, chain_key=KASPA, label="hot")
     stub_chain_providers(
         monkeypatch,
         {
@@ -523,9 +474,9 @@ async def test_a_failed_chain_reaches_the_runs_endpoint_with_its_kind(
             ),
         },
     )
-    await signed_in.post(SYNC, headers=JSON_HEADERS)
+    await signed_in_api_client.post(SYNC, headers=JSON_HEADERS)
 
-    runs = (await signed_in.get(RUNS)).json()["runs"]
+    runs = (await signed_in_api_client.get(RUNS)).json()["runs"]
 
     chains = {chain["chain_key"]: chain for chain in runs[0]["chains"]}
     assert runs[0]["status"] == "partial"
@@ -543,8 +494,8 @@ async def test_a_failed_chain_reaches_the_runs_endpoint_with_its_kind(
 
 
 async def test_current_balances_are_valued_against_the_price_cache(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     """Criterion 7: a snapshot times a cached price, with every money field a string.
 
@@ -555,26 +506,28 @@ async def test_current_balances_are_valued_against_the_price_cache(
     field in the body and never says where it comes from, so the two halves are asserted
     apart rather than one of them being assumed inside the other.
     """
-    bitcoin_wallet = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    kaspa_wallet = await create_wallet(signed_in, KASPA_TESTNET_V0, chain_key=KASPA, label="hot")
-    run_id = await insert_run(balances_sessionmaker, started_at=THIRD_SEEN, wallets_total=2)
+    bitcoin_wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    kaspa_wallet = await create_wallet(
+        signed_in_api_client, KASPA_TESTNET_V0, chain_key=KASPA, label="hot"
+    )
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN, wallets_total=2)
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=bitcoin_wallet,
         run_id=run_id,
         confirmed=BTC_UNITS,
         observed_at=THIRD_SEEN,
     )
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=kaspa_wallet,
         run_id=run_id,
         confirmed=KAS_UNITS,
         observed_at=THIRD_SEEN,
     )
-    await price_everything(balances_sessionmaker)
+    await price_everything(api_sessionmaker)
 
-    response = await signed_in.get(CURRENT)
+    response = await signed_in_api_client.get(CURRENT)
 
     assert response.status_code == 200, response.text
     payload = response.json()
@@ -613,8 +566,8 @@ async def test_current_balances_are_valued_against_the_price_cache(
 
 
 async def test_the_quote_currency_defaults_to_euro_and_can_be_chosen(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     """The default is EUR and the query parameter overrides it, with the arithmetic following.
 
@@ -630,20 +583,20 @@ async def test_the_quote_currency_defaults_to_euro_and_can_be_chosen(
     fully valued at nothing is the exact failure #9's completeness flag exists to prevent,
     and it is the shape both plausible implementations have to avoid.
     """
-    wallet = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    run_id = await insert_run(balances_sessionmaker, started_at=THIRD_SEEN)
+    wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN)
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=wallet,
         run_id=run_id,
         confirmed=BTC_UNITS,
         observed_at=THIRD_SEEN,
     )
-    await price_everything(balances_sessionmaker)
+    await price_everything(api_sessionmaker)
 
-    default = (await signed_in.get(CURRENT)).json()
-    chosen = (await signed_in.get(CURRENT, params={"quote_currency": "USD"})).json()
-    refused = await signed_in.get(CURRENT, params={"quote_currency": "GBP"})
+    default = (await signed_in_api_client.get(CURRENT)).json()
+    chosen = (await signed_in_api_client.get(CURRENT, params={"quote_currency": "USD"})).json()
+    refused = await signed_in_api_client.get(CURRENT, params={"quote_currency": "GBP"})
 
     assert default["quote_currency"] == "EUR"
     assert Decimal(default["total"]) == BTC_QUANTITY * BTC_PRICE["EUR"]
@@ -659,8 +612,8 @@ async def test_the_quote_currency_defaults_to_euro_and_can_be_chosen(
 
 
 async def test_an_unpriced_asset_makes_the_total_incomplete(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     """#9's contract, re-asserted at the endpoint: the total omits what it could not price.
 
@@ -673,12 +626,14 @@ async def test_an_unpriced_asset_makes_the_total_incomplete(
     four members `services/prices.py` defines. A reason nothing can branch on is the
     failure that enum exists to prevent.
     """
-    bitcoin_wallet = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    kaspa_wallet = await create_wallet(signed_in, KASPA_TESTNET_V0, chain_key=KASPA, label="hot")
-    run_id = await insert_run(balances_sessionmaker, started_at=THIRD_SEEN, wallets_total=2)
+    bitcoin_wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    kaspa_wallet = await create_wallet(
+        signed_in_api_client, KASPA_TESTNET_V0, chain_key=KASPA, label="hot"
+    )
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN, wallets_total=2)
     for wallet_id, units in ((bitcoin_wallet, BTC_UNITS), (kaspa_wallet, KAS_UNITS)):
         await insert_snapshot(
-            balances_sessionmaker,
+            api_sessionmaker,
             wallet_id=wallet_id,
             run_id=run_id,
             confirmed=units,
@@ -687,14 +642,14 @@ async def test_an_unpriced_asset_makes_the_total_incomplete(
     as_of = datetime.now(UTC) - timedelta(minutes=5)
     for currency in ("USD", "EUR"):
         await insert_price(
-            balances_sessionmaker,
+            api_sessionmaker,
             symbol="BTC",
             currency=currency,
             amount=BTC_PRICE[currency],
             as_of=as_of,
         )
 
-    payload = (await signed_in.get(CURRENT)).json()
+    payload = (await signed_in_api_client.get(CURRENT)).json()
 
     currency = payload["quote_currency"]
     assert payload["complete"] is False
@@ -708,27 +663,27 @@ async def test_an_unpriced_asset_makes_the_total_incomplete(
 
 
 async def test_a_wallet_with_no_snapshot_reports_null_rather_than_zero(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     """A zero balance and an unread wallet are different facts, and the dashboard may say which.
 
     The wallet with a real zero is the control: without it, `confirmed: null` would be
     indistinguishable from "the endpoint returns null for everything it has not valued".
     """
-    unread = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH, label="never read")
-    empty = await create_wallet(signed_in, BIP350_TESTNET_V1, label="really empty")
-    run_id = await insert_run(balances_sessionmaker, started_at=THIRD_SEEN)
+    unread = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH, label="never read")
+    empty = await create_wallet(signed_in_api_client, BIP350_TESTNET_V1, label="really empty")
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN)
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=empty,
         run_id=run_id,
         confirmed=0,
         observed_at=THIRD_SEEN,
     )
-    await price_everything(balances_sessionmaker)
+    await price_everything(api_sessionmaker)
 
-    payload = (await signed_in.get(CURRENT)).json()
+    payload = (await signed_in_api_client.get(CURRENT)).json()
 
     by_wallet = {wallet["wallet_id"]: wallet for wallet in payload["wallets"]}
     assert set(by_wallet) == {unread, empty}, "an unread wallet still appears; it is not omitted"
@@ -740,8 +695,8 @@ async def test_a_wallet_with_no_snapshot_reports_null_rather_than_zero(
 
 
 async def test_only_the_newest_snapshot_of_a_wallet_is_current(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     """ "Current" is the latest row, resolved by identity order rather than by an amount.
 
@@ -749,26 +704,26 @@ async def test_only_the_newest_snapshot_of_a_wallet_is_current(
     `MAX(confirmed)`, or that ordered by anything to do with the money, would return the
     stale one and every assertion about the sum would still look plausible.
     """
-    wallet = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    older = await insert_run(balances_sessionmaker, started_at=FIRST_SEEN)
-    newer = await insert_run(balances_sessionmaker, started_at=THIRD_SEEN)
+    wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    older = await insert_run(api_sessionmaker, started_at=FIRST_SEEN)
+    newer = await insert_run(api_sessionmaker, started_at=THIRD_SEEN)
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=wallet,
         run_id=older,
         confirmed=BTC_UNITS * 9,
         observed_at=FIRST_SEEN,
     )
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=wallet,
         run_id=newer,
         confirmed=BTC_UNITS,
         observed_at=THIRD_SEEN,
     )
-    await price_everything(balances_sessionmaker)
+    await price_everything(api_sessionmaker)
 
-    payload = (await signed_in.get(CURRENT)).json()
+    payload = (await signed_in_api_client.get(CURRENT)).json()
 
     wallets = payload["wallets"]
     assert len(wallets) == 1, "one wallet is one line, whatever its history"
@@ -776,9 +731,9 @@ async def test_only_the_newest_snapshot_of_a_wallet_is_current(
     assert payload["as_of"] is not None
 
 
-async def test_the_current_endpoint_requires_a_session(balances_client: AsyncClient) -> None:
+async def test_the_current_endpoint_requires_a_session(api_client: AsyncClient) -> None:
     """Balances are the holdings themselves; this is the body that must never be public."""
-    assert (await balances_client.get(CURRENT)).status_code == 401
+    assert (await api_client.get(CURRENT)).status_code == 401
 
 
 # --------------------------------------------------------------------------------------
@@ -788,24 +743,24 @@ async def test_the_current_endpoint_requires_a_session(balances_client: AsyncCli
 
 @pytest.fixture
 async def wallet_with_history(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> tuple[int, list[int]]:
     """One wallet, three snapshots, inserted newest first so ordering cannot come for free.
 
     The balances step across a digit boundary -- 9, 10, 11 whole coins -- so that a read
     which ordered by the amount as text would put 11 before 9 and this suite would see it.
     """
-    wallet = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
+    wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
     written = [
         (THIRD_SEEN, 1_100_000_000),
         (FIRST_SEEN, 900_000_000),
         (SECOND_SEEN, 1_000_000_000),
     ]
     for observed_at, confirmed in written:
-        run_id = await insert_run(balances_sessionmaker, started_at=observed_at)
+        run_id = await insert_run(api_sessionmaker, started_at=observed_at)
         await insert_snapshot(
-            balances_sessionmaker,
+            api_sessionmaker,
             wallet_id=wallet,
             run_id=run_id,
             confirmed=confirmed,
@@ -815,7 +770,7 @@ async def wallet_with_history(
 
 
 async def test_wallet_history_is_oldest_first(
-    signed_in: AsyncClient,
+    signed_in_api_client: AsyncClient,
     wallet_with_history: tuple[int, list[int]],
 ) -> None:
     """Criterion 8: a chart reads left to right, so the series arrives in that order.
@@ -825,7 +780,7 @@ async def test_wallet_history_is_oldest_first(
     """
     wallet, expected = wallet_with_history
 
-    payload = await history(signed_in, wallet)
+    payload = await history(signed_in_api_client, wallet)
 
     assert set(payload) == {"wallet_id", "decimals", "snapshots"}
     assert payload["wallet_id"] == wallet
@@ -843,7 +798,7 @@ async def test_wallet_history_is_oldest_first(
 
 
 async def test_the_history_orders_across_a_boundary_a_string_would_get_wrong(
-    signed_in: AsyncClient,
+    signed_in_api_client: AsyncClient,
     wallet_with_history: tuple[int, list[int]],
 ) -> None:
     """The spec's asymmetry, cashed: a timestamp may be compared in SQL and money may not.
@@ -860,7 +815,7 @@ async def test_the_history_orders_across_a_boundary_a_string_would_get_wrong(
     """
     wallet, _expected = wallet_with_history
 
-    payload = await history(signed_in, wallet)
+    payload = await history(signed_in_api_client, wallet)
 
     quantities = [row["quantity"] for row in payload["snapshots"]]
     assert quantities == sorted(quantities, key=Decimal)
@@ -870,7 +825,7 @@ async def test_the_history_orders_across_a_boundary_a_string_would_get_wrong(
 
 
 async def test_since_filters_the_history(
-    signed_in: AsyncClient,
+    signed_in_api_client: AsyncClient,
     wallet_with_history: tuple[int, list[int]],
 ) -> None:
     """Criterion 8's window. `since` is inclusive, which is the boundary worth pinning.
@@ -880,25 +835,25 @@ async def test_since_filters_the_history(
     """
     wallet, _expected = wallet_with_history
 
-    payload = await history(signed_in, wallet, since=SECOND_SEEN.isoformat())
+    payload = await history(signed_in_api_client, wallet, since=SECOND_SEEN.isoformat())
 
     assert [int(row["confirmed"]) for row in payload["snapshots"]] == [1_000_000_000, 1_100_000_000]
 
 
 async def test_since_in_the_future_is_an_empty_series_rather_than_an_error(
-    signed_in: AsyncClient,
+    signed_in_api_client: AsyncClient,
     wallet_with_history: tuple[int, list[int]],
 ) -> None:
     """The empty page. Nothing to chart is a fact about the window, not a failure."""
     wallet, _expected = wallet_with_history
 
-    payload = await history(signed_in, wallet, since="2099-01-01T00:00:00Z")
+    payload = await history(signed_in_api_client, wallet, since="2099-01-01T00:00:00Z")
 
     assert payload["snapshots"] == []
 
 
 async def test_limit_is_bounded(
-    signed_in: AsyncClient,
+    signed_in_api_client: AsyncClient,
     wallet_with_history: tuple[int, list[int]],
 ) -> None:
     """`limit` is 1..1000, and outside that it is a 422 rather than a silent clamp.
@@ -909,16 +864,16 @@ async def test_limit_is_bounded(
     wallet, _expected = wallet_with_history
     path = f"{WALLETS}/{wallet}/balances"
 
-    assert (await signed_in.get(path, params={"limit": 0})).status_code == 422
-    assert (await signed_in.get(path, params={"limit": 1001})).status_code == 422
-    assert (await signed_in.get(path, params={"limit": 1000})).status_code == 200
-    limited = await history(signed_in, wallet, limit=2)
+    assert (await signed_in_api_client.get(path, params={"limit": 0})).status_code == 422
+    assert (await signed_in_api_client.get(path, params={"limit": 1001})).status_code == 422
+    assert (await signed_in_api_client.get(path, params={"limit": 1000})).status_code == 200
+    limited = await history(signed_in_api_client, wallet, limit=2)
     assert len(limited["snapshots"]) == 2
 
 
 async def test_another_users_wallet_is_a_404(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     """A wallet id is a small integer, so enumeration is the attack this answer prevents.
 
@@ -926,7 +881,7 @@ async def test_another_users_wallet_is_a_404(
     of addresses this application watches *is* the owner's holdings. The row is inserted for
     a second user directly, because nothing in the API creates one.
     """
-    async with balances_sessionmaker() as session:
+    async with api_sessionmaker() as session:
         result = await session.execute(
             text(
                 "INSERT INTO users (username, password_hash, created_at) "
@@ -951,21 +906,21 @@ async def test_another_users_wallet_is_a_404(
         their_wallet = result.scalar_one()
         await session.commit()
 
-    response = await signed_in.get(f"{WALLETS}/{their_wallet}/balances")
+    response = await signed_in_api_client.get(f"{WALLETS}/{their_wallet}/balances")
 
     assert response.status_code == 404
     assert response.headers["content-type"].startswith(PROBLEM_CONTENT_TYPE)
     assert CORE_REGTEST_P2WPKH not in response.text
 
 
-async def test_an_unknown_wallet_id_is_a_404(signed_in: AsyncClient) -> None:
+async def test_an_unknown_wallet_id_is_a_404(signed_in_api_client: AsyncClient) -> None:
     """The same answer for a wallet that never existed, so the two are indistinguishable."""
-    assert (await signed_in.get(f"{WALLETS}/999999/balances")).status_code == 404
+    assert (await signed_in_api_client.get(f"{WALLETS}/999999/balances")).status_code == 404
 
 
 async def test_an_archived_wallet_still_answers_with_its_history(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     """Its history is the reason archiving is a timestamp rather than a `DELETE`.
 
@@ -973,25 +928,27 @@ async def test_an_archived_wallet_still_answers_with_its_history(
     retired because it is empty, and what the owner wants afterwards is the record of when
     it stopped holding anything.
     """
-    wallet = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    run_id = await insert_run(balances_sessionmaker, started_at=THIRD_SEEN)
+    wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN)
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=wallet,
         run_id=run_id,
         confirmed=BTC_UNITS,
         observed_at=THIRD_SEEN,
     )
-    assert (await signed_in.delete(f"{WALLETS}/{wallet}", headers=JSON_HEADERS)).status_code == 204
+    assert (
+        await signed_in_api_client.delete(f"{WALLETS}/{wallet}", headers=JSON_HEADERS)
+    ).status_code == 204
 
-    payload = await history(signed_in, wallet)
+    payload = await history(signed_in_api_client, wallet)
 
     assert [int(row["confirmed"]) for row in payload["snapshots"]] == [BTC_UNITS]
 
 
-async def test_the_history_endpoint_requires_a_session(balances_client: AsyncClient) -> None:
+async def test_the_history_endpoint_requires_a_session(api_client: AsyncClient) -> None:
     """One wallet's balance history is the same disclosure as all of them, for one address."""
-    assert (await balances_client.get(f"{WALLETS}/1/balances")).status_code == 401
+    assert (await api_client.get(f"{WALLETS}/1/balances")).status_code == 401
 
 
 # --------------------------------------------------------------------------------------
@@ -1000,8 +957,8 @@ async def test_the_history_endpoint_requires_a_session(balances_client: AsyncCli
 
 
 async def test_base_units_cross_the_wire_as_strings(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     """`confirmed` and `pending` are JSON strings, asserted against the raw text.
 
@@ -1012,27 +969,29 @@ async def test_base_units_cross_the_wire_as_strings(
     The tri-state is asserted in the same body: a `pending` of `null` means the chain does
     not answer the question, and it is not a zero and not the string `"None"`.
     """
-    priced = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    mempool = await create_wallet(signed_in, BIP350_TESTNET_V1, label="with a mempool delta")
-    run_id = await insert_run(balances_sessionmaker, started_at=THIRD_SEEN, wallets_total=2)
+    priced = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    mempool = await create_wallet(
+        signed_in_api_client, BIP350_TESTNET_V1, label="with a mempool delta"
+    )
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN, wallets_total=2)
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=priced,
         run_id=run_id,
         confirmed=BTC_UNITS,
         observed_at=THIRD_SEEN,
     )
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=mempool,
         run_id=run_id,
         confirmed=BTC_UNITS,
         pending=-500,
         observed_at=THIRD_SEEN,
     )
-    await price_everything(balances_sessionmaker)
+    await price_everything(api_sessionmaker)
 
-    raw = (await signed_in.get(CURRENT)).text
+    raw = (await signed_in_api_client.get(CURRENT)).text
 
     assert f'"confirmed":"{BTC_UNITS}"' in raw.replace(" ", "")
     assert '"pending":null' in raw.replace(" ", "")
@@ -1046,8 +1005,8 @@ async def test_base_units_cross_the_wire_as_strings(
 
 
 async def test_a_kaspa_balance_past_the_javascript_safe_integer_survives_the_round_trip(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     """The spec's measured case: 2.87e18 sompi, three hundred times `Number.MAX_SAFE_INTEGER`.
 
@@ -1058,18 +1017,20 @@ async def test_a_kaspa_balance_past_the_javascript_safe_integer_survives_the_rou
     a body that `JSON.parse` destroys. The `float` round trip below is the browser's
     behaviour, reproduced, and it is asserted to differ.
     """
-    wallet = await create_wallet(signed_in, KASPA_TESTNET_V1_KEY, chain_key=KASPA, label="whale")
-    run_id = await insert_run(balances_sessionmaker, started_at=THIRD_SEEN)
+    wallet = await create_wallet(
+        signed_in_api_client, KASPA_TESTNET_V1_KEY, chain_key=KASPA, label="whale"
+    )
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN)
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=wallet,
         run_id=run_id,
         confirmed=KASPA_SUPPLY_SOMPI,
         observed_at=THIRD_SEEN,
     )
-    await price_everything(balances_sessionmaker)
+    await price_everything(api_sessionmaker)
 
-    raw = (await signed_in.get(CURRENT)).text
+    raw = (await signed_in_api_client.get(CURRENT)).text
 
     assert KASPA_SUPPLY_SOMPI > MAX_SAFE_INTEGER, "the fixture has to be past the limit"
     assert f'"{KASPA_SUPPLY_SOMPI}"' in raw.replace(" ", "")
@@ -1084,8 +1045,8 @@ async def test_a_kaspa_balance_past_the_javascript_safe_integer_survives_the_rou
 
 
 async def test_every_money_field_is_a_string_and_none_is_a_json_number(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
     """Rule 2 at the boundary, over the whole document rather than field by field.
 
@@ -1094,21 +1055,21 @@ async def test_every_money_field_is_a_string_and_none_is_a_json_number(
     the type of everything under a money-ish name is what covers the field nobody has
     written yet.
     """
-    wallet = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    run_id = await insert_run(balances_sessionmaker, started_at=THIRD_SEEN)
+    wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN)
     await insert_snapshot(
-        balances_sessionmaker,
+        api_sessionmaker,
         wallet_id=wallet,
         run_id=run_id,
         confirmed=BTC_UNITS,
         pending=1,
         observed_at=THIRD_SEEN,
     )
-    await price_everything(balances_sessionmaker)
+    await price_everything(api_sessionmaker)
     money_names = {"total", "value", "quantity", "amount", "confirmed", "pending"}
 
-    payload = json.loads((await signed_in.get(CURRENT)).text)
-    payload["history"] = await history(signed_in, wallet)
+    payload = json.loads((await signed_in_api_client.get(CURRENT)).text)
+    payload["history"] = await history(signed_in_api_client, wallet)
 
     offences: list[str] = []
 
@@ -1160,8 +1121,8 @@ async def test_the_walk_over_money_fields_can_actually_fail() -> None:
 
 
 async def test_one_chain_failing_still_returns_the_other_chains_balances(
-    signed_in: AsyncClient,
-    balances_sessionmaker: async_sessionmaker[AsyncSession],
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Criterion 3 where the user meets it: sync, then read, with one vendor down.
@@ -1171,8 +1132,8 @@ async def test_one_chain_failing_still_returns_the_other_chains_balances(
     it would fail for a service that rolled the whole run back on one chain's exception,
     which is the implementation a single `try` around the `gather` produces.
     """
-    bitcoin_wallet = await create_wallet(signed_in, BIP173_TESTNET_P2WPKH)
-    await create_wallet(signed_in, KASPA_TESTNET_V0, chain_key=KASPA, label="hot")
+    bitcoin_wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    await create_wallet(signed_in_api_client, KASPA_TESTNET_V0, chain_key=KASPA, label="hot")
     stub_chain_providers(
         monkeypatch,
         {
@@ -1184,13 +1145,70 @@ async def test_one_chain_failing_still_returns_the_other_chains_balances(
             ),
         },
     )
-    await price_everything(balances_sessionmaker)
+    await price_everything(api_sessionmaker)
 
-    summary = (await signed_in.post(SYNC, headers=JSON_HEADERS)).json()
-    payload = (await signed_in.get(CURRENT)).json()
+    summary = (await signed_in_api_client.post(SYNC, headers=JSON_HEADERS)).json()
+    payload = (await signed_in_api_client.get(CURRENT)).json()
 
     assert summary["status"] == "partial"
     assert (summary["wallets_succeeded"], summary["wallets_failed"]) == (1, 1)
     by_wallet = {wallet["wallet_id"]: wallet for wallet in payload["wallets"]}
     assert by_wallet[bitcoin_wallet]["confirmed"] == str(BTC_UNITS)
-    assert len(await snapshots(balances_sessionmaker)) == 1, "only the chain that answered wrote"
+    assert len(await snapshots(api_sessionmaker)) == 1, "only the chain that answered wrote"
+
+
+async def test_a_naive_since_is_refused_rather_than_assumed_to_be_utc(
+    signed_in_api_client: AsyncClient,
+    wallet_with_history: tuple[int, list[int]],
+) -> None:
+    """A timestamp with no offset names no instant, and guessing one is how a chart lies.
+
+    `2026-09-10T00:00:00` means a different moment in every timezone a browser might be in,
+    and assuming UTC would silently shift a European user's window by two hours -- visible
+    only as a chart that begins in slightly the wrong place. The refusal is a 422, which is
+    something a client can act on.
+
+    The aware form of the same instant is the control, so the refusal is about the missing
+    offset rather than about the parameter being rejected in general.
+    """
+    wallet, _expected = wallet_with_history
+    path = f"{WALLETS}/{wallet}/balances"
+
+    naive = await signed_in_api_client.get(path, params={"since": "2026-09-10T00:00:00"})
+    aware = await signed_in_api_client.get(path, params={"since": "2026-09-10T00:00:00Z"})
+
+    assert naive.status_code == 422
+    assert aware.status_code == 200
+
+
+async def test_an_unpriced_wallet_carries_a_null_value_and_a_null_price(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A holding nothing could price has no value, and `null` is how that is said.
+
+    Not `"0"`, and not the quantity. A zero would be a claim that the holding is worth
+    nothing, which is a statement about the market rather than about the price cache, and it
+    is the one number a renderer cannot tell from a real zero. The balance itself is still
+    reported, because the chain answered perfectly well -- it is only the valuation that is
+    missing, and the two facts are separate.
+    """
+    wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN)
+    await insert_snapshot(
+        api_sessionmaker,
+        wallet_id=wallet,
+        run_id=run_id,
+        confirmed=BTC_UNITS,
+        observed_at=THIRD_SEEN,
+    )
+
+    payload = (await signed_in_api_client.get(CURRENT)).json()
+
+    line = payload["wallets"][0]
+    assert line["confirmed"] == str(BTC_UNITS)
+    assert Decimal(line["quantity"]) == BTC_QUANTITY
+    assert line["value"] is None
+    assert line["price"] is None
+    assert payload["complete"] is False
+    assert Decimal(payload["total"]) == 0

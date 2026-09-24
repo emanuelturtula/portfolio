@@ -34,12 +34,19 @@ EXPECTED_SEED_SYMBOLS = ["BTC", "KAS", "USDT"]
 
 @pytest.fixture
 def lifespan_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """Point the process-wide settings at a temporary file, and put them back."""
+    """Point the process-wide settings at a temporary file, and put them back.
+
+    The balance schedule is off here for the reason `tests/auth/conftest.py` sets out at
+    length: a lifespan with the loop running syncs at startup against two real public
+    indexes, because a database created a moment ago has no finished run to suppress it.
+    The tests below that are about the scheduler turn it back on by name.
+    """
     database_path = tmp_path / "lifespan" / "portfolio.db"
     monkeypatch.setenv(
         "PORTFOLIO_DATABASE_URL",
         f"sqlite+aiosqlite:///{database_path.as_posix()}",
     )
+    monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     get_settings.cache_clear()
     try:
         yield database_path

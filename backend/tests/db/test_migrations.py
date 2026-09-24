@@ -50,7 +50,21 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
     from sqlalchemy.engine import Connection
 
-APPLICATION_TABLES = frozenset({"users", "sessions", "assets", "wallets", "prices"})
+APPLICATION_TABLES = frozenset(
+    {
+        "users",
+        "sessions",
+        "assets",
+        "wallets",
+        "prices",
+        # #10. `sync_runs` is the record of every attempt, `sync_run_chains` is which chain
+        # did what within one attempt, and `balance_snapshots` is the append-only history a
+        # chart is drawn from.
+        "sync_runs",
+        "sync_run_chains",
+        "balance_snapshots",
+    }
+)
 """Every table the application owns, compared **exactly** rather than with `>=`.
 
 `>=` was the original spelling and it covered less than it looked like it did: a table a
@@ -72,6 +86,12 @@ FIRST_REVISION = "0001_initial_schema"
 #: actually relies on when a release is rolled back on the Pi.
 REVISION_BEFORE_PRICES = "0003_wallets"
 PRICES_REVISION = "0004_prices"
+
+#: #10's revision and its parent, for the same single-step reversal. A rollback on the Pi
+#: moves one step, and one step is the only thing that can tell a `downgrade()` which drops
+#: the right three tables from one which drops somebody else's.
+BALANCES_REVISION = "0005_balances"
+BALANCE_TABLES = frozenset({"sync_runs", "sync_run_chains", "balance_snapshots"})
 
 EXPECTED_SEED_ROWS = [
     ("BTC", "Bitcoin", 8, "crypto"),
@@ -100,6 +120,31 @@ EXPECTED_CONSTRAINT_NAMES = {
         "uq_prices_asset_currency",
         "ck_prices_quote_currency",
         "fk_prices_asset_id_assets",
+    },
+    # #10. Every CHECK here is invisible to the drift check, exactly as `ck_assets_kind`
+    # is; `tests/db/test_sync_runs_repository.py` and `tests/db/test_balances_repository.py`
+    # compare each one's text against the model's constant and exercise it with a real
+    # insert. What this map adds is that the constraints exist *and are named*, which is
+    # what a batch rebuild needs in order to re-create them at all.
+    "sync_runs": {
+        "pk_sync_runs",
+        "ck_sync_runs_trigger",
+        "ck_sync_runs_status",
+    },
+    "sync_run_chains": {
+        "pk_sync_run_chains",
+        "uq_sync_run_chains_run_chain",
+        "ck_sync_run_chains_chain_key",
+        "ck_sync_run_chains_status",
+        "ck_sync_run_chains_error_kind",
+        "fk_sync_run_chains_sync_run_id_sync_runs",
+    },
+    "balance_snapshots": {
+        "pk_balance_snapshots",
+        "uq_balance_snapshots_wallet_run",
+        "ck_balance_snapshots_confirmed",
+        "fk_balance_snapshots_wallet_id_wallets",
+        "fk_balance_snapshots_sync_run_id_sync_runs",
     },
 }
 
@@ -274,12 +319,60 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
 
     command.downgrade(build_alembic_config(database_url), REVISION_BEFORE_PRICES)
 
-    assert table_names(sync_engine) == (APPLICATION_TABLES - {"prices"}) | {STAMP_TABLE}
+    # Everything above `0003_wallets` comes down, which since #10 is `prices` *and* the
+    # three balance tables. Subtracting both is what keeps this test about the prices
+    # migration rather than about how many revisions happen to sit on top of it.
+    assert table_names(sync_engine) == (APPLICATION_TABLES - {"prices"} - BALANCE_TABLES) | {
+        STAMP_TABLE
+    }
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
     upgrade_to_head(database_url)
 
     assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
+def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """#10's migration, downgraded one step. The three new tables go; nothing else moves.
+
+    The same argument the prices test makes, and it is worth repeating for this revision in
+    particular: `balance_snapshots` has foreign keys into both `wallets` and `sync_runs`, so
+    a `downgrade()` that drops the tables in the wrong order fails on the Pi at exactly the
+    moment a release is being rolled back -- which is the worst possible time to discover
+    it, and the only time it would ever be run.
+
+    The seed rows are asserted afterwards because a `downgrade()` written with a stray
+    `op.execute` would be invisible to a comparison of table names.
+    """
+    upgrade_to_head(database_url)
+    assert table_names(sync_engine) >= BALANCE_TABLES
+
+    command.downgrade(build_alembic_config(database_url), PRICES_REVISION)
+
+    assert table_names(sync_engine) == (APPLICATION_TABLES - BALANCE_TABLES) | {STAMP_TABLE}
+    assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
+def test_the_balances_revision_sits_directly_on_top_of_the_prices_one() -> None:
+    """Adjacency, pinned, because the single-step downgrade above is written in terms of it.
+
+    Asserted as adjacency rather than as the head, for the reason the prices test gives: the
+    next issue adds a revision on top of this one, and a test pinning the head would fail on
+    that change for a reason that has nothing to do with balances.
+    """
+    revisions = [
+        script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+    ]
+
+    assert BALANCES_REVISION in revisions
+    assert revisions.index(BALANCES_REVISION) == revisions.index(PRICES_REVISION) - 1
 
 
 def test_the_prices_revision_sits_directly_on_top_of_the_wallets_one() -> None:
@@ -328,6 +421,22 @@ def test_the_migrated_schema_carries_the_convention_names(
 
     assert {index["name"] for index in inspector.get_indexes("sessions")} == {"ix_sessions_user_id"}
     assert {index["name"] for index in inspector.get_indexes("wallets")} == {"ix_wallets_user_id"}
+    # #10's two, named exactly as the spec's DDL writes them. An index the model declares
+    # and the migration forgets is invisible to the drift check on SQLite and shows up only
+    # as a table scan per chart render, on the slowest hardware this runs on.
+    assert {index["name"] for index in inspector.get_indexes("sync_runs")} == {
+        "ix_sync_runs_started_at"
+    }
+    assert {index["name"] for index in inspector.get_indexes("balance_snapshots")} == {
+        "ix_balance_snapshots_wallet_observed"
+    }
+    # **No index on either `sync_run_id`**, and the absence is part of the pin, exactly as
+    # `prices` having none at all is. `uq_sync_run_chains_run_chain` already leads with that
+    # column, so an index beside it would be a second copy paid for on every write; and
+    # nothing queries snapshots by run -- the two reads are "the latest per wallet", which
+    # is the primary key, and "one wallet's history", which is the index above. A name
+    # appearing here later is a decision somebody has to make on purpose.
+    assert inspector.get_indexes("sync_run_chains") == []
 
 
 def test_models_and_migrations_have_not_drifted(database_url: str, sync_engine: Engine) -> None:
