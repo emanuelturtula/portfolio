@@ -243,14 +243,8 @@ class BalanceService:
         """
         wallets = await self._wallets.list_for_user(principal.user_id)
         latest = await self._balances.latest_for_wallets([wallet.id for wallet in wallets])
-
-        quantities = {
-            wallet.id: _quantity_of(latest.get(wallet.id))
-            for wallet in wallets
-            if latest.get(wallet.id) is not None
-        }
         portfolio = await self._prices.value_portfolio(
-            _holdings_of(wallets, quantities),
+            _holdings_of(wallets, latest),
             quote_currency=quote_currency,
         )
         price_by_symbol = {entry.asset_symbol: entry.price for entry in portfolio.valued}
@@ -332,34 +326,31 @@ def _clamped(limit: int, ceiling: int) -> int:
     return min(max(limit, 1), ceiling)
 
 
-def _quantity_of(snapshot: BalanceSnapshot | None) -> Decimal:
-    """A snapshot's confirmed balance as a decimal amount, by the domain's one rule.
-
-    Called only for a wallet that has one; the `None` arm exists because `dict.get` is how
-    the caller asks, and returning a zero for it would be the ambiguity this module refuses
-    -- so it is unreachable by construction rather than by a comment, and mypy needs the arm.
-    """
-    if snapshot is None:
-        return Decimal(0)
-    return from_base_units(snapshot.confirmed, snapshot.decimals)
-
-
-def _holdings_of(wallets: Sequence[Wallet], quantities: dict[int, Decimal]) -> list[Holding]:
+def _holdings_of(
+    wallets: Sequence[Wallet],
+    latest: dict[int, BalanceSnapshot],
+) -> list[Holding]:
     """One holding per asset symbol, with the wallets' quantities summed.
 
     Per symbol rather than per wallet, because `PortfolioValue.unpriced` has to come back as
     one reason per asset -- "KAS has no price" -- rather than the same reason repeated once
     per wallet holding it.
 
+    **A wallet with no snapshot contributes nothing at all**, rather than a zero holding. A
+    zero would be valued, would sum, and would appear in neither `unpriced` nor anywhere
+    else -- an unread address quietly claiming to hold nothing, which is the one thing this
+    module refuses.
+
     Sorted by symbol so that two calls over one registry produce the same `unpriced` order
     and a response is stable between renders.
     """
     totals: dict[str, Decimal] = {}
     for wallet in wallets:
-        quantity = quantities.get(wallet.id)
-        if quantity is None:
+        snapshot = latest.get(wallet.id)
+        if snapshot is None:
             continue
         symbol = ChainKey(wallet.chain_key).asset_symbol
+        quantity = from_base_units(snapshot.confirmed, snapshot.decimals)
         totals[symbol] = totals.get(symbol, Decimal(0)) + quantity
     return [Holding(asset_symbol=symbol, quantity=totals[symbol]) for symbol in sorted(totals)]
 

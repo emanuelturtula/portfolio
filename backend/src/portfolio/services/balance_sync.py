@@ -323,8 +323,11 @@ class BalanceSyncService:
         observed_at = self._clock()
         try:
             provider = self._provider_for(chain_key)
-            by_address = {wallet.address_canonical: wallet for wallet in wallets}
-            balances = await provider.fetch_balances(tuple(by_address))
+            # `dict.fromkeys` rather than a `set`: it de-duplicates *and* keeps the order
+            # the wallets were registered in, so the request a vendor receives is stable
+            # between runs and a log of two syncs is comparable.
+            addresses = tuple(dict.fromkeys(wallet.address_canonical for wallet in wallets))
+            balances = await provider.fetch_balances(addresses)
             readings = _fan_out(balances, wallets, observed_at)
         except ProviderError as error:
             kind = error_kind_of(error)
