@@ -51,6 +51,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+
+# A real import, not a `TYPE_CHECKING` one: `decode_json` hands this class to `json.loads`
+# as `parse_float`, so it is needed at run time and not only in an annotation.
+from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
 from portfolio.domain.money import from_base_units
@@ -58,7 +62,6 @@ from portfolio.providers.errors import ProviderResponseError
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-    from decimal import Decimal
 
     from portfolio.domain.chains import ChainKey, ValidatedAddress
 
@@ -460,8 +463,8 @@ def decode_json(body: str | bytes) -> object:
     |---|---|
     | `not json` | `json.JSONDecodeError` |
     | bytes that are not UTF-8 | `UnicodeDecodeError` |
-    | an integer of 5000 digits | `ValueError: Exceeds the limit (4300 digits)` |
-    | 5000 nested arrays | `RecursionError` |
+    | an integer past the digit limit | `ValueError: Exceeds the limit (4300 digits)` |
+    | arrays nested past the scanner's depth | `RecursionError` |
 
     The first two are `ValueError` subclasses, so naming `ValueError` subsumes them and
     catches the integer-limit case that the narrower pair let escape untyped. The last one
@@ -471,22 +474,97 @@ def decode_json(body: str | bytes) -> object:
 
     `CPython` sets the digit limit and the recursion limit; neither is something this
     application configures, and both are the kind of boundary a vendor can cross by
-    accident. "A malformed body raises a typed schema error rather than propagating a parse
-    error" is a criterion on both providers, and "parse error" is exactly what these two
-    were.
+    accident. **Neither depth is a number to write down.** The digit limit is per process
+    (`PYTHONINTMAXSTRDIGITS`), and the nesting limit is `Py_C_RECURSION_LIMIT`, a build
+    constant `sys.setrecursionlimit` does not move: measured at 2998 arrays on a Windows
+    build and past 5000 on `ubuntu-24.04`, which is the platform this deploys to. So the
+    same body that trips this arm on a developer's machine parses cleanly on the Pi and is
+    refused one layer later for not being an object -- a difference invisible in a green
+    suite, and the reason the fixtures for this arm probe the interpreter instead.
+
+    "A malformed body raises a typed schema error rather than propagating a parse error" is
+    a criterion on both providers, and "parse error" is exactly what these two were.
 
     The message says the body did not parse and **never shows it**. A parser error that
     quotes the offending text is the disclosure every parser in this package is written to
     avoid: the text is a response body containing the owner's addresses.
 
+    ## `parse_float=Decimal`, which is rule 2 applied at the only moment it can be
+
+    A JSON number is read into an IEEE-754 double by every mainstream parser, `json.loads`
+    included. **By the time a value reaches the first line any of our code could inspect,
+    the digits the vendor sent are already gone**: `0.04228645` is a `float` whose nearest
+    representable value is not that number, and no care afterwards recovers it. Rule 2 is
+    not "do not write the word `float`"; it is "do not let a monetary value pass through
+    binary floating point", and this hook is where that is decided.
+
+    `Decimal` is constructed from the *literal text* of the number, so a price arrives
+    carrying exactly the digits that were on the wire. The one vendor that forces the
+    issue is the Kaspa price endpoint, whose body is `{"price": 0.04228645}` -- a JSON
+    number where Kraken and Coinbase both send a string -- but this is not a special case
+    for that vendor: any future API rendering money as a number is covered by the same
+    line, in the one place every provider's decode already passes through.
+
+    **It is fixed rather than a parameter, deliberately.** A `parse_float` argument would
+    let a call site ask for the float back, and the guarantee is worth more than the
+    flexibility; there is no vendor for whom the double is the more faithful answer.
+
+    Nothing this change touches loosens a balance parser. `_require_base_units`,
+    `chains.kaspa._require_sompi` and `chains.bitcoin.parse_tip_height` each demand an
+    `int`, and `Decimal("1.0E+8")` is no more an `int` than `1.0e8` was -- so a vendor
+    rendering a balance with a decimal point is refused exactly as before, with the type
+    in the message reading `Decimal` instead of `float`.
+
+    ## `parse_float` alone leaves a hole, and `parse_constant` is the rest of it
+
+    **Measured, because it is not what the argument name suggests.** `json.loads` routes
+    the three bare tokens `NaN`, `Infinity` and `-Infinity` through `parse_constant`, not
+    through `parse_float`, and its default hands back a Python `float`:
+
+    ```
+    json.loads('{"p": NaN}', parse_float=Decimal)["p"]  -> nan   (a float)
+    json.loads('{"p": 1.5}', parse_float=Decimal)["p"]  -> Decimal("1.5")
+    ```
+
+    So a vendor sending `{"price": Infinity}` would have put a `float` inside `providers/`
+    through the very decoder that exists to stop that -- invisible to the AST ban, which
+    reads source and would find no literal and no name. The individual price and balance
+    parsers do refuse it, each by demanding a type it is not, but relying on that means the
+    guarantee is "every parser remembered" rather than "the decoder does not produce one".
+
+    `parse_constant` therefore refuses outright. **None of the three is valid JSON**: RFC
+    8259 admits no non-finite number, so this is Python's extension being turned off rather
+    than a vendor's legitimate output being rejected. The refusal is typed and says which
+    token, which is a fixed word from a closed set of three and discloses nothing.
+
     Raises:
-        ProviderResponseError: the body is not JSON, or is JSON the decoder cannot finish.
+        ProviderResponseError: the body is not JSON, is JSON the decoder cannot finish, or
+            carries one of JSON's three non-finite extensions.
     """
     try:
-        return json.loads(body)
+        return json.loads(body, parse_float=Decimal, parse_constant=_refuse_json_constant)
     except (ValueError, RecursionError) as error:
         message = "The response body is not JSON."
         raise ProviderResponseError(message) from error
+
+
+def _refuse_json_constant(token: str) -> object:
+    """Refuse `NaN`, `Infinity` and `-Infinity`, which `parse_float` never sees.
+
+    Raised rather than returned, and **deliberately not a `ValueError`**:
+    `ProviderResponseError` travels out through `json.loads` and past `decode_json`'s own
+    `except (ValueError, RecursionError)` untouched, so the caller gets a message naming
+    the token instead of the generic "not JSON" that every malformed body produces. A
+    `ValueError` here would be caught by that clause and the reason would be lost.
+
+    Returning a sentinel instead would push the decision back into every parser, which is
+    the arrangement this function exists to replace.
+    """
+    message = (
+        f"The response body carries the JSON extension {token}, which is not a number "
+        "and is not valid JSON."
+    )
+    raise ProviderResponseError(message)
 
 
 def require_json_object(body: str | bytes) -> Mapping[str, object]:

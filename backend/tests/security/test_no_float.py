@@ -308,6 +308,27 @@ def test_dropping_a_package_from_the_walk_is_visible() -> None:
     assert len(shrunken) >= len(wrong_tuple)
 
 
+def test_the_price_providers_are_inside_the_ban() -> None:
+    """#9's package is scanned, asserted by name rather than inferred from the `rglob`.
+
+    `pure_layer_modules` walks `providers/` recursively, so `providers/prices/` is covered
+    the moment it exists -- and that is exactly why it needs an assertion. "Recursively"
+    is a property of the helper, not a fact about the tree: a package that was never
+    created, or one created as `provider_prices/` beside `providers/` rather than inside
+    it, is scanned by nobody and reported by nothing. The ban would stay green over a
+    package full of floats.
+
+    This is the module where money arrives as a decimal from a vendor for the first time,
+    which makes it the one package whose membership is worth stating out loud.
+    """
+    scanned = {path.relative_to(SOURCE_ROOT).as_posix() for path in pure_layer_modules()}
+
+    prices = {name for name in scanned if name.startswith("providers/prices/")}
+
+    assert prices, "providers/prices/ contributed no module to the float ban"
+    assert "providers/prices/base.py" in prices
+
+
 def test_no_float_in_the_pure_layers() -> None:
     """Criterion 7, over the real tree."""
     violations = [
@@ -445,6 +466,70 @@ def test_the_float_ban_catches_dividing_two_integer_literals(tmp_path: Path) -> 
     }
 
     assert lines == {1, 2, 4}
+
+
+def test_a_parse_float_keyword_naming_decimal_is_not_a_violation(tmp_path: Path) -> None:
+    """#9's shared decoder, checked against the ban it has to live inside.
+
+    `decode_json` gains `parse_float=Decimal` so that a JSON *number* from a vendor becomes
+    a `Decimal` built from the literal text rather than a `float` built by CPython. The
+    keyword is spelled `parse_float`, and the ban's subject is the **name** `float`, which
+    an `ast.keyword`'s `arg` is not -- it is a plain string on the node, never visited as
+    an `ast.Name`.
+
+    The spec says that if the walk reported this, the answer would be to make the walk
+    precise rather than to add an ignore. It does not report it, and this is the assertion
+    that says so deliberately instead of leaving it to be rediscovered by whoever next
+    reads a green build and wonders whether the ban saw the line at all.
+    """
+    module = tmp_path / "decoder.py"
+    module.write_text(
+        "\n".join(
+            [
+                "import json",
+                "from decimal import Decimal",
+                "",
+                "",
+                "def decode(body: str) -> object:",
+                "    return json.loads(body, parse_float=Decimal)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert find_float_usage(module, module.read_text(encoding="utf-8")) == []
+
+
+def test_a_parse_float_keyword_naming_the_builtin_is_still_a_violation(tmp_path: Path) -> None:
+    """The control, and it is the whole reason the test above is not an exemption.
+
+    The keyword's *name* is not the ban's subject; its *value* is. `parse_float=float` is
+    the default `json.loads` already has, written out -- and it is a monetary value going
+    through binary floating point at the one boundary rule 2 exists to guard. It is
+    reported, at the line that does it.
+
+    Written beside the passing case rather than in its own module, so that nobody can read
+    the one above as "the ban does not look at `parse_float=` at all".
+    """
+    module = tmp_path / "still_a_float.py"
+    module.write_text(
+        "\n".join(
+            [
+                "import json",  # 1
+                "",  # 2
+                "",  # 3
+                "def decode(body: str) -> object:",  # 4
+                "    return json.loads(body, parse_float=float)",  # 5
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    violations = find_float_usage(module, module.read_text(encoding="utf-8"))
+
+    assert {(violation.line, violation.reason) for violation in violations} == {
+        (5, "reference to the builtin float")
+    }
 
 
 def test_the_division_rule_does_not_fire_on_values_it_cannot_decide(tmp_path: Path) -> None:

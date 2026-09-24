@@ -22,6 +22,8 @@ import pytest
 from portfolio.providers.http import (
     ADDRESS_BALANCE,
     ADDRESS_BALANCES,
+    ASSET_PRICE,
+    ASSET_PRICES,
     BLOCK_TIP_HEIGHT,
     ENDPOINT_EXTENSION,
     ENDPOINT_LABELS,
@@ -365,15 +367,28 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     same question asked two ways -- and `node_health`, which is its health probe. Adding
     them here is the deliberate act rule 8's shape requires; a provider that shipped with a
     label not on this list would be correct, quiet and impossible to find in a log.
+
+    Six at #9, and the pair added there carries an extra job. `asset_prices` is the
+    batched read -- Kraken's ticker and CoinGecko's simple price -- and `asset_price` is
+    the single one, Coinbase's spot and the Kaspa node's price endpoint. **One
+    `asset_prices` line per hour is the whole of the measured call budget against the
+    primary vendor**, so a log that starts showing more of them is the evidence that
+    something began fetching prices on a request path. That is the failure
+    `backend/.importlinter`'s price contract exists to make impossible, observed from the
+    other side, and it only works because the two labels are distinguishable.
     """
     assert sorted(ENDPOINT_LABELS) == [
         "address_balance",
         "address_balances",
+        "asset_price",
+        "asset_prices",
         "block_tip_height",
         "node_health",
     ]
     assert ADDRESS_BALANCE == "address_balance"
     assert ADDRESS_BALANCES == "address_balances"
+    assert ASSET_PRICE == "asset_price"
+    assert ASSET_PRICES == "asset_prices"
     assert BLOCK_TIP_HEIGHT == "block_tip_height"
     assert NODE_HEALTH == "node_health"
     assert ENDPOINT_LABELS, "an empty allowlist makes every request <unlabelled>"

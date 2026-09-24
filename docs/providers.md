@@ -1,8 +1,14 @@
-# Adding a chain provider
+# Adding a provider
 
-What a new chain has to implement, what the shared machinery already does for it, and --
-kept separate on purpose -- which facts about the two current vendors were confirmed
-against their published documentation and which are still guesses.
+What a new chain has to implement, what a new price source has to implement, what the
+shared machinery already does for both, and -- kept separate on purpose -- which facts
+about each vendor were confirmed against its published documentation, which were measured
+against the live service, and which are still guesses.
+
+Two kinds of provider live under `backend/src/portfolio/providers/`. A **chain provider**
+reads balances from addresses (`providers/chains/`); a **price source** reads what an asset
+costs (`providers/prices/`). Everything down to "Vendor facts" is about the first kind; the
+"Price sources" section near the end is about the second, and says where the two differ.
 
 Read `backend/src/portfolio/providers/base.py` alongside this. The docstrings there are the
 reasoning; this is the checklist.
@@ -624,6 +630,258 @@ vendor's own documentation, and record here what you confirmed and what you assu
 those words, **with the date you read it** -- an unverified fact and a fact verified two
 years ago are different things, and only one of them says so.
 
+## Price sources, which are a different kind of provider
+
+A chain provider answers a question about the owner's addresses. A price source answers a
+question about the market, which has the same answer for everyone. They share a transport, a
+rate limiter and an error hierarchy, and they differ in three ways worth stating before the
+numbers:
+
+- **A price source declares which pairs it can answer**, and the order for a pair is the
+  global source order filtered by that declaration. There is no single failover chain,
+  because the sources are four unrelated vendors rather than interchangeable instances of one
+  API. `providers/prices/base.py` holds the loop; `providers/prices/registry.py` holds the
+  order.
+- **A partial answer is normal.** `EndpointSet` treats one endpoint answering about half a
+  request as a correlation bug; `fetch_prices` treats one source answering three pairs of
+  four as the ordinary case and asks the next source for the fourth.
+- **An answer that is wrong rather than incomplete is discarded whole.** Two checks in the
+  loop, both applied to the response rather than trusted to the four parsers: a source that
+  answers about a pair nobody asked for has proved its correlation is broken, and a source
+  whose amount the `prices` column cannot hold has produced something no later layer can
+  store. Either way the source is passed over as though it had not answered, and the
+  outstanding pairs go to the next one. Each parser checks the same things for its own
+  document; the duplication is deliberate, because a rule enforced in four places is a rule
+  one of them can drop, and the fifth source nobody has written yet is the one that would.
+  The second check also keeps a value problem on the vendor's error path: without it an
+  unstorable amount reaches `NumericText`, and the `ValueError` rolls back every pair that
+  had already succeeded in the same refresh.
+- **No request path may reach one.** `backend/.importlinter`'s
+  `prices-are-never-fetched-in-a-request` contract forbids any chain from
+  `portfolio.api.routers` to `portfolio.providers.prices`, **without**
+  `allow_indirect_imports` — so `router -> service -> source` is caught as a chain. The
+  mechanical consequence is that `services/prices.py` (valuation) imports no provider and
+  `services/price_refresh.py` is the only module in `services/` that does. That split is the
+  guarantee; see both module docstrings.
+
+### The measured monthly call budget
+
+**One request per refresh. At an hourly refresh that is 24 a day and 24 × 30 = 720 a month**,
+to one host. Measured on **2026-09-23**:
+
+```
+GET https://api.kraken.com/0/public/Ticker?pair=XXBTZUSD,XXBTZEUR,KASUSD,KASEUR
+-> 200, {"error": [], "result": { ...four entries... }}
+```
+
+All four pairs come back from a single call, key-free, so the whole of a healthy refresh is
+one request. The arithmetic in full, so it can be checked rather than believed:
+
+| Quantity | Value | Where it comes from |
+|---|---|---|
+| requests per refresh, healthy | **1** | measured: Kraken batches all four pairs |
+| refreshes per day | **24** | hourly, which is `STALE_AFTER` |
+| days per month, for this budget | **30** | the conventional month |
+| **requests per month** | **24 × 30 = 720** | one host, Kraken |
+| a 31-day month | 24 × 31 = 744 | the worst case, still nowhere near any published limit |
+| a year | 24 × 365 = 8,760 | |
+
+**Kraken publishes no monthly quota for the public ticker at all**, and none was measured.
+The shared `DEFAULT_MIN_HOST_INTERVAL_MS` floor of one request per second per host applies,
+which is about 86,400 requests a day if anything ever wanted them — three orders of magnitude
+above what this needs.
+
+**The budget on a bad day is bounded and worth knowing.** If Kraken fails, the fallbacks cost
+more because they are not batched: Coinbase is one request per pair for the two BTC pairs, the
+Kaspa endpoint is one request for KAS/USD, and KAS/EUR has no key-free fallback at all. So a
+refresh with Kraken down costs at most **3 requests to three different hosts** (plus one
+failed Kraken attempt), or 4 with CoinGecko keyed. It never costs more than one request per
+pair per source.
+
+**The issue's premise about the budget turned out not to hold, and the conclusion still
+does.** #9 was written around CoinGecko's Demo quota — roughly 10,000 calls a month, about 13
+an hour — and concluded that no request path may call a price API. Once the primary is
+key-free and batched, that quota stops being the binding constraint. The rule stands for two
+better reasons: a request path that calls a price API inherits the vendor's **latency** (a
+dashboard that renders in 80 ms would block on a third party) and its **outages** (a vendor
+having a bad afternoon would take the portfolio page down with it). Quota was the weakest of
+the three arguments and is the only one that changed.
+
+### Coverage, per pair, and what each source is
+
+| Pair | Order | Why |
+|---|---|---|
+| BTC/USD | Kraken, Coinbase, CoinGecko¹ | all three list it |
+| BTC/EUR | Kraken, Coinbase, CoinGecko¹ | all three list it |
+| KAS/USD | Kraken, Kaspa, CoinGecko¹ | Coinbase does not list KAS |
+| KAS/EUR | Kraken, CoinGecko¹ | Coinbase does not list KAS; the Kaspa endpoint has no EUR |
+| anything else | nothing | refused without a request |
+
+¹ only when `PORTFOLIO_COINGECKO_API_KEY` is set. With no key the source is **not in the
+list and not constructed** — criterion 5's "absent, not skipped" — and its class refuses to
+be built without one, so there is no object holding a blank credential.
+
+### Confirmed against the live services on 2026-09-23
+
+| Source | Endpoint | BTC/USD | BTC/EUR | KAS/USD | KAS/EUR | Key | Price type |
+|---|---|---|---|---|---|---|---|
+| Kraken | `GET /0/public/Ticker` | yes | yes | yes | yes | none | **string**, in `c[0]` |
+| Coinbase | `GET /v2/prices/{pair}/spot` | yes | yes | **404** | **404** | none | **string**, `data.amount` |
+| Kaspa | `GET /info/price` | — | — | yes | **no** | none | **JSON number** |
+| CoinGecko | `GET /api/v3/simple/price` | doc | doc | doc | doc | Demo | **not measured** |
+
+- Kraken's last traded price is `c[0]`, where `c` is `[price, lot volume]`. The envelope is
+  `{"error": [], "result": {...}}` and **a failure is reported in `error` with a 200 status**,
+  so a status check alone would read an error document as "no prices".
+- Coinbase echoes `base` and `currency` in its body, and the parser checks both against what
+  it asked for. The pair is in the **path**, so a mis-keyed cache entry is one step from
+  attaching one asset's price to another.
+- **The Kaspa body is `{"price": 0.04228645}` and it names no currency.** See below.
+- **No vendor returns a quote timestamp**, on any of the three measured endpoints. `as_of` is
+  therefore the time *we observed* the price, and the column, the dataclass and the docstrings
+  all say so rather than implying otherwise. A vendor that starts supplying one can populate
+  that field more honestly without a migration.
+
+### The Kaspa price endpoint's currency is an assumption, not a fact
+
+The body is `{"price": ...}` and nothing else. The documentation names no quote currency. USD
+is an inference from the number's magnitude against the market on the day it was measured,
+which is not evidence.
+
+Three mitigations, and they are the whole of the answer:
+
+1. It is **last** for the one pair it can answer — KAS/USD is `Kraken, Kaspa, CoinGecko` — so
+   the guess is only used when a source that *states* its currency has already failed.
+2. It is **absent** from KAS/EUR entirely. It never converts and never infers a second
+   currency from the one it assumed.
+3. The assumption is named at the call site (`ASSUMED_CURRENCY` in
+   `providers/prices/kaspa.py`), in that module's docstring, and here.
+
+Using a price whose currency is a guess to value somebody's holdings is exactly the failure
+criterion 3 describes. The blast radius is one asset, in one currency, only when Kraken and
+CoinGecko are both unavailable — but it is still a guess being used to value money, and it is
+recorded as one.
+
+### CoinGecko is the one parser written from documentation rather than a response
+
+**Its response shape was not measured**, because measuring it needs a Demo key and rule 3
+forbids this repository from containing one. Read from the vendor's documentation on
+2026-09-23:
+
+- Demo root `https://api.coingecko.com/api/v3/`, distinct from the Pro root
+  `https://pro-api.coingecko.com/api/v3/`.
+- Demo key header `x-cg-demo-api-key`; the Pro header is `x-cg-pro-api-key`.
+- `GET /api/v3/simple/price` takes `vs_currencies` (required) and `ids`, both comma-separated,
+  plus a `precision` of `0`–`18` or `full`. This application sends `full`, because the default
+  rounds and a price rounded before it reaches us cannot be un-rounded.
+- The response is keyed by coin id and then by lower-case currency:
+  `{"bitcoin": {"usd": 86123.45, "eur": 79211.02}}` — **JSON numbers, not strings**.
+- "Each successful request (HTTP 200) deducts 1 credit from your monthly quota."
+
+**The Demo plan's numbers — 10,000 calls a month, 100 a minute — come from the issue, not from
+a page read here.** The authentication documentation says credits and rate limits depend on
+the plan and points at a pricing page. Both figures are far above an hourly refresh either
+way, and this source is only asked when the primary has already failed.
+
+So this is the one parser in the package that meets a real server for the first time on the
+day it is needed. A response that differs from the shape above is refused as untrustworthy
+rather than mis-parsed, which is the right direction to be wrong in; it is still a refusal
+that arrives in production rather than in a test.
+
+**The key travels in a request header and never in the query string.** Both spellings are
+documented and they are not equivalent: a key in a query string is recorded by the vendor's
+access log, by every intermediary, and by anything that renders a URL. `providers/http.py`
+warns by name that `strip_query` meets the letter of this repository's logging rule and leaks
+anyway. The header is passed per request through `EndpointSet.read`, never set on the shared
+client — where it would be sent to every host every other provider talks to.
+
+### The float boundary, which is what this change was actually about
+
+Two of the four sources send a price as a JSON **number**. `json.loads` turns
+`0.04228645` into a `float` before any application code runs, and the digits the vendor sent
+are gone by then — no care afterwards recovers them. Rule 2 is not "do not write the word
+`float`"; it is "do not let a monetary value pass through binary floating point", and the only
+place that can be decided is the parser.
+
+`providers/base.decode_json` therefore passes **`parse_float=Decimal`**, so a JSON number
+arrives built from the literal text on the wire. It is fixed rather than a parameter: an
+argument would let a call site ask for the double back, and there is no vendor for which the
+double is the more faithful answer.
+
+It is a **shared** decoder change and the blast radius is every provider, the two balance
+providers included. Their parsers demand an `int` and `Decimal("1.0E+8")` is no more an `int`
+than `1.0e8` was, so a balance rendered with a decimal point is refused exactly as before —
+with the type in the message reading `Decimal` instead of `float`. The existing Bitcoin and
+Kaspa suites are the control for that and were run untouched.
+
+### What a price source must implement
+
+| Member | Kind | What it must do |
+|---|---|---|
+| `name` | property | The vendor's brand, lower case, as written to `prices.source`. **Never a host.** |
+| `pairs` | property | Every `(symbol, currency)` it can answer. A declaration, so an ineligible pair costs no request. |
+| `fetch` | async method | Read the requested pairs in as few calls as it can. A partial answer is allowed; an answer about a pair nobody asked for is a refusal. |
+
+`PriceSource` is a `typing.Protocol` and is **not** `@runtime_checkable`, for the reason
+`ChainProvider` is not.
+
+Two more rules a new source inherits rather than decides:
+
+- **Prices go through `require_price`**, which is the one boundary deciding what counts as a
+  price: a JSON string or a `Decimal` from the shared decoder, positive, finite. Four vendors,
+  one rule.
+- **A new endpoint label goes in `ENDPOINT_LABELS`** in `providers/http.py`, in the same
+  change as the call site that uses it. Membership is the gate; an unlisted label renders as
+  `<unlabelled>` and the request becomes invisible in a log.
+
+### Prices in the database
+
+One table, `prices`, one row per `(asset_id, quote_currency)` — four today. `amount` is
+`NumericText(12)` and **never `sqlalchemy.Numeric`**, which round-trips through a C double on
+SQLite. Twelve decimal places serve a sub-cent asset and a five-figure one in the same column:
+KAS was quoted near `0.042` and BTC near `86,000` on the day this was measured.
+
+**Money is never aggregated in SQL.** `SUM`, `ORDER BY` and `<` on a `TEXT` money column all
+apply SQLite's numeric affinity, which is the double the column type exists to avoid — applied
+to every row at once. `repositories/prices.py` has no method that totals, sorts by price or
+compares one; the valuation service loads the rows and sums them in Python.
+
+**Staleness is computed at read time from an injected clock and is never stored.**
+`STALE_AFTER` is one hour, matching the refresh interval #10 will schedule. A stored
+`is_stale` boolean would be wrong one second after it was written and would need a background
+job whose only purpose was to keep a derived field true. A stale price is still returned, with
+its age visible: the last known price is better information than none, which is the same
+argument `ProviderUnavailableError` makes about a balance.
+
+**A missing price is a reason and never a zero.** `lookup_price` returns a `Price` or a
+`PriceUnavailable`, and `value_portfolio` returns the total it could compute, the holdings it
+could not price, and a `complete` flag. A portfolio silently showing 0 is worse than one
+showing an error, because it is believed.
+
+**That rule is enforced at the column as well as at the row**, because review found a path
+that defeated it. `require_price` refuses a price of zero or below, but it runs *before* the
+value is rounded to the column's twelve places — so a positive price under half of one unit
+in the last place was accepted, stored as `0.000000000000`, and produced a portfolio total of
+zero marked `complete`. No missing row for a valuation to notice, and no reason to report.
+
+Closed in two places, which is the shape worth copying:
+
+- **`NumericText` refuses a non-zero amount that rounds away to nothing.** That belongs to
+  the column, not to prices — a fee, a fill or a cost basis added later meets the same
+  boundary — and it is a `ValueError` beside the existing refusal for too many digits *before*
+  the point. A true zero still binds. The message names the scale and not the amount, because
+  this type will eventually hold a quantity and a quantity is the owner's holdings.
+- **`require_price` refuses a price outside what the column can store, in both directions.**
+  Too large by `MAX_PRICE_INTEGER_DIGITS`, or so fine that rounding it leaves zero. Doing it
+  here makes an implausible number an ordinary vendor error: the failover passes the source
+  over, the other pairs are kept, and the pair falls to the next source or becomes a reason.
+  Leaving it to the column would surface as a `ValueError` out of a repository — a traceback
+  from an operator's command, and a whole refresh lost to one bad number.
+
+The general rule: **a value a money column would silently transform is refused by the column,
+and a value a vendor should never have sent is refused by the parser.** The first protects
+every writer; the second keeps a vendor's mistake on the vendor's error path.
+
 ## Not done yet, and who owns it
 
 - **Lifespan wiring.** `build_http_client()` is process-wide by construction -- the rate
@@ -651,6 +909,27 @@ years ago are different things, and only one of them says so.
 - **The Kaspa batch ceiling.** 64 is a guess; see above. The first evidence will be a
   refused batch in production, and the refusal is written to carry the size so that the
   evidence is actionable when it arrives.
+- **Building the price sources in the lifespan, and scheduling a refresh.** #9 ships
+  `refresh_prices()` as a service with no caller in the running application, plus a
+  `portfolio refresh-prices` command so the measured call budget can be checked by hand
+  before anything automates it. **#10 owns the scheduler**, and a scheduler invented in #9
+  would have been a second one to delete.
+- **The price source base URLs are module constants, not settings.** Kraken, Coinbase and
+  CoinGecko each have exactly one correct host and no self-hosting story, so a
+  `PORTFOLIO_*_URL` for them would be a variable with one right value plus a validation path
+  and a row in the operations table. The Kaspa price source deliberately reuses
+  `PORTFOLIO_KASPA_API_URL`, since it is the same server the balances are read from.
+  Promoting the other three is a change a real need should drive.
+- **CoinGecko's parser has never met its vendor.** Its response shape is documentation
+  rather than measurement, because measuring it needs a key this repository must not
+  contain. It is the one parser here that meets a real server for the first time on the day
+  it is needed, and the sections above say so rather than leaving it to be assumed.
+- **The Kaspa price endpoint's currency is assumed.** USD, inferred from magnitude. Confined
+  to one pair, placed behind every source that states its currency, and written down in
+  three places. If the vendor ever names a currency, `ASSUMED_CURRENCY` is deleted rather
+  than edited.
+- **Kraken is a single point of failure for KAS/EUR**, the only key-free source for that
+  pair. Losing it means that pair falls to CoinGecko or to a reason.
 - **`parse_rate_limit` has no production exerciser.** Measured on 2026-09-23: neither Kaspa
   endpoint sends a `ratelimit-*` header, and Esplora was never claimed to. It is tested
   against synthesised headers only, which is to say it is code that looks tested and is not

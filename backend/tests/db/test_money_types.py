@@ -244,8 +244,13 @@ async def test_a_null_money_column_reads_back_as_none(money_engine: AsyncEngine)
 @pytest.mark.parametrize(
     ("value", "scale", "expected"),
     [
-        # The ties, at scale 0. Half-up would give "1", "2" and "3".
-        ("0.5", 0, "0"),
+        # The ties, at scale 0. Half-up would give "2", "3" and "4".
+        #
+        # `0.5` used to be the first row here and is now in
+        # `test_a_non_zero_amount_that_rounds_away_is_refused`: it is the one tie at this
+        # scale whose banker's-rounded result is **zero**, and a non-zero amount becoming a
+        # zero is what the column now refuses. The rounding rule is unchanged; what changed
+        # is that one of its outcomes is no longer storable.
         ("1.5", 0, "2"),
         ("2.5", 0, "2"),
         ("3.5", 0, "4"),
@@ -279,10 +284,17 @@ async def test_the_column_rounds_on_the_way_in(money_engine: AsyncEngine) -> Non
 
 
 def test_numeric_text_normalises_negative_zero() -> None:
-    """`-0.00` and `0.00` are equal as Decimals and different as the text SQLite compares."""
+    """`-0.00` and `0.00` are equal as Decimals and different as the text SQLite compares.
+
+    Both spellings here are **already** zero, which is the whole of what this test is about:
+    one stored form for one amount. `-0.001` used to be a third case on this list and has
+    moved to `test_a_non_zero_amount_that_rounds_away_is_refused` -- it is not a spelling of
+    zero, it is a value the scale would destroy, and the two are different questions that
+    happened to produce the same string.
+    """
     assert SCALE_2.process_bind_param(Decimal("-0.00"), DIALECT) == "0.00"
-    assert SCALE_2.process_bind_param(Decimal("-0.001"), DIALECT) == "0.00"
     assert SCALE_2.process_bind_param(Decimal("0.00"), DIALECT) == "0.00"
+    assert SCALE_2.process_bind_param(Decimal("-0"), DIALECT) == "0.00"
 
 
 async def test_negative_zero_is_stored_as_one_spelling(money_engine: AsyncEngine) -> None:
@@ -628,3 +640,157 @@ def test_the_money_table_is_not_in_the_application_metadata() -> None:
     assert "amounts" not in models.metadata.tables
     assert MONEY_METADATA is not models.metadata
     assert set(MONEY_METADATA.tables) == {"amounts"}
+
+
+# --------------------------------------------------------------------------------------
+# An amount the scale would destroy: refused, not rounded to nothing
+# --------------------------------------------------------------------------------------
+#
+# The column's two over-precision rules used to be "too many digits after the point is
+# rounded away, too many in front is refused". The first of those had an outcome nobody had
+# looked at: a value small enough that rounding leaves **zero**.
+#
+# That is not a rounding. It is the amount being destroyed, and it is the one outcome a
+# money column must never produce quietly, because a zero is a number every consumer
+# believes. Measured end to end before the guard existed, through the real service and a
+# real migrated database:
+#
+#     vendor sends 0.0000000000005  ->  stored TEXT "0.000000000000"
+#     value_portfolio(1_000_000 KAS) -> total=0E-12  complete=True  unpriced=()
+#
+# A positive price became a zero and `complete=True` told every renderer the total was
+# whole. There is no missing row for a valuation to notice and no reason for it to report:
+# it is `services/prices.py`'s whole subject arriving through the column instead of through
+# an absent row.
+#
+# The guard lives here rather than in the prices repository because it is a property of the
+# **column**. A fee, a fill or a cost basis added later meets the same boundary, and a guard
+# beside one caller protects one caller.
+
+
+@pytest.mark.parametrize(
+    ("value", "scale"),
+    [
+        pytest.param("0.0000000000005", 12, id="the measured price, at the price scale"),
+        pytest.param("0.5", 0, id="the one banker's tie at scale 0 that rounds to zero"),
+        pytest.param("-0.5", 0, id="and its negative"),
+        pytest.param("0.001", 2, id="a tenth of a cent"),
+        pytest.param("0.005", 2, id="a half cent, which rounds to zero half-to-even"),
+        pytest.param("-0.001", 2, id="a negative that used to be a spelling of zero"),
+        pytest.param("1E-30", 2, id="far below the scale"),
+        pytest.param("0.04", 1, id="rounds down to zero at one place"),
+        pytest.param("0.05", 1, id="and the half-even tie there, which also lands on zero"),
+    ],
+)
+def test_a_non_zero_amount_that_rounds_away_is_refused(value: str, scale: int) -> None:
+    """A `ValueError`, in the same vocabulary as the too-many-digits-in-front refusal.
+
+    The two over-precision rules are now one rule with two ends: the column refuses an
+    amount it cannot represent, whichever end of the number the lost digits are at. A
+    reader meeting them side by side should not have to learn that one of them silently
+    succeeds.
+
+    `0.5` at scale 0 is the row worth reading twice. It is a genuine banker's-rounding tie
+    and its correct rounded value *is* zero -- the rounding rule is not wrong, the storage
+    is impossible. `1.5` at the same scale is in
+    `test_numeric_text_quantizes_half_to_even` and still stores `2`, which is what makes
+    the pair a boundary rather than a blanket refusal of small numbers.
+    """
+    with pytest.raises(ValueError, match=r"(?i)finer than its scale") as caught:
+        NumericText(scale).process_bind_param(Decimal(value), DIALECT)
+
+    assert not isinstance(caught.value, TypeError), (
+        "a value the column cannot represent is not a caller passing the wrong type"
+    )
+
+
+def test_the_refusal_names_the_scale_and_never_the_amount() -> None:
+    """The scale is what an operator can act on; the amount is the owner's data.
+
+    `prices.amount` holds public market data, so quoting a price would be harmless today.
+    This type is the one every future money column is built from, and the next one holds a
+    **quantity** -- which is the owner's holdings. The sibling refusal for an over-large
+    amount does quote its value; this one does not, and the asymmetry is deliberate rather
+    than an oversight, so it is asserted.
+    """
+    with pytest.raises(ValueError, match=r"finer than its scale") as caught:
+        NumericText(12).process_bind_param(Decimal("0.0000000000005"), DIALECT)
+
+    message = str(caught.value)
+
+    assert "12" in message
+    assert "0.0000000000005" not in message
+    assert "5E-13" not in message
+
+
+@pytest.mark.parametrize(
+    ("value", "scale", "expected"),
+    [
+        pytest.param("0", 12, "0.000000000000", id="a plain zero"),
+        pytest.param("0.00", 2, "0.00", id="a zero that already carries a scale"),
+        pytest.param("-0.00", 2, "0.00", id="a negative zero"),
+        pytest.param("0E-30", 12, "0.000000000000", id="a zero with an exponent"),
+    ],
+)
+def test_a_true_zero_still_binds(value: str, scale: int, expected: str) -> None:
+    """The boundary the guard must not cross, and the half a naive check would get wrong.
+
+    "The quantized result is zero" is the obvious way to write this refusal and it is
+    wrong: it refuses zero itself. A price of zero is already refused upstream by
+    `require_price`, but a money column holds more than prices -- a realised gain of
+    exactly nothing, a fee that was waived -- and a type that could not store zero would be
+    useless for them.
+
+    The guard is "the result is zero **and the input was not**", and this is the test that
+    says so.
+    """
+    assert NumericText(scale).process_bind_param(Decimal(value), DIALECT) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "scale", "expected"),
+    [
+        pytest.param("0.01", 2, "0.01", id="the smallest representable amount at scale 2"),
+        pytest.param("0.006", 2, "0.01", id="rounds up to it rather than away"),
+        pytest.param("0.000000000001", 12, "0.000000000001", id="one unit at the price scale"),
+        pytest.param("0.0000000000006", 12, "0.000000000001", id="rounds up to one unit"),
+    ],
+)
+def test_the_smallest_representable_amount_still_binds(
+    value: str,
+    scale: int,
+    expected: str,
+) -> None:
+    """The other side of the boundary: refusing what vanishes must not refuse what survives.
+
+    Each pair here is one digit away from a row in the refusal table above. `0.006` at scale
+    2 rounds *up* to `0.01` and is stored; `0.005` rounds to zero and is refused. A guard
+    written against the magnitude of the input rather than against the rounded result would
+    fail these, and would quietly refuse every legitimate sub-cent amount a fee column will
+    ever hold.
+    """
+    assert NumericText(scale).process_bind_param(Decimal(value), DIALECT) == expected
+
+
+async def test_the_database_write_is_what_refuses_an_amount_that_rounds_away(
+    money_engine: AsyncEngine,
+) -> None:
+    """Through a real column and a real INSERT, not only through a unit call on the type.
+
+    A `TypeDecorator` that was never attached to the column, or a column built with a
+    different scale than the test believed, would satisfy every assertion above. This is
+    the one that says the refusal reaches the statement -- and that **nothing is written**,
+    which is the outcome that matters: a refusal that still left a zero row behind would be
+    the original defect with a traceback attached.
+    """
+    with pytest.raises(StatementError) as caught:
+        async with money_engine.begin() as connection:
+            await connection.execute(amounts.insert().values(id=1, fiat=Decimal("0.001")))
+
+    assert isinstance(caught.value.orig, ValueError)
+    assert "finer than its scale" in str(caught.value.orig)
+
+    async with money_engine.connect() as connection:
+        remaining = await connection.scalar(text("SELECT COUNT(*) FROM amounts"))
+
+    assert remaining == 0, "a refused amount must not have left a zero row behind"

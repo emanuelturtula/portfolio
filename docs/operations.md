@@ -1,8 +1,9 @@
 # Operations
 
 Day-two tasks on the running instance: creating the account, tuning the password hash to the
-hardware, changing the password, understanding when a session ends, and pointing the
-application at the chain index it reads balances from.
+hardware, changing the password, understanding when a session ends, pointing the application
+at the chain index it reads balances from, and refreshing the prices that turn a balance into
+a value.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -331,6 +332,135 @@ The same disclosure applies as in section 8: with the default URL, every Kaspa a
 register is sent to the public instance on every sync. Run your own if that is not a price
 you want to pay.
 
+## 10. Where prices come from, and refreshing them by hand
+
+Balances are counts; prices are what turns a count into a value. Four sources, tried per pair
+in a fixed order, **none of them required to be configured** — the primary needs no key and no
+URL.
+
+| Pair | Order | Notes |
+|---|---|---|
+| BTC/USD, BTC/EUR | Kraken, Coinbase, CoinGecko¹ | |
+| KAS/USD | Kraken, Kaspa, CoinGecko¹ | Coinbase does not list KAS |
+| KAS/EUR | Kraken, CoinGecko¹ | **Kraken is the only key-free source for this pair** |
+
+¹ only when a CoinGecko key is set; see below.
+
+### There is no scheduler yet
+
+Nothing in the running application fetches a price. #10 owns scheduling the refresh; until it
+lands, prices are refreshed by running the command below. A deployed instance that has never
+had it run reports every holding as *unpriced with a reason*, which is deliberate — see "What
+a missing price looks like".
+
+### Refreshing by hand
+
+```bash
+cd <deploy-root>
+docker compose exec app python -m portfolio refresh-prices
+```
+
+It fetches every supported pair once, writes what it got, and prints one line per pair:
+
+```
+as of 2026-09-23T12:00:00+00:00
+BTC/EUR 79211.100000000000 via kraken
+BTC/USD 86123.400000000000 via kraken
+KAS/EUR 0.038881000000 via kraken
+KAS/USD 0.042286450000 via kraken
+```
+
+`via <source>` is the source that **actually answered**, not the one that was asked first, so
+a line reading `via coinbase` is how you find out Kraken was down without reading a log.
+
+**The number is the one in the database, not the one the vendor sent**, printed at the
+column's full twelve decimal places. A transcript showing the vendor's number would disagree
+with the row every later valuation reads.
+
+The trailing zeros are padding and carry no information on their own — every line gets twelve
+places whatever the vendor sent. What the full scale is for is that it shows you **where the
+column's precision ends**, so you can compare a line against the vendor's own page and see
+whether anything was dropped: `0.042286450000` next to a quoted `0.0422864500004` tells you
+the thirteenth place is gone, where a trimmed `0.04228645` would look like a clean price.
+
+`as of` is the instant the refresh **began**, not the instant each price arrived: the clock
+is read once, before the first request, so every row of one refresh carries the same
+timestamp. A refresh that fails over across several hosts therefore stamps its rows a few
+seconds early — which is the safe direction, since it can only make a price look older than
+it is, never fresher.
+
+**Exit code 1 means the refresh was incomplete**, and the pairs it could not fetch are printed
+to stderr with a reason. A refresh that got three pairs out of four has not succeeded: the
+missing one would otherwise surface days later as a portfolio total that has been quietly
+short the whole time. The pairs that did work are still stored.
+
+| Reason printed | What it means | What to do |
+|---|---|---|
+| `every_source_failed` | every eligible source was asked and none answered | look at the network, or at the vendors |
+| `unsupported_pair` | this application does not price that pair | nothing was asked; check what you asked for |
+| `no_source_configured` | the pair is supported but no source was available | check the configuration |
+
+### The call budget
+
+**One request per refresh**, because Kraken returns all four pairs in a single call —
+measured on 2026-09-23. At an hourly refresh that is **24 a day and 24 × 30 = 720 a month**,
+to one host, against a vendor that publishes no monthly quota for this endpoint. A 31-day
+month is 744. The shared floor of one request per second per host is three orders of
+magnitude above that.
+
+A refresh with Kraken down costs more, because the fallbacks are not batched: at most three
+requests to three different hosts, or four with CoinGecko configured. It never costs more than
+one request per pair per source.
+
+`docs/providers.md` carries the full arithmetic and the measurements behind it.
+
+### The optional CoinGecko key
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PORTFOLIO_COINGECKO_API_KEY` | *(unset)* | a CoinGecko **Demo** key. Optional. |
+
+**Everything works without it**, and that is the normal deployment: the three key-free
+sources cover all four pairs. Setting it adds a last-resort fallback for every pair.
+
+With the variable unset, **the source is not built at all** — not built and skipped, not
+built. Nothing in the process holds a blank credential and nothing can reach the vendor.
+
+If you do set it:
+
+- It is a **Demo** key, not a Pro key. They use different hosts and different headers, and a
+  Demo key sent to the Pro host is rejected.
+- It goes in the host-local `secrets.env` and **nowhere else**. It is never written to the
+  database, never returned by any endpoint and never logged; the application sends it as a
+  request header on the one call that uses it, never in a URL.
+- A wrong or exhausted key is not an outage. That source refuses, the failover moves past it,
+  and the pair is priced by whoever else can — which is also why a wrong key can sit there
+  unnoticed. If you set one, check a refresh line says `via coingecko` at least once with the
+  other sources unreachable.
+
+### What a missing price looks like, and why it is not a zero
+
+A price that cannot be fetched is reported as **unavailable with a reason**, never as zero. A
+portfolio total that silently omits a holding is indistinguishable from one that includes it,
+and a zero renders, sums and gets believed. A valuation therefore comes back with the total it
+could compute, the list of assets it could not price, and a flag saying the total is
+incomplete.
+
+**A price older than one hour is flagged stale and is still returned.** Staleness is computed
+when the price is read, not stored, so it is never out of date by a second. The last known
+price is better information than none — the same reasoning that makes an unreachable chain
+report "unavailable" rather than a balance of zero.
+
+### Two things worth knowing before you rely on this
+
+- **No vendor returns a quote timestamp.** Measured on all three key-free sources. The `as_of`
+  a price carries is when *we asked*, not when the vendor says the price was true, so a price
+  can be older than it looks by however long the vendor cached it.
+- **The Kaspa price endpoint does not say what currency it is in.** Its body is a bare number.
+  USD is an inference, so that source is used only for KAS/USD, only after Kraken has failed,
+  and never for KAS/EUR. If you need certainty about a KAS price's currency, use a refresh
+  line that says `via kraken`.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -354,3 +484,10 @@ you want to pay.
 | "A batch of N addresses was refused" with **no** sentence about the batch being too large | **Not a batch-size problem.** Read the HTTP status in the same message: 403 is usually a CDN or firewall block on the host, 401 an auth proxy in front of it, 404 a wrong base URL — section 9 |
 | Kaspa health says "no node is synced and UTXO-indexed" | The upstream's nodes cannot answer a balance query, whatever a ping says — section 9 |
 | A Kaspa balance shows its pending amount as unknown | Working as intended: this chain exposes no mempool figure — section 9 |
+| Every holding reports "unpriced", reason `never_fetched` | No refresh has run. There is no scheduler yet — run `refresh-prices` — section 10 |
+| `refresh-prices` exits 1 and names a pair as `every_source_failed` | Every eligible source refused or did not answer. Check connectivity, then the vendors — section 10 |
+| `refresh-prices` exits 1 with `unsupported_pair` | The pair is not one this application prices. Nothing was asked — section 10 |
+| A portfolio total looks too small | Check the incomplete flag: a total omits any holding it could not price, on purpose — section 10 |
+| Prices are all flagged stale | The last refresh is over an hour old. The price is still shown; it is the age that is being reported — section 10 |
+| KAS/EUR is the only pair that ever fails | Kraken is the only key-free source for it. CoinGecko is the only fallback — section 10 |
+| A pair reports `every_source_failed` while the vendor is plainly up | A vendor can be refused for what it *sent*: a price of zero or below, a non-finite number, or one too large or too small for the column. Failover treats that like any other refusal — section 10 |

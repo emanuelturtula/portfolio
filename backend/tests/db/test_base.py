@@ -33,6 +33,21 @@ EXPECTED_NAMES = {
         "fk_wallets_user_id_users",
         "ix_wallets_user_id",
     },
+    # #9. `uq_prices_asset_currency` is named explicitly for the same reason
+    # `uq_wallets_user_chain_address` is: the convention would render
+    # `uq_prices_asset_id_quote_currency`, and this is the constraint whose name appears in
+    # the `IntegrityError` a duplicate refresh produces.
+    #
+    # **No index**, deliberately, and its absence is part of the pin. The table holds one
+    # row per pair -- four today -- so an index would be cost with no benefit, and an index
+    # over the money column would have SQLite coerce a `TEXT` amount to a double on every
+    # write. A name appearing here later is a decision somebody has to make on purpose.
+    "prices": {
+        "pk_prices",
+        "uq_prices_asset_currency",
+        "ck_prices_quote_currency",
+        "fk_prices_asset_id_assets",
+    },
 }
 
 

@@ -97,6 +97,8 @@ if TYPE_CHECKING:
 __all__ = [
     "ADDRESS_BALANCE",
     "ADDRESS_BALANCES",
+    "ASSET_PRICE",
+    "ASSET_PRICES",
     "BLOCK_TIP_HEIGHT",
     "DEFAULT_MIN_HOST_INTERVAL_MS",
     "DEFAULT_RETRY_POLICY",
@@ -233,8 +235,34 @@ height is a number a provider interprets; this endpoint is the vendor's own verd
 nodes and its database, and it names neither a block nor an address.
 """
 
+ASSET_PRICE: Final = "asset_price"
+"""A read of one asset's price in one currency: Coinbase's spot endpoint, Kaspa's price.
+
+Named for the *asset*, not for the vendor's spelling of the pair, because the pair is what
+the request carries and a label may not repeat a request's contents. It carries no more
+information than "somebody asked what something costs", which is the amount a log line about
+a price should say: unlike a balance read, the request itself discloses nothing about the
+owner -- market data is the same for everyone -- but a label that named the pair would still
+be a value computed at a call site rather than written down, which is the shape this
+allowlist exists to refuse.
+"""
+
+ASSET_PRICES: Final = "asset_prices"
+"""A read of several pairs in one call: Kraken's ticker, CoinGecko's simple price.
+
+Plural, one character from `ASSET_PRICE`, for the reason `ADDRESS_BALANCES` gives: the two
+are the same kind of call and a log reader should see them as such, and the number of pairs
+is precisely the fact the label may carry and the path may not.
+
+**This label is what makes the measured call budget visible in a log.** One `asset_prices`
+line per refresh is the whole of an hourly refresh's traffic against the primary vendor, so
+a log that suddenly shows more of them is the evidence that something started fetching
+prices on a request path -- the failure `backend/.importlinter`'s price contract exists to
+make impossible, observed from the other side.
+"""
+
 ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
-    {ADDRESS_BALANCE, ADDRESS_BALANCES, BLOCK_TIP_HEIGHT, NODE_HEALTH}
+    {ADDRESS_BALANCE, ADDRESS_BALANCES, ASSET_PRICE, ASSET_PRICES, BLOCK_TIP_HEIGHT, NODE_HEALTH}
 )
 """Every label that may reach a log. Membership is the gate; the shape is not.
 
@@ -245,8 +273,9 @@ characters, so it passed the pattern and reached the log. Membership in a frozen
 closes that, because a string that is not a member renders as `UNLABELLED` no matter how
 well it is shaped.
 
-Two labels on #7; four since #8 added Kaspa's batch read and its health report. The set
-grows one deliberate line at a time, which is the whole mechanism.
+Two labels on #7; four since #8 added Kaspa's batch read and its health report; six since
+#9 added the two price reads. The set grows one deliberate line at a time, which is the
+whole mechanism.
 
 Same shape as `PUBLIC_API_PATHS`: adding an endpoint protects it, and saying more about
 one is a visible edit to a named constant rather than a value computed at a call site.
