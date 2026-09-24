@@ -658,19 +658,45 @@ async def test_a_since_in_the_future_is_an_empty_series_rather_than_an_error(
     )
 
 
-async def test_limit_takes_the_first_rows_after_since_not_the_newest(
+async def test_without_a_since_the_latest_window_is_returned(
     repository: BalanceRepository,
     wallet_id: int,
     three_readings: list[int],
 ) -> None:
-    """The pair is a forward cursor: read a window, then ask again from its last instant.
+    """A bare `limit` means the most recent readings, still ordered oldest first.
 
-    Worth pinning because the other reading is at least as plausible -- "give me the most
-    recent 500" -- and the two return different rows for the same arguments. A client
-    written against one and served by the other pages backwards through its own history
-    and never notices.
+    The literal reading of the spec's first draft -- always the *first* `limit` rows -- was
+    implemented and then overruled, and the reason is the only consumer there is: a chart of
+    a year-old wallet asking for 500 points wants the last 500, not the first 500 from the
+    week it was registered. A client that wanted the old end has `since`.
+
+    Both halves are asserted, because they are separable and an implementation can get one
+    right and the other wrong: **which** rows come back is the window, and **what order**
+    they come back in is the chart's x-axis.
     """
-    first = await repository.history(wallet_id=wallet_id, since=None, limit=2)
+    window = await repository.history(wallet_id=wallet_id, since=None, limit=2)
+
+    assert [row.confirmed for row in window] == [TEN_COINS, ELEVEN_COINS]
+    assert [row.observed_at for row in window] == [AFTER_MIDNIGHT, NOON]
+    assert window[0].observed_at < window[1].observed_at, "the window is still oldest first"
+
+
+async def test_with_a_since_the_limit_pages_forward(
+    repository: BalanceRepository,
+    wallet_id: int,
+    three_readings: list[int],
+) -> None:
+    """`since` turns the same pair into a forward cursor: read a window, ask again from its end.
+
+    This is the half that has to keep the *first* rows after the instant, and it is the
+    opposite selection from the test above -- which is exactly why the two are separate. An
+    implementation that applied the latest-window rule to a `since` query would hand a client
+    paging forward the same last page over and over.
+
+    `since` is inclusive, so the second page re-reads its own first row rather than risking a
+    gap; the new row is what the page was asked for.
+    """
+    first = await repository.history(wallet_id=wallet_id, since=BEFORE_MIDNIGHT, limit=2)
     second = await repository.history(
         wallet_id=wallet_id,
         since=first[-1].observed_at,
@@ -678,8 +704,6 @@ async def test_limit_takes_the_first_rows_after_since_not_the_newest(
     )
 
     assert [row.confirmed for row in first] == [NINE_COINS, TEN_COINS]
-    # `since` is inclusive, so the second page re-reads its own first row rather than
-    # risking a gap; the new row is what the page was asked for.
     assert [row.confirmed for row in second] == [TEN_COINS, ELEVEN_COINS]
 
 
