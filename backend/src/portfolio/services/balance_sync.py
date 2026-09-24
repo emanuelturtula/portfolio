@@ -238,9 +238,10 @@ class BalanceSyncService:
 
         The order of the work, and each step is a decision:
 
-        1. **The wallets are listed and the run row is written and committed**, before any
-           provider is built. A run the process dies in the middle of leaves a `running`
-           row, which the lifespan's sweep turns into `interrupted`.
+        1. **Orphans are swept, then the wallets are listed and the run row is written and
+           committed**, before any provider is built. A run the process dies in the middle
+           of leaves a `running` row, which the next run's sweep -- or the lifespan's, at
+           startup and shutdown -- turns into `interrupted`.
         2. **Wallets are grouped by chain and the groups run concurrently.** One chain's
            failure is recorded and does not reach the others -- criterion 3.
         3. **The readings are written one chain at a time, committing per chain**, so that
@@ -263,6 +264,26 @@ class BalanceSyncService:
         """
         started_at = self._clock()
         started_ms = self._monotonic()
+
+        # **Any `running` row that exists now is not live**, so it is swept before this
+        # run's own row is opened. Two guarantees make that true rather than hopeful: the
+        # coordinator allows one run at a time in this process, and there is one process.
+        # So a `running` row at this point belongs to a run whose close-out failed -- the
+        # database was locked, the disk was full -- and without this it would stay
+        # `running` until the next process start, which on the Pi can be weeks.
+        #
+        # **That second guarantee is load-bearing, and it is a constraint on the future.**
+        # An entry point that ran a sync outside the coordinator while the server was up --
+        # a `sync-balances` CLI command in another container, say -- would sweep the
+        # server's live run. Such a command has to go through the server's endpoint or run
+        # with the server stopped. The startup and shutdown sweeps in `main.py` rest on the
+        # same guarantee.
+        #
+        # Swept before the insert, so this run's own row cannot be caught by it, and
+        # committed in the same transaction as the insert.
+        swept = await self._runs.sweep_interrupted()
+        if swept:
+            _logger.warning("balance_sync_runs_marked_interrupted", runs=swept)
 
         wallets = await self._wallets.list_all_active()
         run = await self._runs.open_run(

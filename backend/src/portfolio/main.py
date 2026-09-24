@@ -192,7 +192,7 @@ def balance_scheduler_for(
     return IntervalScheduler(
         name="balance-sync",
         interval_minutes=settings.balance_sync_interval_minutes,
-        last_run_at=lambda: latest_finished_run(app),
+        last_run_at=lambda: latest_sync_attempt(app),
         run=run,
     )
 
@@ -270,25 +270,33 @@ def _report_price_refresh(report: RefreshReport) -> None:
 async def latest_price_refresh(app: FastAPI) -> datetime | None:
     """When the newest price row was written, over a session of its own.
 
-    The price timer's startup condition, and the counterpart of `latest_finished_run`. A
+    The price timer's startup condition, and the counterpart of `latest_sync_attempt`. A
     fresh deployment prices its holdings immediately rather than showing `never_fetched` for
-    an hour; a crash-looping container does not call four market-data APIs on every restart.
+    an hour.
+
+    **Unlike the balance timer, this counts successes**, because there is no record of a
+    price *attempt* -- the refresh writes rows only for what it fetched, and a history of
+    refresh runs was ruled out of scope. The residual is bounded and stated in
+    `docs/operations.md`: while every source is failing, a crash loop costs one price request
+    per restart, and the first refresh that succeeds writes rows and suppresses the next one.
     """
     sessionmaker = app.state.db_sessionmaker
     async with sessionmaker() as session:
         return await PriceRepository(session).latest_fetched_at()
 
 
-async def latest_finished_run(app: FastAPI) -> datetime | None:
-    """When the newest finished sync ended, over a session of its own.
+async def latest_sync_attempt(app: FastAPI) -> datetime | None:
+    """When the newest sync of any status started, over a session of its own.
 
-    The scheduler's startup condition: a fresh deployment syncs immediately rather than
-    leaving the dashboard blank for a whole interval, and a crash-looping container does not
-    hit two public indexes on every restart.
+    The balance timer's "last run", and it counts **attempts** rather than successes: a
+    crash-looping container leaves `interrupted` runs with no `finished_at`, and a guard that
+    only counted finished runs let every restart sync again against both public indexes. The
+    property is "at most one sync per interval across restarts", which `docs/operations.md`
+    states in those words.
     """
     sessionmaker = app.state.db_sessionmaker
     async with sessionmaker() as session:
-        return await SyncRunRepository(session).latest_finished_at()
+        return await SyncRunRepository(session).latest_started_at()
 
 
 async def sweep_interrupted_runs(app: FastAPI) -> None:

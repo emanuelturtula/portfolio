@@ -293,24 +293,26 @@ class SyncRunRepository:
         )
         return len(running)
 
-    async def latest_finished_at(self) -> datetime | None:
-        """When the newest *finished* run ended, or `None` if none ever has.
+    async def latest_started_at(self) -> datetime | None:
+        """When the newest run of **any** status started, or `None` if none ever has.
 
-        What the scheduler's startup condition reads: a fresh deployment syncs immediately
-        rather than showing an empty dashboard for a whole interval, and a container that is
-        crash-looping does not hit two public indexes on every restart.
+        What the balance timer's "last run" is: an *attempt*, not a success. The property it
+        buys is "at most one sync per interval, across restarts", and it is the property a
+        free public index cares about.
 
-        `ORDER BY id DESC` rather than `MAX(finished_at)`: the coordinator allows one run at
-        a time in this process, so identity order is finish order, and an `INTEGER` sort
-        needs no argument about a `TEXT` datetime's collation. A run still in flight and an
-        interrupted one both carry `NULL` here and are skipped, which is what "finished"
-        means.
+        **Counting only finished runs was the first version, and it let a crash loop through.**
+        A container that dies faster than one sync takes -- thirty Bitcoin wallets is thirty
+        seconds at one request a second -- leaves an `interrupted` run with no `finished_at`,
+        so every restart found nothing finished and synced again, against both indexes, for
+        as long as the loop lasted. An interrupted run is still a run that asked a vendor
+        something; this counts it.
+
+        `ORDER BY id DESC` rather than `MAX(started_at)`: the coordinator allows one run at a
+        time in this process, so identity order is start order, and an `INTEGER` sort needs no
+        argument about a `TEXT` datetime's collation.
         """
         found: datetime | None = await self._session.scalar(
-            select(SyncRun.finished_at)
-            .where(SyncRun.finished_at.is_not(None))
-            .order_by(SyncRun.id.desc())
-            .limit(1)
+            select(SyncRun.started_at).order_by(SyncRun.id.desc()).limit(1)
         )
         return found
 

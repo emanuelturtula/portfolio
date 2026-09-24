@@ -29,6 +29,20 @@ So: run at startup only if the last one is older than one interval. `last_run_at
 in as a callable rather than a repository, so this module needs no session and no
 `sqlalchemy` import, and a test can answer the question with a literal.
 
+## When it is not due, the first sleep is what is left of the interval
+
+**Not a whole interval**, which is what the first version slept and which made every deploy
+cost an interval of staleness. Prices refresh at 12:00, a deploy lands at 12:50, nothing is
+due at startup -- and sleeping sixty minutes from there put the next refresh at 13:50, so
+every price read `stale` from 13:00 to 13:50 after every single deploy. Sleeping the ten
+minutes that remained keeps the schedule the process had before it restarted.
+
+The remainder is rounded **up** to a whole second. Rounding down would wake a fraction of a
+second early, find the last run still younger than the interval by that fraction, and --
+because the loop does not re-check, it simply ticks -- run slightly early. Early by less than
+a second is harmless; the point is that "at most once per interval" should be true as
+written, and up is the direction in which it is.
+
 ## Durations are whole minutes in and whole seconds out
 
 `float` is banned in `services/`, and every interval this product will ever want is a whole
@@ -57,6 +71,8 @@ __all__ = [
 ]
 
 SECONDS_PER_MINUTE: Final = 60
+_MICROSECONDS_PER_SECOND: Final = 1_000_000
+_ONE_MICROSECOND: Final = timedelta(microseconds=1)
 
 _logger = structlog.get_logger(__name__)
 
@@ -180,29 +196,58 @@ class IntervalScheduler:
         await asyncio.wait({task})
 
     async def _loop(self) -> None:
-        """Run at startup if one is due, then once per interval, forever."""
-        if await self._due_at_startup():
+        """Run now if one is due, otherwise when it would have been; then once per interval.
+
+        The tick after a partial sleep is `at_startup=False`. It is the run that was
+        scheduled before the process restarted, resumed rather than repeated, and recording
+        it as a startup run would claim the deploy caused it.
+        """
+        wait = await self._seconds_until_due()
+        if wait == 0:
             await self._tick(at_startup=True)
+        else:
+            await self._sleep(wait)
+            await self._tick(at_startup=False)
         while True:
             await self._sleep(self._interval_seconds)
             await self._tick(at_startup=False)
 
-    async def _due_at_startup(self) -> bool:
-        """Whether the last run is old enough to justify running again right now.
+    async def _seconds_until_due(self) -> int:
+        """How long until the next run is due, in whole seconds, rounded up. Zero means now.
 
-        Work that has never run is due. A failure to answer the question is **not** treated
-        as due: what produces it is a database that is not answering at all, and the right
-        response to that is to wait for the first interval rather than to hammer a public API
-        while the process is already unhealthy.
+        Work that has never run is due now. So is work whose last run is at least one
+        interval old.
+
+        Otherwise it is the rest of the interval, which is what keeps a restart from pushing
+        the schedule back by a whole interval -- see the module docstring for the deploy that
+        made every price stale for fifty minutes.
+
+        Two edges, both resolved towards "wait":
+
+        * **A last run in the future** -- the clock was stepped back since it was recorded --
+          would make the remainder longer than an interval. It is clamped to one interval:
+          the loop must never sleep longer than it was configured to, whatever the clock did.
+        * **A failure to answer the question** waits a full interval rather than running now.
+          What produces it is a database that is not answering at all, and the right
+          response is not to hammer a public API while the process is already unhealthy.
+
+        Integer arithmetic throughout. `timedelta // timedelta` is an `int`, and the ceiling is
+        the negated floor of the negation -- `float` is banned here, and `total_seconds()`
+        returns one.
         """
         try:
             last = await self._last_run_at()
         except Exception:
             _logger.exception("scheduler_startup_check_failed", scheduler=self._name)
-            return False
+            return self._interval_seconds
         if last is None:
-            return True
-        return self._clock() - last >= timedelta(seconds=self._interval_seconds)
+            return 0
+        interval = timedelta(seconds=self._interval_seconds)
+        remaining = interval - (self._clock() - last)
+        if remaining <= timedelta(0):
+            return 0
+        microseconds = min(remaining, interval) // _ONE_MICROSECOND
+        return -(-microseconds // _MICROSECONDS_PER_SECOND)
 
     async def _tick(self, *, at_startup: bool) -> None:
         """Run the work once and swallow anything that is not a cancellation.
