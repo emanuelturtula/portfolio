@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from decimal import Decimal
+from typing import TYPE_CHECKING, Final
 
 import pytest
 from anyio import Path as AsyncPath
@@ -25,6 +26,8 @@ from portfolio.db.engine import create_database_engine, create_session_factory
 from portfolio.db.models import Asset
 from portfolio.domain.chains import ChainKey
 from portfolio.main import create_app
+from portfolio.providers.errors import ProviderUnavailableError
+from portfolio.providers.prices.base import SUPPORTED_PAIRS, PriceQuote, PriceSource
 from portfolio.services.sync_coordinator import SyncCoordinator
 from tests.balance_harness import (
     DEFAULT_BITCOIN_ADDRESS,
@@ -37,11 +40,13 @@ from tests.balance_harness import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator, Sequence
     from pathlib import Path
 
     from sqlalchemy.engine.interfaces import DBAPIConnection
     from sqlalchemy.pool import ConnectionPoolEntry
+
+    from portfolio.providers.prices.base import PricePair
 
 EXPECTED_SEED_SYMBOLS = ["BTC", "KAS", "USDT"]
 
@@ -50,10 +55,10 @@ EXPECTED_SEED_SYMBOLS = ["BTC", "KAS", "USDT"]
 def lifespan_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Point the process-wide settings at a temporary file, and put them back.
 
-    The balance schedule is off here for the reason `tests/auth/conftest.py` sets out at
-    length: a lifespan with the loop running syncs at startup against two real public
-    indexes, because a database created a moment ago has no finished run to suppress it.
-    The tests below that are about the scheduler turn it back on by name.
+    Both schedules are off here for the reason `tests/auth/conftest.py` sets out at length:
+    a lifespan with either loop running reaches a vendor at startup, because a database
+    created a moment ago has no finished run and no cached price to suppress it. The tests
+    below that are about a scheduler turn the one they need back on by name.
     """
     database_path = tmp_path / "lifespan" / "portfolio.db"
     monkeypatch.setenv(
@@ -61,6 +66,7 @@ def lifespan_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
         f"sqlite+aiosqlite:///{database_path.as_posix()}",
     )
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
     get_settings.cache_clear()
     try:
         yield database_path
@@ -420,3 +426,197 @@ async def test_a_running_row_from_a_dead_process_is_swept_at_startup(
     swept = await runs_in(lifespan_database)
     assert [row["status"] for row in swept] == ["interrupted"]
     assert swept[0]["finished_at"] is None
+
+
+# --------------------------------------------------------------------------------------
+# The price refresh, which the spec regained after implementation had begun
+# --------------------------------------------------------------------------------------
+
+
+class FakePriceSource:
+    """A price source that answers from a table, or refuses. Structural, checked by `mypy`.
+
+    A near-copy of the fake in `tests/services/test_price_refresh_service.py`, and
+    deliberately not imported from it: that module's fake carries the fields *its* tests need
+    -- a volunteering mode, a per-call log -- and importing a test's fixture into another
+    suite is how the first one stops being free to change.
+    """
+
+    name = "a-vendor"
+    pairs = SUPPORTED_PAIRS
+
+    def __init__(self, *, raises: BaseException | None = None) -> None:
+        self.raises = raises
+        self.calls = 0
+
+    async def fetch(self, pairs: Sequence[PricePair]) -> Sequence[PriceQuote]:
+        self.calls += 1
+        if self.raises is not None:
+            raise self.raises
+        return tuple(
+            PriceQuote(
+                asset_symbol=symbol,
+                quote_currency=currency,
+                amount=Decimal("1000.00"),
+                source=self.name,
+            )
+            for symbol, currency in pairs
+        )
+
+
+_CONFORMS_AS_A_SOURCE: PriceSource = FakePriceSource()
+"""`mypy --strict` is the assertion; see `tests/providers/fakes.py` for why not `isinstance`."""
+
+
+@pytest.fixture
+def priced_lifespan(
+    lifespan_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Path]:
+    """The same environment with the **price** timer on and the balance one still off."""
+    monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        yield lifespan_database
+    finally:
+        get_settings.cache_clear()
+
+
+def stub_price_sources(monkeypatch: pytest.MonkeyPatch, source: FakePriceSource) -> None:
+    """Replace the vendors the lifespan builds, at the composition root that builds them.
+
+    `price_scheduler_for` calls `price_sources(client, settings=...)`, so patching the name
+    where `main` imported it intercepts every path into a vendor without this test knowing
+    anything about Kraken's document shape -- the same argument `stub_chain_providers` makes
+    about `ChainProviderRegistry.create`.
+    """
+    monkeypatch.setattr(
+        "portfolio.main.price_sources",
+        lambda client, **keywords: (source,),
+    )
+
+
+PRICES_SQL: Final = "SELECT asset_id, quote_currency, amount, source FROM prices ORDER BY id"
+
+#: How many times a poll re-reads before giving up. A bound rather than a wait: every
+#: iteration is a bare checkpoint, so this is a count of scheduler turns and not a duration,
+#: and it is only ever exhausted when the write never happens.
+POLL_TURNS: Final = 2000
+
+
+async def prices_in(database: Path) -> list[dict[str, object]]:
+    """Every `prices` row, read through a connection of this test's own."""
+    async with own_session(database) as session:
+        return await rows_of(session, PRICES_SQL)
+
+
+async def wait_for_prices(database: Path, *, count: int) -> list[dict[str, object]]:
+    """Poll `prices` until the refresh has **committed**, rather than until it was called.
+
+    Waiting on the fake source's call counter is the obvious thing and it is one `await` too
+    early: the vendor answers, and the rows are written afterwards. A test that left the
+    lifespan at that moment would be asserting on a transaction that had not finished, and it
+    would pass or fail depending on how the loop happened to interleave.
+
+    `rollback` between reads is load-bearing. A session holds its read transaction open, and
+    under WAL that transaction keeps seeing the snapshot it started with -- so a poll without
+    it would re-read the same empty table forever however many times the writer committed.
+    """
+    async with own_session(database) as session:
+        for _ in range(POLL_TURNS):
+            rows = await rows_of(session, PRICES_SQL)
+            if len(rows) >= count:
+                return rows
+            await session.rollback()
+            await asyncio.sleep(0)
+    message = f"the price refresh never committed {count} rows"
+    raise AssertionError(message)
+
+
+async def test_the_price_refresh_is_scheduled_and_actually_fills_the_cache(
+    priced_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gap the spec was corrected to close, asserted as rows rather than as an object.
+
+    `GET /api/balances/current` is the first consumer of the price cache in the running
+    application and nothing was going to fill it: #9 shipped `refresh_prices()` with no
+    caller so the call budget could be measured by hand first. Without this timer a fresh
+    deployment reads balances every fifteen minutes and reports every one of them
+    `unpriced / never_fetched` forever -- the dashboard's flagship endpoint returning a zero
+    total on a correct install.
+
+    So the assertion is on the `prices` table. A test that checked `app.state.price_scheduler
+    is not None` would pass for a timer whose first tick is an hour away, which is exactly
+    the version of this that does not fix the problem.
+    """
+    await bring_the_schema_up(priced_lifespan)
+    source = FakePriceSource()
+    stub_price_sources(monkeypatch, source)
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        assert app.state.price_scheduler is not None
+        assert app.state.price_scheduler.name == "price-refresh"
+        rows = await wait_for_prices(priced_lifespan, count=len(SUPPORTED_PAIRS))
+
+    assert len(rows) == len(SUPPORTED_PAIRS), "every supported pair is cached at startup"
+    assert {row["source"] for row in rows} == {source.name}
+    assert source.calls == 1, "one refresh, not one per pair"
+    assert await prices_in(priced_lifespan) == rows, "and the rows survived the shutdown"
+
+
+async def test_the_price_scheduler_is_not_started_when_disabled(
+    lifespan_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator's second off switch, asserted as "no task" and as "no vendor call".
+
+    Both halves, because a timer that was built and never ticked and a timer that was never
+    built look identical from outside for an hour -- longer than any test will wait.
+    """
+    source = FakePriceSource()
+    stub_price_sources(monkeypatch, source)
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        assert app.state.price_scheduler is None
+
+    assert source.calls == 0
+    assert await prices_in(lifespan_database) == []
+
+
+async def test_a_failing_price_refresh_does_not_stop_the_balance_sync(
+    priced_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two timers, two tasks, and the spec's one-sentence promise made checkable.
+
+    The realistic shape: Kraken has an afternoon, and the portfolio goes on recording what it
+    holds even though it cannot say what that is worth. The opposite failure -- a chain index
+    down taking the price cache with it -- is the same argument and is why the two have
+    separate switches at all.
+
+    Driven through the whole lifespan rather than through two `IntervalScheduler`s, because
+    what `tests/services/test_scheduler.py` cannot see is whether the lifespan wired them as
+    two tasks or awaited one before starting the other.
+    """
+    monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "true")
+    monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_SHUTDOWN_GRACE_SECONDS", "5")
+    get_settings.cache_clear()
+    await register_a_wallet(priced_lifespan)
+    failing = FakePriceSource(raises=ProviderUnavailableError("the vendor did not answer"))
+    stub_price_sources(monkeypatch, failing)
+    provider = StubChainProvider(ChainKey.BITCOIN, {DEFAULT_BITCOIN_ADDRESS: 123_456_789})
+    stub_chain_providers(monkeypatch, {ChainKey.BITCOIN: provider})
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        await asyncio.wait_for(until(lambda: bool(provider.calls) and failing.calls > 0), timeout=5)
+
+    assert failing.calls > 0, "the price vendor really was asked, and really refused"
+    assert await prices_in(priced_lifespan) == [], "a refused refresh writes no price"
+    runs = await runs_in(priced_lifespan)
+    assert [row["status"] for row in runs] == ["success"], (
+        "the balance sync finished regardless of what the price vendor did"
+    )

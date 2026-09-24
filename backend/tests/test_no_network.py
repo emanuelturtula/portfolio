@@ -52,33 +52,56 @@ class ReachedTheNetworkError(AssertionError):
     """Raised in place of a connection, so a failure names the host rather than timing out."""
 
 
+#: The addresses a test is allowed to reach. `asyncio`'s own event loop builds a loopback
+#: socket pair for its self-pipe on Windows, and `httpx`'s ASGI transport never leaves the
+#: process at all -- so a guard that refused *every* connection would refuse the machinery
+#: running the test rather than the vendor call it is aimed at.
+LOOPBACK: Final = frozenset({"127.0.0.1", "::1", "localhost", "", None})
+
+
+def _host_of(address: object) -> object:
+    """The host out of whatever shape a socket call was handed it in."""
+    if isinstance(address, tuple) and address:
+        return address[0]
+    return address
+
+
 @pytest.fixture
 def no_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make any outbound connection an immediate, readable failure.
+    """Make any connection to anything but the loopback an immediate, readable failure.
 
-    `getaddrinfo` and `socket.connect` are the two chokepoints: every client in this process
-    -- `httpx`, `anyio`, anything a dependency reaches for -- resolves a name and then
-    connects, and neither can be skipped. Blocking them rather than mocking `httpx` is
-    deliberate: a guard written against one library stops covering the day somebody adds
-    another.
+    `getaddrinfo` and `connect` are the two chokepoints: every client in this process --
+    `httpx`, `anyio`, anything a dependency reaches for -- resolves a name and then connects,
+    and neither can be skipped. Blocking those rather than mocking `httpx` is deliberate: a
+    guard written against one library stops covering the day somebody adds another.
 
-    Nothing legitimate in this suite passes through either. SQLite is a file, and the ASGI
-    transport hands requests to the application in process without binding a port.
+    The loopback is allowed because refusing it would break the event loop rather than the
+    test's subject, and nothing reachable on it is a vendor. A name that has to be resolved
+    is by definition not the loopback, so the resolver check is the one doing the work.
     """
 
-    def refuse(*arguments: Any, **keywords: Any) -> Any:
-        del keywords
-        target = arguments[0] if arguments else "an unknown host"
+    def refuse(what: str, target: object) -> None:
         message = (
-            f"the test suite tried to reach {target!r}. Nothing here may talk to a vendor: "
+            f"the test suite tried to {what} {target!r}. Nothing here may talk to a vendor: "
             "see this module's docstring"
         )
         raise ReachedTheNetworkError(message)
 
-    monkeypatch.setattr(socket, "getaddrinfo", refuse)
-    monkeypatch.setattr(socket, "create_connection", refuse)
-    monkeypatch.setattr(socket.socket, "connect", refuse)
-    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
+    real_getaddrinfo = socket.getaddrinfo
+    real_connect = socket.socket.connect
+
+    def guarded_getaddrinfo(host: Any, *arguments: Any, **keywords: Any) -> Any:
+        if host not in LOOPBACK:
+            refuse("resolve", host)
+        return real_getaddrinfo(host, *arguments, **keywords)
+
+    def guarded_connect(self: socket.socket, address: Any) -> Any:
+        if _host_of(address) not in LOOPBACK:
+            refuse("connect to", address)
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
 
 
 def test_the_shared_environment_leaves_no_schedule_running(
@@ -149,11 +172,20 @@ async def test_entering_the_lifespan_opens_no_socket(
 async def test_the_socket_guard_can_actually_fail(no_sockets: None) -> None:
     """The falsification control: a guard that blocked nothing would pass the test above.
 
-    Driven against the resolver rather than a real connection, so this test does not need a
-    hostname -- and does not become the one place in the suite that names one, which rule 3
-    forbids.
+    Driven against the resolver and against a connection to a documentation address, so both
+    halves are shown to fire. `.invalid` is reserved by RFC 2606 and `192.0.2.1` by RFC 5737,
+    so neither is a real host and rule 3 is untouched -- and the loopback is checked to still
+    work, because a guard that refused everything would break the event loop rather than the
+    thing it is aimed at.
     """
     del no_sockets
 
     with pytest.raises(ReachedTheNetworkError):
         socket.getaddrinfo("a-host-that-is-never-resolved.invalid", 443)
+
+    with pytest.raises(ReachedTheNetworkError), socket.socket() as opened:
+        opened.connect(("192.0.2.1", 443))
+
+    # The loopback is deliberately still reachable, and it has to be: this test runs inside
+    # an event loop that built itself a socket pair over it.
+    assert socket.getaddrinfo("127.0.0.1", 0)

@@ -94,7 +94,13 @@ def apply_auth_environment(
     #
     # The two suites that are *about* the scheduler set this back to "true" explicitly, so
     # that what they exercise reads as a decision rather than as inherited state.
+    #
+    # The price refresh is the same hazard with different vendors and has its own switch, so
+    # that the two can be tested apart. Its first tick is also at startup, and there is no
+    # "no wallets registered" case to make it harmless: it asks Kraken for four pairs
+    # whether or not this deployment holds anything.
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
     if bootstrap is None:
         monkeypatch.delenv("PORTFOLIO_BOOTSTRAP_PASSWORD", raising=False)
     else:
