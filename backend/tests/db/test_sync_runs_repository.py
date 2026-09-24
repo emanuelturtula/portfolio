@@ -383,77 +383,63 @@ async def test_sweeping_a_table_with_nothing_to_sweep_reports_zero(
 # --------------------------------------------------------------------------------------
 
 
-async def test_the_latest_finish_time_is_none_on_a_fresh_database(
+async def test_the_latest_attempt_is_none_on_a_fresh_database(
     repository: SyncRunRepository,
 ) -> None:
     """`None` is what makes a fresh deployment sync immediately instead of waiting."""
-    assert await repository.latest_finished_at() is None
+    assert await repository.latest_started_at() is None
 
 
-async def test_a_run_in_flight_and_an_interrupted_one_are_not_finish_times(
+@pytest.mark.parametrize(
+    "newest_status",
+    ["interrupted", "running", "failed", "success"],
+)
+async def test_the_latest_attempt_counts_a_run_of_any_status(
+    session: AsyncSession,
+    repository: SyncRunRepository,
+    newest_status: str,
+) -> None:
+    """An attempt is an attempt, whatever became of it -- which is what review changed.
+
+    The old condition read the newest *finished* run, so a container that crashed mid-sync
+    on every start never finished one: each restart found the last success days old,
+    decided a sync was due, and started another one straight into the same crash. Counting
+    attempts is what stops a crash loop from also being a loop of vendor calls.
+
+    Every status is driven, the one run that finished long ago is older than all of them,
+    and the answer is always the newest run's own `started_at`.
+    """
+    long_ago = await open_and_commit(session, repository, started_at=STARTED_AT - timedelta(days=2))
+    await repository.finish_run(
+        long_ago,
+        status=SyncRunStatus.SUCCESS,
+        finished_at=STARTED_AT - timedelta(days=2),
+        duration_ms=1,
+        wallets_succeeded=1,
+        wallets_failed=0,
+        chains=(),
+    )
+    await session.commit()
+    await insert_run_with(session, trigger="startup", status=newest_status)
+    await session.commit()
+
+    assert await repository.latest_started_at() == STARTED_AT
+
+
+async def test_the_latest_attempt_is_the_newest_by_identity_not_by_clock(
     session: AsyncSession,
     repository: SyncRunRepository,
 ) -> None:
-    """Only a run that ended counts, which is what "finished" has to mean here.
+    """Newest by `id`, so a wall clock stepped backwards between two runs cannot reorder them.
 
-    A `running` row treated as a finish time would suppress the startup sync forever after
-    one crash: the newest row would always look recent and the schedule would never run
-    again until somebody deleted it by hand.
+    The later run is given the *earlier* `started_at`. Resolved by `MAX(started_at)` the
+    answer would be the older run's, which is the hazard `duration_ms` exists to sidestep,
+    arriving here through a different column.
     """
-    done = await open_and_commit(session, repository)
-    await repository.finish_run(
-        done,
-        status=SyncRunStatus.SUCCESS,
-        finished_at=FINISHED_AT,
-        duration_ms=1,
-        wallets_succeeded=1,
-        wallets_failed=0,
-        chains=(),
-    )
-    await session.commit()
-    await open_and_commit(session, repository)  # still running, newer
-    await repository.sweep_interrupted()
-    await open_and_commit(session, repository)  # and one genuinely in flight
-    await session.commit()
+    await open_and_commit(session, repository, started_at=STARTED_AT)
+    await open_and_commit(session, repository, started_at=STARTED_AT - timedelta(hours=1))
 
-    assert await repository.latest_finished_at() == FINISHED_AT
-
-
-async def test_the_latest_finish_time_is_the_newest_run_that_ended(
-    session: AsyncSession,
-    repository: SyncRunRepository,
-) -> None:
-    """Newest by identity order, which is finish order because one run happens at a time.
-
-    The later run is given the **earlier** wall-clock finish time, so a query resolved by
-    `MAX(finished_at)` returns a different answer from one resolved by `id`. That is not a
-    contrived case: it is exactly what a clock stepped backwards between two runs produces,
-    which is the same hazard `duration_ms` exists to sidestep.
-    """
-    older = await open_and_commit(session, repository)
-    await repository.finish_run(
-        older,
-        status=SyncRunStatus.SUCCESS,
-        finished_at=FINISHED_AT,
-        duration_ms=1,
-        wallets_succeeded=1,
-        wallets_failed=0,
-        chains=(),
-    )
-    await session.commit()
-    newer = await open_and_commit(session, repository)
-    await repository.finish_run(
-        newer,
-        status=SyncRunStatus.SUCCESS,
-        finished_at=STARTED_AT,
-        duration_ms=1,
-        wallets_succeeded=1,
-        wallets_failed=0,
-        chains=(),
-    )
-    await session.commit()
-
-    assert await repository.latest_finished_at() == STARTED_AT
+    assert await repository.latest_started_at() == STARTED_AT - timedelta(hours=1)
 
 
 # --------------------------------------------------------------------------------------

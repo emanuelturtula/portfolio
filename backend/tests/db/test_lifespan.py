@@ -882,3 +882,78 @@ async def test_fresh_prices_suppress_the_startup_refresh(
         await sleep.reached()
 
     assert source.calls == (1 if refreshed_at_startup else 0)
+
+
+# --------------------------------------------------------------------------------------
+# Review contract 3: the balance timer counts attempts, so a crash loop is not a sync loop
+# --------------------------------------------------------------------------------------
+
+
+async def seed_runs(database: Path, runs: list[tuple[str, timedelta]]) -> None:
+    """`sync_runs` rows by status and age, in the order given -- which is identity order."""
+    now = datetime.now(UTC)
+    async with own_session(database) as session:
+        for status, age in runs:
+            started = sqlite_timestamp(now - age)
+            finished = started if status == "success" else None
+            await session.execute(
+                text(
+                    "INSERT INTO sync_runs (trigger, status, started_at, finished_at, "
+                    "duration_ms, wallets_total, wallets_succeeded, wallets_failed) "
+                    "VALUES ('startup', :status, :started, :finished, :duration, 1, 0, 0)"
+                ),
+                {
+                    "status": status,
+                    "started": started,
+                    "finished": finished,
+                    "duration": 1 if finished else None,
+                },
+            )
+        await session.commit()
+
+
+@pytest.mark.parametrize(
+    ("history", "synced_at_startup"),
+    [
+        (
+            [
+                ("success", timedelta(days=2)),
+                ("interrupted", timedelta(minutes=5)),
+                ("interrupted", timedelta(minutes=3)),
+                ("interrupted", timedelta(minutes=1)),
+            ],
+            False,
+        ),
+        ([("success", timedelta(days=2))], True),
+    ],
+    ids=["three recent interrupted attempts", "only an old success"],
+)
+async def test_recent_attempts_suppress_the_startup_sync_even_when_none_finished(
+    scheduled_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    history: list[tuple[str, timedelta]],
+    synced_at_startup: bool,
+) -> None:
+    """The review's scenario: a success two days old, and interrupted runs 5, 3 and 1 minute ago.
+
+    A process that crashes mid-sync leaves `interrupted` runs and no finished one. Reading
+    only finished runs, every restart found the success two days old, decided a sync was
+    due, and walked straight back into the crash -- two public indexes called once per
+    restart, for as long as the loop lasted. Counting attempts, the newest is a minute old
+    and nothing is due.
+
+    The second case is the control: the same lifespan with only the old success does sync
+    at startup, so the first case's silence is the condition, not a timer that never ticks.
+    """
+    await register_a_wallet(scheduled_lifespan)
+    await seed_runs(scheduled_lifespan, history)
+    provider = StubChainProvider(ChainKey.BITCOIN, {DEFAULT_BITCOIN_ADDRESS: 123_456_789})
+    stub_chain_providers(monkeypatch, {ChainKey.BITCOIN: provider})
+    sleep = PacedSleep()
+    with_a_paced_sleep(monkeypatch, sleep)
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        await sleep.reached()
+
+    assert bool(provider.calls) is synced_at_startup

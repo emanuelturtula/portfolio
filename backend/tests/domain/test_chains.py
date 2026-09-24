@@ -170,7 +170,7 @@ def test_the_validator_accepts_the_enum_and_the_bare_string_alike() -> None:
     assert from_enum == from_string
 
 
-@pytest.mark.parametrize("module", ["addresses.py", "chains.py"])
+@pytest.mark.parametrize("module", ["addresses.py", "chains.py", "currencies.py"])
 def test_the_address_modules_import_nothing_that_could_block_or_drift(module: str) -> None:
     """The property that puts these modules in `domain` instead of in `providers`.
 

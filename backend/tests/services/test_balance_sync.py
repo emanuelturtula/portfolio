@@ -43,6 +43,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final
 
 import pytest
+from structlog.testing import capture_logs
 
 from portfolio.domain.addresses import AddressInvalidError, AddressRejection
 from portfolio.domain.chains import ChainKey
@@ -56,6 +57,7 @@ from portfolio.providers.errors import (
 )
 from portfolio.repositories.sync_runs import (
     SyncErrorKind,
+    SyncRunRepository,
     SyncRunStatus,
     SyncTrigger,
 )
@@ -1121,3 +1123,36 @@ async def test_two_wallets_on_one_address_are_one_request_and_two_snapshots(
     assert stored == {(mine, BTC_UNITS), (theirs, BTC_UNITS)}
     assert summary.status == SyncRunStatus.SUCCESS
     assert (summary.wallets_total, summary.wallets_succeeded) == (2, 2)
+
+
+async def test_a_running_row_left_behind_is_swept_when_the_next_run_opens(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    """No restart needed: the next run clears what a failed close-out left at `running`.
+
+    The lifespan sweeps at startup and at shutdown, and review found the gap between them:
+    a run whose close-out failed -- the database locked at the wrong moment -- stays
+    `running` until the process restarts, which on a healthy Pi is weeks. For all that time
+    the table says a sync is in progress that is not. The sync now sweeps before it opens
+    its own row, so the new row is never swept by itself.
+    """
+    await plant_wallets(sessions, kaspa=())
+    async with sessions() as session:
+        stale = await SyncRunRepository(session).open_run(
+            trigger=SyncTrigger.SCHEDULED,
+            started_at=STARTED_AT - timedelta(hours=1),
+            wallets_total=1,
+        )
+        await session.commit()
+        stale_id = stale.id
+    bitcoin = StubChainProvider(ChainKey.BITCOIN, {BIP173_TESTNET_P2WPKH: BTC_UNITS})
+
+    with capture_logs() as captured:
+        summary = await run_sync(sessions, {ChainKey.BITCOIN: bitcoin})
+
+    statuses = {row["id"]: row["status"] for row in await sync_runs(sessions)}
+    assert statuses == {stale_id: "interrupted", summary.run_id: "success"}
+    swept = [
+        entry for entry in captured if entry["event"] == "balance_sync_runs_marked_interrupted"
+    ]
+    assert [entry["runs"] for entry in swept] == [1]

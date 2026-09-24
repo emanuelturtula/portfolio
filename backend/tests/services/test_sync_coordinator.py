@@ -28,15 +28,18 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import pytest
+from structlog.testing import capture_logs
 
 from portfolio.repositories.sync_runs import SyncRunStatus, SyncRunSummary, SyncTrigger
+from portfolio.services.scheduler import IntervalScheduler
 from portfolio.services.sync_coordinator import SyncCoordinator, SyncOutcome
+from tests.balance_harness import PacedSleep
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
+    from collections.abc import Awaitable, Mapping, Sequence
 
 STARTED_AT: Final = datetime(2026, 9, 24, 0, 0, tzinfo=UTC)
 
@@ -433,3 +436,125 @@ async def test_a_run_that_fails_inside_the_grace_counts_as_drained() -> None:
     assert in_flight(coordinator) is False
     with pytest.raises(RuntimeError):
         await wait_for(running)
+
+
+# --------------------------------------------------------------------------------------
+# Review contract 8: a failed run is logged once, by whoever received it
+# --------------------------------------------------------------------------------------
+
+
+def tracebacks(captured: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The events among `captured` that carried a traceback, in the order they were logged."""
+    return [str(entry["event"]) for entry in captured if entry.get("exc_info")]
+
+
+async def settle(coordinator: SyncCoordinator) -> None:
+    """Let the run end and its done-callback fire, which happens a loop turn after the await."""
+    await wait_for(until_not_in_flight(coordinator))
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+async def until_not_in_flight(coordinator: SyncCoordinator) -> None:
+    while in_flight(coordinator):  # noqa: ASYNC110 - bounded by the caller's wait_for
+        await asyncio.sleep(0)
+
+
+async def test_a_failure_the_caller_receives_is_not_logged_again_by_the_coordinator() -> None:
+    """The review's R5: the waiter got the exception, and the callback logged it as well.
+
+    Two tracebacks for one failure is how a log ends up read as two incidents, and it is the
+    kind of noise that teaches an operator to skim. Whoever receives the exception owns
+    logging it; the coordinator's callback is only for the failure nobody is left to receive.
+    """
+    coordinator = SyncCoordinator(Runner(raises=RuntimeError("the database went away")))
+
+    with capture_logs() as captured:
+        with pytest.raises(RuntimeError):
+            await wait_for(coordinator.sync(SyncTrigger.MANUAL))
+        await settle(coordinator)
+
+    assert [entry for entry in captured if entry["event"] == "balance_sync_failed"] == []
+
+
+async def test_a_failure_nobody_is_left_to_receive_is_logged_once_by_the_coordinator() -> None:
+    """The browser went away before the run failed: the callback is the only one who can say so.
+
+    Without it the failure would vanish -- the waiter was cancelled and never receives the
+    exception, and asyncio stays quiet because the shield has already retrieved it.
+    """
+    runner = Runner(gated=True, raises=RuntimeError("the database went away"))
+    coordinator = SyncCoordinator(runner)
+
+    with capture_logs() as captured:
+        waiter = asyncio.create_task(coordinator.sync(SyncTrigger.MANUAL))
+        await wait_for(runner.started.wait())
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        runner.gate.set()
+        await settle(coordinator)
+
+    assert tracebacks(captured) == ["balance_sync_failed"]
+
+
+async def test_one_waiter_cancelled_and_one_still_waiting_leaves_the_logging_to_the_second() -> (
+    None
+):
+    """The remaining waiter receives the failure, so the callback stays silent.
+
+    Counting waiters, not just checking for one, is the difference: a callback that only
+    asked "was anyone cancelled" would log here as well, and so would the waiter.
+    """
+    runner = Runner(gated=True, raises=RuntimeError("the database went away"))
+    coordinator = SyncCoordinator(runner)
+
+    with capture_logs() as captured:
+        leaving = asyncio.create_task(coordinator.sync(SyncTrigger.MANUAL))
+        await wait_for(runner.started.wait())
+        staying = asyncio.create_task(coordinator.sync(SyncTrigger.SCHEDULED))
+        await asyncio.sleep(0)
+        leaving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leaving
+        runner.gate.set()
+        with pytest.raises(RuntimeError):
+            await wait_for(staying)
+        await settle(coordinator)
+
+    assert [entry for entry in captured if entry["event"] == "balance_sync_failed"] == []
+
+
+async def test_a_failed_scheduled_run_is_one_traceback_end_to_end() -> None:
+    """The whole path the review measured: timer, coordinator, a run that raises.
+
+    The scheduler's tick receives the failure and logs `scheduler_tick_failed` with its
+    traceback. Exactly one record carries a traceback -- the count is over every event,
+    not over one event name, so a second logger added anywhere on the path fails this.
+    """
+    coordinator = SyncCoordinator(Runner(raises=RuntimeError("the database went away")))
+    sleep = PacedSleep()
+
+    async def tick(at_startup: bool) -> None:
+        await coordinator.sync(SyncTrigger.STARTUP if at_startup else SyncTrigger.SCHEDULED)
+
+    scheduler = IntervalScheduler(
+        name="balance-sync",
+        interval_minutes=15,
+        last_run_at=never_ran,
+        run=tick,
+        sleep=sleep,
+    )
+
+    with capture_logs() as captured:
+        await scheduler.start()
+        await sleep.reached()
+        await settle(coordinator)
+        await scheduler.stop()
+
+    assert tracebacks(captured) == ["scheduler_tick_failed"]
+
+
+async def never_ran() -> None:
+    """`last_run_at` for a timer that has never run, so its first tick is at startup."""
+    return

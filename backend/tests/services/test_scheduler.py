@@ -549,3 +549,80 @@ async def test_stop_returns_only_once_the_task_has_really_finished() -> None:
 
     assert task.done(), "stop() returned while the loop's task was still unwinding"
     assert task.cancelled()
+
+
+# --------------------------------------------------------------------------------------
+# Review contract 2: a restart resumes the schedule rather than restarting it
+# --------------------------------------------------------------------------------------
+
+
+async def test_a_restart_sleeps_the_rest_of_the_interval_and_then_resumes() -> None:
+    """Fifty minutes into a sixty-minute interval, a restart sleeps ten, not sixty.
+
+    The review measured `[3600]` here: every restart pushed the next run a whole interval
+    past the restart, so a container that restarted every fifty minutes never refreshed at
+    all. The tick after the short sleep is the one that was already due before the restart,
+    so it is a scheduled tick -- `at_startup=False` -- and the sleep after it is a full one.
+    """
+    sleep = PacedSleep()
+    run = RecordingRun()
+    scheduler = scheduler_over(
+        run, sleep, interval_minutes=60, last=NOW - timedelta(minutes=50), name=PRICE_REFRESH
+    )
+
+    await scheduler.start()
+    await sleep.step()
+    await sleep.reached()
+    await scheduler.stop()
+
+    assert sleep.delays == [600, 3600]
+    assert run.ticks == [False]
+
+
+@pytest.mark.parametrize(
+    ("age", "first_sleep"),
+    [
+        (timedelta(minutes=50, milliseconds=400), 600),
+        (timedelta(minutes=49, seconds=59, milliseconds=600), 601),
+    ],
+    ids=["a fraction under ten minutes left", "a fraction over ten minutes left"],
+)
+async def test_the_remainder_is_rounded_up_to_a_whole_second(
+    age: timedelta,
+    first_sleep: int,
+) -> None:
+    """Up, never down, so the resumed tick is never early -- and early is the wrong side.
+
+    A tick a fraction of a second early finds the previous run not quite an interval old,
+    and on the price side that is a refresh a vendor sees one second sooner than the
+    schedule promised. Sleeping whole seconds is the scheduler's unit, so something has to
+    round, and up is the direction that cannot shorten an interval.
+    """
+    sleep = PacedSleep()
+    scheduler = scheduler_over(RecordingRun(), sleep, interval_minutes=60, last=NOW - age)
+
+    await scheduler.start()
+    await sleep.reached()
+    await scheduler.stop()
+
+    assert sleep.delays == [first_sleep]
+
+
+async def test_a_last_run_in_the_future_sleeps_one_interval_and_never_longer() -> None:
+    """A clock stepped backwards leaves the last run apparently in the future. Clamp it.
+
+    Taken literally, "interval minus age" with a negative age is longer than an interval,
+    and a Raspberry Pi whose clock stepped back a day would wait a day and an hour for its
+    next sync. The clamp is to the interval: late by at most one period, whatever the clock
+    did.
+    """
+    sleep = PacedSleep()
+    run = RecordingRun()
+    scheduler = scheduler_over(run, sleep, interval_minutes=60, last=NOW + timedelta(minutes=10))
+
+    await scheduler.start()
+    await sleep.reached()
+    await scheduler.stop()
+
+    assert sleep.delays == [3600]
+    assert run.ticks == []

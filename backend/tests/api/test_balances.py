@@ -31,6 +31,7 @@ changed, it is that one test that fails first and says so.
 
 from __future__ import annotations
 
+import base64
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -534,13 +535,22 @@ async def test_current_balances_are_valued_against_the_price_cache(
 
     assert response.status_code == 200, response.text
     payload = response.json()
-    assert set(payload) == {"quote_currency", "total", "complete", "as_of", "wallets", "unpriced"}
+    assert set(payload) == {
+        "quote_currency",
+        "total",
+        "complete",
+        "as_of",
+        "wallets",
+        "unpriced",
+        "unread",
+    }
     currency = payload["quote_currency"]
     assert currency in {"EUR", "USD"}
     expected = BTC_QUANTITY * BTC_PRICE[currency] + KAS_QUANTITY * KAS_PRICE[currency]
     assert Decimal(payload["total"]) == expected
     assert payload["complete"] is True
     assert payload["unpriced"] == []
+    assert payload["unread"] == [], "both wallets were read, so neither is unread"
 
     by_wallet = {wallet["wallet_id"]: wallet for wallet in payload["wallets"]}
     assert set(by_wallet) == {bitcoin_wallet, kaspa_wallet}
@@ -606,12 +616,7 @@ async def test_the_quote_currency_defaults_to_euro_and_can_be_chosen(
     assert chosen["quote_currency"] == "USD"
     assert Decimal(chosen["total"]) == BTC_QUANTITY * BTC_PRICE["USD"]
     assert Decimal(chosen["total"]) != Decimal(default["total"])
-    if refused.status_code == 200:
-        assert refused.json()["complete"] is False, (
-            "a currency nothing prices must not report a complete valuation"
-        )
-    else:
-        assert refused.status_code == 422
+    assert refused.status_code == 422, "review settled it: a currency nothing prices is refused"
 
 
 async def test_an_unpriced_asset_makes_the_total_incomplete(
@@ -692,6 +697,10 @@ async def test_a_wallet_with_no_snapshot_reports_null_rather_than_zero(
     assert set(by_wallet) == {unread, empty}, "an unread wallet still appears; it is not omitted"
     assert by_wallet[unread]["confirmed"] is None
     assert by_wallet[unread]["observed_at"] is None
+    # And the total says so. Everything that *was* read is priced, which is the case the
+    # review found reporting `complete: true` while a wallet contributed nothing to it.
+    assert payload["unread"] == [{"wallet_id": unread, "chain_key": BITCOIN, "asset_symbol": "BTC"}]
+    assert payload["complete"] is False
     assert by_wallet[empty]["confirmed"] == "0"
     assert by_wallet[empty]["observed_at"] is not None
     assert Decimal(by_wallet[empty]["quantity"]) == 0
@@ -785,7 +794,7 @@ async def test_wallet_history_is_oldest_first(
 
     payload = await history(signed_in_api_client, wallet)
 
-    assert set(payload) == {"wallet_id", "decimals", "snapshots"}
+    assert set(payload) == {"wallet_id", "decimals", "snapshots", "next_cursor"}
     assert payload["wallet_id"] == wallet
     assert payload["decimals"] == 8
     assert [int(row["confirmed"]) for row in payload["snapshots"]] == expected
@@ -1384,3 +1393,317 @@ async def test_the_current_balances_are_the_callers_and_nobody_elses(
     listed_elsewhere = {entry["wallet_id"] for entry in payload.get("unread", [])}
     assert listed_elsewhere.isdisjoint({theirs, theirs_unread})
     assert KASPA_TESTNET_V1_KEY not in json.dumps(payload)
+
+
+# --------------------------------------------------------------------------------------
+# Review contract 1: a total is complete only when every wallet was read *and* priced
+# --------------------------------------------------------------------------------------
+
+
+async def test_a_wallet_never_read_makes_the_total_incomplete_though_everything_read_is_priced(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The review's scenario, exactly: Bitcoin read and priced, Kaspa never read at all.
+
+    Before, this reported `complete: true`, because completeness only asked whether every
+    *reading* could be priced -- and a wallet with no reading contributed no holding to ask
+    about. The total then silently left a whole wallet out while claiming to be whole, which
+    is the failure #9's completeness flag exists to prevent, arriving from the other side.
+
+    `unpriced` stays empty, and that is part of the assertion: the Kaspa wallet has not
+    failed to be priced, it has not been read, and the two lists say different things.
+    """
+    bitcoin_wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    kaspa_wallet = await create_wallet(
+        signed_in_api_client, KASPA_TESTNET_V0, chain_key=KASPA, label="hot"
+    )
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN, wallets_total=2)
+    await insert_snapshot(
+        api_sessionmaker,
+        wallet_id=bitcoin_wallet,
+        run_id=run_id,
+        confirmed=BTC_UNITS,
+        observed_at=THIRD_SEEN,
+    )
+    await price_everything(api_sessionmaker)
+
+    payload = (await signed_in_api_client.get(CURRENT)).json()
+
+    assert payload["complete"] is False
+    assert payload["unpriced"] == []
+    assert payload["unread"] == [
+        {"wallet_id": kaspa_wallet, "chain_key": KASPA, "asset_symbol": "KAS"}
+    ]
+    kaspa_line = next(line for line in payload["wallets"] if line["wallet_id"] == kaspa_wallet)
+    assert kaspa_line["confirmed"] is None, "still listed, and still null rather than zero"
+    assert Decimal(payload["total"]) == BTC_QUANTITY * BTC_PRICE[payload["quote_currency"]]
+
+
+async def test_an_archived_wallet_that_was_never_read_is_not_unread(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """`unread` is about *active* wallets, or one retired wallet spoils every total forever.
+
+    A wallet archived before its first sync is never going to be read -- the sync skips
+    archived wallets, correctly -- so counting it as unread would make `complete` false for
+    the rest of the account's life, and the flag would stop meaning anything.
+    """
+    live = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    retired = await create_wallet(signed_in_api_client, BIP350_TESTNET_V1, label="retired")
+    assert (
+        await signed_in_api_client.delete(f"{WALLETS}/{retired}", headers=JSON_HEADERS)
+    ).status_code == 204
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN)
+    await insert_snapshot(
+        api_sessionmaker, wallet_id=live, run_id=run_id, confirmed=BTC_UNITS, observed_at=THIRD_SEEN
+    )
+    await price_everything(api_sessionmaker)
+
+    payload = (await signed_in_api_client.get(CURRENT)).json()
+
+    assert payload["unread"] == []
+    assert payload["complete"] is True
+
+
+# --------------------------------------------------------------------------------------
+# Review contracts 5 and 7: bad input is a 422, never a 500 and never a quiet 200
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "since",
+    ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"],
+    ids=["before year one in UTC", "after year 9999 in UTC"],
+)
+async def test_a_since_that_cannot_be_moved_to_utc_is_a_422_not_a_500(
+    signed_in_api_client: AsyncClient,
+    since: str,
+) -> None:
+    """The review's two values. Both are valid ISO-8601 and neither exists in UTC.
+
+    Normalising either to UTC overflows `datetime`'s range, which escaped as an
+    `OverflowError` and a 500 -- a traceback in the log for input any client can type. It is
+    the client's input that is wrong, so it is the client's error, and it names the field.
+    """
+    wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+
+    response = await signed_in_api_client.get(
+        f"{WALLETS}/{wallet}/balances", params={"since": since}
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith(PROBLEM_CONTENT_TYPE)
+    assert [error["loc"] for error in response.json()["errors"]] == [["query", "since"]]
+
+
+@pytest.mark.parametrize("currency", ["eur", "gbp", "GBP"], ids=["wrong case", "lower", "upper"])
+async def test_a_quote_currency_this_product_does_not_price_is_a_422(
+    signed_in_api_client: AsyncClient,
+    currency: str,
+) -> None:
+    """Refused, rather than a 200 that reports every holding `never_fetched`.
+
+    `never_fetched` means "wait for the refresh", and no refresh will ever price GBP -- so
+    that answer sent a client to wait for something that cannot happen. Case matters: the
+    parameter is an enum in the OpenAPI document, and the generated client can only send
+    `EUR` or `USD`.
+    """
+    response = await signed_in_api_client.get(CURRENT, params={"quote_currency": currency})
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith(PROBLEM_CONTENT_TYPE)
+
+
+# --------------------------------------------------------------------------------------
+# Review contract 6: keyset pagination over the history
+# --------------------------------------------------------------------------------------
+
+#: Three readings share one instant. A cursor keyed on time alone skips the second and third
+#: of them or repeats the first, whichever way its comparison leans; only `(observed_at, id)`
+#: visits each once. The earliest and latest instants bracket them.
+KEYSET_EARLY: Final = datetime(2026, 9, 10, 0, 0, 0, 1, tzinfo=UTC)
+KEYSET_SHARED: Final = datetime(2026, 9, 10, 6, 0, 0, tzinfo=UTC)
+KEYSET_LATE: Final = datetime(2026, 9, 10, 12, 0, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+async def keyset_history(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+) -> int:
+    """Five readings, confirmed 1 to 5 in `(observed_at, id)` order, **inserted out of it**.
+
+    Written 5, 2, 1, 3, 4, so that identity order and time order disagree as well: a cursor
+    keyed on `id` alone fails too. Returns the wallet id.
+    """
+    wallet = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    for observed_at, confirmed in (
+        (KEYSET_LATE, 5),
+        (KEYSET_SHARED, 2),
+        (KEYSET_EARLY, 1),
+        (KEYSET_SHARED, 3),
+        (KEYSET_SHARED, 4),
+    ):
+        run_id = await insert_run(api_sessionmaker, started_at=observed_at)
+        await insert_snapshot(
+            api_sessionmaker,
+            wallet_id=wallet,
+            run_id=run_id,
+            confirmed=confirmed,
+            observed_at=observed_at,
+        )
+    return wallet
+
+
+def cursor_for(payload: bytes) -> str:
+    """URL-safe base64 without padding: the cursor's documented envelope, built by the test."""
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+async def test_a_limit_one_walk_visits_every_reading_exactly_once_and_ends(
+    signed_in_api_client: AsyncClient,
+    keyset_history: int,
+) -> None:
+    """The review's broken walk, now finishing: five pages, five readings, then `null`.
+
+    The old forward cursor was "the last `observed_at` you saw", inclusive, so a `limit=1`
+    page returned the same reading forever -- four pages, one row, four times. The walk is
+    bounded at ten pages so that a cursor that stops advancing fails here with a message
+    instead of hanging the suite.
+    """
+    wallet = keyset_history
+    seen: list[int] = []
+    params: dict[str, object] = {"since": KEYSET_EARLY.isoformat(), "limit": 1}
+    for _page in range(10):
+        page = await history(signed_in_api_client, wallet, **params)
+        seen.extend(int(row["confirmed"]) for row in page["snapshots"])
+        if page["next_cursor"] is None:
+            break
+        params = {"cursor": page["next_cursor"], "limit": 1}
+    else:
+        pytest.fail(f"the cursor never ended; readings seen so far: {seen}")
+
+    assert seen == [1, 2, 3, 4, 5], "every reading once, in (observed_at, id) order"
+
+
+async def test_the_default_window_and_an_exhausted_page_both_end_with_a_null_cursor(
+    signed_in_api_client: AsyncClient,
+    keyset_history: int,
+) -> None:
+    """`next_cursor` is non-null exactly when more rows exist forward, and never otherwise.
+
+    The latest window has nothing after it, so a cursor there would be a "more" signal with
+    nothing behind it. A forward page holding exactly the rows that remain is the other
+    edge: `limit + 1` is fetched to tell "exactly this many" from "more", and a guess would
+    get this case wrong. The page one short of the end is the control.
+    """
+    wallet = keyset_history
+
+    latest = await history(signed_in_api_client, wallet, limit=2)
+    exactly_the_rest = await history(
+        signed_in_api_client, wallet, since=KEYSET_SHARED.isoformat(), limit=4
+    )
+    one_short = await history(
+        signed_in_api_client, wallet, since=KEYSET_SHARED.isoformat(), limit=3
+    )
+
+    assert [int(row["confirmed"]) for row in latest["snapshots"]] == [4, 5]
+    assert latest["next_cursor"] is None
+    assert [int(row["confirmed"]) for row in exactly_the_rest["snapshots"]] == [2, 3, 4, 5]
+    assert exactly_the_rest["next_cursor"] is None
+    assert one_short["next_cursor"] is not None
+
+
+async def test_a_cursor_resumes_strictly_after_its_reading_and_carries_no_address(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+    keyset_history: int,
+) -> None:
+    """A cursor built by this test from the documented envelope works like the server's.
+
+    This is the control for the malformed-cursor test below: if the envelope written here
+    did not match the server's, every "malformed" cursor there would be refused for the
+    wrong reason and the test would prove nothing. Resuming after the *second* of the three
+    readings that share an instant is the case a time-only cursor gets wrong.
+
+    The server's own cursor is then checked for the one thing it must never carry.
+    """
+    wallet = keyset_history
+    async with api_sessionmaker() as session:
+        second_id = await session.scalar(
+            text("SELECT id FROM balance_snapshots WHERE confirmed = 2")
+        )
+    handmade = cursor_for(f"{KEYSET_SHARED.isoformat()}|{second_id}".encode())
+
+    resumed = await history(signed_in_api_client, wallet, cursor=handmade, limit=10)
+    issued = (await history(signed_in_api_client, wallet, since=KEYSET_EARLY.isoformat(), limit=1))[
+        "next_cursor"
+    ]
+
+    assert [int(row["confirmed"]) for row in resumed["snapshots"]] == [3, 4, 5]
+    assert isinstance(issued, str)
+    decoded = base64.urlsafe_b64decode(issued + "=" * (-len(issued) % 4)).decode("utf-8")
+    assert BIP173_TESTNET_P2WPKH not in issued
+    assert BIP173_TESTNET_P2WPKH not in decoded
+
+
+MALFORMED_CURSORS: Final[dict[str, str]] = {
+    "not base64": "!!!not-base64!!!",
+    "no separator": cursor_for(b"2026-09-10T06:00:00+00:00"),
+    "three parts": cursor_for(b"2026-09-10T06:00:00+00:00|1|2"),
+    "a naive instant": cursor_for(b"2026-09-10T06:00:00|1"),
+    "an unparseable instant": cursor_for(b"yesterday|1"),
+    "a non-integer id": cursor_for(b"2026-09-10T06:00:00+00:00|one"),
+    "a zero id": cursor_for(b"2026-09-10T06:00:00+00:00|0"),
+    "a negative id": cursor_for(b"2026-09-10T06:00:00+00:00|-3"),
+    "an id past the 64-bit range": cursor_for(f"2026-09-10T06:00:00+00:00|{2**63}".encode()),
+    "an offset UTC cannot hold": cursor_for(b"0001-01-01T00:00:00+01:00|1"),
+    "not UTF-8": cursor_for(b"\xff\xfe|1"),
+    "longer than the parameter allows": "A" * 200,
+}
+
+
+@pytest.mark.parametrize("cursor", list(MALFORMED_CURSORS.values()), ids=list(MALFORMED_CURSORS))
+async def test_a_malformed_cursor_is_a_422_naming_the_cursor(
+    signed_in_api_client: AsyncClient,
+    keyset_history: int,
+    cursor: str,
+) -> None:
+    """Every way a cursor can be wrong is the client's error, and it says which parameter.
+
+    A cursor is opaque to the client but not to anyone who edits a URL, and each of these
+    reached a 500 or a wrong page in some version of a decoder. The instant-overflow case is
+    the same hazard as the extreme `since`, through a second door.
+    """
+    response = await signed_in_api_client.get(
+        f"{WALLETS}/{keyset_history}/balances", params={"cursor": cursor}
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith(PROBLEM_CONTENT_TYPE)
+    assert [error["loc"] for error in response.json()["errors"]] == [["query", "cursor"]]
+
+
+async def test_a_cursor_and_a_since_together_are_a_422(
+    signed_in_api_client: AsyncClient,
+    keyset_history: int,
+) -> None:
+    """Two starting points for one page is an ambiguous request, so it is refused.
+
+    Silently preferring one would return a page from a place the client did not ask about,
+    and a chart built from it would join two windows with nothing marking the seam.
+    """
+    wallet = keyset_history
+    issued = (await history(signed_in_api_client, wallet, since=KEYSET_EARLY.isoformat(), limit=1))[
+        "next_cursor"
+    ]
+
+    response = await signed_in_api_client.get(
+        f"{WALLETS}/{wallet}/balances",
+        params={"cursor": issued, "since": KEYSET_EARLY.isoformat()},
+    )
+
+    assert response.status_code == 422
+    assert [error["loc"] for error in response.json()["errors"]] == [["query", "cursor"]]
