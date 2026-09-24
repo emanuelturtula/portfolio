@@ -129,6 +129,12 @@ process is gone. The lifespan sweeps them to `interrupted` at startup, before th
 starts. This is one status and one sweep more than the issue asks for, and it is here
 because the alternative is a table where a crashed run and a live run look identical.
 
+**Every run sweeps too, before it opens its own row** -- added in review. A run whose
+close-out commit fails (a locked database after the busy timeout) otherwise stays `running`
+until the next process start, which on the Pi can be weeks. Sweeping at the start of a run is
+safe for the same reason the startup sweep is: the coordinator allows one run at a time and
+there is one process, so any `running` row that exists when a run begins is not live.
+
 ### Timing is measured twice, on purpose
 
 `started_at` and `finished_at` are wall-clock (`UtcDateTime`) and answer *when*.
@@ -253,8 +259,11 @@ this field carries the same discipline.
 
 ### `GET /api/balances/current`
 
-Query: `quote_currency` (`EUR` or `USD`, default `EUR`). The first draft showed the field in
-the response and never said where it came from.
+Query: `quote_currency` (`EUR` or `USD`, default `EUR`; anything else is a 422). The first
+draft showed the field in the response and never said where it came from, and the first
+implementation accepted any string -- `?quote_currency=gbp` answered 200 with every holding
+`never_fetched`, which tells an operator the refresh has not run when the cause is a currency
+this application does not price.
 
 Response `200`:
 
@@ -284,24 +293,46 @@ Response `200`:
 ```
 
 `total`, `value`, `quantity`, `price.amount`, `confirmed` and `pending` are **strings**.
-`complete` is false whenever any holding could not be priced, and `total` is then the sum of
-those that could — #9's contract, unchanged and re-asserted at the endpoint.
+`complete` is false whenever any holding could not be priced **or any active wallet has
+never been read**, and `total` is then the sum of what could be computed. The unread wallets
+are listed in `unread: [{wallet_id, chain_key, asset_symbol}]`, beside `unpriced`.
+
+The first draft defined `complete` by pricing alone, and review reproduced the cost: a BTC
+wallet read and a KAS wallet never read answered `complete: true` with a total that left
+Kaspa out. That is #9's own failure -- a number that silently omits a holding -- arriving
+through a missing *reading* rather than a missing price, and the draft had written it into
+the contract.
 
 A wallet with no snapshot yet appears with `confirmed: null` and `observed_at: null` rather
 than a zero. A zero balance and an unread wallet are different facts and the dashboard is
-allowed to say which.
+allowed to say which. A wallet with an *old* snapshot is not unread: its `observed_at` says
+how old, and whether that is too old is #11's decision to render.
 
 ### `GET /api/wallets/{wallet_id}/balances`
 
-Query: `since` (ISO-8601, optional), `limit` (1..1000, default 500).
+Query: `since` (ISO-8601, optional), `cursor` (opaque, optional), `limit` (1..1000,
+default 500). `since` and `cursor` together is a 422, and so is a malformed cursor.
 
-**Without `since` the latest `limit` readings are returned; with `since` it is a forward
-cursor from that instant.** Both are ordered oldest first. The literal reading -- always the
-first `limit` rows at or after `since` -- was implemented first and overruled: a year-old
-wallet's *oldest* 500 readings is the wrong end of the history for the only consumer there
-is, which is #11's chart.
+| Parameters | Rows |
+|---|---|
+| neither | the latest `limit` readings |
+| `since` | the first `limit` readings at or after `since` |
+| `cursor` | the next `limit` readings strictly after the `(observed_at, id)` it encodes |
 
-Response `200`: `{"wallet_id": 7, "decimals": 8, "snapshots": [{"observed_at": ..., "confirmed": "...", "pending": null, "quantity": "...", "sync_run_id": 41}]}`, oldest first.
+All three are ordered `(observed_at, id)`, oldest first. The response carries
+`next_cursor`, non-null exactly when there may be more rows forward.
+
+**Keyset pagination was added in review**, because the draft's "forward cursor from `since`"
+did not advance: `since` is inclusive and has no tie-break, so re-asking from the last
+`observed_at` with `limit=1` returned the same row forever. It matters because paging is the
+only way to chart more than one page -- at one reading every fifteen minutes, 1000 rows is
+about ten days. The cursor encodes a timestamp and an integer and nothing else.
+
+The latest-window default was itself a correction: the draft's literal reading returned a
+year-old wallet's *oldest* 500 readings, which is the wrong end for the only consumer there
+is, #11's chart.
+
+Response `200`: `{"wallet_id": 7, "decimals": 8, "snapshots": [{"observed_at": ..., "confirmed": "...", "pending": null, "quantity": "...", "sync_run_id": 41}], "next_cursor": null}`, oldest first.
 
 `404` when the wallet is not the caller's, via the existing `WalletNotFoundError` — an
 archived wallet still answers, because its history is the reason archiving is a timestamp.
@@ -383,10 +414,32 @@ vendor reaches for, and one switch taking both away would defeat its purpose.
 The interval is validated `>= 1` in `_refuse_unsafe_configuration`: zero or a negative value
 is a loop with no sleep against a public API that documents a ban as the consequence.
 
-**The first run happens at startup only if the newest finished run is older than one
-interval.** Sleeping first leaves a fresh deployment blank for fifteen minutes; running
-unconditionally lets a crash-looping container hit two public APIs on every restart. The
-condition costs one query and answers both.
+**The first run happens at startup only if the last *attempt* is older than one interval,
+and otherwise the first sleep is only the time remaining.** Sleeping first leaves a fresh
+deployment blank for fifteen minutes; running unconditionally lets a crash-looping container
+hit two public APIs on every restart.
+
+Review corrected both halves of the draft:
+
+- **Attempts, not successes.** The draft counted only *finished* runs. A container that dies
+  faster than one sync takes -- thirty BTC wallets are at least thirty seconds at one request
+  a second -- leaves `interrupted` rows with no `finished_at`, so every restart synced again.
+  The balance timer now reads the `started_at` of the latest run of any status, which makes
+  the property "at most one sync per interval across restarts".
+- **The remaining time, not a whole interval.** A deploy fifty minutes after an hourly price
+  refresh slept another full hour, so every price read stale for fifty minutes after every
+  deploy. The first sleep is now `interval - elapsed`, in whole seconds, rounded up.
+
+Two residuals, accepted and documented rather than engineered away:
+
+- **Prices have no attempt record** (a price-refresh history is out of scope). When every
+  source fails, a crash loop costs one price request per restart; any success writes rows and
+  suppresses the next one.
+- **Prices read stale for a few seconds each hour.** The interval equals `STALE_AFTER` and
+  `as_of` is stamped when a refresh begins, so between the hour and the new rows' commit the
+  old ones are over an hour old. Bounded by how long a refresh takes, and it errs toward
+  "stale" -- the direction #9's `as_of` argument already chose, because it is the only one
+  that cannot make an old price look fresh.
 
 ## Acceptance criteria
 
