@@ -20,11 +20,19 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
-from sqlalchemy import CheckConstraint, ForeignKey, Integer, Text, UniqueConstraint
+from sqlalchemy import (
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from portfolio.db.base import Base
-from portfolio.db.types import NumericText, UtcDateTime
+from portfolio.db.types import BaseUnits, NumericText, UtcDateTime
 
 if TYPE_CHECKING:
     from sqlalchemy import MetaData
@@ -57,6 +65,46 @@ _WALLET_CHAIN_KEY_CHECK: Final = "chain_key IN ('bitcoin', 'kaspa')"
 # together. Adding a currency is therefore a migration -- which is the honest cost, since
 # an existing row would have no price in the new one.
 _PRICE_QUOTE_CURRENCY_CHECK: Final = "quote_currency IN ('EUR', 'USD')"
+
+# How a balance sync run was started, and how it ended. Both carry the same duplication
+# hazard as the constants above -- the text is repeated verbatim in `0005_balances` and
+# nothing mechanical compares the two -- and both are covered the same way, by a test that
+# reflects the constraint off a migrated database.
+#
+# `running` and `interrupted` are the two statuses the issue did not ask for and they are
+# what make the table honest. A row is written at `running` *before* the first provider
+# call, so a run the process died in the middle of leaves evidence; the lifespan sweeps any
+# surviving `running` row to `interrupted` at startup and at shutdown. Without them a
+# crashed run and a live run are the same row.
+_SYNC_RUN_TRIGGER_CHECK: Final = "trigger IN ('scheduled', 'manual', 'startup')"
+_SYNC_RUN_STATUS_CHECK: Final = (
+    "status IN ('running', 'success', 'partial', 'failed', 'interrupted')"
+)
+
+# A chain's own outcome within a run: it either produced balances or it did not. There is
+# no `partial` here, because partial is a property of the *run* -- one chain succeeding
+# while another fails -- and a chain that raised produced nothing at all. #54 owns the
+# per-address case that would make a chain itself partial.
+_SYNC_RUN_CHAIN_STATUS_CHECK: Final = "status IN ('success', 'failed')"
+
+# Whose fault a chain's failure was. The first four are `providers/errors.py`'s vocabulary
+# and mean the vendor failed; `internal` means we did, and it exists so that a parser bug
+# is never reported as an outage at the chain. Nullable, because a chain that succeeded has
+# no error to name.
+_SYNC_RUN_CHAIN_ERROR_KIND_CHECK: Final = (
+    "error_kind IS NULL OR "
+    "error_kind IN ('unavailable', 'rate_limited', 'response', 'unknown_chain', 'internal')"
+)
+
+# A confirmed balance is a count of base units the chain has already accepted, so it cannot
+# be negative; `align_balances` refuses one at the provider boundary and this refuses one at
+# the column, for the reason `PriceRepository.upsert` gives about checking twice.
+#
+# **`pending` deliberately has no such constraint.** It is a signed net mempool delta, and
+# an outgoing payment waiting to confirm spends a confirmed output and funds nothing, so it
+# is legitimately negative. A "balances cannot be negative" guard applied to it would refuse
+# the ordinary case.
+_BALANCE_SNAPSHOT_CONFIRMED_CHECK: Final = "confirmed >= 0"
 
 PRICE_SCALE: Final = 12
 """Decimal places `prices.amount` rounds to and stores. Public, because a test pins it.
@@ -254,6 +302,167 @@ class AssetPrice(Base):
     source: Mapped[str] = mapped_column(Text, nullable=False)
     as_of: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
+class SyncRun(Base):
+    """One attempt to read every active wallet's balance, whatever became of it.
+
+    **The row is inserted before any provider is called, at `status='running'`**, and
+    updated when the run ends. A row written only at the end is not written by a run the
+    process died in the middle of, and "every run writes a row" is a criterion rather than
+    an aspiration.
+
+    **Timing is recorded twice and the two are not redundant.** `started_at` and
+    `finished_at` are wall clock and answer *when*; `duration_ms` is an integer from
+    `providers.http.monotonic_ms` and answers *how long*. The difference of two wall-clock
+    reads is wrong by however much the clock was stepped between them, and a Raspberry Pi
+    that syncs its clock mid-run would otherwise record a negative duration. It is an
+    `INTEGER` of milliseconds rather than a fraction of seconds because `float` is banned in
+    `services/`, which is where the subtraction happens.
+
+    `finished_at` and `duration_ms` are both `NULL` while a run is in flight **and stay
+    `NULL` for an interrupted one**: a run the process did not live to finish has no honest
+    end time, and inventing the sweep's own clock reading would record a duration that is
+    mostly the time the process spent dead.
+
+    Counts are plain integers and are counts of *wallets*, not of addresses: a wallet is
+    what the owner registered and what the dashboard renders.
+    """
+
+    __tablename__ = "sync_runs"
+    __table_args__ = (
+        # Named, because a batch rebuild cannot re-create an anonymous CHECK.
+        CheckConstraint(_SYNC_RUN_TRIGGER_CHECK, name="trigger"),
+        CheckConstraint(_SYNC_RUN_STATUS_CHECK, name="status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # `trigger` is a SQLite keyword; SQLAlchemy quotes it on the way out, and the CHECK
+    # above parses with it unquoted, which was measured rather than assumed.
+    trigger: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    # Indexed because an operator reading the run history reads it by time. The index is
+    # `ix_sync_runs_started_at` by the metadata naming convention.
+    started_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    wallets_total: Mapped[int] = mapped_column(Integer, nullable=False)
+    wallets_succeeded: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
+    wallets_failed: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
+
+
+class SyncRunChain(Base):
+    """What one chain did during one run: success, or a failure with whose fault it was.
+
+    **One row per chain per run is what makes failure isolation observable.** The run's own
+    `status` says `partial`; this table says which half was which and why, which is the
+    difference between "the sync half worked" and something an operator can act on.
+
+    `detail` is the provider error's message. Those providers are written never to quote a
+    response body, a URL or an address into one -- `request_target` logs a label rather than
+    a path for the same reason -- and this column inherits that discipline, because it is
+    rendered by an endpoint and read in an operations view.
+
+    `UNIQUE (sync_run_id, chain_key)` because a chain is attempted once per run: the
+    addresses of one chain are one group and one coroutine, and a second row for the same
+    pair would mean the grouping had broken.
+    """
+
+    __tablename__ = "sync_run_chains"
+    __table_args__ = (
+        UniqueConstraint("sync_run_id", "chain_key", name="uq_sync_run_chains_run_chain"),
+        # The same text as `wallets.chain_key`'s constraint, and deliberately the same
+        # constant rather than a second copy of it: two spellings of "which chains exist"
+        # is how one of them comes to admit a chain the other does not.
+        CheckConstraint(_WALLET_CHAIN_KEY_CHECK, name="chain_key"),
+        CheckConstraint(_SYNC_RUN_CHAIN_STATUS_CHECK, name="status"),
+        CheckConstraint(_SYNC_RUN_CHAIN_ERROR_KIND_CHECK, name="error_kind"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sync_run_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("sync_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chain_key: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    wallets_read: Mapped[int] = mapped_column(Integer, nullable=False)
+    error_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class BalanceSnapshot(Base):
+    """What one wallet held the last time one run managed to read it.
+
+    Append-only: a run adds a row, nothing updates one. That is what makes `MAX(id)` a
+    correct answer to "the latest snapshot per wallet" -- identity order is insertion order
+    -- and it needs no argument about how a `TEXT` datetime collates.
+
+    **This table is the per-address cache #7 deferred.** A previous reading, with the
+    instant it was taken, durable across restarts and visible to an operator. A second
+    in-memory cache in front of it would be a copy of this table with a different lifetime
+    and no way to look at it, and it would answer a repeated manual refresh by handing back
+    a stale number that looks exactly like a fresh one. What the deferral was protecting
+    against -- a refresh button that hammers a public index -- is answered by the sync
+    coordinator instead: a second caller joins the run in flight rather than starting one.
+
+    **`confirmed` and `pending` are integer base units, not `Decimal`.** A satoshi and a
+    sompi cannot be subdivided and every chain API reports them as whole numbers, so there
+    is nothing to round; `BaseUnits` refuses anything that is not an integer on the way in
+    *and* on the way out, because SQLite has no column type enforcement and a row written
+    by hand on the Pi would otherwise come back as a `float`.
+
+    **`pending` keeps #7's tri-state exactly.** `NULL` means this chain cannot answer the
+    question -- the Kaspa REST balance endpoint exposes no mempool figures at all -- and a
+    value is a signed net delta that is legitimately negative. Zero is neither of those; it
+    means the mempool holds nothing for this address, which only a chain that answers the
+    question can say.
+
+    **`decimals` is stored here rather than read from `assets` at query time**, so that
+    editing an asset row cannot reinterpret history that was already recorded. The same
+    reason `AddressBalance` carries it beside the provider's capabilities.
+
+    `UNIQUE (wallet_id, sync_run_id)`: one run reads a wallet once. A second row for the
+    pair would mean the same address was counted twice in one total.
+    """
+
+    __tablename__ = "balance_snapshots"
+    __table_args__ = (
+        UniqueConstraint("wallet_id", "sync_run_id", name="uq_balance_snapshots_wallet_run"),
+        # Named, because a batch rebuild cannot re-create an anonymous CHECK.
+        CheckConstraint(_BALANCE_SNAPSHOT_CONFIRMED_CHECK, name="confirmed"),
+        # Named explicitly rather than left to the convention, which would render
+        # `ix_balance_snapshots_wallet_id_observed_at`. This is the index the history
+        # endpoint reads: one wallet, filtered and ordered by time.
+        Index("ix_balance_snapshots_wallet_observed", "wallet_id", "observed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wallet_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("wallets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sync_run_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("sync_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    confirmed: Mapped[int] = mapped_column(BaseUnits, nullable=False)
+    pending: Mapped[int | None] = mapped_column(BaseUnits, nullable=True)
+    decimals: Mapped[int] = mapped_column(Integer, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 # Re-exported so that anything needing the schema -- Alembic's `env.py`, the drift check --

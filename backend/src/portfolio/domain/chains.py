@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
 __all__ = [
+    "CHAIN_ASSET_SYMBOLS",
     "CHAIN_VALIDATORS",
     "AddressInvalidError",
     "AddressRejection",
@@ -58,10 +59,46 @@ class ChainKey(StrEnum):
     BITCOIN = "bitcoin"
     KASPA = "kaspa"
 
+    @property
+    def asset_symbol(self) -> str:
+        """The ticker of the asset this chain's native balance is denominated in.
+
+        **This is here rather than in `providers/prices/base.py`, and the move is the
+        point.** `BTC` and `KAS` are declared there too, as the symbols a price source
+        builds a vendor pair code out of, and reaching for those from the balance read path
+        would make `api.routers -> services.balances -> providers.prices` a real edge --
+        which `backend/.importlinter`'s `prices-are-never-fetched-in-a-request` contract
+        forbids, deliberately and without `allow_indirect_imports`. That contract has never
+        failed on a real chain, and the obvious implementation of the valuation read would
+        have been the first thing to fail it, correctly.
+
+        The symbol is a property of the chain rather than of the price package: Bitcoin's
+        native asset is BTC whether or not anything is pricing it today. So it lives in the
+        layer that imports nothing, and a test asserts the two declarations agree -- the
+        same arrangement that holds `_ASSET_KIND_CHECK` and its migration together.
+
+        A property rather than a second enum member value, because a `StrEnum` member *is*
+        its chain key and giving it a tuple value would change what
+        `wallets.chain_key == ChainKey.BITCOIN` compares.
+        """
+        return CHAIN_ASSET_SYMBOLS[self]
+
 
 # A PEP 695 alias rather than an assignment: its right-hand side is evaluated lazily, so
 # `Callable` can stay in the type-checking block where ruff's TC rules want it.
 type AddressValidator = Callable[[str], ValidatedAddress]
+
+CHAIN_ASSET_SYMBOLS: Final[Mapping[ChainKey, str]] = {
+    ChainKey.BITCOIN: "BTC",
+    ChainKey.KASPA: "KAS",
+}
+"""One asset symbol per chain, spelled exactly as `assets.symbol` holds it.
+
+Module level rather than inside `ChainKey.asset_symbol`, so that a test can assert the
+mapping is total over `ChainKey` without constructing every member -- the same treatment
+`CHAIN_VALIDATORS` gets, and for the same reason: a chain added without an entry must fail
+the build rather than raise a `KeyError` on the first sync after it ships.
+"""
 
 CHAIN_VALIDATORS: Final[Mapping[ChainKey, AddressValidator]] = {
     ChainKey.BITCOIN: validate_bitcoin_address,
