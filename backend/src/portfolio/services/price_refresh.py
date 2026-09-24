@@ -15,12 +15,19 @@ stale" inside `value_portfolio` -- is precisely the one that turns every dashboa
 into four vendor calls. It would also turn the contract red, which is the point of writing
 it without `allow_indirect_imports`.
 
-## No scheduler here
+## Still no scheduler, and that is now a gap rather than a deferral
 
-#10 owns scheduling. This change delivers `refresh_prices()` as a service with **no caller
-in the running application** and a CLI entry point beside it, so the call budget can be
-measured by hand before anything automates it. A scheduler invented here would be a second
-one to delete.
+#9 delivered `refresh_prices()` as a service with **no caller in the running application**
+and a CLI entry point beside it, so the call budget could be measured by hand before
+anything automated it. #10 was to own the scheduling; what #10 actually scheduled was
+**balances**, because that is the scope its issue set.
+
+So this is still called only by `portfolio refresh-prices`, and the consequence is visible
+to a user rather than only to a maintainer: on a fresh deployment `GET /api/balances/current`
+reports every holding under `unpriced` with `reason: never_fetched` until an operator runs
+the command. `services/scheduler.py` is generic over what it ticks and the shared HTTP client
+is now open for the life of the process, so the missing piece is a caller rather than a
+design. `docs/providers.md` records it as outstanding with no owner yet.
 
 ## The sources are handed in, never imported by the caller's caller
 

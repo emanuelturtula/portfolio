@@ -847,7 +847,9 @@ to every row at once. `repositories/prices.py` has no method that totals, sorts 
 compares one; the valuation service loads the rows and sums them in Python.
 
 **Staleness is computed at read time from an injected clock and is never stored.**
-`STALE_AFTER` is one hour, matching the refresh interval #10 will schedule. A stored
+`STALE_AFTER` is one hour. That was chosen to match a price refresh interval that **has still
+not been scheduled** -- #10 scheduled balances, not prices -- so today it is a threshold
+against a refresh somebody runs by hand. A stored
 `is_stale` boolean would be wrong one second after it was written and would need a background
 job whose only purpose was to keep a derived field true. A stale price is still returned, with
 its age visible: the last known price is better information than none, which is the same
@@ -882,38 +884,84 @@ The general rule: **a value a money column would silently transform is refused b
 and a value a vendor should never have sent is refused by the parser.** The first protects
 every writer; the second keeps a vendor's mistake on the vendor's error path.
 
+## Who calls a provider, and when
+
+**Landed in #10.** The wiring three earlier issues each deferred now exists.
+
+`portfolio.main.lifespan` builds the shared `httpx.AsyncClient` with `build_http_client()`,
+publishes it on `app.state.http_client`, and closes it on the way down. One client per
+application, which is what the rate limiter requires rather than a tidiness preference: its
+state lives on the transport and the transport lives on the client, so a second one would
+keep its own idea of the interval and the effective floor would silently become half of what
+`DEFAULT_MIN_HOST_INTERVAL_MS` says.
+
+`services/balance_sync.py` is the only module in `services/` that reaches a chain provider,
+and it does not import `httpx` or the registry: it takes a `provider_for` callable, and the
+lifespan passes `lambda key: get_chain_provider(key, client)`. `main.py` imports
+`portfolio.providers.chains` for its registration side effect, which is the one line that
+makes the registry able to answer at all.
+
+Two things reach a provider, and both go through `SyncCoordinator`:
+
+- **the scheduler**, every `PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES` minutes, plus once at
+  startup when the newest finished run is older than one interval;
+- **`POST /api/balances/sync`**, which is a request path calling a vendor *on purpose* --
+  the owner asked for the read and is waiting for it. That is the deliberate asymmetry with
+  prices, where `prices-are-never-fetched-in-a-request` forbids the same thing.
+
+A second caller does not start a second run. It attaches to the one in flight and gets that
+run's summary with `joined: true`, so a double-clicked refresh button costs no extra requests
+at a public index.
+
+### The per-address cache is the snapshot table
+
+An earlier revision of this document said a per-address cache was outstanding and that #10
+owned it. It is answered rather than built: `balance_snapshots` **is** the previous reading,
+with the instant it was taken, durable across restarts and visible to an operator. A second
+in-memory cache in front of it would be a copy of that table with a different lifetime and
+no way to look at it.
+
+What the deferral was really protecting against -- a refresh button that hammers a public
+index -- is answered by the coordinator's join, not by a cache. A cache would have answered
+it by returning a stale number that looks exactly like a fresh one, which is the failure
+`ProviderUnavailableError` exists to prevent.
+
 ## Not done yet, and who owns it
 
-- **Lifespan wiring.** `build_http_client()` is process-wide by construction -- the rate
-  limiter's state lives on the transport, which lives on the client, so two clients would
-  each keep their own idea of the interval and it would silently become half of what it
-  says. Nothing calls a provider yet, so nothing builds one at startup; creating and
-  closing it in `main.py` today would be an unused connection pool held open for the life
-  of the application. **#10 owns building it in the lifespan and closing it there.**
+- **Nothing schedules a price refresh.** #9 shipped `refresh_prices()` with no caller in the
+  running application and a `portfolio refresh-prices` command beside it; #10 scheduled
+  **balances** and not prices, because that is what the issue and its spec asked for. The
+  consequence is real and is worth stating rather than discovering: on a fresh deployment
+  `GET /api/balances/current` returns every holding under `unpriced` with
+  `reason: never_fetched` until somebody runs the command by hand. The pieces are all in
+  place -- the scheduler takes a coordinator and an interval, and the client it would need is
+  now open for the life of the process -- so this is a small change with an owner to be
+  assigned, not a design question.
 - **Tuning settings.** Every number in the first table above is still a module constant.
   Promoting one to a `PORTFOLIO_PROVIDER_*` setting is a change an operator's measurement
   should drive, not a guess made before anything has ever made a request.
-- **A per-address cache.** Not the provider's: an instance is built per `registry.create()`
-  call, so a cache on it would be dead on arrival, and a cached balance looks exactly like a
-  read one -- which is the failure `ProviderUnavailableError` exists to prevent. **#10 owns
-  it**, because the scheduler knows how often a read may repeat and the snapshot table is
-  where a previous reading already lives.
-- **The source-walk test over `providers/`.** `backend/tests/security/test_address_logging.py`
-  walks the wallet modules and fails on a log call that could carry an address. Neither
-  provider has a log call at all -- deliberately, since the transport's contract is the only
-  one that is enforced rather than remembered -- so the walk is worth extending the day a
-  provider needs one.
+- **The source-walk test over `providers/`, and now over the sync.**
+  `backend/tests/security/test_address_logging.py` walks the wallet modules and fails on a
+  log call that could carry an address. Neither provider has a log call at all --
+  deliberately, since the transport's contract is the only one that is enforced rather than
+  remembered -- so the walk is worth extending the day a provider needs one.
+
+  **#10 added the first log call that could carry one, and it is worth knowing about.**
+  `services/balance_sync.py` catches any non-`ProviderError` exception from a chain and calls
+  `_logger.exception`, which writes the traceback -- and a `KeyError` raised while correlating
+  a balance renders its key, which would be an address. The database column and the response
+  body are protected: only the exception's *type name* is recorded there, never its message.
+  The log is not, and the precedent for accepting that is
+  `api.errors.handle_unexpected_error`, which has logged unhandled exceptions from the wallet
+  router the same way since #5. The alternative is a defect nobody can diagnose. Worth either
+  extending the module walk to `services/balance_sync.py` or dropping the traceback for a
+  correlation id, and worth deciding rather than inheriting.
 - **Network-aware address registration.** A wrong-network address is refused by the
   *provider*, at read time, not when the wallet is registered. Making registration
   network-aware changes #5's contract and needs a story for rows that already exist.
 - **The Kaspa batch ceiling.** 64 is a guess; see above. The first evidence will be a
   refused batch in production, and the refusal is written to carry the size so that the
   evidence is actionable when it arrives.
-- **Building the price sources in the lifespan, and scheduling a refresh.** #9 ships
-  `refresh_prices()` as a service with no caller in the running application, plus a
-  `portfolio refresh-prices` command so the measured call budget can be checked by hand
-  before anything automates it. **#10 owns the scheduler**, and a scheduler invented in #9
-  would have been a second one to delete.
 - **The price source base URLs are module constants, not settings.** Kraken, Coinbase and
   CoinGecko each have exactly one correct host and no self-hosting story, so a
   `PORTFOLIO_*_URL` for them would be a variable with one right value plus a validation path

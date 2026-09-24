@@ -346,12 +346,16 @@ URL.
 
 ¹ only when a CoinGecko key is set; see below.
 
-### There is no scheduler yet
+### Prices still have no scheduler. Balances do
 
-Nothing in the running application fetches a price. #10 owns scheduling the refresh; until it
-lands, prices are refreshed by running the command below. A deployed instance that has never
-had it run reports every holding as *unpriced with a reason*, which is deliberate — see "What
-a missing price looks like".
+Nothing in the running application fetches a **price**. #10 scheduled **balances** — section
+11 — and deliberately stopped there, because that is the scope its issue set. So a deployed
+instance reads balances every fifteen minutes on its own and does not price them until
+somebody runs the command below.
+
+A deployment that has never had it run reports every holding as *unpriced with a reason*,
+which is deliberate — see "What a missing price looks like". Run `refresh-prices` after the
+first deploy, and put it on a host cron until the scheduler exists.
 
 ### Refreshing by hand
 
@@ -461,6 +465,71 @@ report "unavailable" rather than a balance of zero.
   and never for KAS/EUR. If you need certainty about a KAS price's currency, use a refresh
   line that says `via kraken`.
 
+## 11. Reading balances: the schedule, the run log and the off switch
+
+The application reads every active wallet's balance on a timer and writes what it found to
+`balance_snapshots`. Each attempt is one row in `sync_runs` plus one row per chain in
+`sync_run_chains`, so what happened is a query rather than a guess.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PORTFOLIO_BALANCE_SYNC_ENABLED` | `true` | Whether the timer runs. **Does not disable `POST /api/balances/sync`** — the manual trigger is the tool you debug a vendor with. |
+| `PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES` | `15` | Minutes between runs. Must be at least 1; the container refuses to start otherwise, because zero is a loop with no sleep in it against an index that documents a ban as the consequence. |
+| `PORTFOLIO_BALANCE_SYNC_SHUTDOWN_GRACE_SECONDS` | `10` | How long shutdown waits for a run in flight before cancelling it and recording it `interrupted`. |
+
+**A run at startup happens only if the newest finished run is older than one interval.**
+Sleeping first would leave a fresh deployment blank for fifteen minutes, which is exactly when
+somebody is watching; running unconditionally would let a crash-looping container hit two
+public indexes on every restart. The condition costs one query and answers both.
+
+### Reading the run log
+
+```bash
+curl -s --cookie-jar - -b "$COOKIE" https://<host>/api/balances/runs | jq .
+```
+
+Each run carries `status`, `started_at`, `finished_at`, `duration_ms`, the three wallet counts
+and one entry per chain. `duration_ms` comes from a monotonic clock, not from subtracting the
+two timestamps, so a host that syncs its clock mid-run cannot report a negative one.
+
+A run's `status` is one of five:
+
+| Status | Means |
+|---|---|
+| `running` | in flight right now |
+| `success` | every chain attempted produced balances — including a database with no wallets at all, which has nothing to read |
+| `partial` | at least one chain worked and at least one did not. **The balances of the chains that worked were written** |
+| `failed` | every chain attempted failed |
+| `interrupted` | the process died, or was shut down, while the run was in flight |
+
+A failed chain carries an `error_kind`. The first four mean the vendor failed and are the
+vocabulary from `docs/providers.md`: `unavailable`, `rate_limited`, `response`,
+`unknown_chain`. The fifth, **`internal`, means our own code raised** — a bug, not an outage —
+and the container log carries the traceback. The distinction exists because a defect recorded
+as "Kaspa is unavailable" gets read as a vendor problem for months.
+
+### Triggering one by hand
+
+```bash
+curl -X POST -H 'Content-Type: application/json' -H "Origin: https://<host>" \
+     -b "$COOKIE" https://<host>/api/balances/sync
+```
+
+Pressing it twice does not start two runs: the second call attaches to the one already going
+and returns that run's summary with `"joined": true`. That is also what happens when you
+trigger one while the timer's own run is in progress.
+
+### When a run is interrupted
+
+A `sync_runs` row is written at `running` **before the first request to any chain**, so a
+process that is killed mid-sync leaves evidence. Startup and shutdown both sweep any surviving
+`running` row to `interrupted`, leaving `finished_at` and `duration_ms` null — the run has no
+honest end time, and stamping the sweep's own clock on it would record a duration that is
+mostly however long the container was down.
+
+Snapshots are committed per chain as the run goes, so an interrupted run keeps whatever it had
+already read.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -484,7 +553,13 @@ report "unavailable" rather than a balance of zero.
 | "A batch of N addresses was refused" with **no** sentence about the batch being too large | **Not a batch-size problem.** Read the HTTP status in the same message: 403 is usually a CDN or firewall block on the host, 401 an auth proxy in front of it, 404 a wrong base URL — section 9 |
 | Kaspa health says "no node is synced and UTXO-indexed" | The upstream's nodes cannot answer a balance query, whatever a ping says — section 9 |
 | A Kaspa balance shows its pending amount as unknown | Working as intended: this chain exposes no mempool figure — section 9 |
-| Every holding reports "unpriced", reason `never_fetched` | No refresh has run. There is no scheduler yet — run `refresh-prices` — section 10 |
+| Every holding reports "unpriced", reason `never_fetched` | No **price** refresh has run. Balances are scheduled; prices are not — run `refresh-prices` — section 10 |
+| A wallet shows `confirmed: null` rather than a balance | No run has read it yet. Not the same as a zero, on purpose — check `/api/balances/runs` — section 11 |
+| Balances never update and `/api/balances/runs` is empty | The timer is off. `PORTFOLIO_BALANCE_SYNC_ENABLED=false` — section 11 |
+| Container refuses to start naming the sync interval | `PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES` is zero or negative. To stop syncing, use the enabled flag — section 11 |
+| A run says `partial` every time, one chain always failing | Read that chain's `error_kind`. The first four mean the vendor; `internal` means our bug and there is a traceback in the container log — section 11 |
+| Runs pile up as `interrupted` | Each one was cut off by a restart or a deploy. If it is every run, the sync is outliving `PORTFOLIO_BALANCE_SYNC_SHUTDOWN_GRACE_SECONDS` — section 11 |
+| Clicking refresh twice returns the same `run_id` | Working as intended: the second caller joins the run in flight rather than starting a second one — section 11 |
 | `refresh-prices` exits 1 and names a pair as `every_source_failed` | Every eligible source refused or did not answer. Check connectivity, then the vendors — section 10 |
 | `refresh-prices` exits 1 with `unsupported_pair` | The pair is not one this application prices. Nothing was asked — section 10 |
 | A portfolio total looks too small | Check the incomplete flag: a total omits any holding it could not price, on purpose — section 10 |

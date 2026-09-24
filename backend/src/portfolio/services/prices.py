@@ -75,8 +75,10 @@ __all__ = [
 STALE_AFTER: Final = timedelta(hours=1)
 """How old an observation may be before a price is flagged stale.
 
-One hour, matching the refresh interval #10 will schedule: a price that has missed exactly
-one refresh is the first one worth flagging, and anything shorter would mark every price
+One hour, chosen to match a price refresh interval that **still does not exist**: #10
+scheduled balances and not prices, so today this is a threshold against a refresh somebody
+runs by hand. The reasoning stands for the day one is scheduled -- a price that has missed
+exactly one refresh is the first worth flagging, and anything shorter would mark every price
 stale in the minutes before the next run.
 
 **The threshold is not an expiry.** A stale price is still returned, with its age visible,
