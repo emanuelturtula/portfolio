@@ -209,7 +209,18 @@ concurrency = ["thread", "greenlet"]
 # The three remaining misses are still the same three, now 0.11 points. The whole of
 # `providers/prices/`, the prices repository, both services and the new migration are fully
 # covered.
-fail_under = 99.6
+#
+# **99.6 -> 99.7 with the balance sync (#10)**, measured 99.91% over 3853 statements and 636
+# branches. 0.31 points of 4489 units is about fourteen units of headroom; 99.7 leaves about
+# nine and a half, which clears the nine-unit standard by half a unit, and 99.8 would leave
+# five. Half a unit is thin, and it is stated rather than rounded up: the next change that
+# adds an unreachable branch should expect to argue for it rather than find room.
+#
+# The misses are the same three lines, now 0.09 points -- four units: `web/spa.py:52` and its
+# partial branch, and the two engine guards. Every module #10 added is fully covered, and it
+# got there because the first measurement was 99.44% against a 99.6 floor: the tester added
+# tests for eight uncovered #10 branches rather than anyone asking for the floor to move.
+fail_under = 99.7
 show_missing = true
 skip_covered = true
 exclude_also = [
