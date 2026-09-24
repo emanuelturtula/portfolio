@@ -48,6 +48,7 @@ from portfolio.services.scheduler import SECONDS_PER_MINUTE, IntervalScheduler
 from portfolio.services.sync_coordinator import SyncCoordinator
 from tests.balance_harness import (
     DEFAULT_BITCOIN_ADDRESS,
+    PacedSleep,
     StubChainProvider,
     plant_wallets,
     snapshots,
@@ -86,38 +87,6 @@ async def sessions(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSess
     """A migrated file, for the one test that asserts the loop persists something."""
     async with migrated_sessionmaker(tmp_path) as factory:
         yield factory
-
-
-class PacedSleep:
-    """The injected sleep. It records what it was asked to wait and waits for the test.
-
-    Backpressure is the point. A sleep that simply returned would let the loop spin
-    thousands of times before the test regained control, and "two ticks happened" would be
-    a statement about scheduling luck. Here the loop stops at every sleep until `step()`
-    releases it, so the number of ticks is exactly the number the test asked for.
-    """
-
-    def __init__(self) -> None:
-        self.delays: list[float] = []
-        self._arrived = asyncio.Event()
-        self._resume = asyncio.Event()
-
-    async def __call__(self, delay: float) -> None:
-        self.delays.append(delay)
-        self._arrived.set()
-        await self._resume.wait()
-        self._resume.clear()
-
-    async def reached(self) -> None:
-        """Wait until the loop is parked in a sleep, so a tick can be counted."""
-        await asyncio.wait_for(self._arrived.wait(), timeout=DEADLOCK_TIMEOUT)
-        self._arrived.clear()
-
-    async def step(self) -> None:
-        """Let the loop out of the sleep it is parked in."""
-        await self.reached()
-        self._resume.set()
-        await asyncio.sleep(0)
 
 
 class RecordingRun:
@@ -535,3 +504,48 @@ async def test_the_default_clock_is_the_real_one_and_is_timezone_aware(
     await scheduler.stop()
 
     assert run.ticks == ([True] if due else [])
+
+
+async def test_a_run_exactly_one_interval_old_is_due() -> None:
+    """The boundary itself: at exactly one interval, the startup run happens.
+
+    `>=` rather than `>`, and the difference is one tick an interval late on a restart that
+    lands on the minute. Asserted with an injected clock, because no real clock lands on a
+    boundary on purpose.
+    """
+    sleep = PacedSleep()
+    run = RecordingRun()
+    scheduler = scheduler_over(
+        run, sleep, last=NOW - timedelta(minutes=DEFAULT_BALANCE_INTERVAL_MINUTES)
+    )
+
+    await scheduler.start()
+    await sleep.reached()
+    await scheduler.stop()
+
+    assert run.ticks == [True]
+
+
+async def test_stop_returns_only_once_the_task_has_really_finished() -> None:
+    """`stop()` awaits the cancelled task, so when it returns the loop is gone, not going.
+
+    `running` cannot show this: it reads the scheduler's own reference to the task, which
+    `stop()` clears before cancelling, so it reports `False` whether or not the task has
+    finished. The task is found by its public name instead and asked directly. The lifespan
+    closes the HTTP client and disposes the engine straight after `stop()` returns, so a task
+    still unwinding at that moment meets a closed pool.
+    """
+    sleep = PacedSleep()
+    scheduler = scheduler_over(RecordingRun(), sleep, name=PRICE_REFRESH, last=None)
+    await scheduler.start()
+    await sleep.reached()
+    task = next(
+        candidate
+        for candidate in asyncio.all_tasks()
+        if candidate.get_name() == f"{PRICE_REFRESH}-scheduler"
+    )
+
+    await scheduler.stop()
+
+    assert task.done(), "stop() returned while the loop's task was still unwinding"
+    assert task.cancelled()

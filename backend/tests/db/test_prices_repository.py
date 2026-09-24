@@ -931,3 +931,32 @@ def test_the_table_carries_no_index_beyond_its_unique_constraint(
         for index in inspect(sync_engine).get_indexes("prices")
     ), "an index over the money column coerces it to a float on every write"
     assert indexes <= {"uq_prices_asset_currency", "sqlite_autoindex_prices_1"}
+
+
+async def test_the_latest_fetch_time_is_the_newest_row_and_none_on_an_empty_cache(
+    session: AsyncSession,
+    repository: PriceRepository,
+) -> None:
+    """What the price timer's startup condition reads, answered from the rows.
+
+    `None` on an empty cache is what makes a fresh deployment refresh at once, and the newest
+    `fetched_at` of the rows present is what stops a restart refreshing again. A method that
+    always answered `None` would refresh on every restart and pass every other test in this
+    module, which is how the review found it unguarded.
+    """
+    assert await repository.latest_fetched_at() is None
+
+    btc = await asset_id(session, BTC)
+    kas = await asset_id(session, KAS)
+    for asset, fetched_at in ((btc, LATER), (kas, AS_OF)):
+        await repository.upsert(
+            asset_id=asset,
+            quote_currency=USD,
+            amount=Decimal(BTC_USD_DIGITS),
+            source=KRAKEN,
+            as_of=fetched_at,
+            fetched_at=fetched_at,
+        )
+    await session.commit()
+
+    assert await repository.latest_fetched_at() == LATER

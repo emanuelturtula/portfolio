@@ -874,6 +874,46 @@ async def test_limit_is_bounded(
     assert len(limited["snapshots"]) == 2
 
 
+async def insert_another_users_wallet(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    chain_key: str,
+    address: str,
+    username: str = "someone-else",
+) -> int:
+    """A wallet belonging to a second account, written directly: nothing in the API makes one."""
+    async with sessionmaker() as session:
+        user_id = await session.scalar(
+            text("SELECT id FROM users WHERE username = :username"), {"username": username}
+        )
+        if user_id is None:
+            result = await session.execute(
+                text(
+                    "INSERT INTO users (username, password_hash, created_at) "
+                    "VALUES (:username, 'not-a-hash', :created_at) RETURNING id"
+                ),
+                {"username": username, "created_at": sqlite_timestamp(THIRD_SEEN)},
+            )
+            user_id = result.scalar_one()
+        result = await session.execute(
+            text(
+                "INSERT INTO wallets (user_id, chain_key, address_canonical, address_display, "
+                "label, archived_at, created_at, updated_at) "
+                "VALUES (:user_id, :chain_key, :address, :address, NULL, NULL, :now, :now) "
+                "RETURNING id"
+            ),
+            {
+                "user_id": user_id,
+                "chain_key": chain_key,
+                "address": address,
+                "now": sqlite_timestamp(THIRD_SEEN),
+            },
+        )
+        wallet_id: int = result.scalar_one()
+        await session.commit()
+        return wallet_id
+
+
 async def test_another_users_wallet_is_a_404(
     signed_in_api_client: AsyncClient,
     api_sessionmaker: async_sessionmaker[AsyncSession],
@@ -1299,3 +1339,48 @@ def test_the_coordinator_dependency_refuses_an_application_whose_lifespan_never_
 
     with pytest.raises(RuntimeError, match="lifespan"):
         get_sync_coordinator(request)
+
+
+async def test_the_current_balances_are_the_callers_and_nobody_elses(
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A second account's wallets, readings and value are invisible to the first.
+
+    The sync reads every account's wallets, so the snapshot table holds everyone's
+    holdings; what keeps them apart on the way out is that the read starts from *this
+    caller's* wallets. Swapping that for "every active wallet" passed the whole suite until
+    this test, because no test used two accounts on this endpoint.
+
+    The other account holds a Kaspa balance large enough that its inclusion could not hide in
+    rounding, and a second wallet it has never read, so the check covers all three places a
+    wallet can surface: `wallets`, the total, and the lists of what could not be valued.
+    """
+    mine = await create_wallet(signed_in_api_client, BIP173_TESTNET_P2WPKH)
+    theirs = await insert_another_users_wallet(
+        api_sessionmaker, chain_key=KASPA, address=KASPA_TESTNET_V1_KEY
+    )
+    theirs_unread = await insert_another_users_wallet(
+        api_sessionmaker, chain_key=BITCOIN, address=CORE_REGTEST_P2WPKH
+    )
+    run_id = await insert_run(api_sessionmaker, started_at=THIRD_SEEN, wallets_total=2)
+    await insert_snapshot(
+        api_sessionmaker, wallet_id=mine, run_id=run_id, confirmed=BTC_UNITS, observed_at=THIRD_SEEN
+    )
+    await insert_snapshot(
+        api_sessionmaker,
+        wallet_id=theirs,
+        run_id=run_id,
+        confirmed=KAS_UNITS * 1000,
+        observed_at=THIRD_SEEN,
+    )
+    await price_everything(api_sessionmaker)
+
+    payload = (await signed_in_api_client.get(CURRENT)).json()
+
+    assert [wallet["wallet_id"] for wallet in payload["wallets"]] == [mine]
+    assert Decimal(payload["total"]) == BTC_QUANTITY * BTC_PRICE[payload["quote_currency"]]
+    assert payload["unpriced"] == []
+    listed_elsewhere = {entry["wallet_id"] for entry in payload.get("unread", [])}
+    assert listed_elsewhere.isdisjoint({theirs, theirs_unread})
+    assert KASPA_TESTNET_V1_KEY not in json.dumps(payload)

@@ -41,6 +41,7 @@ the schema.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 
@@ -191,10 +192,14 @@ class RegistryStub:
     def __init__(self, providers: Mapping[ChainKey, StubChainProvider]) -> None:
         self.providers = dict(providers)
         self.created: list[str] = []
+        #: The client each provider would have been built over. The stub opens no socket,
+        #: but a test about *shutdown ordering* needs to see whether that client was still
+        #: open while a run was using it.
+        self.clients: list[httpx.AsyncClient] = []
 
     def create(self, chain_key: str, client: httpx.AsyncClient) -> ChainProvider:
         """Stand in for the registry: build nothing, hand back the stub for this key."""
-        del client  # The stub opens no socket, which is the whole point of it.
+        self.clients.append(client)  # Kept, never used: the stub opens no socket.
         self.created.append(chain_key)
         try:
             key = ChainKey(chain_key)
@@ -228,6 +233,43 @@ def stub_chain_providers(
     stub = RegistryStub(providers)
     monkeypatch.setattr(CHAIN_PROVIDERS, "create", stub.create)
     return stub
+
+
+#: How long `PacedSleep.reached` waits for a loop it expects to arrive at once. Reached only
+#: when the behaviour under test is wrong, and then it turns a hang into a readable failure.
+PACED_SLEEP_TIMEOUT: Final = 5
+
+
+class PacedSleep:
+    """The injected sleep. It records what it was asked to wait and waits for the test.
+
+    Backpressure is the point. A sleep that simply returned would let the loop spin
+    thousands of times before the test regained control, and "two ticks happened" would be
+    a statement about scheduling luck. Here the loop stops at every sleep until `step()`
+    releases it, so the number of ticks is exactly the number the test asked for.
+    """
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+        self._arrived = asyncio.Event()
+        self._resume = asyncio.Event()
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
+        self._arrived.set()
+        await self._resume.wait()
+        self._resume.clear()
+
+    async def reached(self) -> None:
+        """Wait until the loop is parked in a sleep, so a tick can be counted."""
+        await asyncio.wait_for(self._arrived.wait(), timeout=PACED_SLEEP_TIMEOUT)
+        self._arrived.clear()
+
+    async def step(self) -> None:
+        """Let the loop out of the sleep it is parked in."""
+        await self.reached()
+        self._resume.set()
+        await asyncio.sleep(0)
 
 
 # --------------------------------------------------------------------------------------

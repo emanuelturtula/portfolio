@@ -68,6 +68,8 @@ from tests.address_vectors import (
 )
 from tests.balance_harness import (
     StubChainProvider,
+    insert_user,
+    insert_wallet,
     plant_wallets,
     rows_of,
     snapshots,
@@ -1085,3 +1087,37 @@ async def test_a_provider_that_answers_about_fewer_addresses_fails_its_chain_as_
         "neither Kaspa wallet is written, not even the one that did come back"
     )
     assert summary.status == SyncRunStatus.PARTIAL
+
+
+async def test_two_wallets_on_one_address_are_one_request_and_two_snapshots(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two accounts may watch one address; the vendor is asked about it once.
+
+    Not a contrived case: a household where both people register the same savings address is
+    the ordinary one, and uniqueness is per account for that reason. Without the
+    de-duplication the provider is handed the address twice, refuses the duplicate -- every
+    provider does, through `align_balances` -- and the whole chain is recorded as `internal`
+    on every tick, for both accounts, forever.
+
+    Two snapshots rather than one, because the reading belongs to each wallet: the fan-out
+    after the request is the half a de-duplication that dropped a wallet would get wrong.
+    """
+    async with sessions() as session:
+        first_owner = await insert_user(session, "first-owner")
+        second_owner = await insert_user(session, "second-owner")
+        mine = await insert_wallet(
+            session, user_id=first_owner, chain_key=ChainKey.BITCOIN, address=BIP173_TESTNET_P2WPKH
+        )
+        theirs = await insert_wallet(
+            session, user_id=second_owner, chain_key=ChainKey.BITCOIN, address=BIP173_TESTNET_P2WPKH
+        )
+    bitcoin = StubChainProvider(ChainKey.BITCOIN, {BIP173_TESTNET_P2WPKH: BTC_UNITS})
+
+    summary = await run_sync(sessions, {ChainKey.BITCOIN: bitcoin})
+
+    assert bitcoin.calls == [(BIP173_TESTNET_P2WPKH,)], "one address, asked about once"
+    stored = {(row["wallet_id"], row["confirmed"]) for row in await snapshots(sessions)}
+    assert stored == {(mine, BTC_UNITS), (theirs, BTC_UNITS)}
+    assert summary.status == SyncRunStatus.SUCCESS
+    assert (summary.wallets_total, summary.wallets_succeeded) == (2, 2)

@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 from anyio import Path as AsyncPath
@@ -29,14 +30,17 @@ from portfolio.domain.chains import ChainKey
 from portfolio.main import create_app
 from portfolio.providers.errors import ProviderUnavailableError
 from portfolio.providers.prices.base import SUPPORTED_PAIRS, PriceQuote, PriceSource
+from portfolio.services.scheduler import IntervalScheduler
 from portfolio.services.sync_coordinator import SyncCoordinator
 from tests.balance_harness import (
     DEFAULT_BITCOIN_ADDRESS,
     SYNC_RUNS_SQL,
+    PacedSleep,
     StubChainProvider,
     insert_user,
     insert_wallet,
     rows_of,
+    sqlite_timestamp,
     stub_chain_providers,
 )
 from tests.offline_http import (
@@ -54,7 +58,6 @@ if TYPE_CHECKING:
     from sqlalchemy.pool import ConnectionPoolEntry
 
     from portfolio.providers.prices.base import PricePair
-    from portfolio.services.scheduler import IntervalScheduler
 
 EXPECTED_SEED_SYMBOLS = ["BTC", "KAS", "USDT"]
 
@@ -476,11 +479,13 @@ async def test_a_running_row_from_a_dead_process_is_swept_at_startup(
 
     second = create_app()
     async with second.router.lifespan_context(second):
-        pass
+        # Read **inside** the running lifespan. After it exits, the shutdown sweep would have
+        # marked the row anyway, and a check made there proves nothing about startup --
+        # which is how a lifespan with its startup sweep deleted passed this test before.
+        during = await runs_in(lifespan_database)
 
-    swept = await runs_in(lifespan_database)
-    assert [row["status"] for row in swept] == ["interrupted"]
-    assert swept[0]["finished_at"] is None
+    assert [row["status"] for row in during] == ["interrupted"], "swept at startup"
+    assert during[0]["finished_at"] is None
 
 
 # --------------------------------------------------------------------------------------
@@ -738,7 +743,15 @@ async def test_an_incomplete_price_refresh_is_a_warning_naming_pairs_and_never_a
 
     with capture_logs() as captured:
         async with app.router.lifespan_context(app):
-            await wait_for_prices(priced_lifespan, count=len(SUPPORTED_PAIRS) - 1)
+            # The line itself, not the commit before it: the warning is logged one awaited
+            # read after the rows land, and a lifespan left inside that window cancels the
+            # tick before it logs. Waiting on the rows failed 2 runs in 15 for that reason.
+            await asyncio.wait_for(
+                until(
+                    lambda: any(entry["event"] == "price_refresh_incomplete" for entry in captured)
+                ),
+                timeout=5,
+            )
 
     incomplete = [entry for entry in captured if entry["event"] == "price_refresh_incomplete"]
     assert len(incomplete) == 1
@@ -746,3 +759,126 @@ async def test_an_incomplete_price_refresh_is_a_warning_naming_pairs_and_never_a
     assert incomplete[0]["unavailable"] == ("KAS/EUR",)
     assert incomplete[0]["refreshed"] == len(SUPPORTED_PAIRS) - 1
     assert "1000" not in repr(incomplete[0]), "a price must never reach a log line"
+
+
+async def test_the_shared_client_is_still_open_while_shutdown_waits_for_a_run(
+    scheduled_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown drains the run in flight *before* it closes the client that run is using.
+
+    The order is the content of the lifespan's `finally`: stop the timers, drain the run,
+    sweep, and only then close the client and dispose the engine. Closing the client first
+    passes every other test here, because they stub the provider above the client and never
+    touch it. This provider does touch it: it runs during the grace period, after the timers
+    have stopped, and records whether the client it was built over is still open -- failing
+    its chain if not, as a real provider would with a closed client.
+
+    It waits a bounded number of loop turns for the client to close rather than looking once.
+    With the right order nothing can close it until the run ends, so it never closes; with
+    the wrong one it closes within a few turns, and a single early look could miss that.
+    """
+    monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_SHUTDOWN_GRACE_SECONDS", "5")
+    get_settings.cache_clear()
+    await register_a_wallet(scheduled_lifespan)
+    observed_closed: list[bool] = []
+
+    async def use_the_client_during_shutdown(addresses: object) -> None:
+        del addresses
+        client = registry.clients[-1]
+        # Shutdown has begun once the lifespan has stopped the balance timer.
+        await asyncio.wait_for(
+            until(lambda: not is_running(app.state.balance_scheduler)), timeout=5
+        )
+        for _ in range(200):
+            if client.is_closed:
+                break
+            await asyncio.sleep(0)
+        observed_closed.append(client.is_closed)
+        if client.is_closed:
+            message = "the shared client was closed while a run still needed it"
+            raise RuntimeError(message)
+
+    provider = StubChainProvider(
+        ChainKey.BITCOIN,
+        {DEFAULT_BITCOIN_ADDRESS: 123_456_789},
+        on_fetch=use_the_client_during_shutdown,
+    )
+    registry = stub_chain_providers(monkeypatch, {ChainKey.BITCOIN: provider})
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        await asyncio.wait_for(until(lambda: bool(provider.calls)), timeout=5)
+
+    assert observed_closed == [False], "the client was open for the whole of the drained run"
+    runs = await runs_in(scheduled_lifespan)
+    assert [row["status"] for row in runs] == ["success"]
+
+
+# --------------------------------------------------------------------------------------
+# G: the price timer's startup condition, driven with a sleep the test controls
+# --------------------------------------------------------------------------------------
+
+
+def with_a_paced_sleep(monkeypatch: pytest.MonkeyPatch, sleep: PacedSleep) -> None:
+    """Give every timer the lifespan builds a sleep this test controls.
+
+    Patched at the composition root, where `main` looks the class up, and only the `sleep`
+    is changed. It is what lets a test observe the one thing that otherwise has no outside
+    trace: that the timer decided **not** to run at startup and went straight to sleep.
+    """
+
+    class PacedScheduler(IntervalScheduler):
+        def __init__(self, **keywords: Any) -> None:
+            keywords.setdefault("sleep", sleep)
+            super().__init__(**keywords)
+
+    monkeypatch.setattr("portfolio.main.IntervalScheduler", PacedScheduler)
+
+
+async def seed_every_price(database: Path, *, fetched_at: datetime) -> None:
+    """A price for every supported pair, as if the last refresh happened at `fetched_at`."""
+    async with own_session(database) as session:
+        for symbol, currency in sorted(SUPPORTED_PAIRS):
+            await session.execute(
+                text(
+                    "INSERT INTO prices (asset_id, quote_currency, amount, source, as_of, "
+                    "fetched_at) VALUES ((SELECT id FROM assets WHERE symbol = :symbol), "
+                    ":currency, '1000.000000000000', 'a-vendor', :at, :at)"
+                ),
+                {"symbol": symbol, "currency": currency, "at": sqlite_timestamp(fetched_at)},
+            )
+        await session.commit()
+
+
+@pytest.mark.parametrize(
+    ("age", "refreshed_at_startup"),
+    [(timedelta(minutes=5), False), (timedelta(hours=2), True)],
+    ids=["five minutes old", "two hours old"],
+)
+async def test_fresh_prices_suppress_the_startup_refresh(
+    priced_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    age: timedelta,
+    refreshed_at_startup: bool,
+) -> None:
+    """A restart with prices five minutes old asks no vendor; one with prices two hours old does.
+
+    The price side of the crash-loop argument: a container restarting every thirty seconds
+    must not ask Kraken for four pairs every thirty seconds. The startup condition reads the
+    newest `fetched_at` in the cache, so the test seeds it and then watches what the timer
+    does before its first sleep. Both ages are asserted, because a condition that never ran
+    at startup would pass the fresh case alone.
+    """
+    await bring_the_schema_up(priced_lifespan)
+    await seed_every_price(priced_lifespan, fetched_at=datetime.now(UTC) - age)
+    source = FakePriceSource()
+    stub_price_sources(monkeypatch, source)
+    sleep = PacedSleep()
+    with_a_paced_sleep(monkeypatch, sleep)
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        await sleep.reached()
+
+    assert source.calls == (1 if refreshed_at_startup else 0)
