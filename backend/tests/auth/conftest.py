@@ -14,6 +14,11 @@ Three things are arranged here and nowhere else:
   product ships, and a cookie jar will not return a `Secure` cookie over `http://`. A test
   suite that quietly set `session_cookie_secure=False` to get around that would be testing
   a cookie the application never sends.
+* **Both schedules off, and an HTTP client that refuses every request.** Since #10 the
+  lifespan starts two timers that reach vendors at startup and builds the shared client,
+  which costs 117 ms of SSL setup per startup. `tests/offline_http.py` has the account; the
+  short of it is that no suite built here may reach a vendor, and none pays for a client it
+  never uses.
 
 `get_settings` is `lru_cache`d, so the cache is cleared on both sides of the environment
 override. Skipping the second clear would leave a temporary database URL cached for every
@@ -29,6 +34,7 @@ from httpx import ASGITransport, AsyncClient
 
 from portfolio.config import get_settings
 from portfolio.main import create_app
+from tests.offline_http import use_an_offline_http_client
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -101,6 +107,11 @@ def apply_auth_environment(
     # whether or not this deployment holds anything.
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
+    # The switches stop the application deciding to call a vendor; this stops the call
+    # arriving anywhere if something decides to anyway -- and removes the SSL setup that
+    # made every lifespan in the suite four times slower. A test whose subject is the real
+    # client takes it back with `tests.offline_http.the_real_http_client`.
+    use_an_offline_http_client(monkeypatch)
     if bootstrap is None:
         monkeypatch.delenv("PORTFOLIO_BOOTSTRAP_PASSWORD", raising=False)
     else:

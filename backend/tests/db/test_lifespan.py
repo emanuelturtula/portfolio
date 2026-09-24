@@ -39,6 +39,11 @@ from tests.balance_harness import (
     rows_of,
     stub_chain_providers,
 )
+from tests.offline_http import (
+    ReachedAVendorError,
+    the_real_http_client,
+    use_an_offline_http_client,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator, Sequence
@@ -69,6 +74,9 @@ def lifespan_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
     )
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
+    # Offline unless a test says otherwise: see `tests/offline_http.py`. The two tests here
+    # whose subject is the client itself take the real one back and prove they got it.
+    use_an_offline_http_client(monkeypatch)
     get_settings.cache_clear()
     try:
         yield database_path
@@ -246,6 +254,7 @@ async def until(condition: Callable[[], bool]) -> None:
 
 async def test_the_http_client_is_closed_on_shutdown(
     lifespan_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The wiring #6 through #9 each deferred to #10, and the half that gets forgotten.
 
@@ -253,15 +262,48 @@ async def test_the_http_client_is_closed_on_shutdown(
     its transport, so a second client would silently halve the interval it claims to
     enforce. Closing it is what releases the connection pool; a lifespan that built one and
     never closed it would leak a socket per restart on a machine expected to run for months.
+
+    **The real client**, deliberately, and `built` proves it: this is one of the two tests
+    in the suite whose subject is the client production builds, so it opts out of the
+    offline one every other lifespan here runs on.
+    """
+    del lifespan_database
+    built = the_real_http_client(monkeypatch)
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        client = app.state.http_client
+        assert built == [client], "the lifespan built the real client, exactly once"
+        assert client.is_closed is False
+
+    assert client.is_closed is True
+
+
+async def test_the_suite_runs_the_lifespan_on_a_client_that_refuses_every_request(
+    lifespan_database: Path,
+) -> None:
+    """The second no-network layer, asserted rather than assumed.
+
+    With the offline client in place a request through `app.state.http_client` fails at
+    once, naming the host. Without it this test would either hang on a real connection or
+    reach a real vendor -- the failure the layer exists to make loud -- so it is also what
+    fails if `lifespan_database` stops installing it.
+
+    The path carries a testnet address, as a chain provider's would, and the assertion that
+    it is absent from the message is the half that keeps the refusal itself from becoming a
+    place an address is printed.
     """
     del lifespan_database
     app = create_app()
 
     async with app.router.lifespan_context(app):
-        client = app.state.http_client
-        assert client.is_closed is False
+        with pytest.raises(ReachedAVendorError) as caught:
+            await app.state.http_client.get(
+                f"https://an-index.invalid/address/{DEFAULT_BITCOIN_ADDRESS}"
+            )
 
-    assert client.is_closed is True
+    assert "an-index.invalid" in str(caught.value)
+    assert DEFAULT_BITCOIN_ADDRESS not in str(caught.value)
 
 
 async def test_the_sync_coordinator_is_published_for_the_router(
@@ -653,12 +695,15 @@ async def test_a_startup_that_fails_early_still_closes_what_it_opened(
         raise RuntimeError(message)
 
     monkeypatch.setattr("portfolio.main.bootstrap_owner", refuse_to_bootstrap)
+    # The real client: whether *it* is closed on a failed startup is the question.
+    built = the_real_http_client(monkeypatch)
     app = create_app()
 
     with pytest.raises(RuntimeError, match="the owner could not be created"):
         async with app.router.lifespan_context(app):
             pytest.fail("the lifespan must not have started")
 
+    assert built == [app.state.http_client], "the real client was the one built"
     assert app.state.http_client.is_closed is True
     assert getattr(app.state, "sync_coordinator", None) is None
 

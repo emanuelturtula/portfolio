@@ -39,10 +39,14 @@ import pytest
 
 from portfolio.config import Settings, get_settings
 from portfolio.main import create_app
+from tests.address_vectors import BIP173_TESTNET_P2WPKH
 from tests.auth.conftest import apply_auth_environment
+from tests.offline_http import ReachedAVendorError, the_real_http_client
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from fastapi import FastAPI
 
 #: The settings that decide whether a lifespan reaches a vendor. Both default to `true`,
 #: which is right in production and is exactly why a test environment has to say otherwise.
@@ -162,12 +166,35 @@ async def test_entering_the_lifespan_opens_no_socket(
     """
     del no_sockets  # Ordering only: the fixture is the whole point of the test.
     apply_auth_environment(monkeypatch, tmp_path)
+    # The shared environment installs an offline client that could never open a socket,
+    # which would make this test pass by construction. The real builder is put back, and
+    # `built` proves it ran: the claim is about the client production builds.
+    built = the_real_http_client(monkeypatch)
     try:
         app = create_app()
         async with app.router.lifespan_context(app):
+            assert built == [app.state.http_client], "the real client, built once"
             assert app.state.http_client.is_closed is False
     finally:
         get_settings.cache_clear()
+
+
+async def test_the_shared_fixtures_give_the_application_a_client_that_refuses(
+    api_app: FastAPI,
+) -> None:
+    """The second layer, on the application every API suite actually uses.
+
+    `api_app` is built on `apply_auth_environment`, so this is the client `tests/api/`,
+    `tests/auth/` and `tests/security/` run against. A request through it fails at once and
+    names only the host -- never the path, which is where a chain provider puts an address.
+    """
+    with pytest.raises(ReachedAVendorError) as caught:
+        await api_app.state.http_client.get(
+            f"https://an-index.invalid/address/{BIP173_TESTNET_P2WPKH}"
+        )
+
+    assert "an-index.invalid" in str(caught.value)
+    assert BIP173_TESTNET_P2WPKH not in str(caught.value)
 
 
 async def test_the_socket_guard_can_actually_fail(no_sockets: None) -> None:
