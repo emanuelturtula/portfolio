@@ -1,7 +1,7 @@
 # 010 — Balance sync service, scheduler and snapshot history
 
 Issue: #10
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -510,4 +510,69 @@ listed as owned rather than left to be discovered in CI.
 
 ## What the plan got wrong
 
-Filled in at the end, before the pull request opens.
+### It dropped work the repository had already assigned to it
+
+`docs/providers.md` on `main` ended with a list headed "Not done yet, and who owns it", and
+one bullet said **#10 owns the scheduler** for #9's price refresh. This spec was written
+after reading that file and scoped #10 to balances anyway, because the issue's own text never
+mentions prices. The consequence would not have been a gap in a backlog: `GET
+/api/balances/current` is the first consumer of the price cache, nothing else fills it, and a
+correctly installed system would have answered `"total": "0", "complete": false` forever.
+
+backend-dev found it and, correctly, refused to widen scope on their own. **When an earlier
+change defers work to this one, the deferral is part of this issue's text** -- it is just
+written in a different file.
+
+### `complete` was copied, not re-derived
+
+#9 defined `complete` as "every holding was priced", and this spec carried that definition
+to a new endpoint without asking what *else* can make a total partial there. The answer was
+the thing this change introduces: a wallet with no reading. The spec even argued, three
+paragraphs away, that an unread wallet and a zero balance are different facts -- and applied
+it to the row and not to the total. Review reproduced `complete: true` with a Kaspa wallet
+silently missing from the sum.
+
+An invariant inherited from an earlier change has to be re-derived against every input the
+new change adds, not re-asserted.
+
+### Two catch clauses answered "whose fault" with two answers, and there were three
+
+The table was built on the right question -- a vendor's failure versus our bug -- and then
+offered only those two. A wallet on the wrong network is neither: it is the owner's mistake,
+and the draft filed it as `internal`, with a traceback, on every tick, forever. That is the
+exact failure the `internal` clause exists to prevent, pointed the other way.
+
+### The startup condition guarded against the crash loop it named, and did not
+
+The paragraph explaining the condition named a crash-looping container as the case it
+existed for, and then counted only *finished* runs -- which a container that dies mid-sync
+never produces. Its other half slept a whole interval after a restart, so every deploy left
+prices stale for most of an hour. Both were caught by review, by reproduction, and neither
+was caught by a test the plan asked for, because the plan's tests were written from the same
+reasoning as the code.
+
+### The harness produced more defects than the code
+
+Three guards in the test suite could not fail for the thing they were named after, and each
+had its subject removed rather than contradicted:
+
+- **The logging "restore" was an install.** `structlog.reset_defaults()` replaces the
+  application's configuration with structlog's defaults, whose renderer prints every frame's
+  locals. The suite hung forever, and only when a security test ran first.
+- **The no-network test ran with both timers off**, and its guard raised a subclass of
+  `AssertionError` -- an `Exception`, swallowed by precisely the scheduler and sync code whose
+  job is to swallow failures. It passed while a vendor was being reached.
+- **The startup orphan sweep was proven by the shutdown sweep**, because the test read the
+  row after the lifespan had exited.
+
+**A guard that works by raising is disarmed by any code written to survive exceptions.**
+Record the attempt and assert on the record.
+
+### Left open, for #11
+
+- **No backward cursor.** The default window is the latest readings and the cursor walks
+  forward, so a chart that opens on recent history reaches older data by starting again from
+  a `since`. A backward cursor is #11's to ask for when it has a scroll to drive it.
+- **A stale balance counts as read.** A wallet whose chain has failed on every run since its
+  first success keeps an old `observed_at` and `complete` stays true. What age is too old to
+  render as current is a display decision, and #11 is where it has a consumer.
