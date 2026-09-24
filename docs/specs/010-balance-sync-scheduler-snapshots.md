@@ -26,6 +26,28 @@ first one where the layering contracts have two real ends to check.
   history, read the sync runs.
 - `ChainKey.asset_symbol`, because the read path needs a chain's symbol and must not import
   the package that currently holds one.
+- **Scheduling #9's price refresh.** Added after implementation began; see below.
+
+### The price refresh, added to scope after this spec was first committed
+
+The first draft of this spec scoped #10 to balances and never mentioned prices, and
+`backend-dev` was right to refuse to widen it on their own. It was already in scope and the
+spec had simply lost it. `docs/providers.md` on merged `main` says so in as many words:
+
+> **Building the price sources in the lifespan, and scheduling a refresh.** ... **#10 owns
+> the scheduler**, and a scheduler invented in #9 would have been a second one to delete.
+
+What made the omission expensive rather than tidy: `GET /api/balances/current` is the first
+consumer of the price cache in the running application, and nothing fills that cache. A
+fresh deployment would report every holding `unpriced` forever, until an operator ran
+`portfolio refresh-prices` by hand -- which is #11's flagship endpoint answering
+`"total": "0", "complete": false` on a correctly installed system.
+
+`PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES` defaults to **60**, matching `STALE_AFTER` in
+`services/prices.py`, which `docs/providers.md` already describes as "one hour, matching the
+refresh interval #10 will schedule". A failed price refresh does not stop the balance
+scheduler, and vice versa. A price-refresh history table is **not** in scope: prices carry
+`fetched_at` per row and #59 owns "why did it fail".
 
 ## Non-goals
 
@@ -74,6 +96,7 @@ Two catch clauses, deliberately not one:
 | Caught | Recorded as | Why separate |
 |---|---|---|
 | `ProviderError` | the provider's own kind: `unavailable`, `rate_limited`, `response`, `unknown_chain` | the vendor failed, which is what #6's vocabulary is for |
+| a rejected address (wrong network) | its own kind, **no traceback** | the owner's mistake. Filed as `internal` it logs a traceback every tick forever, which is this row's failure pointed the other way -- corrected after implementation found it |
 | any other `Exception` | `internal`, logged with the traceback | our bug, and calling it "Kaspa is unavailable" is how a code defect gets read as a vendor outage for months |
 
 Both keep the other chain's results. The alternative — catching only `ProviderError` and
@@ -263,6 +286,13 @@ allowed to say which.
 ### `GET /api/wallets/{wallet_id}/balances`
 
 Query: `since` (ISO-8601, optional), `limit` (1..1000, default 500).
+
+**Without `since` the latest `limit` readings are returned; with `since` it is a forward
+cursor from that instant.** Both are ordered oldest first. The literal reading -- always the
+first `limit` rows at or after `since` -- was implemented first and overruled: a year-old
+wallet's *oldest* 500 readings is the wrong end of the history for the only consumer there
+is, which is #11's chart.
+
 Response `200`: `{"wallet_id": 7, "decimals": 8, "snapshots": [{"observed_at": ..., "confirmed": "...", "pending": null, "quantity": "...", "sync_run_id": 41}]}`, oldest first.
 
 `404` when the wallet is not the caller's, via the existing `WalletNotFoundError` — an
