@@ -111,13 +111,6 @@ def upgrade() -> None:
             name=op.f("uq_sync_run_chains_run_chain"),
         ),
     )
-    op.create_index(
-        op.f("ix_sync_run_chains_sync_run_id"),
-        "sync_run_chains",
-        ["sync_run_id"],
-        unique=False,
-    )
-
     op.create_table(
         "balance_snapshots",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -150,12 +143,6 @@ def upgrade() -> None:
             name=op.f("uq_balance_snapshots_wallet_run"),
         ),
     )
-    op.create_index(
-        op.f("ix_balance_snapshots_sync_run_id"),
-        "balance_snapshots",
-        ["sync_run_id"],
-        unique=False,
-    )
     # Named rather than left to the convention, which would render
     # `ix_balance_snapshots_wallet_id_observed_at`. This is what the history endpoint reads:
     # one wallet, filtered and ordered by time.
@@ -178,9 +165,7 @@ def downgrade() -> None:
     and a reader moving between the two should not carry that reassurance across.
     """
     op.drop_index("ix_balance_snapshots_wallet_observed", table_name="balance_snapshots")
-    op.drop_index(op.f("ix_balance_snapshots_sync_run_id"), table_name="balance_snapshots")
     op.drop_table("balance_snapshots")
-    op.drop_index(op.f("ix_sync_run_chains_sync_run_id"), table_name="sync_run_chains")
     op.drop_table("sync_run_chains")
     op.drop_index(op.f("ix_sync_runs_started_at"), table_name="sync_runs")
     op.drop_table("sync_runs")

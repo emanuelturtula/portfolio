@@ -388,11 +388,13 @@ class SyncRunChain(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No index of its own: `uq_sync_run_chains_run_chain` leads with this column, so the
+    # only query that filters on it -- `list_runs` fetching the chains of a page of runs --
+    # is already served. A second index would be a second thing to keep.
     sync_run_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("sync_runs.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     chain_key: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
@@ -453,11 +455,14 @@ class BalanceSnapshot(Base):
         ForeignKey("wallets.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # No index of its own, and unlike `sync_run_chains` no unique constraint leads with
+    # it either. Nothing queries snapshots by run: the reads are "the latest per wallet" and
+    # "one wallet's history", both of which the primary key and the index below serve. The
+    # cascade on this foreign key would scan, and nothing deletes a run.
     sync_run_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("sync_runs.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     confirmed: Mapped[int] = mapped_column(BaseUnits, nullable=False)
     pending: Mapped[int | None] = mapped_column(BaseUnits, nullable=True)
