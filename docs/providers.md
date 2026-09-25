@@ -977,13 +977,22 @@ Four rules a provider inherits rather than decides:
   dropped without a word. #14 must check its venue.
 - **Amounts go through `require_fill_amount(value, field=...)`** -- a JSON string holding a
   plain decimal number, a `Decimal` from `decode_json`, or an `int`. A `bool`, a `float`,
-  whitespace, underscores, Unicode digits, `NaN` and `Infinity` are refused. It is the
-  exchange counterpart of `require_price`.
+  whitespace, underscores, Unicode digits, `NaN` and `Infinity` are refused, and so is a
+  number longer than `MAX_AMOUNT_DIGITS` (100) digits written out in full -- five thousand
+  decimal places is valid JSON, and without the bound it reached the interpreter's
+  4300-digit conversion limit as an untyped `ValueError`. From `require_fill_amount`
+  through `derive_quote_quantity` to `NormalizedFill`, every refusal is an
+  `ExchangeSchemaError`. It is the exchange counterpart of `require_price`.
 - **`raw_payload` is `encode_raw_payload(fill_object)`**: canonical JSON, keys sorted, no
-  whitespace, every `Decimal` written with its own digits so `0.00012300` stays `0.00012300`
-  and `decode_json(encode_raw_payload(d)) == d`. Pass **the venue's fill object, never the
-  envelope or the request** -- those are where a key or a signature could be. Anything
-  `decode_json` could not have produced is a `TypeError`: a provider bug, not a vendor's.
+  whitespace. The promise is that every `Decimal`'s sign, digits and exponent survive and
+  every other leaf keeps its type, so `decode_json(encode_raw_payload(d)) == d` and
+  `0.00012300` comes back as `0.00012300`. It is a promise about the number rather than the
+  text: `1.5e1` decodes to `Decimal("15")` and is written `15E0`, because a bare `15` would
+  decode as an `int`. Pass **the venue's fill object, never the envelope or the request**
+  -- those are where a key or a signature could be. An object nested more than
+  `MAX_RAW_PAYLOAD_DEPTH` (32) levels is an `ExchangeSchemaError`, at the same depth on
+  every platform; anything `decode_json` could not have produced is a `TypeError`, a
+  provider bug rather than a vendor's.
 
 Timestamps: `datetime_from_epoch_ms(value)` takes an `int` or a digit string and returns an
 aware UTC `datetime` as `EPOCH + timedelta(milliseconds=value)`. The obvious
@@ -1001,6 +1010,7 @@ It is the `align_balances` of this seam:
 | the window is longer than `max_query_window` | `ValueError` -- the caller's mistake |
 | `symbol` given and not `requires_symbol`, or missing and required | `ValueError` |
 | a fill executed outside `[since, until)` | `ExchangeSchemaError` -- an answer about something not asked |
+| `symbol` given and a fill is for another symbol | `ExchangeSchemaError` -- the same, per symbol |
 | two fills in the page share an `external_trade_id` | `ExchangeSchemaError` |
 | more fills than `page_size` | `ExchangeSchemaError` |
 | `next_cursor` equal to `cursor` (and not `None`) | `ExchangeSchemaError` -- pagination stopped advancing |

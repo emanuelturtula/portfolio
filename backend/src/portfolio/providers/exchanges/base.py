@@ -64,7 +64,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     "EPOCH",
+    "MAX_AMOUNT_DIGITS",
     "MAX_FILL_INTEGER_DIGITS",
+    "MAX_RAW_PAYLOAD_DEPTH",
     "RETENTION_MARGIN",
     "CursorKind",
     "ExchangeCapabilities",
@@ -102,6 +104,34 @@ MAX_FILL_INTEGER_DIGITS: Final = MONEY_PRECISION - FILL_SCALE
 
 Derived from the column, not invented here, for the reason `MAX_PRICE_INTEGER_DIGITS` gives:
 an amount this application cannot store is not an amount it should accept.
+"""
+
+MAX_AMOUNT_DIGITS: Final = 100
+"""The most digits an amount may have written out in full, before and after the point.
+
+A fill amount this application can store is at most 20 + 18 = 38 digits written out, and a
+venue padding it with trailing zeros -- `0.00012300` is the ordinary spelling -- adds a few
+more. A hundred leaves room for any padding a venue plausibly uses and refuses a number no
+venue sends: `1.` followed by five thousand ones is valid JSON, and `1e999999999999999999`
+is a finite `Decimal`. Neither is an amount, and both are values the next arithmetic step
+would spend its time on or fail on.
+
+Counted written out rather than as significant digits, so the bound covers the exponent as
+well: a single digit a billion places from the point is refused here, not in a `quantize`
+three layers later. And a hundred digits is far inside the interpreter's 4300-digit
+limit on converting an integer to or from a string, so no amount this admits can trip it.
+"""
+
+MAX_RAW_PAYLOAD_DEPTH: Final = 32
+"""How deeply the containers in a venue's fill object may nest before it is refused.
+
+A fill object is a flat record with, at most, a list or an object inside it -- a fee
+breakdown, say -- so a depth of three is realistic and thirty-two is an order of magnitude
+past it. **The bound is ours rather than the interpreter's on purpose.** Leaving it to the
+recursion limit would refuse at a depth that differs by platform -- `decode_json`'s own
+docstring measured its parser failing near 3000 levels on Windows and past 5000 on the
+Pi -- and would surface as a `RecursionError` outside the taxonomy. This is the same
+refusal on every machine, and it is a schema error, because the depth is the venue's choice.
 """
 
 _DECIMAL_TEXT: Final = re.compile(r"\A-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z")
@@ -283,7 +313,8 @@ class NormalizedFill:
     * an empty or whitespace `external_trade_id`, `symbol`, `base_asset` or `quote_asset`;
     * a `side` that is not a `FillSide`;
     * a `fee_asset` of `None` beside a non-zero fee, or a blank one;
-    * a naive `executed_at`.
+    * a naive `executed_at`;
+    * a `quote_quantity_derived` that is not exactly a `bool`, or a blank `raw_payload`.
 
     **No message quotes an amount or a trade id**: a fill quantity is the owner's holdings.
     Each names the field and the rule.
@@ -350,6 +381,8 @@ class NormalizedFill:
         if not _is_aware(self.executed_at):
             detail = "executed_at must be a timezone-aware datetime"
             raise ExchangeSchemaError(detail)
+        _require_flag(self.quote_quantity_derived, field="quote_quantity_derived")
+        _require_text(self.raw_payload, field="raw_payload")
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,17 +530,23 @@ def assemble_fill_page(
     | the window is longer than `max_query_window` | `ValueError` -- the caller's mistake |
     | `symbol` given and not required, or missing and required | `ValueError` |
     | a fill executed outside `[since, until)` | `ExchangeSchemaError` |
+    | `symbol` given and a fill is for another symbol | `ExchangeSchemaError` |
     | two fills in the page share an `external_trade_id` | `ExchangeSchemaError` |
     | more fills than `page_size` | `ExchangeSchemaError` |
     | `next_cursor` equal to `cursor` (and not `None`) | `ExchangeSchemaError` |
 
     The first two are `ValueError` because the caller built the request wrongly; the rest
     are the venue answering something other than what was asked -- a fill outside the
-    window is an answer about something nobody asked for, and dropping it quietly would
-    hide a paging bug behind a history that still looks plausible.
+    window, or for a symbol nobody asked about, is an answer to a different question, and
+    dropping it quietly would hide a paging or correlation bug behind a history that still
+    looks plausible.
 
-    **No message names a trade id, a cursor or an amount.** Counts and field names are
-    enough to act on.
+    The symbol is compared exactly, in the venue's spelling: the provider passes the
+    symbol it asked with and builds each fill's `symbol` from the same venue's response, so
+    the two are the same string or the venue answered about something else.
+
+    **No message names a trade id, a symbol, a cursor or an amount.** Counts and field
+    names are enough to act on.
 
     Returns:
         The page, with `fills` as a tuple in the order the provider gave them.
@@ -531,6 +570,11 @@ def assemble_fill_page(
     if outside:
         detail = f"{outside} fill(s) have an executed_at outside the requested window"
         raise ExchangeSchemaError(detail)
+    if symbol is not None:
+        elsewhere = sum(1 for fill in fills if fill.symbol != symbol)
+        if elsewhere:
+            detail = f"{elsewhere} fill(s) are for a symbol other than the one requested"
+            raise ExchangeSchemaError(detail)
     distinct = len({fill.external_trade_id for fill in fills})
     if distinct != len(fills):
         detail = (
@@ -588,7 +632,13 @@ def require_fill_amount(value: object, *, field: str) -> Decimal:
     whitespace, underscores, Unicode digits and `NaN`; a venue sending any of those in an
     amount is sending something that is not an amount.
 
-    Sign, magnitude and scale are not checked here: `NormalizedFill` checks them, once,
+    **Nor may the number be absurdly long.** More than `MAX_AMOUNT_DIGITS` digits written
+    out in full -- five thousand decimal places, or one digit a billion places from the
+    point -- is refused here, as a schema error, so that nothing downstream spends its time
+    on the number or fails on it with an exception outside the taxonomy. From here to
+    `derive_quote_quantity` to `NormalizedFill`, every refusal is an `ExchangeSchemaError`.
+
+    Sign and the column's scale are not checked here: `NormalizedFill` checks them, once,
     for every amount however it arrived.
     """
     if isinstance(value, bool) or not isinstance(value, Decimal | int | str):
@@ -607,7 +657,25 @@ def require_fill_amount(value: object, *, field: str) -> Decimal:
     if not amount.is_finite():
         detail = f"{field} must be a finite number"
         raise ExchangeSchemaError(detail)
+    if _written_length(amount) > MAX_AMOUNT_DIGITS:
+        detail = f"{field} has more than {MAX_AMOUNT_DIGITS} digits written out in full"
+        raise ExchangeSchemaError(detail)
     return amount
+
+
+def _written_length(amount: Decimal) -> int:
+    """How many digits `amount` has in plain positional notation, both sides of the point.
+
+    `0.00012300` is 8 (no integer digits, eight places), `1E+2` is 3, `12.5` is 3. Computed
+    from the coefficient length and the exponent, so an exponent of a billion costs nothing
+    to measure.
+    """
+    _, digits, exponent = amount.as_tuple()
+    # An `int` on a finite Decimal; the caller has refused the other kinds.
+    places = int(exponent)
+    integer_digits = max(len(digits) + places, 0)
+    fractional_digits = max(-places, 0)
+    return integer_digits + fractional_digits
 
 
 def derive_quote_quantity(quantity: Decimal, price: Decimal) -> Decimal:
@@ -682,18 +750,20 @@ def epoch_ms(moment: datetime) -> int:
 
 
 def encode_raw_payload(document: object) -> str:
-    """The venue's decoded fill object as canonical JSON, exactly as it was received.
+    """The venue's decoded fill object as canonical JSON, every `Decimal` intact.
 
     Canonical: keys sorted, no whitespace, strings escaped to ASCII -- so the same fill
     renders to the same text on every run and a stored payload can be compared byte for
     byte.
 
-    **Every `Decimal` is written with `str()`**, which renders its coefficient and exponent
-    exactly, so `decode_json(encode_raw_payload(d)) == d` holds and a decoded
-    `Decimal("0.00012300")` stays `0.00012300` and `1E+2` stays `1E+2`. The one adjustment
-    is a `Decimal` whose exponent is zero, which `str()` writes as a bare integer that would
-    decode as an `int`; it is written `15E0` instead, so it decodes to the identical
-    `Decimal`. `json.dumps` cannot do any of this: it has no `Decimal` support, and the
+    **The invariant is that every `Decimal`'s sign, digits and exponent survive**, and so do
+    the type and value of every other leaf: `decode_json(encode_raw_payload(d)) == d`, and
+    each `Decimal` decoded back has the same `as_tuple()` as the one encoded. That is a
+    promise about the number, not about the text the venue sent -- `0.00012300` comes back
+    as `0.00012300` and `1E+2` as `1E+2`, but `1.5e1` and `15E0` decode to the same
+    `Decimal("15")`, and it is written `15E0`. The `E0` is there because `str()` renders a
+    zero exponent as a bare integer, which would decode as an `int`: equal in value, a
+    different type. `json.dumps` cannot do any of this: it has no `Decimal` support, and the
     obvious workaround -- converting to `float` -- destroys the digits the payload is kept
     to preserve.
 
@@ -701,16 +771,20 @@ def encode_raw_payload(document: object) -> str:
     request echo, and a request carries a key and a signature.
 
     Raises:
+        ExchangeSchemaError: containers nest more than `MAX_RAW_PAYLOAD_DEPTH` deep. How
+            deep is the venue's choice, so it is the venue's error, and it is refused at the
+            same depth on every platform rather than wherever the interpreter's recursion
+            limit happens to fall.
         TypeError: anything `decode_json` cannot produce -- a `float`, a `set`, a `tuple`,
             a `datetime`, a non-finite `Decimal`, a non-string key, or a subclass of a
             JSON type. That is a provider bug, not a vendor's: the provider was meant to
             pass what the decoder gave it.
     """
-    return "".join(_encode_json(document))
+    return "".join(_encode_json(document, depth=0))
 
 
-def _encode_json(value: object) -> Iterator[str]:
-    """Render one decoded JSON value.
+def _encode_json(value: object, *, depth: int) -> Iterator[str]:
+    """Render one decoded JSON value, `depth` containers down from the top.
 
     **Exact types, compared with `type(...) is`, not `isinstance`.** The decoder produces a
     `dict`, a `list`, a `str`, an `int`, a `Decimal`, a `bool` or `None` and never a
@@ -718,6 +792,8 @@ def _encode_json(value: object) -> Iterator[str]:
     something the provider built rather than something the venue sent -- and a `bool`,
     which `isinstance(value, int)` would accept, has to be told apart from an `int` anyway.
     """
+    if type(value) is list or type(value) is dict:
+        _require_shallow(depth + 1)
     if value is None:
         yield "null"
     elif type(value) is bool:
@@ -740,10 +816,10 @@ def _encode_json(value: object) -> Iterator[str]:
         for index, item in enumerate(value):
             if index:
                 yield ","
-            yield from _encode_json(item)
+            yield from _encode_json(item, depth=depth + 1)
         yield "]"
     elif type(value) is dict:
-        yield from _encode_object(value)
+        yield from _encode_object(value, depth=depth + 1)
     else:
         message = (
             f"encode_raw_payload cannot render a {type(value).__name__}: only what "
@@ -752,8 +828,8 @@ def _encode_json(value: object) -> Iterator[str]:
         raise TypeError(message)
 
 
-def _encode_object(document: dict[object, object]) -> Iterator[str]:
-    """Render a JSON object with its keys sorted. Every key must be a `str`."""
+def _encode_object(document: dict[object, object], *, depth: int) -> Iterator[str]:
+    """Render a JSON object, `depth` containers deep, keys sorted. Every key is a `str`."""
     keys: list[str] = []
     for key in document:
         if type(key) is not str:
@@ -766,8 +842,22 @@ def _encode_object(document: dict[object, object]) -> Iterator[str]:
             yield ","
         yield json.dumps(key)
         yield ":"
-        yield from _encode_json(document[key])
+        yield from _encode_json(document[key], depth=depth)
     yield "}"
+
+
+def _require_shallow(depth: int) -> None:
+    """Refuse a container nested deeper than `MAX_RAW_PAYLOAD_DEPTH`.
+
+    Checked before the container is opened, so a document a thousand levels deep costs
+    thirty-three frames to refuse rather than a `RecursionError` to discover.
+    """
+    if depth > MAX_RAW_PAYLOAD_DEPTH:
+        detail = (
+            f"the fill object nests more than {MAX_RAW_PAYLOAD_DEPTH} levels deep, which is "
+            "too deep to record"
+        )
+        raise ExchangeSchemaError(detail)
 
 
 def _require_storable_amount(value: object, *, field: str, positive: bool) -> None:
@@ -810,6 +900,18 @@ def _require_side(value: object) -> None:
     """
     if not isinstance(value, FillSide):
         detail = "side must be a FillSide"
+        raise ExchangeSchemaError(detail)
+
+
+def _require_flag(value: object, *, field: str) -> None:
+    """Refuse a flag that is not exactly a `bool`.
+
+    `type(...) is bool` rather than `isinstance`, which is the same test for a `bool` and
+    lets nothing else through: a `1` from a parser that copied a venue's integer flag would
+    satisfy the column's `CHECK (... IN (0, 1))` and still be the wrong type on the fill.
+    """
+    if type(value) is not bool:
+        detail = f"{field} must be a bool"
         raise ExchangeSchemaError(detail)
 
 
