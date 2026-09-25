@@ -1,7 +1,7 @@
 # 014 — Bitget spot fills provider
 
 Issue: #13
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -558,6 +558,53 @@ Disjoint. Nobody edits a file on another row.
   or 403 there was classified `ExchangeAuthError`, but that call carries no credential, so a
   CDN or WAF refusing it would have made #15 mark a working key `auth_failed`. An auth-class
   answer on that call is now `ExchangeUnavailableError`, keeping its status and code.
+
+## What the plan got wrong
+
+The departures above are the record. Three lessons come out of them, and each is worth more
+than any one fix.
+
+### Spec 012's list of limits was about the interpreter, and the leaks were in the libraries
+
+Spec 012 said: at every vendor-text boundary, test the interpreter's digit limit, recursion
+depth, `Decimal` exponent range and UTF-8 encodability. This issue did that, and every probe of
+the provider's own parser passed. **Every defect found here was a library behaving as documented
+in a place nobody had read:**
+
+| Library | Behaviour | Consequence |
+|---|---|---|
+| CPython `int()` behind `parse_retry_after` / `parse_rate_limit` | 4300-digit limit, after an `isdigit()` check | a vendor header broke every provider's `client.get` |
+| `email.utils.parsedate_to_datetime` | `OverflowError`, an `ArithmeticError` | the same, through the date form |
+| h11 | `LocalProtocolError` quotes the whole illegal header value | a credential in a chained traceback |
+| httpx | `DecodingError` is a `RequestError`, not a `TransportError` | a corrupt gzip body escaped every provider (#75) |
+| pydantic | the `input_value` elision keeps both ends | the tail of a secret on the startup log |
+
+So the list grows by one question: **for every library a request, a response or a credential
+passes through, what does it raise, and what does its message quote?** The answer is in the
+library's source, not in our code, and review found these only by feeding hostile input
+through the real client, not through a unit under test.
+
+### An absence check that searches for the whole value proves nothing about a partial leak
+
+#53 measured `str(ValidationError)` and found no secret in it, because the test searched for
+the whole value and pydantic had elided the middle. The tester's first settings test made the
+same mistake, and it stayed green while twenty characters of a secret were in the message. An
+absence assertion about a secret now searches for every short window of it, and asserts that
+its sentinels share no window with the message text, so the check cannot pass vacuously.
+
+### A tolerance for an undocumented shape was weighed against the common case, not the dangerous one
+
+Reading `data: null` as an empty page was argued from where `null` is harmless: an empty
+window. The review argued from where it is plausible and harmful: a UTA account calling v2.
+The second argument is the one that matters, because a history that is silently empty becomes
+permanent at the retention edge. **Before tolerating an undocumented answer, name the situation
+in which the venue is most likely to send it**, and weigh the tolerance there.
+
+Two smaller ones. A duplicate-id rule placed behind a new edge filter stopped seeing the
+edge, which is spec 012's "a rule reasoned about alone" for the third time. And a fact was
+cited from a broker-facing notice as though it were general. backend-dev caught that by
+re-reading the source rather than trusting the spec. **Facts in a spec get re-read by whoever
+writes them into the docs.**
 
 ## Handed on
 
