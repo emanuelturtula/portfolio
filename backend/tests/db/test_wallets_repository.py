@@ -541,7 +541,13 @@ def test_the_foreign_key_cascades_from_users(
     migrated_database_url: str,
     sync_engine: Engine,
 ) -> None:
-    """Deleting the account has to take its wallets, or `create-user --replace` orphans."""
+    """Deleting an account takes its wallets with it rather than leaving them orphaned.
+
+    Nothing in the application deletes an account any more: since #69, `create-user
+    --replace` updates the owner in place (spec 013). The cascade stays because spec 013
+    changes no foreign key. What makes the command safe is that it no longer deletes, not
+    this cascade, and that is asserted in `tests/cli/test_create_user.py`.
+    """
     del migrated_database_url
 
     foreign_keys = inspect(sync_engine).get_foreign_keys("wallets")
