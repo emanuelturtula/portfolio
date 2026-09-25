@@ -1032,6 +1032,77 @@ describe('WalletsPage: focus after a slow archive or restore', () => {
     expect(screen.getByRole('heading', { name: 'Your wallets' })).not.toHaveFocus();
   });
 
+  it('an archive whose row already flipped leaves focus where the owner moved it', async () => {
+    // Already-flipped path, owner elsewhere. Another session archives Cold
+    // storage and an out-of-band refetch shows it before this page's held
+    // archive settles; meanwhile the owner starts typing an address. When the
+    // archive settles there is no flip left to wait for, and focus is not the
+    // row's to take.
+    const { user, fake, queryClient } = await openWithThree(true);
+    const release = fake.hold('archive');
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    fake.changeElsewhere(1, { archived: true });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['wallets'] });
+    });
+    expect(await screen.findByRole('button', { name: 'Restore Cold storage' })).toBeVisible();
+    await user.click(addressInput());
+    await user.keyboard('tb1q');
+
+    release();
+
+    await waitFor(() => {
+      expect(fake.writes('DELETE', '/api/wallets/1')).toHaveLength(1);
+    });
+    expect(screen.getByRole('button', { name: 'Restore Cold storage' })).not.toHaveFocus();
+    await expectTypingSurvives(user, 'tb1q');
+  });
+
+  it('a hand-off armed by a no-op archive moves focus once the row flips, if focus is on the page', async () => {
+    // Arm path, owner on the page. The archive is answered 204 with nothing
+    // changed, so the success arms the hand-off; the flip comes later from an
+    // out-of-band refetch, with focus left on the page.
+    const spent = { value: false };
+    const { user, fake, queryClient } = openWalletsPage(
+      {
+        wallets: [
+          wallet({ id: 1, address: ADDRESSES.btcSegwit, label: 'Cold storage' }),
+          wallet({ id: 2, address: ADDRESSES.btcLegacy, label: 'Spending' }),
+        ],
+      },
+      [
+        http.delete(WALLET_PATH, () => {
+          if (spent.value) {
+            return undefined;
+          }
+          spent.value = true;
+          return new HttpResponse(null, { status: 204 });
+        }),
+      ],
+    );
+    await walletList();
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+    await user.click(await screen.findByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Archive Cold storage' })).toBeEnabled();
+    });
+    await settle();
+    await user.click(screen.getByRole('heading', { name: 'Portfolio', level: 1 }));
+    expect(document.body).toHaveFocus();
+
+    fake.changeElsewhere(1, { archived: true });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['wallets'] });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Restore Cold storage' })).toHaveFocus();
+    });
+  });
+
   it('a hand-off armed by an archive and triggered later still does not steal focus', async () => {
     // With archived shown, the archive is answered 204 but the server state
     // does not change (a repeat, or another session restored it first), so the
@@ -1118,6 +1189,34 @@ describe('WalletsPage: focus after a slow archive or restore', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Archive Old exchange' })).toHaveFocus();
     });
+  });
+
+  it('an archive whose row unmounted first leaves focus in the address field', async () => {
+    // As below, the row is gone before its archive settles - but this time the
+    // owner has started typing an address. The row that would own focus no
+    // longer exists, so it owns nothing, and the heading does not take focus.
+    const { user, fake, queryClient } = await openWithThree(false);
+    const release = fake.hold('archive');
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    fake.changeElsewhere(1, { archived: true });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['wallets'] });
+    });
+    await waitFor(() => {
+      expect(screen.queryByText('Cold storage')).not.toBeInTheDocument();
+    });
+    await user.click(addressInput());
+    await user.keyboard('tb1q');
+
+    release();
+
+    await waitFor(() => {
+      expect(fake.writes('DELETE', '/api/wallets/1')).toHaveLength(1);
+    });
+    expect(screen.getByRole('heading', { name: 'Your wallets' })).not.toHaveFocus();
+    await expectTypingSurvives(user, 'tb1q');
   });
 
   it('an archive whose row unmounted first still moves focus to the heading', async () => {
@@ -1332,6 +1431,62 @@ describe('WalletsPage: archive and restore', () => {
       expect(screen.getByRole('button', { name: 'Archive Old exchange' })).toHaveFocus();
     });
     expect(fake.writes('PATCH', '/api/wallets/4')).toHaveLength(1);
+  });
+
+  it('a spent hand-off does not replay on a later flip, whatever else is on screen', async () => {
+    // A deterministic witness for the reset of `focusAfterFlipRef`. The first
+    // archive is a no-op, so its hand-off is armed and is spent by an
+    // out-of-band flip. Another session then restores the wallet, the owner
+    // clicks on the page, and a second out-of-band refetch flips the row back.
+    // Nothing the owner did asked for focus to move; a flag left armed would
+    // put it on "Archive Cold storage".
+    const spent = { value: false };
+    const { user, fake, queryClient } = openWalletsPage(
+      {
+        wallets: [
+          wallet({ id: 1, address: ADDRESSES.btcSegwit, label: 'Cold storage' }),
+          wallet({ id: 2, address: ADDRESSES.btcLegacy, label: 'Spending' }),
+        ],
+      },
+      [
+        http.delete(WALLET_PATH, () => {
+          if (spent.value) {
+            return undefined;
+          }
+          spent.value = true;
+          return new HttpResponse(null, { status: 204 });
+        }),
+      ],
+    );
+    await walletList();
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+    await user.click(await screen.findByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Archive Cold storage' })).toBeEnabled();
+    });
+    await settle();
+
+    // The armed hand-off is spent on the first flip.
+    fake.changeElsewhere(1, { archived: true });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['wallets'] });
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Restore Cold storage' })).toHaveFocus();
+    });
+
+    // A second flip, from elsewhere, with focus on the page.
+    fake.changeElsewhere(1, { archived: false });
+    await user.click(screen.getByRole('heading', { name: 'Portfolio', level: 1 }));
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['wallets'] });
+    });
+
+    expect(await screen.findByRole('button', { name: 'Archive Cold storage' })).toBeVisible();
+    await settle();
+    expect(screen.getByRole('button', { name: 'Archive Cold storage' })).not.toHaveFocus();
+    expect(document.body).toHaveFocus();
   });
 
   it("a row's focus hand-off is used once: a later flip from elsewhere does not replay it", async () => {
