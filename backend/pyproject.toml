@@ -36,6 +36,8 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
+    # The per-test ceiling configured under [tool.pytest.ini_options] below.
+    "pytest-timeout",
     "mypy",
     "ruff",
     "import-linter",
@@ -126,6 +128,25 @@ testpaths = ["tests"]
 addopts = ["--strict-markers", "--strict-config", "-ra"]
 asyncio_mode = "auto"
 pythonpath = ["src"]
+# A ceiling on each test, setup and teardown included, so that a hang fails as a named
+# test with a stack trace instead of an anonymous CI job timeout. Two hangs found while
+# reviewing #10 ran forever: `rich` spinning inside a SQLAlchemy `__getattr__` while it
+# rendered frame locals, and a mutation that made the scheduler tick catch
+# `BaseException`. Finding the first took `-o faulthandler_timeout=12` by hand; this is
+# that, automated.
+#
+# 30 s is sized against the slowest test, 1.3 s locally (a cold mypy run in
+# `tests/providers/test_protocol.py`), and against the tests that wait on purpose, which
+# bound their own waits at 5 to 10 s so that they fail with a better message first. It
+# cuts a hang, not a slow runner.
+#
+# `timeout_method` is left at its default on purpose. That is `signal` wherever SIGALRM
+# exists, CI included: it fails the one test and lets the run carry on. Windows has no
+# SIGALRM, so there it is `thread`, which dumps every stack and ends the process.
+# Forcing `thread` everywhere would stop CI at the first hang and hide the rest of the
+# run. `--strict-config` above means that losing the plugin fails the run rather than
+# silently dropping this line.
+timeout = 30
 
 [tool.coverage.run]
 # A directory, not the package name. Coverage matches a package source against the

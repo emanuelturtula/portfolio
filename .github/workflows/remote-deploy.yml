@@ -27,6 +27,12 @@ jobs:
   deploy:
     name: Deploy ${{ inputs.environment }}
     runs-on: ubuntu-latest
+    # Not sized from the measured duration (slowest: 48 s). It must outlast
+    # SSH_TIMEOUT_SECONDS in scripts/remote_deploy.py (17 minutes, sized for the host-side
+    # lock wait and the image pull). Then the script's own timeout fires first, and its
+    # `finally` still removes the host directory that holds the registry credential. A job
+    # timeout kills the runner with no cleanup at all.
+    # tests/deploy/test_workflow_timeouts.py pins the ordering.
     timeout-minutes: 20
     # Deployments are serialized by the flock in deploy/deploy.py rather than by a GitHub
     # concurrency group, so a queued deploy waits instead of being silently discarded.
