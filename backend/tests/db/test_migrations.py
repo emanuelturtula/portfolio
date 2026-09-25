@@ -45,6 +45,10 @@ from portfolio.db.base import NAMING_CONVENTION
 from portfolio.db.models import (
     _ASSET_KIND_CHECK,
     _BALANCE_SNAPSHOT_CONFIRMED_CHECK,
+    _EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK,
+    _EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK,
+    _EXCHANGE_FILL_QUOTE_QUANTITY_DERIVED_CHECK,
+    _EXCHANGE_FILL_SIDE_CHECK,
     _SYNC_RUN_CHAIN_ERROR_KIND_CHECK,
     _SYNC_RUN_CHAIN_STATUS_CHECK,
     _SYNC_RUN_STATUS_CHECK,
@@ -73,6 +77,9 @@ APPLICATION_TABLES = frozenset(
         "sync_runs",
         "sync_run_chains",
         "balance_snapshots",
+        # #12. The venue an owner imports from, and the immutable log of its executions.
+        "exchange_accounts",
+        "exchange_fills",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -102,6 +109,10 @@ PRICES_REVISION = "0004_prices"
 #: the right three tables from one which drops somebody else's.
 BALANCES_REVISION = "0005_balances"
 BALANCE_TABLES = frozenset({"sync_runs", "sync_run_chains", "balance_snapshots"})
+
+#: #12's revision and its two tables, for the same single-step reversal.
+EXCHANGES_REVISION = "0006_exchanges"
+EXCHANGE_TABLES = frozenset({"exchange_accounts", "exchange_fills"})
 
 EXPECTED_SEED_ROWS = [
     ("BTC", "Bitcoin", 8, "crypto"),
@@ -155,6 +166,23 @@ EXPECTED_CONSTRAINT_NAMES = {
         "ck_balance_snapshots_confirmed",
         "fk_balance_snapshots_wallet_id_wallets",
         "fk_balance_snapshots_sync_run_id_sync_runs",
+    },
+    # #12. Three CHECKs, each compared with its model constant by
+    # `test_the_exchange_check_constraints_match_the_models`, and exercised with a real insert
+    # in `tests/db/test_exchange_fills.py`.
+    "exchange_accounts": {
+        "pk_exchange_accounts",
+        "uq_exchange_accounts_user_exchange",
+        "ck_exchange_accounts_exchange_key",
+        "fk_exchange_accounts_user_id_users",
+    },
+    "exchange_fills": {
+        "pk_exchange_fills",
+        "uq_exchange_fills_account_trade",
+        "ck_exchange_fills_external_trade_id",
+        "ck_exchange_fills_side",
+        "ck_exchange_fills_quote_quantity_derived",
+        "fk_exchange_fills_exchange_account_id_exchange_accounts",
     },
 }
 
@@ -330,11 +358,12 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
     command.downgrade(build_alembic_config(database_url), REVISION_BEFORE_PRICES)
 
     # Everything above `0003_wallets` comes down, which since #10 is `prices` *and* the
-    # three balance tables. Subtracting both is what keeps this test about the prices
-    # migration rather than about how many revisions happen to sit on top of it.
-    assert table_names(sync_engine) == (APPLICATION_TABLES - {"prices"} - BALANCE_TABLES) | {
-        STAMP_TABLE
-    }
+    # three balance tables, and since #12 the two exchange tables too. Subtracting them all
+    # is what keeps this test about the prices migration rather than about how many
+    # revisions happen to sit on top of it.
+    assert table_names(sync_engine) == (
+        APPLICATION_TABLES - {"prices"} - BALANCE_TABLES - EXCHANGE_TABLES
+    ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
     upgrade_to_head(database_url)
@@ -362,7 +391,10 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
 
     command.downgrade(build_alembic_config(database_url), PRICES_REVISION)
 
-    assert table_names(sync_engine) == (APPLICATION_TABLES - BALANCE_TABLES) | {STAMP_TABLE}
+    # Since #12 the exchange revision sits on top of this one and comes down with it.
+    assert table_names(sync_engine) == (APPLICATION_TABLES - BALANCE_TABLES - EXCHANGE_TABLES) | {
+        STAMP_TABLE
+    }
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
     upgrade_to_head(database_url)
@@ -383,6 +415,67 @@ def test_the_balances_revision_sits_directly_on_top_of_the_prices_one() -> None:
 
     assert BALANCES_REVISION in revisions
     assert revisions.index(BALANCES_REVISION) == revisions.index(PRICES_REVISION) - 1
+
+
+def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standing(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """#12's migration, downgraded one step. The two exchange tables go; nothing else moves.
+
+    `exchange_fills` references `exchange_accounts` with `ON DELETE RESTRICT`, so the order
+    the `downgrade()` drops them in matters, and it only matters with rows present -- which
+    is why one of each is written first. The owner row is asserted afterwards because a
+    `downgrade()` with a stray `op.execute` would be invisible to a comparison of names.
+    """
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        user_id = connection.execute(
+            text(
+                "INSERT INTO users (username, password_hash, created_at) "
+                "VALUES ('owner', 'not-a-hash', '2026-09-25 12:00:00.000000') RETURNING id"
+            )
+        ).scalar_one()
+        account_id = connection.execute(
+            text(
+                "INSERT INTO exchange_accounts (user_id, exchange_key, created_at) "
+                "VALUES (:user_id, 'bitget', '2026-09-25 12:00:00.000000') RETURNING id"
+            ),
+            {"user_id": user_id},
+        ).scalar_one()
+        connection.execute(
+            text(
+                "INSERT INTO exchange_fills (exchange_account_id, external_trade_id, symbol, "
+                "base_asset, quote_asset, side, quantity, price, quote_quantity, "
+                "quote_quantity_derived, fee_amount, executed_at, raw_payload, ingested_at) "
+                "VALUES (:account_id, '1001', 'BTCUSDT', 'BTC', 'USDT', 'buy', '1.0', '2.0', "
+                "'2.0', 0, '0', '2026-09-25 12:00:00.000000', '{}', "
+                "'2026-09-25 12:00:00.000000')"
+            ),
+            {"account_id": account_id},
+        )
+    assert table_names(sync_engine) >= EXCHANGE_TABLES
+
+    command.downgrade(build_alembic_config(database_url), BALANCES_REVISION)
+
+    assert table_names(sync_engine) == (APPLICATION_TABLES - EXCHANGE_TABLES) | {STAMP_TABLE}
+    assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
+    with sync_engine.connect() as connection:
+        assert connection.scalar(text("SELECT COUNT(*) FROM users")) == 1
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
+def test_the_exchanges_revision_sits_directly_on_top_of_the_balances_one() -> None:
+    """Adjacency, for the single-step downgrade above; not the head, which #15 will move."""
+    revisions = [
+        script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+    ]
+
+    assert EXCHANGES_REVISION in revisions
+    assert revisions.index(EXCHANGES_REVISION) == revisions.index(BALANCES_REVISION) - 1
 
 
 def test_the_prices_revision_sits_directly_on_top_of_the_wallets_one() -> None:
@@ -592,6 +685,79 @@ def test_the_new_check_constraints_match_the_models(
         assert set(reflected) == set(constraints), table
         for name, sql in constraints.items():
             assert reflected[name] == normalise_sql(sql), f"{table}.{name}"
+
+
+def test_the_exchange_check_constraints_match_the_models(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Every `CHECK` #12 adds, reflected off a migrated file and compared with its constant.
+
+    The same hazard as the two tests above: autogenerate has no check-constraint comparator,
+    so editing one of these constants without editing `v0006_exchanges.py` passes every
+    other gate. **The absence of a money `CHECK` is part of the pin**: exactly these three
+    exist on `exchange_fills`, because `quantity > 0` on a `TEXT` column is a numeric-affinity
+    comparison -- the float path rule 2 bans.
+    """
+    upgrade_to_head(database_url)
+    inspector = inspect(sync_engine)
+    expected = {
+        "exchange_accounts": {
+            "ck_exchange_accounts_exchange_key": _EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK,
+        },
+        "exchange_fills": {
+            "ck_exchange_fills_external_trade_id": _EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK,
+            "ck_exchange_fills_side": _EXCHANGE_FILL_SIDE_CHECK,
+            "ck_exchange_fills_quote_quantity_derived": _EXCHANGE_FILL_QUOTE_QUANTITY_DERIVED_CHECK,
+        },
+    }
+
+    for table, constraints in expected.items():
+        reflected = {
+            str(found["name"]): normalise_sql(str(found["sqltext"]))
+            for found in inspector.get_check_constraints(table)
+        }
+        assert set(reflected) == set(constraints), table
+        for name, sql in constraints.items():
+            assert reflected[name] == normalise_sql(sql), f"{table}.{name}"
+
+
+def test_the_exchange_check_texts_are_the_specs() -> None:
+    """The four texts, pinned by hand from the spec's data model.
+
+    The reflection test above compares the migration with the model; this compares the
+    model with the spec, so a constant edited in both places at once is still noticed.
+    """
+    assert _EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK == "exchange_key IN ('bingx', 'bitget')"
+    assert _EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK == "external_trade_id <> ''"
+    assert _EXCHANGE_FILL_SIDE_CHECK == "side IN ('buy', 'sell')"
+    assert _EXCHANGE_FILL_QUOTE_QUANTITY_DERIVED_CHECK == "quote_quantity_derived IN (0, 1)"
+
+
+def test_the_exchange_foreign_keys_carry_their_delete_rules(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Cascade from the owner to the account; restrict from the account to its fills.
+
+    Reflected off the migrated file rather than trusted to the drift check, because a
+    `RESTRICT` that became a `CASCADE` would delete an owner's trade history along with the
+    account, without a word. No index on either table, and the absence is part of the pin.
+    """
+    upgrade_to_head(database_url)
+    inspector = inspect(sync_engine)
+
+    accounts = inspector.get_foreign_keys("exchange_accounts")
+    fills = inspector.get_foreign_keys("exchange_fills")
+
+    assert [(fk["referred_table"], fk["options"].get("ondelete")) for fk in accounts] == [
+        ("users", "CASCADE")
+    ]
+    assert [(fk["referred_table"], fk["options"].get("ondelete")) for fk in fills] == [
+        ("exchange_accounts", "RESTRICT")
+    ]
+    assert inspector.get_indexes("exchange_accounts") == []
+    assert inspector.get_indexes("exchange_fills") == []
 
 
 def test_the_check_constraint_comparison_discriminates() -> None:
