@@ -492,6 +492,27 @@ Disjoint. Nobody edits a file on another row.
   The golden-vector signatures are Base64 literals, and the tester runs the secret scan on the
   test module before committing it.
 
+## Departures agreed during implementation
+
+- **A vendor header could make `client.get` raise a bare `ValueError`, for every provider.**
+  `parse_retry_after` and `parse_rate_limit` checked that a value was ASCII digits and then
+  called `int()`, which refuses more than 4300 digits. `parse_rate_limit` runs on every
+  response inside `RetryingTransport`, so a response carrying such a header escaped every
+  provider's `except httpx.TransportError`, and chain `health()`'s never-raise contract.
+  Measured by backend-dev and reproduced by the tech lead. It predates this issue, but
+  criterion 9 cannot hold while it stands, so it is fixed here in `providers/http.py`: a
+  named digit bound, past which a value is unusable (`None`).
+- **A credential with an illegal header character leaked through a transport error.** A
+  newline, a NUL, or surrounding whitespace in the API key makes h11 raise
+  `httpx.LocalProtocolError` quoting the whole header value, and the design chained from
+  transport errors. A non-ASCII character escaped as a bare `UnicodeEncodeError`. The API key
+  and the passphrase must now be printable ASCII with no surrounding whitespace (an interior
+  space is allowed). This is checked at startup (naming the variable) and in the provider's
+  constructor (naming the field). A `LocalProtocolError` is translated `from None`. The secret
+  is only HMAC input and stays unconstrained.
+- **A trade id is the pattern and `int(value) <= 2**63 - 1`.** The pattern alone admits
+  19-digit values above the signed 64-bit maximum, which the rule claims to exclude.
+
 ## Handed on
 
 - **#15:** an `ON CONFLICT DO NOTHING` hit whose stored `raw_payload` differs from the
