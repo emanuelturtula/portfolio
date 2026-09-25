@@ -128,17 +128,24 @@ function WalletRow({ wallet, isShowingArchived, focusListHeading }: WalletRowPro
 
   /**
    * Arranges to focus whichever control corresponds to `expectArchived`, once the row is
-   * showing it. Callers check `ownsFocus` themselves before reaching here.
+   * showing it.
    *
    * The order between "the refetch has already flipped `wallet.archived`" and "this settles"
    * is not fixed. If the flip already happened - `archivedRef.current` already reads
    * `expectArchived` - the effect above already ran for it and found nothing pending, and
-   * `wallet.archived` will not change *again* on its own, so this focuses immediately
-   * instead of arming a hand-off nothing will ever trigger. Otherwise the flip is still
-   * ahead, and the effect is what will catch it.
+   * `wallet.archived` will not change *again* on its own, so this checks `ownsFocus` and
+   * focuses immediately instead of arming a hand-off nothing will ever trigger. Otherwise
+   * the flip is still ahead: arming is unconditional, with no ownership check here, because
+   * whether the owner still owns focus is a question this can only truthfully answer once
+   * the flip actually lands - which is what the effect above checks, right before it acts,
+   * not a moment earlier. Checking here too would only re-ask the same question early and
+   * let its answer go stale by the time the flip arrives.
    */
   function focusOnceFlipped(expectArchived: boolean): void {
     if (archivedRef.current === expectArchived) {
+      if (!ownsFocus()) {
+        return;
+      }
       if (expectArchived) {
         restoreButtonRef.current?.focus();
       } else {
@@ -151,21 +158,15 @@ function WalletRow({ wallet, isShowingArchived, focusListHeading }: WalletRowPro
 
   const archiveMutation = useArchiveWallet({
     onSuccess: () => {
-      if (!ownsFocus()) {
-        return;
-      }
       if (isShowingArchived()) {
         focusOnceFlipped(true);
-      } else {
+      } else if (ownsFocus()) {
         focusListHeading();
       }
     },
   });
   const restoreMutation = useRestoreWallet({
     onSuccess: () => {
-      if (!ownsFocus()) {
-        return;
-      }
       // Restore only ever appears with "Show archived" on, so the row always stays - there
       // is no active-only-view case to branch on here.
       focusOnceFlipped(false);
