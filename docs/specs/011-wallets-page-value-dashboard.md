@@ -1,7 +1,7 @@
 # 011 — Wallets page and portfolio value dashboard
 
 Issue: #11
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -168,7 +168,7 @@ This logic lives in one pure module, `src/lib/freshness.ts`, with no React in it
 | Situation | Where it shows | What it says |
 |---|---|---|
 | no active wallets | dashboard | an empty state linking to `/wallets` |
-| unread wallet (`observed_at` null) | its row, and the total's "missing" list | "Not read yet", and the chain's failure if there is one; quantity and value render "—" |
+| unread wallet (`observed_at` null) | its row, and the total's "missing" list | "Not read yet" in the quantity cell, and the chain's failure if there is one; value renders "—" |
 | read wallet whose chain failed | its row; the total counts it | the reason and the reading's age; the total says it includes balances the last sync could not refresh |
 | `price.stale` | the asset row and the wallet rows | the price's age, and that it is stale; the total says stale prices were used |
 | unpriced asset | the asset row, and the "missing" list | the reason's sentence; value "—" |
@@ -450,4 +450,78 @@ change, it comes back to the tech lead first.
 
 ## What the plan got wrong
 
-Filled in at the end, before the pull request opens.
+### The interrupted-run rule was designed against a response shape, not against its writer
+
+I read `SyncRunResponse` and not the code that fills it. `finish_run` writes chain outcomes in
+the transaction that closes a run, and the orphan sweep only flips the status. So an
+interrupted run never has outcomes. The table's "interrupted" row therefore fired for every
+chain, including the ones the run had read and committed.
+
+The fixtures were typed by the generated schema, and they built an interrupted run *with*
+outcomes. That is a state the backend cannot write, and 467 tests passed over it. A type says
+what a field may hold. Only the writer says which combinations of fields exist. The fixture
+builder now encodes the writer's rule as a type: `interruptedRun` refuses outcomes.
+
+**When a reader's rule depends on what a row can contain, read the code that writes the row.**
+
+### A status became a lock
+
+The plan disabled Refresh while the newest run was `running`, reasoning from the live case
+only. #10 documents the other case: a close-out commit that fails leaves an orphaned `running`
+row. There, the disabled button was the one action that would have swept it. The status line
+also told the owner "a sync is running" about a run that was not. The line now states only
+what the row shows: when the run started, and that it has not finished.
+
+### Two decisions made apart interacted, twice
+
+Polling every minute was right on its own, and so was making a failed balances read the
+whole-page failure. Together they blanked every open dashboard on every deploy, because a
+deploy restarts the container.
+
+The second review found the same interaction again, in freshness. A balances poll fails, the
+run log moves on, and readings still on screen are judged against a run they were not part
+of. A rule about "the data on screen" has to say which fetch of that data it means.
+
+### A number in Risks had no source
+
+"A 28-digit `Decimal` context" was Python's default, written from memory. `domain/money.py`
+sets 38. The conclusion held, with a narrower margin than claimed.
+
+### The plan named two kinds of number and formatted three
+
+It separated quantities from fiat amounts and said nothing about unit prices. So the prices
+took the fiat format, and KAS at `0.084912345678` read "0.08". That is 6% low, in the one
+column that exists to explain the value beside it.
+
+### Focus was not in the plan, and it took three designs
+
+The spec named roles and ARIA attributes and never mentioned focus.
+
+1. **The first implementation** left focus on `<body>` whenever a pressed control vanished.
+2. **The second** handed focus across rows, matched against "the next change to the list".
+   I accepted it because it worked, given the order in which TanStack Query notifies. The
+   tester then found a no-op archive whose pending hand-off fired on a later, unrelated
+   "Show archived" toggle, and took focus off the checkbox the owner had just pressed.
+3. **The third** is the simple design that was available from the start. Where focus should
+   go is known at click time, and a row that stays watches its own flip.
+
+The second review found that the third still moved focus the owner had taken elsewhere, for
+example into the address field during a slow archive. Focus now moves only when the owner is
+still on the row, or nowhere at all.
+
+**"It works because of the library's scheduling order" is a reason to redesign, not a reason
+to accept.**
+
+### Left open
+
+- **A value-over-time chart, and the backward cursor that goes with it.** No issue asks for
+  either.
+- **#46.** Realistic sums are about 33 significant digits against `addMoney`'s 40.
+- **Three wording choices, accepted.**
+  - An unread wallet's quantity cell says "Not read yet" rather than "—".
+  - The total's "missing" sentence counts unread wallets rather than naming them.
+  - The dashboard's empty state also says "No wallets yet" when every wallet is archived.
+- **`parseInstant` assumes one timestamp format.** It truncates the fraction to three digits,
+  and the backend always sends a trailing `Z` with zero or six fraction digits. Review checked
+  that against Pydantic 2.13.5. A backend that starts sending an offset such as `+02:00`
+  still parses, because only the fraction is touched.
