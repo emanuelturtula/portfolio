@@ -477,10 +477,11 @@ Disjoint. Nobody edits a file on another row.
   keeps any key out of this repository and out of this work. The first real request is the
   owner's first sync after #15. Everything above is written to fail loudly, as a typed error
   naming a field, rather than to guess.
-- **The owner's account could become UTA.** Accepting the in-app upgrade makes every call fail,
-  with a code the docs do not list. It falls back to the status and surfaces as an
-  invalid-request or auth error, not as a silent empty history. `docs/operations.md` says not
-  to accept the upgrade. The v3 follow-up is the fix.
+- **The owner's account could become UTA.** What a v2 call from a UTA key returns is not
+  documented. A refusal is expected, and it would surface as an invalid-request or auth error.
+  **An empty success would be indistinguishable from no trades**, which is why `data: null` is
+  refused and why `docs/operations.md` says not to accept the upgrade. The v3 follow-up is the
+  fix.
 - **Retention may be "three months", not 90 days.** If the venue refuses the oldest window,
   `40704` makes it a typed `ExchangeRetentionWindowError`, and #15 clamps further.
 - **A delisted symbol fails its page** if the symbol-info endpoint no longer knows it. The
@@ -538,9 +539,25 @@ Disjoint. Nobody edits a file on another row.
   `repr()`. `errors()` and `json()` still carry the whole input, which is #53's pinned hazard.
   The behaviour predates this issue for any refusal, but this issue adds three credentials,
   and refusals that fire exactly when they are set.
-- **A success whose fills `data` is `null` is an empty page.** The documented form is `[]`.
-  `null` under `"00000"` can only mean "nothing", and refusing it would fail every empty
-  window if the venue spells empty that way. The symbol-info `data` stays strict.
+- **A success whose fills `data` is `null` stays a schema error. The tech lead briefly
+  decided otherwise and reversed it after review.** The tolerance read `null` under
+  `"00000"` as an empty page, on the argument that it can only mean "nothing". The reviewer's
+  counter-case is the one that matters: a v2 call from a UTA-upgraded account is exactly
+  where an undocumented answer is plausible, and an empty success there makes every window
+  read as empty. #15 would then advance its checkpoints, and after 90 days that history is
+  gone. A loud failure costs one fix after the first real sync; a silent empty history is
+  permanent. **Loud-and-recoverable beats quiet-and-permanent**, which is the rule this
+  project already applies to balances.
+- **A duplicate trade id on an edge millisecond escaped the within-page check.** Found by
+  review. The distinct-id rule lived in `assemble_fill_page` and so saw only the fills the
+  edge drop kept: a pair sharing a `tradeId`, one at `since - 1 ms` and one inside the window,
+  was accepted as one fill. The rule now runs on the raw page, beside the raw count and the
+  cursor rule. This is spec 012's "a rule reasoned about alone" again: the duplicate rule
+  predated the edge drop placed in front of it.
+- **The public symbol endpoint can no longer produce an auth error.** Found by review. A 401
+  or 403 there was classified `ExchangeAuthError`, but that call carries no credential, so a
+  CDN or WAF refusing it would have made #15 mark a working key `auth_failed`. An auth-class
+  answer on that call is now `ExchangeUnavailableError`, keeping its status and code.
 
 ## Handed on
 
@@ -550,3 +567,6 @@ Disjoint. Nobody edits a file on another row.
   whichever venue it is.
 - **A follow-up issue for UTA** (`GET /api/v3/trade/fills`), filed with the pull request.
 - **#75:** `httpx.DecodingError` in the chain and price providers.
+- **#14:** `MAX_HEADER_DIGITS` is ten, so a 13-digit epoch-millisecond `x-ratelimit-reset`, a
+  shape some venues use, is now read as absent where it used to cause a 30-second pause.
+  Neither reading is right for such a header. If BingX sends one, it needs its own parser.
