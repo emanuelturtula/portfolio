@@ -964,6 +964,16 @@ refuses a blank trade id, symbol or asset, a `side` that is not a `FillSide`, a 
 `executed_at`, and a `fee_asset` of `None` beside a non-zero fee. `fee_amount` is signed:
 positive is paid, negative a rebate.
 
+**Every text field must encode as UTF-8.** `"\ud800"` is valid JSON -- an escape for a lone
+surrogate -- and `json.loads` returns it as a `str` that passes every string check until
+something encodes it: the database driver inserting the fill, or the signing helper building
+the next request from a cursor. Both fail with a bare `UnicodeEncodeError`, outside the
+taxonomy. `NormalizedFill` refuses such text in every field, `external_order_id` included,
+and `assemble_fill_page` refuses it in `cursor` and `next_cursor`, each as an
+`ExchangeSchemaError` naming the field. A provider that builds a request from any other
+venue-supplied string -- a symbol out of `candidate_symbols`, say -- must check it the same
+way before signing.
+
 Four rules a provider inherits rather than decides:
 
 - **`quote_quantity` is as reported.** When a venue omits it, call
@@ -999,6 +1009,18 @@ aware UTC `datetime` as `EPOCH + timedelta(milliseconds=value)`. The obvious
 `datetime.fromtimestamp(ms / 1000)` is a float division in `providers/` and fails the ban.
 `epoch_ms(moment)` is the inverse for building a request, and refuses a naive `datetime`.
 
+**Milliseconds are the granularity of the seam.** A venue is asked in epoch milliseconds --
+`epoch_ms` floors -- and answers in them, so a window bound with microseconds would be sent
+as the start of its millisecond, and a venue correctly returning a fill from earlier in that
+millisecond would have its page refused for answering outside a window it was never told
+about. So `FillWindow` refuses a bound that is not a whole millisecond (`ValueError`),
+`ExchangeCapabilities` refuses a `max_query_window` or `retention` that is not a whole
+number of milliseconds, and `clamp_to_retention` floors `effective_since`. Build every bound
+with `floor_to_millisecond(moment)`, which keeps the zone and moves the instant back to the
+start of its millisecond: for the start of a window, flooring asks for slightly more and
+never less. Fills from `datetime_from_epoch_ms` are already on the grid, so fills and bounds
+compare on one grid.
+
 ### The page contract, enforced by construction
 
 A provider parses its response into `NormalizedFill`s and hands them to
@@ -1013,6 +1035,7 @@ It is the `align_balances` of this seam:
 | `symbol` given and a fill is for another symbol | `ExchangeSchemaError` -- the same, per symbol |
 | two fills in the page share an `external_trade_id` | `ExchangeSchemaError` |
 | more fills than `page_size` | `ExchangeSchemaError` |
+| `cursor` or `next_cursor` that does not encode as UTF-8 | `ExchangeSchemaError` -- it would fail while signing the next request |
 | `next_cursor` equal to `cursor` (and not `None`) | `ExchangeSchemaError` -- pagination stopped advancing |
 
 `FillWindow(since, until)` is **half-open**: a fill at `since` is in and one at `until` is
@@ -1023,7 +1046,9 @@ it cannot catch one cycling between two, which needs the history only the sync l
 
 `clamp_to_retention(requested_since, now=..., capabilities=...)` returns a `RetentionClamp`
 with both instants and a derived `clamped`: `effective_since = max(requested_since,
-now - retention + RETENTION_MARGIN)`, never later than `now`. **It never raises for a
+now - retention + RETENTION_MARGIN)`, never later than `now`, floored to the millisecond.
+`clamped` means the request was moved forward; a request that was only floored is not
+clamped. **It never raises for a
 request older than retention**; surfacing both dates is #13's criterion, decided here once.
 `RETENTION_MARGIN` is five minutes and **a guess**: without it the oldest window is at the
 edge when computed and past it when the request lands.
@@ -1095,6 +1120,20 @@ A provider raises the result of
 `exchange_error(status, venue_code, error_map=..., retry_after_ms=...)`, which takes no body,
 no message and no URL, by signature. Parse `Retry-After` with the existing
 `parse_retry_after` and pass it unconditionally; only `ExchangeRateLimitedError` keeps it.
+
+**Never call `response.raise_for_status()` in an exchange provider, and never chain `from`
+an `httpx.HTTPStatusError`.** Its message is `Client error '401 Unauthorized' for url
+'...'` with the **full** URL -- path and query string, and for a venue that signs in the
+query string, the signature and the key that produced it. Review demonstrated that
+signature reaching a JSON log line: `logger.exception` renders the traceback through
+`format_exc_info`, and a chained cause is part of the traceback, so the message this
+taxonomy keeps free of the body still carries the URL one link down the chain. Read
+`response.status_code` and build the error with `exchange_error`; chain `from` the
+`httpx.TransportError` for a transport failure, whose message carries no query, and
+`from None` everywhere else. `decode_json` raises nothing but `ProviderResponseError` -- a
+number too large for `Decimal` included, since #12 -- and a provider translates that to
+`ExchangeSchemaError` `from None` as well: the cause is a parser error about the body, and
+the body is what an exchange provider must not repeat.
 
 ### Signing and credentials
 
@@ -1241,6 +1280,21 @@ it by returning a stale number that looks exactly like a fresh one, which is the
   and detecting a cursor that cycles between pages -- `require_cursor_advanced` only catches
   one that repeats. A credential health check is not planned; #15 learns about a bad key
   from a sync.
+- **A signed request replayed by the transport can arrive expired.** `RetryingTransport`
+  retries a `GET` that got a 429, a 5xx or no answer by sending **the same request
+  again** -- same timestamp, same signature -- for up to `RetryPolicy.max_attempts` (3)
+  attempts, with backoff up to `max_backoff_ms` (30 seconds). A venue that checks a request's timestamp
+  against a receive window can refuse the replay as expired. Two consequences for #13 and
+  #14: **never map a venue's "timestamp expired" code to `ExchangeAuthError`**, because #15
+  marks the account `auth_failed` for that class and the key is not what failed; and decide,
+  against the venue's documented receive window, whether it tolerates the transport's
+  backoff or whether signed calls must be re-signed per attempt instead of replayed.
+- **`create-user --replace` and the fills' `ON DELETE RESTRICT`.** `--replace` deletes the
+  user row. `exchange_accounts` cascades from `users`, and `exchange_fills` restricts the
+  delete of an account that has fills, so once #15 writes the first fill, `--replace`
+  fails on a foreign key. Issue #69 owns the fix and **must land before #15**. The
+  `RESTRICT` stays: fills are the history a cost basis is computed from, and replacing a
+  login is not the place to decide to destroy it.
 - **Tuning settings.** Every number in the first table above is still a module constant.
   Promoting one to a `PORTFOLIO_PROVIDER_*` setting is a change an operator's measurement
   should drive, not a guess made before anything has ever made a request.
