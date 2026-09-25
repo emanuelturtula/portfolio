@@ -25,6 +25,29 @@ const SETTLED_RUN_VERBS: Record<SyncRunSummary['status'], string> = {
 };
 
 /**
+ * Fallback shown when `POST /api/balances/sync` fails with no real problem document - a
+ * network error, or a proxy's own error page for a request the coordinator held open for
+ * the whole run (see the spec's Risks section). Paired with a fixed trailing sentence that
+ * deliberately does not say the sync did not start: the coordinator shields the run from
+ * the client connection, so a cut-off request very often means the run is still going, not
+ * that it never began. A real `problem.detail` from the backend still wins over this
+ * fallback - see `describeApiError` - but the trailing sentence is shown either way, since
+ * even a definite backend-side answer does not rule out the run continuing past it.
+ */
+const REFRESH_FAILURE_FALLBACK = 'The server could not be reached.';
+
+/**
+ * Fallbacks for the two degrade-to-notice cases, each a full sentence: every real
+ * `problem.detail` from the backend already is one, and concatenating our own trailing
+ * sentence straight after it - with no literal "." of our own in between - would otherwise
+ * print two full stops back to back for every genuine server refusal, not just a synthetic
+ * test case. See `describeApiError`: a fallback is used only when there is no real detail
+ * to defer to, so it has to carry its own punctuation.
+ */
+const WALLETS_UNAVAILABLE_FALLBACK = 'The wallet list could not be read.';
+const RUNS_UNAVAILABLE_FALLBACK = 'The run log could not be read.';
+
+/**
  * The portfolio value dashboard: total, per-asset and per-wallet value, a refresh button
  * and a "last updated" indicator. See docs/specs/011-wallets-page-value-dashboard.md.
  *
@@ -79,16 +102,14 @@ export function DashboardPage() {
     <div className="dashboard">
       {wallets.isError && (
         <p role="alert">
-          Addresses are unavailable:{' '}
-          {describeApiError(wallets.error, 'the wallet list could not be read')}. Wallet rows show
-          their label, or chain and id, instead.
+          Addresses are unavailable: {describeApiError(wallets.error, WALLETS_UNAVAILABLE_FALLBACK)}{' '}
+          Wallet rows show their label, or chain and id, instead.
         </p>
       )}
       {runs.isError && (
         <p role="alert">
-          Sync status is unavailable:{' '}
-          {describeApiError(runs.error, 'the run log could not be read')}. Balances are still shown
-          below.
+          Sync status is unavailable: {describeApiError(runs.error, RUNS_UNAVAILABLE_FALLBACK)}{' '}
+          Balances are still shown below.
         </p>
       )}
 
@@ -102,6 +123,9 @@ export function DashboardPage() {
         >
           Refresh
         </button>
+        {syncMutation.isPending && (
+          <p role="status">Refreshing balances… this can take a minute.</p>
+        )}
         {inProgress && <p role="status">A sync is running…</p>}
         <p className="last-updated">
           Balances as of {data.as_of === null ? 'never' : <RelativeTime value={data.as_of} />}.{' '}
@@ -117,13 +141,14 @@ export function DashboardPage() {
         </p>
         {syncMutation.isError && (
           <p role="alert">
-            Refresh failed:{' '}
-            {describeApiError(syncMutation.error, 'Could not reach the server to start a sync.')}
+            Refresh did not complete:{' '}
+            {describeApiError(syncMutation.error, REFRESH_FAILURE_FALLBACK)} A sync may still be
+            running on the server; this page updates when it finishes.
           </p>
         )}
       </div>
 
-      <TotalSummary data={data} />
+      <TotalSummary data={data} settledRun={settled} freshnessKnown={freshnessKnown} />
       <AssetTable data={data} />
       <WalletBalanceTable
         data={data}

@@ -11,7 +11,7 @@ import {
   UNKNOWN_FAILURE_MESSAGE,
   type SyncRunSummary,
 } from '@/lib/freshness';
-import { formatMoney, fromBaseUnits, money } from '@/lib/money';
+import { fromBaseUnits, money } from '@/lib/money';
 
 const FIAT_OPTIONS = { minimumFractionDigits: 2, maximumFractionDigits: 2 };
 
@@ -35,22 +35,67 @@ function unreadReason(
     : SYNC_ERROR_MESSAGES[outcome.error_kind];
 }
 
-/** The signed pending amount after the quantity, e.g. "+0.00012 BTC pending". `null` when
- * there is nothing to show: no pending, a zero pending, or a wallet with no decimals yet. */
+/**
+ * The signed pending amount after the quantity, e.g. "(+0.00012 BTC pending)". `null` when
+ * there is nothing to show: no pending, a zero pending, or a wallet with no decimals yet.
+ *
+ * Rendered through `<Money>`, not a hand-formatted string, so it carries its own exact
+ * `<data value>` - AC8 ("amounts render from strings at full precision") applies to every
+ * amount on the page, not only to the quantity next to it. The sign is kept outside the
+ * `<Money>` element and applied to the unsigned magnitude, so the two - the explicit `+`
+ * this row wants, and `formatMoney`'s own `-` for a negative amount - never disagree.
+ */
 function renderPending(wallet: WalletBalance) {
   if (wallet.pending === null || wallet.pending === '0' || wallet.decimals === null) {
     return null;
   }
 
   const amount = fromBaseUnits(wallet.pending, wallet.decimals);
-  const formatted = formatMoney(amount);
-  const signed = formatted.startsWith('-') ? formatted : `+${formatted}`;
+  const negative = amount.startsWith('-');
+  const magnitude = money(negative ? amount.slice(1) : amount);
 
   return (
     <span className="pending">
       {' '}
-      ({signed} {wallet.asset_symbol} pending)
+      ({negative ? '-' : '+'}
+      <Money value={magnitude} /> {wallet.asset_symbol} pending)
     </span>
+  );
+}
+
+/**
+ * The Freshness cell's content for one read wallet (`reading !== undefined`).
+ *
+ * A standalone function, rather than a ternary inline in the JSX, so that the type of
+ * `assessFreshness`'s result narrows correctly: it is computed here exactly once, in the
+ * one branch that needs it, instead of being assigned earlier under a condition that
+ * `freshnessKnown`/`reading` together already guarantee - which left a `freshness !==
+ * undefined` check with an unreachable `else` that nothing could ever exercise.
+ */
+function renderFreshnessCell(
+  reading: { readonly observedAt: string },
+  freshnessKnown: boolean,
+  settledRun: SyncRunSummary | undefined,
+  chainKey: string,
+) {
+  if (!freshnessKnown) {
+    return (
+      <>
+        Read <RelativeTime value={reading.observedAt} />
+      </>
+    );
+  }
+
+  const freshness = assessFreshness(settledRun, chainKey, reading.observedAt);
+  if (freshness.status === 'fresh') {
+    return 'Up to date';
+  }
+
+  return (
+    <>
+      {freshnessMessage(freshness)} - showing the balance from{' '}
+      <RelativeTime value={reading.observedAt} />
+    </>
   );
 }
 
@@ -83,10 +128,6 @@ function WalletBalanceRow({
       : undefined);
   const reasonForUnread =
     reading === undefined ? unreadReason(wallet.chain_key, settledRun, freshnessKnown) : undefined;
-  const freshness =
-    reading !== undefined && freshnessKnown
-      ? assessFreshness(settledRun, wallet.chain_key, reading.observedAt)
-      : undefined;
 
   return (
     <tr>
@@ -109,22 +150,9 @@ function WalletBalanceRow({
         )}
       </td>
       <td>
-        {reading === undefined ? (
-          '—'
-        ) : !freshnessKnown ? (
-          <>
-            Read <RelativeTime value={reading.observedAt} />
-          </>
-        ) : freshness?.status === 'fresh' ? (
-          'Up to date'
-        ) : freshness !== undefined ? (
-          <>
-            {freshnessMessage(freshness)} - showing the balance from{' '}
-            <RelativeTime value={reading.observedAt} />
-          </>
-        ) : (
-          '—'
-        )}
+        {reading === undefined
+          ? '—'
+          : renderFreshnessCell(reading, freshnessKnown, settledRun, wallet.chain_key)}
       </td>
       <td>
         {wallet.value === null ? (
@@ -132,6 +160,12 @@ function WalletBalanceRow({
         ) : (
           <>
             <Money value={money(wallet.value)} options={FIAT_OPTIONS} /> {quoteCurrency}
+            {wallet.price?.stale === true && (
+              <>
+                {' '}
+                (stale, as of <RelativeTime value={wallet.price.as_of} />)
+              </>
+            )}
           </>
         )}
       </td>

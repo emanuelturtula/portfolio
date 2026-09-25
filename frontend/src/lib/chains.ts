@@ -69,7 +69,12 @@ function looksLikeKaspaAddress(trimmed: string): boolean {
 
 function looksLikeBitcoinAddress(trimmed: string): boolean {
   const lower = trimmed.toLowerCase();
-  return lower.startsWith('bc1') || lower.startsWith('tb1') || /^[13mn2]/.test(trimmed);
+  return (
+    lower.startsWith('bc1') ||
+    lower.startsWith('tb1') ||
+    lower.startsWith('bcrt1') ||
+    /^[13mn2]/.test(trimmed)
+  );
 }
 
 /**

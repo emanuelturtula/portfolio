@@ -120,6 +120,10 @@ export function WalletForm() {
           )}
           onChange={(event) => {
             setChainKey(event.target.value as ChainKey);
+            // Clears a field error left over from the previous submission - otherwise a
+            // 409 or 422 from that attempt stays on screen, attached to a value the owner
+            // has already changed, until they submit again.
+            mutation.reset();
           }}
         >
           {CHAIN_KEYS.map((key) => (
@@ -149,6 +153,7 @@ export function WalletForm() {
           onChange={(event) => {
             setAddress(event.target.value);
             setLocalAddressError(undefined);
+            mutation.reset();
           }}
         />
         {hint !== undefined && (
@@ -185,6 +190,7 @@ export function WalletForm() {
           )}
           onChange={(event) => {
             setLabel(event.target.value);
+            mutation.reset();
           }}
         />
         {labelError !== undefined && (
@@ -194,8 +200,11 @@ export function WalletForm() {
         )}
       </div>
 
-      {formErrors?.map((message) => (
-        <p key={message} role="alert">
+      {formErrors?.map((message, index) => (
+        // Keyed by position, not by `message`: two distinct 422 entries can carry the
+        // same text (e.g. two missing-field errors with identical wording), and a
+        // duplicate key would be a React warning at best and a misrendered list at worst.
+        <p key={index} role="alert">
           {message}
         </p>
       ))}

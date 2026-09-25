@@ -118,8 +118,13 @@ export const SYNC_ERROR_MESSAGES: Record<SyncErrorKind, string> = {
   rate_limited: 'The provider is rate-limiting requests.',
   response: 'The provider sent a response that could not be used.',
   unknown_chain: 'This chain is not configured on the server.',
-  address_rejected: 'The server rejected this address.',
-  internal: 'An internal error interrupted the read.',
+  // Per-chain, not per-wallet: until #54 isolates a single address's refusal, one rejected
+  // address aborts the whole chain's read, so this sentence must not read as if it blames
+  // the specific wallet it happens to be shown next to - every other wallet on the chain
+  // was refused for the same reason.
+  address_rejected:
+    'An address on this chain was refused, so none of its wallets were read. Check that every address belongs to the network this server reads.',
+  internal: 'An internal error interrupted the read; see the server log.',
 };
 
 /** The sentence for a `Freshness` whose status is not `'fresh'`. Empty for `'fresh'` itself. */
