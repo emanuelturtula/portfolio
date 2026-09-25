@@ -18,6 +18,7 @@ from portfolio.config import get_settings
 from portfolio.main import create_app
 from tests.auth.conftest import BASE_URL as SECURE_BASE_URL
 from tests.auth.conftest import apply_auth_environment, sign_in
+from tests.offline_http import take_offline_attempts
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -27,6 +28,30 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 BASE_URL = "http://testserver"
+
+
+@pytest.fixture(autouse=True)
+def no_request_reached_the_offline_client() -> Iterator[None]:
+    """Fail any test after which the offline HTTP client had refused a request.
+
+    The refusal itself is an exception, and the application catches exceptions on two paths
+    on purpose -- a failed scheduler tick, and a chain's internal-error clause -- so a vendor
+    call made from either is refused, swallowed, and the test passes. This is what turns it
+    back into a failure: `tests/offline_http.py` records the host of every refused request,
+    and this checks the record is empty once everything the test built has shut down.
+
+    Autouse, so it is set up before any fixture a test requests and torn down after all of
+    them: a vendor call made during a lifespan's *shutdown* is recorded by the time this
+    looks. The record is emptied on the way in as well, so one test's leftover can never be
+    reported against the next.
+    """
+    take_offline_attempts()
+    yield
+    attempts = take_offline_attempts()
+    assert attempts == [], (
+        f"the offline HTTP client refused requests to {attempts!r} during this test, and "
+        "something caught the refusal. Stub the provider or price source above the client."
+    )
 
 
 @pytest.fixture

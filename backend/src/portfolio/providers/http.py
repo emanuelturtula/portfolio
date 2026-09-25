@@ -1078,10 +1078,13 @@ def build_http_client(
 
     **Process-wide by construction.** The rate limiter's state lives on the transport and
     the transport lives on the client, so two clients would not know about each other's
-    requests and the interval would silently become half of what it says. Nothing calls a
-    provider yet, so nothing builds one of these at startup; #10 creates it in the
-    lifespan when it has a caller, and closing it there is how the connection pool is
-    released. `docs/providers.md` records that as work #10 owns.
+    requests and the interval would silently become half of what it says.
+
+    `portfolio.main.lifespan` builds exactly one of these per application, publishes it on
+    `app.state.http_client`, and closes it on the way down -- which is how the connection
+    pool is released. `cli.run_price_refresh` builds its own for the life of one command,
+    for the same reason and with the same `aclose`. Those two are the only callers, and a
+    third would be the bug this paragraph describes.
 
     Args:
         transport: the transport to wrap. Defaults to a real `httpx.AsyncHTTPTransport`;

@@ -241,6 +241,43 @@ class Settings(BaseSettings):
     # credential format, which is exactly what the paragraph above refuses to do.
     coingecko_api_key: SecretStr | None = None
 
+    # The balance scheduler. Three settings, and each answers a question an operator
+    # actually has.
+    #
+    # `enabled` is an off switch that is not a code edit: an operator debugging a vendor --
+    # or waiting out a public index's bad afternoon -- needs a way to stop the loop without
+    # rebuilding an image. **It does not disable `POST /api/balances/sync`**, deliberately:
+    # the manual trigger is the tool they are debugging *with*, and taking it away with the
+    # same switch would be the opposite of the intent.
+    #
+    # `interval_minutes` is the issue's default of fifteen. Whole minutes, because every
+    # interval this product will ever want is one and because `float` is banned in the layer
+    # that consumes it.
+    #
+    # `shutdown_grace_seconds` is how long the lifespan waits for a run in flight before
+    # cancelling it and letting the sweep record it interrupted. Ten seconds is short of a
+    # slow sync and long enough for an ordinary one; the cost of being wrong in either
+    # direction is a row marked `interrupted` rather than lost data, because the run writes
+    # its snapshots per chain as it goes.
+    balance_sync_enabled: bool = True
+    balance_sync_interval_minutes: int = 15
+    balance_sync_shutdown_grace_seconds: int = 10
+
+    # The price refresh, on its own timer and its own switch. **Separate from the balance
+    # pair rather than folded into it**, because the two answer to different vendors on
+    # different schedules: balances come from two chain indexes that ban you for asking too
+    # often, prices from four market-data APIs where the primary answers every configured
+    # pair in a single call. One switch for both would mean an operator waiting out a chain
+    # outage also stopped valuing the balances they already had.
+    #
+    # Sixty minutes because `services.prices.STALE_AFTER` is one hour: a price that has
+    # missed exactly one refresh is the first one worth flagging, and an interval longer than
+    # the staleness threshold would mark every price stale in the minutes before each run.
+    # The two numbers are a pair, and changing one without the other is the mistake this
+    # comment exists to prevent.
+    price_refresh_enabled: bool = True
+    price_refresh_interval_minutes: int = 60
+
     @property
     def session_cookie_name(self) -> str:
         """`__Host-psid`, degrading to `psid` on the one configuration that cannot use it."""
@@ -271,8 +308,13 @@ class Settings(BaseSettings):
           past the `except httpx.TransportError` that is supposed to be where `httpx` stops
           -- or, for the scheme typo, as "the chain is unavailable" on every sync forever
           while nothing mentions the typo. `provider_url_violation` says which.
+        * a balance sync or price refresh interval of zero or less is a loop with no sleep
+          in it, pointed at public APIs that document a ban as the consequence of asking too
+          often. The per-host rate limiter would pace the requests, so the symptom is not a
+          burst -- it is a process that never stops making them, quietly, for as long as it
+          is up.
 
-        Refusing to start turns all five into a container that fails its health check,
+        Refusing to start turns all seven into a container that fails its health check,
         which is a failure the deployment pipeline already knows how to roll back.
 
         **Unconditional, not gated on `prod`.** A URL that cannot be requested is wrong in
@@ -344,6 +386,25 @@ class Settings(BaseSettings):
                 f"minimum of {OWASP_MINIMUM_TIME_COST}."
             )
             raise ValueError(message)
+        for variable, minutes, switch in (
+            (
+                "PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES",
+                self.balance_sync_interval_minutes,
+                "PORTFOLIO_BALANCE_SYNC_ENABLED",
+            ),
+            (
+                "PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES",
+                self.price_refresh_interval_minutes,
+                "PORTFOLIO_PRICE_REFRESH_ENABLED",
+            ),
+        ):
+            if minutes < 1:
+                message = (
+                    f"{variable} must be at least 1, got {minutes}. Zero or less is a loop "
+                    "with no sleep in it against a public API that documents a ban as the "
+                    f"consequence. To stop that timer, set {switch}=false."
+                )
+                raise ValueError(message)
         for name, url in (
             ("PORTFOLIO_BITCOIN_ESPLORA_URL", self.bitcoin_esplora_url),
             ("PORTFOLIO_BITCOIN_ESPLORA_FALLBACK_URL", self.bitcoin_esplora_fallback_url),

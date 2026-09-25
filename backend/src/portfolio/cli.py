@@ -213,8 +213,8 @@ async def run_price_refresh(settings: Settings) -> RefreshReport:
     **The `httpx.AsyncClient` is built here and closed here**, which is the whole reason
     this is one function rather than three. The client owns the connection pool and carries
     the per-host rate limiter's state on its transport, so it has exactly one lifetime and
-    it is this command's; `docs/providers.md` records that #10 owns the equivalent in the
-    application's lifespan. Leaving it open would leak a pool into an operator's shell.
+    it is this command's; the server's equivalent is owned by `portfolio.main.lifespan`.
+    Leaving it open would leak a pool into an operator's shell.
 
     The engine is disposed in a `finally` for the same reason `store_user` does it: a
     command that exits without releasing its SQLite handle leaves a file lock behind on the
@@ -222,8 +222,9 @@ async def run_price_refresh(settings: Settings) -> RefreshReport:
 
     `price_sources` is called **here, in the entry point**, and the built sources are handed
     to the service. That is what keeps `services/price_refresh.py` dependent on the
-    `PriceSource` protocol rather than on which vendors exist, and it is the same shape the
-    scheduler in #10 will use.
+    `PriceSource` protocol rather than on which vendors exist, and it is the same shape
+    #10's balance sync uses: the lifespan hands `BalanceSyncService` a `provider_for`
+    callable rather than a client, for exactly the same reason.
     """
     engine = create_database_engine(settings.database_url)
     client = build_http_client()
@@ -243,10 +244,12 @@ async def run_price_refresh(settings: Settings) -> RefreshReport:
 def refresh_prices(args: argparse.Namespace) -> int:
     """`refresh-prices`: fetch every supported pair once, store it, and say what happened.
 
-    **This exists so the call budget can be measured before #10 automates it.** Run it by
-    hand, count the requests in the log -- one `asset_prices` line per healthy refresh --
-    and the number in `docs/providers.md` stops being arithmetic and becomes an
-    observation.
+    **No longer the only thing that fills the price cache**, and it is still worth having.
+    It was written so the call budget could be measured before anything automated it -- run
+    it by hand, count the `asset_prices` lines in the log, and the number in
+    `docs/providers.md` stops being arithmetic and becomes an observation. #10 added the
+    scheduler; this stays as the way to force a refresh now rather than waiting out an hour,
+    and as the one that prints the prices instead of logging a count.
 
     **An incomplete refresh is exit code 1 and still prints everything it did.** A command
     that succeeded at three pairs out of four has not succeeded: a scheduler reading only
@@ -329,7 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     refresh = commands.add_parser(
         "refresh-prices",
-        help="fetch every supported pair once and store it (no scheduler; #10 owns that)",
+        help="fetch every supported pair once and store it now, without waiting for the timer",
     )
     refresh.set_defaults(handler=refresh_prices)
 

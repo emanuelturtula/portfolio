@@ -28,7 +28,12 @@ if TYPE_CHECKING:
 
     from sqlalchemy import Engine
 
-APPLICATION_TABLES = frozenset({"users", "sessions", "assets", "wallets", "prices"})
+#: Imported rather than written out a second time. This module had its own copy until #10,
+#: and a second list of the application's tables is a list that falls behind the schema on
+#: whichever side nobody happened to be editing -- which is the failure the exact comparison
+#: in `test_migrations.py` exists to prevent, reintroduced one file over.
+from tests.db.test_migrations import APPLICATION_TABLES
+
 """Every table the application owns, compared **exactly** rather than with `>=`.
 
 Under `>=` a table nobody added here satisfied every assertion below, so the list could

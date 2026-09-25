@@ -84,6 +84,83 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/balances/current": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The latest reading of every active wallet, valued
+         * @description Return every active wallet's latest balance and what it is worth.
+         *
+         *     **Reads the snapshot table; asks no chain anything.** A wallet the sync has never
+         *     covered comes back with nulls rather than zeros, and a holding with no price is named in
+         *     `unpriced` rather than valued at nothing.
+         */
+        get: operations["readCurrentBalances"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/balances/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The most recent balance sync runs, newest first
+         * @description Return the run log: what ran, when, how long it took and what each chain did.
+         *
+         *     This is what makes "every run writes a row" checkable without opening the database, and
+         *     it is where an `interrupted` run -- one whose process died mid-sync -- becomes visible.
+         */
+        get: operations["listSyncRuns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/balances/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read every wallet's balance now and return the run summary
+         * @description Run a sync, or attach to the one already in flight, and return what it did.
+         *
+         *     **A second caller joins rather than being refused.** Clicking refresh twice, or clicking
+         *     it while the scheduler's tick is running, returns the in-flight run's summary with
+         *     `joined: true` -- not a 409 that makes the client poll for a result it could have been
+         *     handed, and not a second round of requests at a public index.
+         *
+         *     The response is `200` whatever the run's own status was. A run in which Kaspa failed and
+         *     Bitcoin succeeded is a `partial` run that this endpoint successfully performed and
+         *     successfully reported; turning a vendor's outage into a 5xx would lose the Bitcoin
+         *     balances in the body along with it.
+         */
+        post: operations["syncBalances"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/health": {
         parameters: {
             query?: never;
@@ -165,6 +242,48 @@ export interface paths {
         patch: operations["updateWallet"];
         trace?: never;
     };
+    "/api/wallets/{wallet_id}/balances": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One wallet's balance history, oldest first
+         * @description Return one wallet's readings, oldest first, for charting.
+         *
+         *     **The latest window by default, a forward walk from `since`, continued by `cursor`.**
+         *     All three come back oldest-first, and the asymmetry is the kind a reader assumes is a
+         *     bug, so it is stated here as well as at the repository:
+         *
+         *     | Query | Readings | `next_cursor` |
+         *     |---|---|---|
+         *     | neither | the latest `limit` | always `null` |
+         *     | `since` | the first `limit` at or after it | set when more follow |
+         *     | `cursor` | the first `limit` strictly after it | set when more follow |
+         *
+         *     A chart wants the recent end; a client charting a year starts at `since` and follows
+         *     `next_cursor` until it is `null`. With `limit` capped at 1000 and a reading every fifteen
+         *     minutes, one page holds about ten days, so that walk is the ordinary case rather than an
+         *     edge. `since` alone cannot continue it: it is inclusive and has no tie-break, so paging
+         *     with the last instant seen repeats rows and, at `limit=1`, never advances at all.
+         *
+         *     `cursor` together with `since`, or a cursor this endpoint did not issue, is a 422.
+         *
+         *     An archived wallet still answers: its history is the reason archiving is a timestamp
+         *     rather than a delete. A wallet that is not the caller's is a `404`, the same answer a
+         *     wallet that does not exist gets, because any other status would confirm the id.
+         */
+        get: operations["readWalletBalanceHistory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -179,6 +298,53 @@ export interface components {
          * @enum {string}
          */
         ChainKey: "bitcoin" | "kaspa";
+        /**
+         * ChainOutcomeResponse
+         * @description What one chain did during one run.
+         *
+         *     `detail` is the provider's own message, which those providers are written never to quote
+         *     a body, a URL or an address into. For a failure that was **not** a provider's -- an
+         *     exception from our own code -- it is the exception's type name and nothing else, because
+         *     an arbitrary exception has made no such promise.
+         */
+        ChainOutcomeResponse: {
+            /** Chain Key */
+            chain_key: string;
+            /** Detail */
+            detail: string | null;
+            error_kind: components["schemas"]["SyncErrorKind"] | null;
+            status: components["schemas"]["SyncRunStatus"];
+            /** Wallets Read */
+            wallets_read: number;
+        };
+        /**
+         * CurrentBalancesResponse
+         * @description What the portfolio holds now and what it is worth.
+         *
+         *     **`total` is the sum of what could be valued and is not the answer on its own.** Read
+         *     without `complete` it silently omits a holding, which is indistinguishable from a number
+         *     that includes it. Every renderer has to look at `complete`, and two lists say what is
+         *     missing: `unpriced` has quantities nothing could value, `unread` has wallets whose
+         *     quantity nobody knows yet. `complete` is true only when both are empty.
+         */
+        CurrentBalancesResponse: {
+            /** As Of */
+            as_of: string | null;
+            /** Complete */
+            complete: boolean;
+            quote_currency: components["schemas"]["QuoteCurrency"];
+            /**
+             * Total
+             * @example 1234.56789012
+             */
+            total: string;
+            /** Unpriced */
+            unpriced: components["schemas"]["UnpricedHoldingResponse"][];
+            /** Unread */
+            unread: components["schemas"]["UnreadWalletResponse"][];
+            /** Wallets */
+            wallets: components["schemas"]["WalletBalanceResponse"][];
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -223,12 +389,267 @@ export interface components {
             new_password: string;
         };
         /**
+         * PriceResponse
+         * @description The price one asset was valued at, and how old it is.
+         *
+         *     `stale` is computed at read time against an injected clock and is never stored; `as_of`
+         *     is our own clock at the instant the refresh that wrote the row began, not a vendor quote
+         *     time -- no vendor supplies one. `db.models.AssetPrice` carries the full account.
+         */
+        PriceResponse: {
+            /**
+             * Amount
+             * @example 1234.56789012
+             */
+            amount: string;
+            /**
+             * As Of
+             * Format: date-time
+             */
+            as_of: string;
+            /** Source */
+            source: string;
+            /** Stale */
+            stale: boolean;
+        };
+        /**
+         * PriceUnavailable
+         * @description Why there is no price, as a value a caller can branch on and render.
+         *
+         *     A `StrEnum` so that the member is its own wire form and its own log field with nothing
+         *     to convert, and so that a reason reaching a template renders as the string rather than
+         *     as `PriceUnavailable.NEVER_FETCHED`.
+         *
+         *     Four members, and they are not interchangeable -- each points at a different thing to
+         *     go and look at:
+         *
+         *     * `NEVER_FETCHED`: the pair is one we price and no refresh has stored it yet. Look at
+         *       whether the refresh has run.
+         *     * `EVERY_SOURCE_FAILED`: every eligible source was asked and none answered. Look at the
+         *       vendors, or at the network.
+         *     * `UNSUPPORTED_PAIR`: this product does not price that pair at all. Nothing was asked,
+         *       because nothing could have answered. Look at the request, not at the system.
+         *     * `NO_SOURCE_CONFIGURED`: the pair is supported but no source was available to ask.
+         *       Look at the configuration.
+         *
+         *     Collapsing them into one "unavailable" would be the same mistake `providers/errors.py`
+         *     exists to prevent one layer down: a caller that cannot tell a broken vendor from a
+         *     question nobody could answer has nothing to act on.
+         * @enum {string}
+         */
+        PriceUnavailable: "never_fetched" | "every_source_failed" | "unsupported_pair" | "no_source_configured";
+        /**
+         * QuoteCurrency
+         * @description A currency holdings may be valued in. The member is its own wire form.
+         *
+         *     **Case-sensitive, and deliberately.** ISO 4217 codes are upper case, `prices` stores them
+         *     upper case, and an enumeration in the OpenAPI document means the generated client can
+         *     only send one of these two strings. Accepting `eur` as well would be a second spelling
+         *     the database never holds, normalised in a router that is supposed to only parse.
+         *
+         *     **Neither is ever derived from the other.** Valuing a EUR portfolio from a USD price and
+         *     a cross rate would put a second vendor's error into every number with nothing saying so;
+         *     a holding with only a USD price is unpriced in EUR, which is #9's contract.
+         * @enum {string}
+         */
+        QuoteCurrency: "EUR" | "USD";
+        /**
          * SessionResponse
          * @description Who the caller is. Deliberately the only thing a session read discloses.
          */
         SessionResponse: {
             /** Username */
             username: string;
+        };
+        /**
+         * SnapshotResponse
+         * @description One historical reading of one wallet.
+         */
+        SnapshotResponse: {
+            /**
+             * Confirmed
+             * @example 123456789
+             */
+            confirmed: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Pending */
+            pending: string | null;
+            /**
+             * Quantity
+             * @example 1234.56789012
+             */
+            quantity: string;
+            /** Sync Run Id */
+            sync_run_id: number;
+        };
+        /**
+         * SyncErrorKind
+         * @description Whose fault a chain's failure was, as a value an operator can act on.
+         *
+         *     Six members and **three different parties are to blame**, which is the whole reason this
+         *     is an enumeration rather than a string.
+         *
+         *     The first four are `providers/errors.py`'s vocabulary carried through unchanged and all
+         *     mean *the vendor*: unreachable, throttling us, answering with something unusable, or --
+         *     for `UNKNOWN_CHAIN` -- not being wired up at all.
+         *
+         *     `ADDRESS_REJECTED` means *the owner*. A provider validates an address before it builds a
+         *     URL, and registration does not check the network, so a mainnet address configured against
+         *     a testnet index is refused on every tick forever. Filing that under `INTERNAL` reported a
+         *     configuration mistake as a defect in this application, with a traceback each time; filing
+         *     it under a vendor kind would have told the owner their chain was down. It is neither.
+         *
+         *     `INTERNAL` means *us*. An exception from our own code recorded as "unavailable" tells the
+         *     owner their chain is down, on every sync, for as long as the defect survives -- and
+         *     nothing anywhere mentions the traceback. Keeping it separate is what makes a parser bug
+         *     look like a parser bug.
+         * @enum {string}
+         */
+        SyncErrorKind: "unavailable" | "rate_limited" | "response" | "unknown_chain" | "address_rejected" | "internal";
+        /**
+         * SyncRunListResponse
+         * @description The run log, wrapped in an object rather than returned as a bare array.
+         *
+         *     A top-level array has nowhere to grow: adding a count or a cursor later would break every
+         *     client, and an object costs one key now. The same shape `WalletListResponse` uses.
+         */
+        SyncRunListResponse: {
+            /** Runs */
+            runs: components["schemas"]["SyncRunResponse"][];
+        };
+        /**
+         * SyncRunResponse
+         * @description One run: when, how long, how many wallets, and what each chain did.
+         *
+         *     `finished_at` and `duration_ms` are both `null` for a run still in flight and for one
+         *     that was interrupted; `status` says which. `duration_ms` comes from a monotonic clock
+         *     rather than from `finished_at - started_at`, so a host that synced its clock mid-run
+         *     cannot report a negative one.
+         */
+        SyncRunResponse: {
+            /** Chains */
+            chains: components["schemas"]["ChainOutcomeResponse"][];
+            /** Duration Ms */
+            duration_ms: number | null;
+            /** Finished At */
+            finished_at: string | null;
+            /** Run Id */
+            run_id: number;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            status: components["schemas"]["SyncRunStatus"];
+            trigger: components["schemas"]["SyncTrigger"];
+            /** Wallets Failed */
+            wallets_failed: number;
+            /** Wallets Succeeded */
+            wallets_succeeded: number;
+            /** Wallets Total */
+            wallets_total: number;
+        };
+        /**
+         * SyncRunStatus
+         * @description How a run ended, or that it has not.
+         *
+         *     `RUNNING` is written before the first provider call and `INTERRUPTED` is what the
+         *     lifespan's sweep leaves behind for a run whose process is gone. Neither is in the
+         *     issue's wording, and without them a crashed run and a live run are the same row.
+         *
+         *     `SUCCESS`, `PARTIAL` and `FAILED` also serve as a chain's own outcome within a run,
+         *     where only the first and the last are legal -- a chain either produced balances or it
+         *     raised, and there is no middle case until #54 isolates a single address's refusal.
+         *     `sync_run_chains`'s `CHECK` is what enforces that, rather than a second enum whose two
+         *     members would have to be kept spelled identically to two of these.
+         * @enum {string}
+         */
+        SyncRunStatus: "running" | "success" | "partial" | "failed" | "interrupted";
+        /**
+         * SyncTrigger
+         * @description What started a run. A `StrEnum` so the member is its own column value and wire form.
+         *
+         *     Three, and `STARTUP` is separate from `SCHEDULED` on purpose: the run that happens when
+         *     the process comes up is the one an operator is looking at when they ask "did the deploy
+         *     work", and folding it into the interval's own ticks would make it invisible.
+         * @enum {string}
+         */
+        SyncTrigger: "scheduled" | "manual" | "startup";
+        /**
+         * SyncTriggeredResponse
+         * @description A run summary plus whether this request started it or attached to one in flight.
+         *
+         *     **`joined` is on this model and not on `SyncRunResponse`**, which is what
+         *     `GET /api/balances/runs` returns. It is a fact about *this call* rather than about the
+         *     run -- the same run is `joined: false` for the caller that started it and `joined: true`
+         *     for everyone who arrived afterwards -- so a historical run has no honest value for it,
+         *     and publishing a hardcoded `false` there would be an answer to a question nobody asked.
+         *
+         *     When `joined` is true, `trigger` is the *running* run's trigger and not this caller's: a
+         *     scheduled run that a manual click attached to is still a scheduled run.
+         */
+        SyncTriggeredResponse: {
+            /** Chains */
+            chains: components["schemas"]["ChainOutcomeResponse"][];
+            /** Duration Ms */
+            duration_ms: number | null;
+            /** Finished At */
+            finished_at: string | null;
+            /** Joined */
+            joined: boolean;
+            /** Run Id */
+            run_id: number;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            status: components["schemas"]["SyncRunStatus"];
+            trigger: components["schemas"]["SyncTrigger"];
+            /** Wallets Failed */
+            wallets_failed: number;
+            /** Wallets Succeeded */
+            wallets_succeeded: number;
+            /** Wallets Total */
+            wallets_total: number;
+        };
+        /**
+         * UnpricedHoldingResponse
+         * @description One asset the portfolio holds and could not value, with the reason.
+         *
+         *     The reason is `PriceUnavailable`, so a client can branch on `never_fetched` against
+         *     `every_source_failed` without parsing prose -- the first means the refresh has not run,
+         *     the second means a vendor is down, and they send an operator to look at different things.
+         */
+        UnpricedHoldingResponse: {
+            /** Asset Symbol */
+            asset_symbol: string;
+            /**
+             * Quantity
+             * @example 1234.56789012
+             */
+            quantity: string;
+            reason: components["schemas"]["PriceUnavailable"];
+        };
+        /**
+         * UnreadWalletResponse
+         * @description An active wallet no successful run has ever read, so it is missing from `total`.
+         *
+         *     The address is deliberately not here: a client matches `wallet_id` against the wallet
+         *     list it already has, and every field this endpoint adds is one more place an address
+         *     could reach a log.
+         */
+        UnreadWalletResponse: {
+            /** Asset Symbol */
+            asset_symbol: string;
+            /** Chain Key */
+            chain_key: string;
+            /** Wallet Id */
+            wallet_id: number;
         };
         /** ValidationError */
         ValidationError: {
@@ -244,6 +665,37 @@ export interface components {
             type: string;
         };
         /**
+         * WalletBalanceResponse
+         * @description One wallet's latest reading, valued if its asset could be priced.
+         *
+         *     The address is deliberately **not** here. It is the owner's holdings, the client already
+         *     has it from `GET /api/wallets`, and every field this endpoint adds is one more place it
+         *     could reach a log.
+         */
+        WalletBalanceResponse: {
+            /** Asset Symbol */
+            asset_symbol: string;
+            /** Chain Key */
+            chain_key: string;
+            /** Confirmed */
+            confirmed: string | null;
+            /** Decimals */
+            decimals: number | null;
+            /** Label */
+            label: string | null;
+            /** Observed At */
+            observed_at: string | null;
+            /** Pending */
+            pending: string | null;
+            price: components["schemas"]["PriceResponse"] | null;
+            /** Quantity */
+            quantity: string | null;
+            /** Value */
+            value: string | null;
+            /** Wallet Id */
+            wallet_id: number;
+        };
+        /**
          * WalletCreateRequest
          * @description A new wallet: which chain, which address, and optionally what to call it.
          */
@@ -253,6 +705,28 @@ export interface components {
             chain_key: components["schemas"]["ChainKey"];
             /** Label */
             label?: string | null;
+        };
+        /**
+         * WalletHistoryResponse
+         * @description One wallet's readings, oldest first, and where the next page starts if there is one.
+         *
+         *     `decimals` is `null` for a wallet that has never been read: the exponent is a property
+         *     of the readings, and there are none.
+         *
+         *     `next_cursor` is non-null exactly when more readings exist forward at the moment of the
+         *     request; pass it back as `cursor` to get them. It is always `null` for the default,
+         *     latest window -- nothing exists forward of the newest reading -- and on the last page of
+         *     a walk forward, which is how a client knows to stop.
+         */
+        WalletHistoryResponse: {
+            /** Decimals */
+            decimals: number | null;
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Snapshots */
+            snapshots: components["schemas"]["SnapshotResponse"][];
+            /** Wallet Id */
+            wallet_id: number;
         };
         /**
          * WalletListResponse
@@ -417,6 +891,90 @@ export interface operations {
             };
         };
     };
+    readCurrentBalances: {
+        parameters: {
+            query?: {
+                /** @description The fiat currency to value holdings in. Case-sensitive; anything but the supported codes is refused rather than valued at nothing. */
+                quote_currency?: components["schemas"]["QuoteCurrency"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurrentBalancesResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    listSyncRuns: {
+        parameters: {
+            query?: {
+                /** @description How many runs to return, newest first. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncRunListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    syncBalances: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncTriggeredResponse"];
+                };
+            };
+        };
+    };
     getHealth: {
         parameters: {
             query?: never;
@@ -553,6 +1111,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WalletResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    readWalletBalanceHistory: {
+        parameters: {
+            query?: {
+                /** @description Start a walk forward: the first `limit` readings at or after this instant. Must carry a timezone offset; a naive timestamp is refused rather than assumed to be UTC. May not be combined with `cursor`. */
+                since?: string | null;
+                /** @description Continue a walk forward: pass the previous page's `next_cursor` to get the readings strictly after it. Opaque. May not be combined with `since`. */
+                cursor?: string | null;
+                /** @description How many readings to return: the latest that many by default, or that many counting forward from `since` or `cursor`. */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                wallet_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WalletHistoryResponse"];
                 };
             };
             /** @description Validation Error */

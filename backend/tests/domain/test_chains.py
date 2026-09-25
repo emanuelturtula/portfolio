@@ -15,7 +15,13 @@ from typing import Final
 import pytest
 
 from portfolio.domain.addresses import AddressInvalidError, AddressRejection
-from portfolio.domain.chains import CHAIN_VALIDATORS, ChainKey, validate_address
+from portfolio.domain.chains import (
+    CHAIN_ASSET_SYMBOLS,
+    CHAIN_VALIDATORS,
+    ChainKey,
+    validate_address,
+)
+from portfolio.providers.prices.base import BTC, KAS, SUPPORTED_PAIRS
 from tests.address_vectors import BIP173_TESTNET_P2WPKH, CORE_SIGNET_P2PKH
 
 #: Pinned against a literal. Adding a chain is a deliberate act that also has to touch the
@@ -164,7 +170,7 @@ def test_the_validator_accepts_the_enum_and_the_bare_string_alike() -> None:
     assert from_enum == from_string
 
 
-@pytest.mark.parametrize("module", ["addresses.py", "chains.py"])
+@pytest.mark.parametrize("module", ["addresses.py", "chains.py", "currencies.py"])
 def test_the_address_modules_import_nothing_that_could_block_or_drift(module: str) -> None:
     """The property that puts these modules in `domain` instead of in `providers`.
 
@@ -206,3 +212,70 @@ def test_the_purity_scan_can_actually_fail(tmp_path: Path) -> None:
     # Both assertions in the test above have to reject this file, not just one of them.
     assert {name.split(".")[0] for name in found} & IMPURE_IMPORTS == {"socket"}
     assert not found <= PURE_IMPORTS_ALLOWED
+
+
+# --------------------------------------------------------------------------------------
+# #10: the asset symbol, and the duplication a test is what holds together
+# --------------------------------------------------------------------------------------
+
+
+def test_every_chain_has_a_symbol_and_the_mapping_is_total() -> None:
+    """A chain with no symbol is a `KeyError` on the valuation path, not a missing feature.
+
+    Compared as a set against `ChainKey` rather than iterated, for the reason
+    `test_the_registry_has_a_validator_for_every_chain_key` gives: a chain added without a
+    symbol must fail the build rather than the first read of that wallet's balance.
+    """
+    assert set(CHAIN_ASSET_SYMBOLS) == set(ChainKey)
+    assert {key: key.asset_symbol for key in ChainKey} == {
+        ChainKey.BITCOIN: "BTC",
+        ChainKey.KASPA: "KAS",
+    }
+
+
+def test_every_chain_symbol_matches_the_price_packages_constant() -> None:
+    """Two declarations of one fact, held together here because the layering forbids an import.
+
+    `BTC` and `KAS` are declared in `providers/prices/base.py` as the symbols a source builds
+    a vendor pair code out of, and again on `ChainKey` as the asset a chain's balance is
+    denominated in. The obvious de-duplication -- `domain` importing the price package -- is
+    the one direction `domain` may never take, and the other -- the read path importing it --
+    is what `prices-are-never-fetched-in-a-request` exists to forbid.
+
+    So the copy stays and this test is what stops the two drifting, exactly as
+    `test_the_kind_check_constraint_matches_the_model` holds `_ASSET_KIND_CHECK` and its
+    migration together. The failure it prevents is quiet: a symbol renamed on one side and
+    not the other values every holding of that asset at nothing, with `unpriced` naming a
+    ticker the price table has never heard of.
+    """
+    assert ChainKey.BITCOIN.asset_symbol == BTC
+    assert ChainKey.KASPA.asset_symbol == KAS
+
+    # And every symbol a chain declares is one this product actually prices, which is the
+    # half that would fail if a third chain were added without a price pair for it.
+    priced = {symbol for symbol, _currency in SUPPORTED_PAIRS}
+    assert {key.asset_symbol for key in ChainKey} <= priced
+
+
+def test_the_symbols_are_the_ones_the_seed_migration_writes() -> None:
+    """The third copy of the same fact, and it is the one with rows behind it.
+
+    `assets.symbol` is what `PriceRepository` joins on, so a chain whose `asset_symbol` is
+    not a seeded symbol produces `NEVER_FETCHED` for a pair that is being refreshed hourly.
+    Asserted against the migration's own literal list rather than against the database, so
+    this stays a pure test.
+    """
+    seeded = {"BTC", "KAS", "USDT"}
+
+    assert {key.asset_symbol for key in ChainKey} <= seeded
+
+
+def test_the_symbol_is_a_property_rather_than_a_stored_field() -> None:
+    """Derived, never assigned, for the reason `ChainCapabilities.can_batch` is derived.
+
+    A settable attribute on a `StrEnum` member is a second source of truth that one caller
+    can change for everybody in the process, and the change would be invisible in a diff of
+    the domain.
+    """
+    with pytest.raises(AttributeError):
+        ChainKey.BITCOIN.asset_symbol = "XBT"  # type: ignore[misc]
