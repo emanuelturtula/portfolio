@@ -247,6 +247,32 @@ def test_bitget_credentials_carry_the_three_values_or_are_none() -> None:
     assert bitget_credentials(settings_with({})) is None
 
 
+@pytest.mark.parametrize(
+    "present", PARTIAL_SETS, ids=lambda present: "+".join(sorted(present)) or "none"
+)
+def test_bitget_credentials_refuse_a_partial_set_that_skipped_validation(
+    present: frozenset[str],
+) -> None:
+    """`Settings.model_construct` skips the validator; the credentials still refuse to build.
+
+    The one route to a partial set past startup, and the refusal names all three variables
+    and none of the values.
+    """
+    fields = {
+        field: SecretStr(value) for variable, field, value in VARIABLES if variable in present
+    }
+    unvalidated = Settings.model_construct(**fields)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="all or none") as caught:
+        bitget_credentials(unvalidated)
+
+    message = str(caught.value)
+    for variable in ALL_VARIABLES:
+        assert variable in message
+    for _variable, _field, value in VARIABLES:
+        assert value not in message
+
+
 async def test_an_unconfigured_venue_is_absent_not_built() -> None:
     """No credentials: an empty table, and nothing asked of the network building it."""
     fake = FakeBitget()

@@ -54,6 +54,7 @@ from portfolio.providers.exchanges.bitget import (
     build_fills_query,
     build_prehash,
     fill_symbols,
+    parse_fill,
     parse_fills_page,
     require_trade_id,
     unwrap_envelope,
@@ -1265,6 +1266,7 @@ def _entry_without(field: str) -> str:
         ),
         pytest.param('{"code":"00000","msg":"success","data":null}', id="data null"),
         pytest.param("not json", id="not JSON"),
+        pytest.param('{"code":"00000","msg":"success","data":[1]}', id="an entry not an object"),
     ],
 )
 async def test_a_symbol_answer_about_another_symbol_is_refused(body: str) -> None:
@@ -1445,6 +1447,55 @@ async def test_a_caller_mistake_costs_no_request() -> None:
             FillWindow(since=since, until=since + timedelta(days=30)), cursor=None, symbol=None
         )
     assert len(fake.fill_requests) == 1
+
+
+async def test_a_window_ending_at_the_epoch_is_a_caller_mistake_that_costs_no_request() -> None:
+    """`endTime=0` asks for nothing, and a negative one is not a time: refused, not sent.
+
+    The companion is `test_a_window_at_the_epoch_sends_zero`: a window *starting* there is
+    fine, because only its start is clamped.
+    """
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    window = FillWindow(since=epoch - timedelta(milliseconds=2), until=epoch)
+    fake = FakeBitget()
+
+    with pytest.raises(ValueError, match="epoch"):
+        build_fills_query(window, cursor=None)
+    with pytest.raises(ValueError, match="epoch"):
+        await fetch_page(fake, window)
+
+    assert fake.requests == []
+
+
+# -- the public pure functions refuse their own callers' mistakes -----------------------
+#
+# The provider never reaches these: `fill_symbols` refuses a non-object fill before
+# `parse_fill` sees one, and it resolves every symbol before `parse_fills_page` runs. They
+# are public so that they can be tested without HTTP, which makes them callable without the
+# provider too, and a direct caller's mistake is still refused rather than half-parsed.
+
+
+def test_parse_fill_refuses_a_fill_that_is_not_an_object() -> None:
+    with pytest.raises(ExchangeSchemaError, match="JSON object"):
+        parse_fill(1, assets=SymbolAssets(base_asset="BTC", quote_asset="USDT"))
+
+
+def test_parse_fills_page_refuses_a_symbol_nobody_resolved() -> None:
+    """A `ValueError`, the caller's mistake: the venue did nothing wrong."""
+    data = unwrap_envelope(200, fills_body(spread_fills(1)))
+
+    with pytest.raises(ValueError, match="resolve") as caught:
+        parse_fills_page(data, window=WINDOW, cursor=None, symbols={})
+
+    assert not isinstance(caught.value, ExchangeError)
+    # The companion: the same page with its symbol resolved parses.
+    page = parse_fills_page(
+        data,
+        window=WINDOW,
+        cursor=None,
+        symbols={"BTCUSDT": SymbolAssets(base_asset="BTC", quote_asset="USDT")},
+    )
+    assert len(page.fills) == 1
 
 
 # --------------------------------------------------------------------------------------
