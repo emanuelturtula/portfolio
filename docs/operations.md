@@ -144,14 +144,24 @@ Every browser gets a login page immediately afterwards. That is deliberate — a
 change is what you do when you think someone else may have a session.
 
 If the password is lost entirely there is no reset flow, by design: no email, no recovery
-question, nothing to attack. Recover by deleting the row and creating the account again:
+question, nothing to attack. Recover by setting a new password on the existing account from
+the host:
 
 ```bash
 docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio create-user --replace
 ```
 
-Deleting the user cascades to that user's sessions. Nothing else in the schema references
-the user, so no portfolio data is lost.
+The command asks for confirmation, then for the new password twice. It updates the account
+in place: the password, and the username — the one you pass with `--username`, otherwise
+`PORTFOLIO_BOOTSTRAP_USERNAME` (default `owner`), so pass `--username` if you signed in under a
+different name. The account keeps its identity, so **wallets, balance history, exchange
+accounts and imported fills are all kept**. Every session is signed out in the same
+transaction, exactly as a password change through the application does, so a cookie stolen
+before the recovery stops working the moment it completes.
+
+With no account yet, the command creates one. With more than one account — which the
+application cannot produce, only hand-written SQL can — it refuses and changes nothing,
+rather than guessing which one you mean.
 
 ## 5. Sessions
 
