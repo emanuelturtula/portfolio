@@ -28,6 +28,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
 
 from portfolio import cli
+from portfolio.config import get_settings
 from portfolio.services.password_hasher import PasswordHasher
 from tests.address_vectors import BIP173_TESTNET_P2WPKH
 from tests.balance_harness import sqlite_timestamp
@@ -75,6 +76,12 @@ EXECUTED_AT: Final = datetime(2026, 9, 3, 15, 30, 0, 123000, tzinfo=UTC)
 FIRST_OF_TWO: Final = "alpha-keeper"
 SECOND_OF_TWO: Final = "bravo-keeper"
 A_THIRD_NAME: Final = "charlie-keeper"
+
+#: An owner who is not called `PORTFOLIO_BOOTSTRAP_USERNAME`: the reviewer's reproduction.
+OPERATORS_OWN_NAME: Final = "alice"
+
+#: A bootstrap username that appears nowhere else in the suite.
+DISTINCT_BOOTSTRAP_NAME: Final = "bootstrap-keeper"
 
 
 def script_prompts(monkeypatch: pytest.MonkeyPatch, answers: list[str]) -> list[str]:
@@ -412,18 +419,58 @@ def test_create_user_replace_can_rename_the_owner(
     assert FAST_HASHER.verify(str(users[0]["password_hash"]), REPLACEMENT_PHRASE)
 
 
+def test_create_user_replace_without_a_username_keeps_the_owners_name(
+    cli_database: Path,
+    sync_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Spec 013, change A: no `--username` means the account keeps the name it has.
+
+    The owner here is not called `PORTFOLIO_BOOTSTRAP_USERNAME`, and that difference is the
+    whole test. The command used to resolve a missing `--username` to the default before it
+    knew an account existed, so copying the recovery line from `docs/operations.md` renamed
+    `alice` to `owner`, during a recovery. A recovery is when the operator is least likely
+    to notice.
+    """
+    del cli_database
+    owner_id = create_the_owner(monkeypatch, sync_engine, username=OPERATORS_OWN_NAME)
+    assert get_settings().bootstrap_username != OPERATORS_OWN_NAME
+    capsys.readouterr()
+
+    assert run_replace(monkeypatch) == 0
+
+    # The success line names the account that was changed, not the default it fell back to.
+    last_line = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last_line == f"Account '{OPERATORS_OWN_NAME}' is ready."
+    users = database_contents(sync_engine)["users"]
+    assert [(user["id"], user["username"], user["created_at"]) for user in users] == [
+        (owner_id, OPERATORS_OWN_NAME, sqlite_timestamp(PINNED_CREATED_AT))
+    ]
+    # Kept the name, and still changed the password: not a command that did nothing.
+    assert FAST_HASHER.verify(str(users[0]["password_hash"]), REPLACEMENT_PHRASE)
+    assert not FAST_HASHER.verify(str(users[0]["password_hash"]), OWNER_PHRASE)
+
+
 def test_create_user_replace_on_an_empty_database_creates_the_account(
     cli_database: Path,
     sync_engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no account yet, `--replace` creates one: a fresh volume is an ordinary target."""
+    """With no account yet, `--replace` creates one: a fresh volume is an ordinary target.
+
+    With no `--username`, the new account is named by `PORTFOLIO_BOOTSTRAP_USERNAME`. The
+    setting is changed to a value used nowhere else, so a name hard-coded anywhere on the
+    path cannot pass for the setting.
+    """
     del cli_database
+    monkeypatch.setenv("PORTFOLIO_BOOTSTRAP_USERNAME", DISTINCT_BOOTSTRAP_NAME)
+    get_settings.cache_clear()
 
     assert run_replace(monkeypatch) == 0
 
     users = read_users(sync_engine)
-    assert [user.username for user in users] == [OWNER_USERNAME]
+    assert [user.username for user in users] == [DISTINCT_BOOTSTRAP_NAME]
     assert FAST_HASHER.verify(users[0].password_hash, REPLACEMENT_PHRASE)
 
 
@@ -472,19 +519,38 @@ def test_create_user_replace_refuses_when_more_than_one_account_exists(
         assert name not in captured.err
 
 
+@pytest.mark.parametrize(
+    ("account_exists", "arguments", "name", "rename"),
+    [
+        (True, [], OWNER_USERNAME, False),
+        (True, ["--username", "keeper"], "keeper", True),
+        (False, [], OWNER_USERNAME, False),
+    ],
+    ids=["existing-account-no-username", "existing-account-with-username", "empty-database"],
+)
 def test_create_user_replace_says_what_it_keeps(
     cli_database: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    account_exists: bool,
+    arguments: list[str],
+    name: str,
+    rename: bool,
 ) -> None:
-    """Spec 013, criterion 5: the confirmation describes the command the operator is running.
+    """Spec 013, criterion 5 and change B: the confirmation is true in every case it can meet.
+
+    The command asks before it has read the database, so the same words have to be true
+    whether or not an account exists. They must not claim anything is deleted. They must
+    say sessions are signed out and data is kept. They must name a rename only when
+    `--username` asked for one: without it, the text says the username is kept.
 
     What was on screen is captured at the moment the question is asked, so this reads the
     warning the operator answers and not the success line that follows it.
     """
     del cli_database
-    script_prompts(monkeypatch, [OWNER_PHRASE, OWNER_PHRASE])
-    assert cli.main(["create-user"]) == 0
+    if account_exists:
+        script_prompts(monkeypatch, [OWNER_PHRASE, OWNER_PHRASE])
+        assert cli.main(["create-user"]) == 0
     capsys.readouterr()
 
     shown: list[str] = []
@@ -496,15 +562,23 @@ def test_create_user_replace_says_what_it_keeps(
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", answer)
     script_prompts(monkeypatch, [REPLACEMENT_PHRASE, REPLACEMENT_PHRASE])
-    assert cli.main(["create-user", "--replace"]) == 0
+    assert cli.main(["create-user", "--replace", *arguments]) == 0
 
     assert len(shown) == 1
     warning = shown[0].casefold()
+    assert "delet" not in warning
     assert "session" in warning
     assert re.search(r"\bsign(s|ed)? out\b", warning), warning
     assert "wallets" in warning
-    assert "kept" in warning
-    assert "delet" not in warning
+    # What happens on a database with no account yet, which this may well be.
+    assert f"creates '{name}'" in warning, warning
+    [kept] = [sentence for sentence in re.split(r"(?<=\.)\s+", warning) if "kept" in sentence]
+    if rename:
+        assert f"becomes '{name}'" in warning, warning
+        assert "username" not in kept, warning
+    else:
+        assert "becomes" not in warning, warning
+        assert "username" in kept, warning
 
 
 def test_create_user_replace_still_prompts_for_the_password(
