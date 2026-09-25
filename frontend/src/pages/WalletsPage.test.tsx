@@ -1092,6 +1092,45 @@ describe('WalletsPage: archive and restore', () => {
     expect(fake.writes('PATCH', '/api/wallets/4')).toHaveLength(1);
   });
 
+  it("a row's focus hand-off is used once: a later flip from elsewhere does not replay it", async () => {
+    // Witness for the reset of `focusAfterFlipRef` in `WalletList.tsx`. The
+    // flag armed by archiving Spending must be spent when Spending's Restore
+    // takes focus. Left armed, the next time Spending flips - here, another
+    // session restoring it, picked up by the refetch after Cold storage is
+    // archived - replays the old hand-off and pulls focus onto Spending.
+    const { user, fake } = openWalletsPage({
+      wallets: [
+        wallet({ id: 1, address: ADDRESSES.btcSegwit, label: 'Cold storage' }),
+        wallet({ id: 2, address: ADDRESSES.btcLegacy, label: 'Spending' }),
+      ],
+    });
+    await walletList();
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+
+    // 1. Archive Spending: focus lands on Spending's Restore.
+    await user.click(await screen.findByRole('button', { name: 'Archive Spending' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Spending' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Restore Spending' })).toHaveFocus();
+    });
+
+    // 2. Another session restores Spending, straight to the server.
+    fake.changeElsewhere(2, { archived: false });
+
+    // 3. The owner archives Cold storage; its refetch also brings Spending back.
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    expect(await screen.findByRole('button', { name: 'Archive Spending' })).toBeVisible();
+
+    // 4. Focus follows the action the owner just took, not a spent one.
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Restore Cold storage' })).toHaveFocus();
+    });
+    await settle();
+    expect(screen.getByRole('button', { name: 'Restore Cold storage' })).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Archive Spending' })).not.toHaveFocus();
+  });
+
   it('an archive whose row another refetch already flipped still lands focus on Restore', async () => {
     // Two actions in flight. While this row's archive is held, another session
     // archives the same wallet, and a restore of a different row refetches the
