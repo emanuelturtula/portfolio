@@ -106,10 +106,19 @@ export function DashboardPage() {
     );
   }
 
-  const freshnessKnown = runs.isSuccess;
-  const { settled, inProgress, runningRun } = freshnessKnown
+  const runsKnown = runs.isSuccess;
+  const { settled, inProgress, runningRun } = runsKnown
     ? selectSettledRun(runs.data)
     : { settled: undefined, inProgress: false, runningRun: undefined };
+  // Stricter than `runsKnown`, and it is what goes to the per-row and per-total judgments
+  // below, not the "last sync" line above: while `balances.isRefetchError`, `data` is still
+  // showing the *previous* reading, but `runs` has already moved on to whatever the newest
+  // run is. Judging that stale reading against a newer run's `started_at` makes every row
+  // read "not covered" and the total claim balances the newest sync could not refresh -
+  // both false, since the reading on screen simply has not been re-fetched, not skipped by
+  // anything. The run log itself is still accurate regardless, which is why "last sync
+  // succeeded 5 minutes ago" keeps showing off `runsKnown` alone.
+  const freshnessKnown = runsKnown && !balances.isRefetchError;
   const walletsById = new Map((wallets.data ?? []).map((wallet) => [wallet.id, wallet]));
 
   return (
@@ -148,13 +157,17 @@ export function DashboardPage() {
           <p role="status">Refreshing balances… this can take a minute.</p>
         )}
         {inProgress && runningRun !== undefined && (
-          <p role="status">
+          // Not a live region: `<RelativeTime>` ticks every 30s, and a `role="status"` here
+          // would re-announce "started N minutes ago" on every tick. This is page state to
+          // read on demand, not a transition the owner triggered - unlike the refresh-pending
+          // line above, which is, and keeps its `role="status"`.
+          <p>
             A sync started <RelativeTime value={runningRun.started_at} /> and has not finished.
           </p>
         )}
         <p className="last-updated">
           Balances as of {data.as_of === null ? 'never' : <RelativeTime value={data.as_of} />}.{' '}
-          {freshnessKnown &&
+          {runsKnown &&
             (settled === undefined ? (
               NEVER_SYNCED_MESSAGE
             ) : (

@@ -71,16 +71,39 @@ export function useCreateWallet(): UseMutationResult<Wallet, unknown, CreateWall
   });
 }
 
-export function useArchiveWallet(): UseMutationResult<void, unknown, number> {
+export interface WalletMutationOptions {
+  /**
+   * Runs after the wallet and balance queries have been invalidated and awaited - as the
+   * hook's own `onSuccess`, not a callback passed to a particular `.mutate()` call.
+   *
+   * That distinction is why this exists: a callback passed to `mutate(vars, {onSuccess})`
+   * is dropped by TanStack Query once the observer that issued it is gone - which for a
+   * per-row mutation means "once that row unmounts" - while the hook-level `onSuccess`
+   * configured here keeps running regardless, because it belongs to the mutation itself
+   * rather than to whichever component happened to call `.mutate()`. A row that archives
+   * itself out of the active-only view needs exactly that: the caller still needs to know
+   * once the invalidated data has landed, even after its own row is gone.
+   */
+  readonly onSuccess?: () => void;
+}
+
+export function useArchiveWallet(
+  options: WalletMutationOptions = {},
+): UseMutationResult<void, unknown, number> {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (walletId: number) =>
       apiSend(`${WALLETS_PATH}/${String(walletId)}`, { method: 'DELETE' }),
-    onSuccess: () => invalidateWalletsAndBalances(queryClient),
+    onSuccess: async () => {
+      await invalidateWalletsAndBalances(queryClient);
+      options.onSuccess?.();
+    },
   });
 }
 
-export function useRestoreWallet(): UseMutationResult<Wallet, unknown, number> {
+export function useRestoreWallet(
+  options: WalletMutationOptions = {},
+): UseMutationResult<Wallet, unknown, number> {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (walletId: number) =>
@@ -88,6 +111,9 @@ export function useRestoreWallet(): UseMutationResult<Wallet, unknown, number> {
         method: 'PATCH',
         body: { archived: false },
       }),
-    onSuccess: () => invalidateWalletsAndBalances(queryClient),
+    onSuccess: async () => {
+      await invalidateWalletsAndBalances(queryClient);
+      options.onSuccess?.();
+    },
   });
 }

@@ -124,7 +124,15 @@ export function assessFreshness(
 }
 
 export const NEVER_SYNCED_MESSAGE = 'No sync has finished yet.';
-export const INTERRUPTED_MESSAGE = 'The last sync was interrupted before it read this chain.';
+/**
+ * Worded around "this wallet", not "this chain": an interrupted run can still have read
+ * the chain - other wallets on it may show `fresh` - while this specific wallet's own
+ * reading predates the run, because it was archived and skipped when the run reached that
+ * chain and only came back on restore. "Before it read this chain" would be false right
+ * next to a sibling row saying "Up to date"; "before it read this wallet" is true either
+ * way, whether the chain was never reached at all or was reached without this wallet.
+ */
+export const INTERRUPTED_MESSAGE = 'The last sync was interrupted before it read this wallet.';
 export const NOT_COVERED_MESSAGE = 'Not covered by the last sync.';
 /** Shown for a `'failed'` status whose outcome carries no `error_kind` (should not happen). */
 export const UNKNOWN_FAILURE_MESSAGE = 'The last sync could not read this wallet.';
