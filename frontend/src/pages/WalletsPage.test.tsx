@@ -21,6 +21,17 @@ import { renderApp, settle } from '@/test/render';
 import { fakeSession, problem, server, TEST_USERNAME } from '@/test/server';
 
 /**
+ * The action half of a per-row control's accessible name (R8). Every row's
+ * control is named for its row - "Archive Cold storage" - and these match the
+ * action within one row; the tests under "row names" pin the full names.
+ */
+const ARCHIVE = /^Archive /;
+const CONFIRM_ARCHIVE = /^Confirm archive of /;
+const CANCEL_ARCHIVE = /^Cancel archiving /;
+const RESTORE = /^Restore /;
+const COPY_ADDRESS = /^Copy address of /;
+
+/**
  * The owner's registry for most tests: two Bitcoin wallets, one labelled and
  * one not, and a Kaspa wallet.
  */
@@ -63,6 +74,23 @@ async function openEmptyWalletsPage(overrides: readonly HttpHandler[] = []): Pro
   const setup = openWalletsPage({ wallets: [] }, overrides);
   await screen.findByRole('heading', { name: /no wallets yet/i });
   return setup;
+}
+
+/**
+ * The outline level of a heading, from `aria-level` or its `h1`-`h6` tag. The
+ * list section's own heading is an `h3` ("Your wallets"), so anything inside it
+ * has to sit below that for the page outline to stay a tree (R7).
+ */
+function headingLevel(heading: HTMLElement): number {
+  const explicit = heading.getAttribute('aria-level');
+  if (explicit !== null) {
+    return Number(explicit);
+  }
+  const match = /^H([1-6])$/.exec(heading.tagName);
+  if (match?.[1] === undefined) {
+    throw new Error(`<${heading.tagName.toLowerCase()}> is not a heading.`);
+  }
+  return Number(match[1]);
 }
 
 /** The list region, once it has loaded. */
@@ -161,8 +189,8 @@ describe('WalletsPage: list', () => {
     expect(unlabelled).not.toHaveTextContent('null');
 
     // Active wallets offer archive, not restore.
-    expect(within(cold).getByRole('button', { name: 'Archive' })).toBeInTheDocument();
-    expect(within(cold).queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
+    expect(within(cold).getByRole('button', { name: ARCHIVE })).toBeInTheDocument();
+    expect(within(cold).queryByRole('button', { name: RESTORE })).not.toBeInTheDocument();
     expect(within(cold).queryByText('Archived')).not.toBeInTheDocument();
   });
 
@@ -173,7 +201,48 @@ describe('WalletsPage: list', () => {
 
     const row = await rowFor('Other');
     expect(row).toHaveTextContent('litecoin');
-    expect(within(row).getByRole('button', { name: 'Archive' })).toBeInTheDocument();
+    expect(within(row).getByRole('button', { name: ARCHIVE })).toBeInTheDocument();
+  });
+
+  it('names every row control for its row', async () => {
+    // R8. Three rows of "Archive" and "Copy address" give a screen reader user
+    // three identical controls to choose between. Each name carries the row's
+    // label, or its chain and truncated address when it has none.
+    openWalletsPage({ wallets: threeWallets() });
+    await walletList();
+
+    // Three archive buttons and three copy buttons, and each exact name
+    // matches exactly one control on the page: together, one distinct name
+    // per row, and no row's name shared with anything else.
+    expect(screen.getAllByRole('button', { name: ARCHIVE })).toHaveLength(3);
+    expect(screen.getAllByRole('button', { name: COPY_ADDRESS })).toHaveLength(3);
+    for (const name of [
+      'Archive Cold storage',
+      'Archive Bitcoin mwgS2HRb…fFBmGq',
+      'Archive Mining payouts',
+      'Copy address of Cold storage',
+      'Copy address of Bitcoin mwgS2HRb…fFBmGq',
+      'Copy address of Mining payouts',
+    ]) {
+      expect(screen.getAllByRole('button', { name })).toHaveLength(1);
+    }
+  });
+
+  it('names the confirm, cancel and restore controls for their row', async () => {
+    const { user } = openWalletsPage({
+      wallets: [
+        ...threeWallets(),
+        wallet({ id: 4, address: ADDRESSES.btcScript, label: 'Old exchange', archived: true }),
+      ],
+    });
+    await walletList();
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    expect(screen.getByRole('button', { name: 'Confirm archive of Cold storage' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Cancel archiving Cold storage' })).toBeVisible();
+
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+    expect(await screen.findByRole('button', { name: 'Restore Old exchange' })).toBeVisible();
   });
 
   it('shows the full address nowhere but in the title until the owner asks', async () => {
@@ -227,9 +296,11 @@ describe('WalletsPage: states', () => {
     openWalletsPage({ wallets: [] });
 
     const region = await screen.findByRole('region', { name: 'Your wallets' });
-    expect(
-      await within(region).findByRole('heading', { name: /no wallets yet/i }),
-    ).toBeInTheDocument();
+    const empty = await within(region).findByRole('heading', { name: /no wallets yet/i });
+    // R7: below the section's own h3, not a second h2 beside the page title.
+    const sectionHeading = within(region).getByRole('heading', { name: 'Your wallets' });
+    expect(headingLevel(sectionHeading)).toBe(3);
+    expect(headingLevel(empty)).toBe(4);
     expect(within(region).queryByRole('list')).not.toBeInTheDocument();
     // An empty state is not a failure.
     expect(within(region).queryByRole('alert')).not.toBeInTheDocument();
@@ -250,6 +321,8 @@ describe('WalletsPage: states', () => {
     const alert = await within(region).findByRole('alert');
     expect(alert).toHaveTextContent('Could not load your wallets');
     expect(alert).toHaveTextContent('The database is not reachable.');
+    // R7: the error's heading sits below the section's h3.
+    expect(headingLevel(within(alert).getByRole('heading'))).toBe(4);
     // A failure to read the list is not an empty list.
     expect(screen.queryByText(/no wallets yet/i)).not.toBeInTheDocument();
 
@@ -306,8 +379,8 @@ describe('WalletsPage: states', () => {
     ]);
 
     const row = await rowFor('Cold storage');
-    await user.click(within(row).getByRole('button', { name: 'Archive' }));
-    await user.click(within(row).getByRole('button', { name: 'Confirm archive' }));
+    await user.click(within(row).getByRole('button', { name: ARCHIVE }));
+    await user.click(within(row).getByRole('button', { name: CONFIRM_ARCHIVE }));
 
     expect(await within(row).findByRole('alert')).toHaveTextContent(
       'The server encountered an unexpected condition.',
@@ -316,7 +389,7 @@ describe('WalletsPage: states', () => {
     // Still listed, still active, and the owner can try again.
     expect(await rowFor('Cold storage')).toBeInTheDocument();
     expect(fake.wallets().find((entry) => entry.id === 1)?.archived).toBe(false);
-    expect(within(row).getByRole('button', { name: 'Confirm archive' })).toBeEnabled();
+    expect(within(row).getByRole('button', { name: CONFIRM_ARCHIVE })).toBeEnabled();
   });
 
   it('a failed archive that never reached the server says so in words', async () => {
@@ -325,8 +398,8 @@ describe('WalletsPage: states', () => {
     ]);
 
     const row = await rowFor('Cold storage');
-    await user.click(within(row).getByRole('button', { name: 'Archive' }));
-    await user.click(within(row).getByRole('button', { name: 'Confirm archive' }));
+    await user.click(within(row).getByRole('button', { name: ARCHIVE }));
+    await user.click(within(row).getByRole('button', { name: CONFIRM_ARCHIVE }));
 
     const alert = await within(row).findByRole('alert');
     expect(alert).toHaveTextContent(/could not archive/i);
@@ -520,6 +593,27 @@ describe('WalletsPage: hints', () => {
       chain_key: 'kaspa',
       address: ADDRESSES.kasSecondary,
     });
+  });
+
+  it('the switch-chain control clears a server error and returns focus to the address', async () => {
+    // R4 and R5. The 422 was about this address on Bitcoin. Switching to Kaspa
+    // makes it a different request, so the old verdict must go - and focus
+    // goes back to the field the owner was editing, not onto <body>.
+    const { user, fake } = await openEmptyWalletsPage();
+    fake.rejectAddress(ADDRESSES.kasSecondary, 'malformed');
+
+    await user.type(addressInput(), ADDRESSES.kasSecondary);
+    await user.click(submitButton());
+    await waitFor(() => {
+      expectFieldError(addressInput(), ADDRESS_REJECTIONS.malformed);
+    });
+
+    await user.click(within(addForm()).getByRole('button', { name: 'Use Kaspa instead' }));
+
+    expect(chainSelect()).toHaveValue('kaspa');
+    expectNoFieldError(addressInput(), ADDRESS_REJECTIONS.malformed);
+    expect(screen.queryByText(ADDRESS_REJECTIONS.malformed)).not.toBeInTheDocument();
+    expect(addressInput()).toHaveFocus();
   });
 
   it('switches back to Bitcoin the same way', async () => {
@@ -754,6 +848,27 @@ describe('WalletsPage: field errors', () => {
     expectNoFieldError(addressInput(), DUPLICATE_DETAIL);
   });
 
+  it('a server error under the address clears once the chain is changed', async () => {
+    // Witness for M5 (the reset on a chain-select change). The duplicate is a
+    // fact about this address on Bitcoin; on Kaspa it is a different question
+    // the server has not answered yet.
+    const { user } = openWalletsPage({
+      wallets: [wallet({ id: 1, address: ADDRESSES.btcSegwit, label: 'Existing' })],
+    });
+    await rowFor('Existing');
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+    await waitFor(() => {
+      expectFieldError(addressInput(), DUPLICATE_DETAIL);
+    });
+
+    await user.selectOptions(chainSelect(), 'kaspa');
+
+    expectNoFieldError(addressInput(), DUPLICATE_DETAIL);
+    expect(screen.queryByText(DUPLICATE_DETAIL)).not.toBeInTheDocument();
+  });
+
   it('a server error under the label clears once the label is edited', async () => {
     const { user } = await openEmptyWalletsPage();
 
@@ -796,42 +911,144 @@ describe('WalletsPage: archive and restore', () => {
     const { user, fake } = openWalletsPage({ wallets: threeWallets() });
 
     const row = await rowFor('Cold storage');
-    await user.click(within(row).getByRole('button', { name: 'Archive' }));
+    await user.click(within(row).getByRole('button', { name: ARCHIVE }));
 
     // The consequence, in words, before anything is sent.
     expect(row).toHaveTextContent(/stop being read/i);
     expect(row).toHaveTextContent(/leave the total/i);
-    expect(within(row).getByRole('button', { name: 'Confirm archive' })).toBeInTheDocument();
+    expect(within(row).getByRole('button', { name: CONFIRM_ARCHIVE })).toBeInTheDocument();
     await settle();
     expect(fake.writes('DELETE', '/api/wallets/1')).toHaveLength(0);
     expect(fake.requests.filter((entry) => entry.method !== 'GET')).toHaveLength(0);
 
     // Cancel sends nothing and puts the row back.
-    await user.click(within(row).getByRole('button', { name: 'Cancel' }));
-    expect(within(row).getByRole('button', { name: 'Archive' })).toBeInTheDocument();
-    expect(within(row).queryByRole('button', { name: 'Confirm archive' })).not.toBeInTheDocument();
+    await user.click(within(row).getByRole('button', { name: CANCEL_ARCHIVE }));
+    expect(within(row).getByRole('button', { name: ARCHIVE })).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: CONFIRM_ARCHIVE })).not.toBeInTheDocument();
     await settle();
     expect(fake.requests.filter((entry) => entry.method !== 'GET')).toHaveLength(0);
+  });
+
+  it('moves focus to Confirm, and back to Archive on Cancel', async () => {
+    // R5. The pressed button disappears in both steps; focus left on <body>
+    // sends a keyboard user back to the top of the page.
+    const { user } = openWalletsPage({ wallets: threeWallets() });
+    await walletList();
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    expect(screen.getByRole('button', { name: 'Confirm archive of Cold storage' })).toHaveFocus();
+
+    await user.click(screen.getByRole('button', { name: 'Cancel archiving Cold storage' }));
+    expect(screen.getByRole('button', { name: 'Archive Cold storage' })).toHaveFocus();
+  });
+
+  it('moves focus the same way from the keyboard', async () => {
+    const { user } = openWalletsPage({ wallets: threeWallets() });
+    await walletList();
+
+    screen.getByRole('button', { name: 'Archive Mining payouts' }).focus();
+    await user.keyboard('{Enter}');
+    expect(screen.getByRole('button', { name: 'Confirm archive of Mining payouts' })).toHaveFocus();
+
+    await user.tab();
+    expect(screen.getByRole('button', { name: 'Cancel archiving Mining payouts' })).toHaveFocus();
+    await user.keyboard('{Enter}');
+    expect(screen.getByRole('button', { name: 'Archive Mining payouts' })).toHaveFocus();
+  });
+
+  it('moves focus to the list heading once an archived row leaves the list', async () => {
+    const { user } = openWalletsPage({ wallets: threeWallets() });
+    await walletList();
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+
+    await waitFor(() => {
+      expect(screen.queryByText('Cold storage')).not.toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Your wallets' })).toHaveFocus();
+    });
+  });
+
+  it('moves focus to Restore when an archived row stays in the list', async () => {
+    // With archived wallets shown, the row stays and swaps Archive for Restore.
+    const { user } = openWalletsPage({ wallets: threeWallets() });
+    await walletList();
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+
+    await user.click(await screen.findByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Restore Cold storage' })).toHaveFocus();
+    });
+  });
+
+  it('an archive the server did not apply does not steal focus on a later list change', async () => {
+    // The server answers 204 but the list does not change: another session
+    // restored the wallet in between, or the request was a repeat. The
+    // refetched list is structurally equal, so the pending focus hand-off never
+    // fires. It must not fire later either: toggling "Show archived" is the
+    // owner's own action, and focus belongs on the control they just used.
+    const { user } = openWalletsPage({ wallets: threeWallets() }, [
+      http.delete(WALLET_PATH, () => new HttpResponse(null, { status: 204 })),
+    ]);
+    await walletList();
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Archive Cold storage' })).toBeVisible();
+    });
+    await settle();
+
+    const toggle = screen.getByRole('checkbox', { name: 'Show archived' });
+    await user.click(toggle);
+    await screen.findByRole('button', { name: 'Archive Cold storage' });
+    await settle();
+
+    expect(toggle).toHaveFocus();
+  });
+
+  it('archive then restore with archived shown brings back Archive, not the confirm step', async () => {
+    // Witness for M10: without `setConfirming(false)` after a successful
+    // archive, the row keeps its confirm state through the archived phase and
+    // comes back from a restore already armed.
+    const { user, fake } = openWalletsPage({ wallets: threeWallets() });
+    await walletList();
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+
+    await user.click(await screen.findByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    await user.click(await screen.findByRole('button', { name: 'Restore Cold storage' }));
+
+    await waitFor(() => {
+      expect(fake.wallets().find((entry) => entry.id === 1)?.archived).toBe(false);
+    });
+    expect(await screen.findByRole('button', { name: 'Archive Cold storage' })).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Confirm archive of Cold storage' }),
+    ).not.toBeInTheDocument();
+    expect(await rowFor('Cold storage')).not.toHaveTextContent(/stop being read/i);
   });
 
   it('confirming one row does not arm the others', async () => {
     const { user } = openWalletsPage({ wallets: threeWallets() });
 
     const cold = await rowFor('Cold storage');
-    await user.click(within(cold).getByRole('button', { name: 'Archive' }));
+    await user.click(within(cold).getByRole('button', { name: ARCHIVE }));
 
     const mining = await rowFor('Mining payouts');
-    expect(
-      within(mining).queryByRole('button', { name: 'Confirm archive' }),
-    ).not.toBeInTheDocument();
+    expect(within(mining).queryByRole('button', { name: CONFIRM_ARCHIVE })).not.toBeInTheDocument();
   });
 
   it('archiving removes the wallet from the active list', async () => {
     const { user, fake } = openWalletsPage({ wallets: threeWallets() });
 
     const row = await rowFor('Cold storage');
-    await user.click(within(row).getByRole('button', { name: 'Archive' }));
-    await user.click(within(row).getByRole('button', { name: 'Confirm archive' }));
+    await user.click(within(row).getByRole('button', { name: ARCHIVE }));
+    await user.click(within(row).getByRole('button', { name: CONFIRM_ARCHIVE }));
 
     await waitFor(() => {
       expect(screen.queryByText('Cold storage')).not.toBeInTheDocument();
@@ -852,8 +1069,8 @@ describe('WalletsPage: archive and restore', () => {
     });
 
     const row = await rowFor('Only one');
-    await user.click(within(row).getByRole('button', { name: 'Archive' }));
-    await user.click(within(row).getByRole('button', { name: 'Confirm archive' }));
+    await user.click(within(row).getByRole('button', { name: ARCHIVE }));
+    await user.click(within(row).getByRole('button', { name: CONFIRM_ARCHIVE }));
 
     expect(await screen.findByRole('heading', { name: /no wallets yet/i })).toBeInTheDocument();
   });
@@ -879,13 +1096,13 @@ describe('WalletsPage: archive and restore', () => {
     const archived = await rowFor('Old exchange');
     // Marked in text, not by colour alone.
     expect(within(archived).getByText('Archived')).toBeInTheDocument();
-    expect(within(archived).getByRole('button', { name: 'Restore' })).toBeInTheDocument();
-    expect(within(archived).queryByRole('button', { name: 'Archive' })).not.toBeInTheDocument();
+    expect(within(archived).getByRole('button', { name: RESTORE })).toBeInTheDocument();
+    expect(within(archived).queryByRole('button', { name: ARCHIVE })).not.toBeInTheDocument();
 
     // The active ones are still there, unmarked, with no restore.
     const cold = await rowFor('Cold storage');
     expect(within(cold).queryByText('Archived')).not.toBeInTheDocument();
-    expect(within(cold).queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
+    expect(within(cold).queryByRole('button', { name: RESTORE })).not.toBeInTheDocument();
 
     expect(
       fake.requests.some(
@@ -911,7 +1128,7 @@ describe('WalletsPage: archive and restore', () => {
     await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
     const archived = await rowFor('Old exchange');
 
-    await user.click(within(archived).getByRole('button', { name: 'Restore' }));
+    await user.click(within(archived).getByRole('button', { name: RESTORE }));
 
     await waitFor(() => {
       expect(fake.wallets().find((entry) => entry.id === 4)?.archived).toBe(false);
@@ -924,7 +1141,7 @@ describe('WalletsPage: archive and restore', () => {
     await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
 
     const restored = await rowFor('Old exchange');
-    expect(within(restored).getByRole('button', { name: 'Archive' })).toBeInTheDocument();
+    expect(within(restored).getByRole('button', { name: ARCHIVE })).toBeInTheDocument();
     expect(within(restored).queryByText('Archived')).not.toBeInTheDocument();
   });
 
@@ -939,7 +1156,7 @@ describe('WalletsPage: archive and restore', () => {
     await screen.findByRole('heading', { name: /no wallets yet/i });
     await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
     const archived = await rowFor('Old exchange');
-    await user.click(within(archived).getByRole('button', { name: 'Restore' }));
+    await user.click(within(archived).getByRole('button', { name: RESTORE }));
 
     expect(await within(archived).findByRole('alert')).toHaveTextContent(WALLET_NOT_FOUND_DETAIL);
     expect(fake.wallets()[0]?.archived).toBe(true);
@@ -963,7 +1180,7 @@ describe('WalletsPage: archive and restore', () => {
     });
 
     await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
-    await user.click(within(await rowFor('Old exchange')).getByRole('button', { name: 'Restore' }));
+    await user.click(within(await rowFor('Old exchange')).getByRole('button', { name: RESTORE }));
 
     await waitFor(() => {
       expect(fake.wallets()[0]?.archived).toBe(false);

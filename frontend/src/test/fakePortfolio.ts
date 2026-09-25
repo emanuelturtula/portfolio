@@ -13,7 +13,7 @@ import {
   type SyncTriggeredResponse,
   type WalletResponse,
 } from './fixtures';
-import { problem, refuseNonJsonWrite, server } from './server';
+import { problem, refuseNonJsonWrite, server, unauthorized } from './server';
 
 export const WALLETS_PATH = '/api/wallets';
 export const WALLET_PATH = '/api/wallets/:walletId';
@@ -86,6 +86,13 @@ export interface RecordedRequest {
 /** A write route a test can hold open, to observe the page while it is in flight. */
 export type HoldableRoute = 'create' | 'archive' | 'restore' | 'sync';
 
+/**
+ * A current view computed from the registry at request time, for flows where
+ * archiving or restoring a wallet has to change what the next balance read
+ * returns - as it does on the backend, which excludes archived wallets.
+ */
+export type CurrentView = (activeWallets: readonly WalletResponse[]) => CurrentBalancesResponse;
+
 export interface FakePortfolioOptions {
   readonly wallets?: readonly WalletResponse[];
   /**
@@ -93,7 +100,7 @@ export interface FakePortfolioOptions {
    * way the backend derives it for wallets no run has read: every one unread,
    * with nulls, a total of `"0"` and `complete` false unless there are none.
    */
-  readonly current?: CurrentBalancesResponse;
+  readonly current?: CurrentBalancesResponse | CurrentView;
   readonly runs?: readonly SyncRunResponse[];
   /**
    * What `POST /api/balances/sync` does. Receives the fake so it can replace
@@ -102,6 +109,15 @@ export interface FakePortfolioOptions {
    * nothing.
    */
   readonly onSync?: (fake: FakePortfolio) => SyncTriggeredResponse;
+  /**
+   * The session these endpoints belong to. When given, every request made
+   * while it is signed out is answered `401`, as the backend's deny-by-default
+   * middleware answers it. Without this, a query rebuilt in the instant
+   * between a `401` and the redirect is answered with data the dead session
+   * could never have read, and a test can pass on a cache the real backend
+   * would have refused to fill.
+   */
+  readonly session?: { currentUser(): string | null };
 }
 
 export interface FakePortfolio {
@@ -112,7 +128,7 @@ export interface FakePortfolio {
   wallets(): readonly WalletResponse[];
   current(): CurrentBalancesResponse;
   runs(): readonly SyncRunResponse[];
-  setCurrent(current: CurrentBalancesResponse | undefined): void;
+  setCurrent(current: CurrentBalancesResponse | CurrentView | undefined): void;
   setRuns(runs: readonly SyncRunResponse[]): void;
   /** The next create of this address answers a 422 on `["body", "address"]`. */
   rejectAddress(address: string, rejection: AddressRejectionType): void;
@@ -138,7 +154,7 @@ export interface FakePortfolio {
  */
 export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio {
   let wallets: WalletResponse[] = (options.wallets ?? []).map((row) => ({ ...row }));
-  let current: CurrentBalancesResponse | undefined = options.current;
+  let current: CurrentBalancesResponse | CurrentView | undefined = options.current;
   let runs: SyncRunResponse[] = [...(options.runs ?? [])];
   const rejections = new Map<string, AddressRejectionType>();
   const holds = new Map<HoldableRoute, Promise<void>>();
@@ -181,7 +197,14 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     handlers: [],
     requests,
     wallets: () => wallets,
-    current: () => current ?? derivedCurrent(),
+    current: () => {
+      if (current === undefined) {
+        return derivedCurrent();
+      }
+      return typeof current === 'function'
+        ? current(wallets.filter((row) => !row.archived))
+        : current;
+    },
     runs: () => runs,
     setCurrent: (next) => {
       current = next;
@@ -209,7 +232,20 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
       requests.filter((entry) => entry.method === method && new URL(entry.url).pathname === path),
   };
 
+  /** Answers `401` while the session is signed out; otherwise falls through. */
+  const requireSession = async ({ request }: { request: Request }) => {
+    // No session given, or one that is signed in: let the route answer.
+    if (options.session?.currentUser() !== null) {
+      return undefined;
+    }
+    await record(request);
+    return unauthorized();
+  };
+
   const handlers: HttpHandler[] = [
+    http.all(WALLETS_PATH, requireSession),
+    http.all(WALLET_PATH, requireSession),
+    http.all('/api/balances/*', requireSession),
     http.get(WALLETS_PATH, async ({ request }) => {
       await record(request);
       const includeArchived = new URL(request.url).searchParams.get('include_archived') === 'true';

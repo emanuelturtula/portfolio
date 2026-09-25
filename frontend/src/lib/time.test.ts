@@ -1,7 +1,7 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { formatAbsoluteTime, formatRelativeTime, useNow } from '@/lib/time';
+import { formatAbsoluteTime, formatRelativeTime, parseInstant, useNow } from '@/lib/time';
 
 const NOW_MS = Date.parse('2026-09-24T12:00:00.000Z');
 
@@ -50,6 +50,10 @@ describe('formatRelativeTime', () => {
     );
   });
 
+  it('reads a microsecond timestamp from the backend', () => {
+    expect(formatRelativeTime('2026-09-24T11:45:00.123456Z', NOW_MS)).toBe('15 minutes ago');
+  });
+
   it('reads an instant with an offset as that instant', () => {
     // 10:45 at -01:00 is 11:45 UTC: fifteen minutes before noon UTC.
     expect(formatRelativeTime('2026-09-24T10:45:00-01:00', NOW_MS)).toBe('15 minutes ago');
@@ -61,6 +65,77 @@ describe('formatRelativeTime', () => {
     expect(formatRelativeTime(iso, NOW_MS)).toBe('15 minutes ago');
     expect(formatRelativeTime(iso, NOW_MS + MINUTE)).toBe('16 minutes ago');
     expect(formatRelativeTime(iso, NOW_MS + HOUR)).toBe('1 hour ago');
+  });
+});
+
+describe('parseInstant', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** 2026-09-24T11:40:00.000Z, with `ms` milliseconds added. Written out, not parsed. */
+  const at = (ms: number): number => Date.UTC(2026, 8, 24, 11, 40, 0, ms);
+
+  it.each([
+    ['2026-09-24T11:40:00.123456Z', at(123)],
+    ['2026-09-24T11:40:00.123999Z', at(123)],
+    ['2026-09-24T11:40:00.999999Z', at(999)],
+    ['2026-09-24T11:40:00.1234567891Z', at(123)],
+    ['2026-09-24T11:40:00.123Z', at(123)],
+    ['2026-09-24T11:40:00.5Z', at(500)],
+    ['2026-09-24T11:40:00Z', at(0)],
+    ['2026-09-24T13:40:00.123456+02:00', at(123)],
+  ])('reads %s as the millisecond %i', (iso, expected) => {
+    expect(parseInstant(iso)).toBe(expected);
+  });
+
+  it('truncates the fraction rather than rounding it', () => {
+    // .999999 must stay in the same second: rounding would carry it into the
+    // next one, and the next minute, hour and day with it at the edges.
+    expect(parseInstant('2026-09-24T23:59:59.999999Z')).toBe(
+      Date.UTC(2026, 8, 24, 23, 59, 59, 999),
+    );
+  });
+
+  it('hands Date only the three-digit fraction ECMAScript guarantees', () => {
+    // What an engine does with six fractional digits is implementation-
+    // defined; V8 happens to truncate, which is why no behavioural assertion
+    // above can tell a truncating parseInstant from one that passes the raw
+    // string through. This pins what is actually handed to `Date`.
+    const seen: unknown[] = [];
+    const RealDate = Date;
+    vi.stubGlobal(
+      'Date',
+      class extends RealDate {
+        constructor(...args: [string | number]) {
+          seen.push(args[0]);
+          super(...args);
+        }
+      },
+    );
+
+    parseInstant('2026-09-24T11:40:00.123456+02:00');
+
+    expect(seen).toEqual(['2026-09-24T11:40:00.123+02:00']);
+  });
+
+  it('leaves a timestamp with no excess digits untouched', () => {
+    const seen: unknown[] = [];
+    const RealDate = Date;
+    vi.stubGlobal(
+      'Date',
+      class extends RealDate {
+        constructor(...args: [string | number]) {
+          seen.push(args[0]);
+          super(...args);
+        }
+      },
+    );
+
+    parseInstant('2026-09-24T11:40:00Z');
+    parseInstant('2026-09-24T11:40:00.12Z');
+
+    expect(seen).toEqual(['2026-09-24T11:40:00Z', '2026-09-24T11:40:00.12Z']);
   });
 });
 

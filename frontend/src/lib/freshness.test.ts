@@ -45,14 +45,22 @@ const JUST_BEFORE_RUN = '2026-09-24T11:39:59.999Z';
 
 describe('selectSettledRun', () => {
   it('has nothing to judge against when no run has ever happened', () => {
-    expect(selectSettledRun([])).toEqual({ settled: undefined, inProgress: false });
+    expect(selectSettledRun([])).toStrictEqual({
+      settled: undefined,
+      inProgress: false,
+      runningRun: undefined,
+    });
   });
 
   it('takes the newest run when it has finished', () => {
     const latest = syncRun();
     const older = previousRun();
 
-    expect(selectSettledRun([latest, older])).toEqual({ settled: latest, inProgress: false });
+    expect(selectSettledRun([latest, older])).toStrictEqual({
+      settled: latest,
+      inProgress: false,
+      runningRun: undefined,
+    });
   });
 
   it('falls through a running first run to the second, and says a sync is running', () => {
@@ -65,10 +73,18 @@ describe('selectSettledRun', () => {
 
     expect(selected.settled).toBe(latest);
     expect(selected.inProgress).toBe(true);
+    // The running run itself, so the page can say when it started (R1).
+    expect(selected.runningRun).toBe(running);
   });
 
   it('has nothing settled when the first run ever is still running', () => {
-    expect(selectSettledRun([runningRun()])).toEqual({ settled: undefined, inProgress: true });
+    const running = runningRun();
+
+    expect(selectSettledRun([running])).toStrictEqual({
+      settled: undefined,
+      inProgress: true,
+      runningRun: running,
+    });
   });
 
   it.each(['success', 'partial', 'failed', 'interrupted'] as const)(
@@ -76,7 +92,11 @@ describe('selectSettledRun', () => {
     (status) => {
       const run = syncRun({ status });
 
-      expect(selectSettledRun([run, previousRun()])).toEqual({ settled: run, inProgress: false });
+      expect(selectSettledRun([run, previousRun()])).toStrictEqual({
+        settled: run,
+        inProgress: false,
+        runningRun: undefined,
+      });
     },
   );
 
@@ -130,11 +150,39 @@ describe('assessFreshness', () => {
   });
 
   it('treats sub-millisecond digits as within the same millisecond, never as older', () => {
-    // The backend's timestamps carry microseconds, and `Date` keeps
-    // milliseconds. Truncating both sides the same way cannot reorder them.
+    // R10. The backend's timestamps carry microseconds, and `Date` keeps
+    // milliseconds. Truncating both sides the same way cannot reorder them:
+    // `observed` at or after `started` in microseconds stays at or after.
     const settled = syncRun({ started_at: '2026-09-24T11:40:00.123456Z' });
 
     expect(assessFreshness(settled, 'bitcoin', '2026-09-24T11:40:00.123999Z').status).toBe('fresh');
+    expect(assessFreshness(settled, 'bitcoin', '2026-09-24T11:40:00.123456Z').status).toBe('fresh');
+  });
+
+  it('does not round a reading past the start of the next millisecond', () => {
+    // Rounding .123999 up to .124 would be harmless here, but rounding the
+    // *start* up is not: a start at .123999 rounded to .124 would put a
+    // reading at .123999 before it. Truncation keeps them equal.
+    const settled = syncRun({ started_at: '2026-09-24T11:40:00.123999Z' });
+
+    expect(assessFreshness(settled, 'bitcoin', '2026-09-24T11:40:00.123999Z').status).toBe('fresh');
+  });
+
+  it('applies the microsecond rule to an interrupted run as well', () => {
+    const settled = interruptedRun({ started_at: '2026-09-24T11:40:00.500100Z' });
+
+    expect(assessFreshness(settled, 'bitcoin', '2026-09-24T11:40:00.500900Z').status).toBe('fresh');
+    expect(assessFreshness(settled, 'bitcoin', '2026-09-24T11:40:00.499999Z').status).toBe(
+      'interrupted',
+    );
+  });
+
+  it('compares microsecond timestamps a whole millisecond apart correctly', () => {
+    const settled = syncRun({ started_at: '2026-09-24T11:40:00.124000Z' });
+
+    expect(assessFreshness(settled, 'bitcoin', '2026-09-24T11:40:00.123999Z').status).toBe(
+      'not_covered',
+    );
   });
 
   it('says no sync has run when there is no settled run', () => {
@@ -189,33 +237,74 @@ describe('assessFreshness', () => {
     expect(assessFreshness(settled, 'kaspa', RUN_STARTED_AT).status).toBe('failed');
   });
 
-  it('says the last sync was interrupted before this chain when it has no outcome', () => {
-    const settled = interruptedRun({ chains: [chainOutcome({ chain_key: 'bitcoin' })] });
+  /*
+   * An interrupted run, as the backend writes it, has no chain outcomes at all:
+   * `finish_run` never ran, and the orphan sweep only flips the status. The
+   * snapshots it took before dying were committed per chain, so the reading
+   * itself is the only evidence of how far it got. Rules 4 and 5 of R9.
+   */
 
-    expect(assessFreshness(settled, 'kaspa', PREVIOUS_OBSERVED_AT)).toEqual({
+  it('calls a reading an interrupted run took before it died fresh', () => {
+    // Bitcoin was read at 11:41, a minute into a run that later died. The run
+    // has no outcome for Bitcoin - it has none for anything - but the reading
+    // is from that run, so it is as current as a reading gets.
+    const settled = interruptedRun();
+
+    expect(settled.chains).toEqual([]);
+    expect(assessFreshness(settled, 'bitcoin', '2026-09-24T11:41:00.000Z')).toEqual({
+      status: 'fresh',
+    });
+  });
+
+  it('counts a reading stamped at the instant an interrupted run started as fresh', () => {
+    expect(assessFreshness(interruptedRun(), 'bitcoin', RUN_STARTED_AT)).toEqual({
+      status: 'fresh',
+    });
+  });
+
+  it('says the last sync was interrupted for a reading older than the run', () => {
+    // The run died before it reached this chain: the reading is from the run
+    // before, and the interruption is the reason it was not refreshed.
+    expect(assessFreshness(interruptedRun(), 'kaspa', PREVIOUS_OBSERVED_AT)).toEqual({
       status: 'interrupted',
     });
-    expect(assessFreshness(settled, 'kaspa', null)).toEqual({ status: 'interrupted' });
-  });
-
-  it('calls an old reading on a chain an interrupted run did read not covered, not interrupted', () => {
-    // The run got to Bitcoin and read it successfully, then died. A Bitcoin
-    // reading older than the run (a restored wallet) was skipped by it, not
-    // cut off by the interruption, so "interrupted before it read this chain"
-    // would be false.
-    const settled = interruptedRun({ chains: [chainOutcome({ chain_key: 'bitcoin' })] });
-
-    expect(assessFreshness(settled, 'bitcoin', PREVIOUS_OBSERVED_AT)).toEqual({
-      status: 'not_covered',
+    expect(assessFreshness(interruptedRun(), 'kaspa', JUST_BEFORE_RUN)).toEqual({
+      status: 'interrupted',
     });
-    expect(assessFreshness(settled, 'bitcoin', null)).toEqual({ status: 'not_covered' });
   });
 
-  it('still calls a chain an interrupted run did read fresh', () => {
-    // Interrupted after Bitcoin: Bitcoin's rows are as current as they get.
-    const settled = interruptedRun({ chains: [chainOutcome({ chain_key: 'bitcoin' })] });
+  it('says the last sync was interrupted for a wallet it never read', () => {
+    expect(assessFreshness(interruptedRun(), 'kaspa', null)).toEqual({ status: 'interrupted' });
+  });
+
+  it('judges two chains of one interrupted run by their own readings', () => {
+    // Died between chains: Bitcoin's reading is from this run, Kaspa's is not.
+    const settled = interruptedRun();
 
     expect(assessFreshness(settled, 'bitcoin', RUN_STARTED_AT).status).toBe('fresh');
+    expect(assessFreshness(settled, 'kaspa', PREVIOUS_OBSERVED_AT).status).toBe('interrupted');
+  });
+
+  it('only an interrupted run earns the interrupted sentence', () => {
+    // A finished run with no outcome for a chain did not get cut off: it had
+    // nothing to read there. "Interrupted" would send the owner to look for a
+    // crash that never happened.
+    for (const status of ['success', 'partial', 'failed'] as const) {
+      const settled = syncRun({ status, chains: [chainOutcome({ chain_key: 'bitcoin' })] });
+
+      expect(assessFreshness(settled, 'kaspa', PREVIOUS_OBSERVED_AT)).toEqual({
+        status: 'not_covered',
+      });
+      expect(assessFreshness(settled, 'kaspa', null)).toEqual({ status: 'not_covered' });
+    }
+  });
+
+  it('never calls a reading fresh on a finished run with no outcome for its chain', () => {
+    // Rule 4 is for interrupted runs only. A finished run that says nothing
+    // about Kaspa did not read Kaspa, however new the reading looks.
+    const settled = syncRun({ chains: [chainOutcome({ chain_key: 'bitcoin' })] });
+
+    expect(assessFreshness(settled, 'kaspa', RUN_STARTED_AT)).toEqual({ status: 'not_covered' });
   });
 
   it('calls a chain with no outcome in a finished run not covered', () => {
@@ -260,11 +349,13 @@ describe('assessFreshness', () => {
     }
   });
 
-  it('puts a failed outcome ahead of an interrupted run', () => {
-    // Order matters: the chain's own failure is the more specific reason.
-    const settled = interruptedRun({ chains: [failedOutcome('kaspa', 'response')] });
+  it('puts a failed outcome ahead of a reading that looks new', () => {
+    // Rule 3 before rule 4's shape: a failed chain wrote no readings in this
+    // run, so a reading newer than its start cannot have come from it - but if
+    // one ever appears, the chain's own failure is still what the row says.
+    const settled = syncRun({ status: 'partial', chains: [failedOutcome('kaspa', 'response')] });
 
-    expect(assessFreshness(settled, 'kaspa', PREVIOUS_OBSERVED_AT)).toEqual({
+    expect(assessFreshness(settled, 'kaspa', RUN_STARTED_AT)).toEqual({
       status: 'failed',
       errorKind: 'response',
     });
@@ -329,7 +420,7 @@ describe('freshnessMessage', () => {
   });
 
   it.each([
-    ['never_synced', NEVER_SYNCED_MESSAGE, /no sync has run yet/i],
+    ['never_synced', NEVER_SYNCED_MESSAGE, /^No sync has finished yet\.$/],
     ['interrupted', INTERRUPTED_MESSAGE, /interrupted/i],
     ['not_covered', NOT_COVERED_MESSAGE, /not covered by the last sync/i],
   ] as const)('explains %s', (status, constant, pattern) => {

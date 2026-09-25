@@ -8,6 +8,16 @@ import { renderApp, settle, visitedPaths } from '@/test/render';
 import { fakeSession, server, TEST_USERNAME } from '@/test/server';
 
 /**
+ * The action half of a per-row control's accessible name (R8). Every row's
+ * control is named for its row - "Archive Cold storage" - and these match the
+ * action within one row; the tests under "row names" pin the full names.
+ */
+const ARCHIVE = /^Archive /;
+const CONFIRM_ARCHIVE = /^Confirm archive of /;
+const RESTORE = /^Restore /;
+const COPY_ADDRESS = /^Copy address of /;
+
+/**
  * Every form an address could take in a URL: as typed, percent-encoded, and
  * form-encoded. `kaspatest:` encodes its colon, so a check for the raw string
  * alone would miss exactly the address most likely to be put in a query.
@@ -55,7 +65,7 @@ describe('privacy', () => {
     if (archivedRow === null) {
       throw new Error('The archived wallet is not in a list item.');
     }
-    await user.click(within(archivedRow).getByRole('button', { name: 'Restore' }));
+    await user.click(within(archivedRow).getByRole('button', { name: RESTORE }));
     await waitFor(() => {
       expect(fake.wallets().find((entry) => entry.id === 4)?.archived).toBe(false);
     });
@@ -64,8 +74,8 @@ describe('privacy', () => {
     if (coldRow === null) {
       throw new Error('The Cold storage wallet is not in a list item.');
     }
-    await user.click(within(coldRow).getByRole('button', { name: 'Archive' }));
-    await user.click(within(coldRow).getByRole('button', { name: 'Confirm archive' }));
+    await user.click(within(coldRow).getByRole('button', { name: ARCHIVE }));
+    await user.click(within(coldRow).getByRole('button', { name: CONFIRM_ARCHIVE }));
     await waitFor(() => {
       expect(fake.wallets().find((entry) => entry.id === 1)?.archived).toBe(true);
     });
@@ -92,7 +102,7 @@ describe('privacy', () => {
     });
 
     // Copying an address is a clipboard write, not a request.
-    await user.click(within(archivedRow).getByRole('button', { name: 'Copy address' }));
+    await user.click(within(archivedRow).getByRole('button', { name: COPY_ADDRESS }));
 
     // Dashboard: every read, and a refresh.
     const nav = screen.getByRole('navigation', { name: 'Main' });

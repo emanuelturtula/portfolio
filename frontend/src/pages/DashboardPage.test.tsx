@@ -39,6 +39,7 @@ import {
   price,
   RUN_FINISHED_AT,
   RUN_STARTED_AT,
+  RUNNING_STARTED_AT,
   runningRun,
   STALE_PRICE_AS_OF,
   syncRun,
@@ -53,7 +54,14 @@ import {
   type SyncErrorKind,
 } from '@/test/fixtures';
 import { currentPath, renderApp, settle } from '@/test/render';
-import { fakeSession, problem, server, TEST_USERNAME } from '@/test/server';
+import {
+  fakeSession,
+  problem,
+  server,
+  TEST_PASSWORD,
+  TEST_USERNAME,
+  unauthorized,
+} from '@/test/server';
 
 /**
  * Every dashboard test runs under a fixed clock, faking `Date` only.
@@ -344,6 +352,51 @@ describe('DashboardPage: values', () => {
     expect(within(await assetsRegion()).getAllByRole('rowheader')).toHaveLength(1);
   });
 
+  it('a price finer than a cent keeps its digits, while values stay at cents', async () => {
+    // R3. KAS trades well below a cent's resolution: at two decimals
+    // 0.084912345678 reads as 0.08, a 6% error on every Kaspa value an owner
+    // tries to check by hand. 100 KAS x 0.084912345678 = 8.4912345678.
+    const kasPrice = price({ amount: '0.084912345678', source: 'kaspa' });
+    openDashboard({
+      wallets: [
+        wallet({ id: 3, chain_key: 'kaspa', address: ADDRESSES.kasPrimary, label: 'Mining' }),
+      ],
+      current: currentBalances({
+        total: '8.49123456780000000000',
+        as_of: KAS_OBSERVED_AT,
+        wallets: [
+          walletBalance({
+            wallet_id: 3,
+            chain_key: 'kaspa',
+            label: 'Mining',
+            asset_symbol: 'KAS',
+            confirmed: '10000000000',
+            quantity: '100.00000000',
+            value: '8.49123456780000000000',
+            price: kasPrice,
+            observed_at: KAS_OBSERVED_AT,
+          }),
+        ],
+      }),
+      runs: [syncRun(), previousRun()],
+    });
+
+    const kas = await assetRow('KAS');
+    expect(cell(kas, 'Price')).toHaveTextContent('0.08491235 EUR');
+    expect(cell(kas, 'Price')).not.toHaveTextContent(/0\.08 EUR/);
+    expect(dataValues(cell(kas, 'Price'))).toEqual(['0.084912345678']);
+    // Values and the total are amounts of money, and stay at two decimals.
+    expect(cell(kas, 'Value')).toHaveTextContent('8.49 EUR');
+    expect(cell(await walletRow('Mining'), 'Value')).toHaveTextContent('8.49 EUR');
+    expect(await totalRegion()).toHaveTextContent('8.49 EUR');
+  });
+
+  it('a price with whole cents still shows its cents', async () => {
+    openDashboard();
+
+    expect(cell(await assetRow('BTC'), 'Price')).toHaveTextContent('52,000.00 EUR');
+  });
+
   it('lists each asset once, whatever order the wallets come in', async () => {
     const scenario = healthyPortfolio();
     const [first, second, third] = scenario.current.wallets;
@@ -387,6 +440,12 @@ describe('DashboardPage: precision', () => {
     const spending = await walletRow('Spending');
     expect(cell(spending, 'Quantity')).toHaveTextContent('-0.0015 BTC pending');
     expect(cell(spending, 'Quantity')).not.toHaveTextContent('+-');
+    // R6: the exact value carries the sign. A magnitude in `<data value>` with
+    // a "-" typed beside it reads correctly and machine-reads as incoming.
+    const [, pendingValue] = dataValues(cell(spending, 'Quantity'));
+    expect(withoutTrailingZeros(pendingValue)).toBe('-0.0015');
+    const [, incomingValue] = dataValues(cell(cold, 'Quantity'));
+    expect(withoutTrailingZeros(incomingValue)).toBe('0.00012');
 
     // The quantity is still `confirmed` alone: pending is shown beside it,
     // never folded into it.
@@ -449,10 +508,7 @@ describe('DashboardPage: last updated', () => {
     const scenario = healthyPortfolio();
     openDashboard({
       ...scenario,
-      runs: [
-        interruptedRun({ chains: [chainOutcome({ chain_key: 'bitcoin', wallets_read: 2 })] }),
-        previousRun(),
-      ],
+      runs: [interruptedRun(), previousRun()],
     });
     await loaded();
 
@@ -627,7 +683,7 @@ describe('DashboardPage: refresh', () => {
     expect(await lastUpdated()).toHaveTextContent(/last sync succeeded just now/i);
   });
 
-  it('refresh is disabled while a sync is in flight', async () => {
+  it('refresh is disabled while its own request is in flight', async () => {
     const { user, fake } = openDashboard();
     await loaded();
     const release = fake.hold('sync');
@@ -1004,19 +1060,29 @@ describe('DashboardPage: stale prices and provider failures', () => {
   );
 
   it('a sync that was interrupted before a chain says so on that chain', async () => {
+    // The run died after reading Bitcoin (its readings are from this run, and
+    // were committed) and before Kaspa (its reading is from the run before).
+    // As on the backend, the interrupted run carries no outcomes at all.
     const scenario = kaspaDownPortfolio();
-    openDashboard({
-      ...scenario,
-      runs: [
-        interruptedRun({ chains: [chainOutcome({ chain_key: 'bitcoin', wallets_read: 2 })] }),
-        previousRun(),
-      ],
-    });
+    openDashboard({ ...scenario, runs: [interruptedRun(), previousRun()] });
 
-    expect(cell(await walletRow(ADDRESSES.kasPrimary), 'Freshness')).toHaveTextContent(
-      INTERRUPTED_MESSAGE,
-    );
-    expect(cell(await walletRow('Cold storage'), 'Freshness')).toHaveTextContent(/up to date/i);
+    const kas = cell(await walletRow(ADDRESSES.kasPrimary), 'Freshness');
+    expect(kas).toHaveTextContent(INTERRUPTED_MESSAGE);
+    expect(kas).toHaveTextContent(/showing the balance from 35 minutes ago/i);
+    for (const label of ['Cold storage', 'Spending']) {
+      expect(cell(await walletRow(label), 'Freshness')).toHaveTextContent(/up to date/i);
+    }
+  });
+
+  it('an unread wallet on an interrupted run says it has not been read and renders no zero', async () => {
+    const wallets = [
+      wallet({ id: 1, chain_key: 'kaspa', address: ADDRESSES.kasPrimary, label: 'Never read' }),
+    ];
+    openDashboard({ wallets, runs: [interruptedRun(), previousRun()] });
+
+    const row = await walletRow('Never read');
+    expect(row).toHaveTextContent(/not read yet/i);
+    expectNoRenderedZero(row);
   });
 
   it('a restored wallet with an old reading is not called up to date', async () => {
@@ -1179,6 +1245,31 @@ describe('DashboardPage: partial failure', () => {
     expect(total).toHaveTextContent(/1 wallet not yet read/i);
   });
 
+  it('a read wallet with no value is not counted among the balances the sync could not refresh', async () => {
+    // Witness for M3. Kaspa failed and is unpriced: its reading is old, but it
+    // has no value, so it is not part of the total and the sentence about the
+    // total must not count it. Bitcoin wallet 1 is old too, and is counted.
+    let scenario = withWalletRow(kaspaDownPortfolio(), 3, { value: null, price: null });
+    scenario = withWalletRow(scenario, 1, { observed_at: PREVIOUS_OBSERVED_AT });
+    openDashboard({
+      ...scenario,
+      current: {
+        ...scenario.current,
+        total: '84419.7525600000',
+        complete: false,
+        unpriced: [
+          { asset_symbol: 'KAS', quantity: HUGE_KAS_QUANTITY, reason: 'every_source_failed' },
+        ],
+      },
+    });
+
+    const total = await totalRegion();
+    expect(total).toHaveTextContent(
+      'This total includes 1 balance the last sync could not refresh.',
+    );
+    expect(total).not.toHaveTextContent(/2 balances/);
+  });
+
   it('balances render when the runs request fails', async () => {
     openDashboard(healthyPortfolio(), [
       http.get(BALANCES_RUNS_PATH, () =>
@@ -1212,6 +1303,34 @@ describe('DashboardPage: partial failure', () => {
     expect(await totalRegion()).not.toHaveTextContent(/could not (be )?refresh/i);
   });
 
+  it('a runs poll that fails after a good load stops calling any row up to date', async () => {
+    // Witness for M2: `freshnessKnown = runs.data !== undefined` survives every
+    // first-load test, because a first load that fails has no data. A poll
+    // that fails keeps the last good data - and that data is no longer a basis
+    // for calling anything current.
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    vi.setSystemTime(new Date(NOW));
+    let runsFail = false;
+    openDashboard(healthyPortfolio(), [
+      http.get(BALANCES_RUNS_PATH, () =>
+        runsFail ? problem(500, 'Internal Server Error', 'The run log is locked.') : undefined,
+      ),
+    ]);
+    await loaded();
+    expect(cell(await walletRow('Cold storage'), 'Freshness')).toHaveTextContent(/up to date/i);
+
+    runsFail = true;
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/sync status is unavailable/i);
+    expect(screen.queryByText(/up to date/i)).not.toBeInTheDocument();
+    expect(await totalRegion()).not.toHaveTextContent(/could not refresh/i);
+    // The balances themselves are still there.
+    expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+  });
+
   it('balances render when the wallets request fails', async () => {
     openDashboard(healthyPortfolio(), [
       http.get(WALLETS_PATH, () =>
@@ -1228,7 +1347,7 @@ describe('DashboardPage: partial failure', () => {
     const fallback = await walletRow('Kaspa wallet #3');
     expect(dataValues(cell(fallback, 'Value'))).toEqual([HEALTHY.kasValue]);
     expect(
-      within(await walletsRegion()).queryByRole('button', { name: 'Copy address' }),
+      within(await walletsRegion()).queryByRole('button', { name: /copy address/i }),
     ).not.toBeInTheDocument();
   });
 
@@ -1343,6 +1462,60 @@ describe('DashboardPage: a backend that misbehaves', () => {
   });
 });
 
+describe('DashboardPage: after a wallet changes', () => {
+  /**
+   * The healthy portfolio as the backend would compute it for whichever
+   * wallets are active: archived wallets leave the rows and the total. Totals
+   * are written out per set of active wallets, never summed here.
+   */
+  function healthyFor(active: readonly { id: number }[]): CurrentBalancesResponse {
+    const scenario = healthyPortfolio();
+    const ids = active.map((entry) => entry.id);
+    const totals: Record<string, string> = {
+      '1,2,3': HEALTHY.total,
+      '1,2': '84419.7525600000',
+    };
+    const total = totals[ids.join(',')];
+    if (total === undefined) {
+      throw new Error(`No hand-worked total for active wallets ${ids.join(',')}.`);
+    }
+
+    return {
+      ...scenario.current,
+      total,
+      wallets: scenario.current.wallets.filter((row) => ids.includes(row.wallet_id)),
+    };
+  }
+
+  it('archiving on the wallets page takes the wallet off the dashboard', async () => {
+    // Witness for M1: without the `['balances']` invalidation on archive, the
+    // dashboard's cached reading is still fresh by `staleTime` when the owner
+    // comes back, so it is served as-is - wallet and value included. The
+    // clock is frozen here, so "within staleTime" is every return.
+    const { user, fake } = openDashboard({ ...healthyPortfolio(), current: healthyFor });
+    await loaded();
+    expect(await walletRow(ADDRESSES.kasPrimary)).toBeInTheDocument();
+
+    const nav = screen.getByRole('navigation', { name: 'Main' });
+    await user.click(within(nav).getByRole('link', { name: 'Wallets' }));
+    const kasName = 'Kaspa kaspatest:qxaqrl…gdmpks';
+    await user.click(await screen.findByRole('button', { name: `Archive ${kasName}` }));
+    await user.click(screen.getByRole('button', { name: `Confirm archive of ${kasName}` }));
+    await waitFor(() => {
+      expect(fake.wallets().find((entry) => entry.id === 3)?.archived).toBe(true);
+    });
+
+    await user.click(within(nav).getByRole('link', { name: 'Dashboard' }));
+
+    await waitFor(async () => {
+      expect(dataValues(await totalRegion())).toEqual(['84419.7525600000']);
+    });
+    const region = await walletsRegion();
+    expect(within(region).queryByTitle(ADDRESSES.kasPrimary)).not.toBeInTheDocument();
+    expect(within(await assetsRegion()).queryByRole('rowheader', { name: 'KAS' })).toBeNull();
+  });
+});
+
 describe('DashboardPage: states', () => {
   it('announces that the portfolio is loading', async () => {
     let release: () => void = () => undefined;
@@ -1407,6 +1580,69 @@ describe('DashboardPage: states', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
+  it('a failed poll keeps the dashboard on screen', async () => {
+    // R2. Every deploy restarts the container, so a poll that misses is
+    // routine. The data already on screen stays, with a notice; the whole-page
+    // error is for a first load that got nothing.
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    vi.setSystemTime(new Date(NOW));
+    let failing = false;
+    openDashboard(healthyPortfolio(), [
+      http.get(BALANCES_CURRENT_PATH, () =>
+        failing ? problem(503, 'Service Unavailable', 'The database is restarting.') : undefined,
+      ),
+    ]);
+    await loaded();
+
+    failing = true;
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+
+    const notice = await screen.findByRole('alert');
+    expect(notice).toHaveTextContent(
+      'Could not refresh the portfolio: The database is restarting. Showing what was last loaded.',
+    );
+    expect(notice.textContent).not.toMatch(DOUBLE_PERIOD);
+    expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+    expect(dataValues(cell(await walletRow('Cold storage'), 'Value'))).toEqual([
+      '78000.0000000000',
+    ]);
+    expect(
+      screen.queryByRole('heading', { name: /could not load your portfolio/i }),
+    ).not.toBeInTheDocument();
+
+    // The next good poll clears the notice.
+    failing = false;
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+    expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+  });
+
+  it('a poll that never reached the server keeps the dashboard and says so in words', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    vi.setSystemTime(new Date(NOW));
+    let failing = false;
+    openDashboard(healthyPortfolio(), [
+      http.get(BALANCES_CURRENT_PATH, () => (failing ? HttpResponse.error() : undefined)),
+    ]);
+    await loaded();
+
+    failing = true;
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not refresh the portfolio: The server could not be reached. Showing what was last loaded.',
+    );
+    expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+  });
+
   it('a balances read that never reached the server says so in words', async () => {
     openDashboard(healthyPortfolio(), [
       http.get(BALANCES_CURRENT_PATH, () => HttpResponse.error()),
@@ -1422,11 +1658,39 @@ describe('DashboardPage: states', () => {
     openDashboard({ ...scenario, runs: [runningRun(), syncRun()] });
     await loaded();
 
-    expect(await screen.findByText(/a sync is running/i)).toHaveAttribute('role', 'status');
-    expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
+    const status = await screen.findByText(/a sync started/i);
+    expect(status).toHaveAttribute('role', 'status');
+    expect(status).toHaveTextContent('A sync started 1 minute ago and has not finished.');
+    expect(status.querySelector('time')?.getAttribute('datetime')).toBe(RUNNING_STARTED_AT);
     // Judged against the run that finished, not the one with no outcomes yet.
     expect(cell(await walletRow('Cold storage'), 'Freshness')).toHaveTextContent(/up to date/i);
     expect(await lastUpdated()).toHaveTextContent(/last sync succeeded 15 minutes ago/i);
+  });
+
+  it('a running run does not disable refresh', async () => {
+    // R1. A `running` row may be an orphan: its process died and nothing will
+    // ever finish it until the next run sweeps it. A button disabled until
+    // that run finishes would stay disabled for good - and pressing it is
+    // what joins a live run or, starting a new one, sweeps the orphan.
+    const orphanStartedAt = '2026-09-24T11:30:00.000Z';
+    const scenario = healthyPortfolio();
+    const { user, fake } = openDashboard({
+      ...scenario,
+      runs: [runningRun({ started_at: orphanStartedAt }), syncRun()],
+    });
+    await loaded();
+
+    const status = await screen.findByText(/a sync started/i);
+    expect(status).toHaveTextContent('A sync started 30 minutes ago and has not finished.');
+    expect(status.querySelector('time')?.getAttribute('datetime')).toBe(orphanStartedAt);
+
+    const refresh = screen.getByRole('button', { name: 'Refresh' });
+    expect(refresh).toBeEnabled();
+    await user.click(refresh);
+
+    await waitFor(() => {
+      expect(fake.writes('POST', BALANCES_SYNC_PATH)).toHaveLength(1);
+    });
   });
 
   it('a first sync still running says so, and that none has finished', async () => {
@@ -1434,9 +1698,21 @@ describe('DashboardPage: states', () => {
     openDashboard({ wallets, runs: [runningRun()] });
     await loaded();
 
-    expect(await screen.findByText(/a sync is running/i)).toBeInTheDocument();
+    expect(await screen.findByText(/a sync started/i)).toHaveTextContent(
+      'A sync started 1 minute ago and has not finished.',
+    );
+    expect(await lastUpdated()).toHaveTextContent('No sync has finished yet.');
     expect(await lastUpdated()).toHaveTextContent(NEVER_SYNCED_MESSAGE);
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled();
     expectNoRenderedZero(await walletRow('First wallet'));
+  });
+
+  it('says nothing about a running sync when none is running', async () => {
+    openDashboard();
+    await loaded();
+
+    expect(screen.queryByText(/a sync started/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
   it('the dashboard asks for exactly two runs', async () => {
@@ -1450,6 +1726,46 @@ describe('DashboardPage: states', () => {
     for (const read of runReads) {
       expect(new URL(read.url).searchParams.get('limit')).toBe('2');
     }
+  });
+
+  it('a 401 mid-session drops the cached portfolio, so the next sign-in starts from a load', async () => {
+    // Witness for Q2 (`removeQueries` in `queryClient.ts`). Without it, the
+    // balances cached under the dead session are served straight back after
+    // the next sign-in - to whoever signs in next in this tab.
+    const user = userEvent.setup();
+    const session = fakeSession({ initialUser: TEST_USERNAME });
+    const fake = fakePortfolio({ ...healthyPortfolio(), session });
+    server.use(...session.handlers, ...fake.handlers);
+    renderApp(['/']);
+    expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+
+    // The session dies on the server; the next request finds out.
+    session.signOut();
+    server.use(http.post(BALANCES_SYNC_PATH, () => unauthorized()));
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    await screen.findByLabelText(/username/i);
+
+    // Hold the next balances read, so the first render after sign-in shows.
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    server.use(
+      http.get(BALANCES_CURRENT_PATH, async () => {
+        await gate;
+        return undefined;
+      }),
+    );
+    await user.type(screen.getByLabelText(/username/i), TEST_USERNAME);
+    await user.type(screen.getByLabelText(/password/i), TEST_PASSWORD);
+    await user.click(screen.getByRole('button', { name: /sign in/i }));
+
+    expect(await screen.findByText(/loading your portfolio/i)).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Total value' })).not.toBeInTheDocument();
+    expect(document.querySelector(`data[value="${HEALTHY.total}"]`)).toBeNull();
+
+    release();
+    expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
   });
 
   it('a 401 on the balances read returns to the login page', async () => {

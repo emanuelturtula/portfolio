@@ -235,29 +235,56 @@ export function syncRun(overrides: Partial<SyncRunResponse> = {}): SyncRunRespon
   };
 }
 
-/** A run that is still in flight: no `finished_at`, no duration, no outcomes yet. */
-export function runningRun(overrides: Partial<SyncRunResponse> = {}): SyncRunResponse {
+/** The instant {@link runningRun} started: one minute before {@link NOW}. */
+export const RUNNING_STARTED_AT = '2026-09-24T11:59:00.000Z';
+
+/**
+ * A run still at `running`: no `finished_at`, no duration, no outcomes and the
+ * counters `start_run` wrote. Whether it is live or an orphan whose process
+ * died before the sweep, the row looks the same - which is the point.
+ */
+export function runningRun(
+  overrides: Partial<Omit<SyncRunResponse, 'chains' | 'finished_at' | 'duration_ms'>> = {},
+): SyncRunResponse {
   return syncRun({
     run_id: 8,
+    started_at: RUNNING_STARTED_AT,
+    ...overrides,
     status: 'running',
-    started_at: '2026-09-24T11:59:00.000Z',
     finished_at: null,
     duration_ms: null,
     wallets_succeeded: 0,
+    wallets_failed: 0,
     chains: [],
-    ...overrides,
   });
 }
 
-/** A run whose process died: no `finished_at`, and only the chains it got to. */
-export function interruptedRun(overrides: Partial<SyncRunResponse> = {}): SyncRunResponse {
+/**
+ * A run whose process died, exactly as the backend leaves it: **no chain
+ * outcomes at all**, no `finished_at`, no `duration_ms`, and the counters
+ * `start_run` wrote.
+ *
+ * `finish_run` writes the outcomes in the same transaction as the final
+ * status, and the orphan sweep only flips `running` to `interrupted`, so an
+ * interrupted run never carries "the chains it got to". The snapshots it took
+ * before dying were committed per chain, though, which is why a reading can be
+ * newer than an interrupted run's `started_at` while the run says nothing
+ * about that chain.
+ *
+ * Deliberately takes no `chains` override: a test that needs an interrupted
+ * run with outcomes is testing a state the backend cannot produce.
+ */
+export function interruptedRun(
+  overrides: Partial<Omit<SyncRunResponse, 'chains' | 'finished_at' | 'duration_ms'>> = {},
+): SyncRunResponse {
   return syncRun({
+    ...overrides,
     status: 'interrupted',
     finished_at: null,
     duration_ms: null,
-    wallets_succeeded: 2,
-    chains: [chainOutcome({ chain_key: 'bitcoin', wallets_read: 2 })],
-    ...overrides,
+    wallets_succeeded: 0,
+    wallets_failed: 0,
+    chains: [],
   });
 }
 
