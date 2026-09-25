@@ -1,7 +1,7 @@
 # 012 — Exchange provider protocol, normalized fill and error taxonomy
 
 Issue: #12
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -51,7 +51,7 @@ any of them can be written without inventing its own.
 | Path | Holds |
 |---|---|
 | `domain/exchanges.py` | `ExchangeKey` (`bingx`, `bitget`), `FillSide` (`buy`, `sell`) |
-| `domain/money.py` | gains `multiply(left, right)` under the money context |
+| `domain/money.py` | gains `multiply(left, right)`, the exact product |
 | `providers/exchanges/__init__.py` | docstring only; no provider exists yet |
 | `providers/exchanges/errors.py` | the taxonomy, `ErrorMap`, `build_error_map`, `STATUS_FALLBACKS`, `classify_error`, `exchange_error`, `venue_code_of` |
 | `providers/exchanges/signing.py` | `hmac_sha256_hex`, `hmac_sha256_base64` |
@@ -503,7 +503,7 @@ Disjoint. Nobody edits a file on another row.
 
 | Agent | Owns |
 |---|---|
-| backend-dev | `backend/src/portfolio/domain/exchanges.py`, `backend/src/portfolio/domain/money.py`, `backend/src/portfolio/providers/exchanges/**`, `backend/src/portfolio/db/models.py`, `backend/src/portfolio/db/types.py`, `backend/src/portfolio/db/migrations/versions/v0006_exchanges.py`, `docs/providers.md`, `docs/architecture.md` |
+| backend-dev | `backend/src/portfolio/domain/exchanges.py`, `backend/src/portfolio/domain/money.py`, `backend/src/portfolio/providers/exchanges/**`, `backend/src/portfolio/providers/base.py` (added after review, for `decode_json`), `backend/src/portfolio/db/models.py`, `backend/src/portfolio/db/types.py`, `backend/src/portfolio/db/migrations/versions/v0006_exchanges.py`, `docs/providers.md`, `docs/architecture.md` |
 | tester | `backend/tests/**` |
 | tech-lead | `docs/specs/012-*.md`, `backend/pyproject.toml`, `backend/.importlinter` |
 | reviewer | nothing |
@@ -533,3 +533,94 @@ Disjoint. Nobody edits a file on another row.
   default rules flag high-entropy strings beside `secret`/`key`. Synthetic test secrets must be
   obvious and low-entropy (RFC 4231's `Jefe`, `synthetic-not-a-real-secret`) and never named
   after a venue.
+
+## What the plan got wrong
+
+### Every defect review found was one defect: a value the venue picks escaping the seven classes
+
+The spec promised that an exchange provider raises one of seven classes and nothing else, and
+it checked that promise against the values a *vendor* might send wrong: a float, a negative
+quantity, too many decimal places. It never listed what a vendor-chosen value can make the
+*interpreter* do. Four separate reviews of the code each found one of those, and each one left
+the taxonomy as an untyped exception:
+
+| Input the venue chooses | Escaped as | Where |
+|---|---|---|
+| an amount written with 5000 digits | `ValueError`, from CPython's 4300-digit `int`/`str` conversion limit | the first `multiply` |
+| a fill object nested 1500 levels deep | `RecursionError` | `encode_raw_payload` |
+| an exponent past `Decimal`'s range, `1e1000000000000000000` | `decimal.InvalidOperation` | `decode_json`, where #9 added `parse_float=Decimal` |
+| a lone surrogate, `"\ud800"`, valid JSON | `UnicodeEncodeError`, at the insert or while signing the next request | `_require_text`, the cursor guard |
+
+The first two were found by the tech lead probing the implementation, the last two by the
+reviewer. The third is older than this issue and had reached the chain providers' `health()`,
+whose contract is that it never raises.
+
+**The lesson for #13, #14 and whoever writes the next parser:** at every boundary that takes
+text a vendor controls, go through the interpreter's own limits and test each one: integer
+digit count, recursion depth, `Decimal` exponent range, and whether the text can be encoded
+as UTF-8. The list is the same every time. The fixes all have the same shape too: a bound
+this application chooses, the same on every platform, refused as a schema error.
+`MAX_AMOUNT_DIGITS = 100` and `MAX_RAW_PAYLOAD_DEPTH = 32` are the two numbers this issue
+chose.
+
+### Two helpers met at a boundary on different grids
+
+`epoch_ms` floored to the millisecond, as its docstring said, so a request asked for slightly
+more. `assemble_fill_page` compared to the microsecond, and `clamp_to_retention` kept the
+microseconds of `now`. A venue correctly returning a fill from earlier in the millisecond
+containing `since` had its whole page refused as a schema error. Because #15 lays windows end
+to end, the refusal would have come back at the same boundary on every run. Each helper was
+correct on its own and was tested on its own.
+
+The seam now works in whole milliseconds. `FillWindow` refuses a bound that is not a whole
+millisecond, `floor_to_millisecond` is how #15 builds one, the clamp floors, and the
+capabilities' durations are whole milliseconds. **When two helpers share a boundary, check
+that they use the same unit, not only that each is right.**
+
+### A foreign key was reasoned about alone, and the parent table is deleted elsewhere
+
+`exchange_accounts.user_id` is `CASCADE` and `exchange_fills.exchange_account_id` is
+`RESTRICT`, and the spec argued for each one separately. `create-user --replace`, the only
+recovery path for a forgotten password, is `DELETE FROM users`. Once a fill exists, the
+cascade is blocked and recovery fails. The reviewer reproduced it against a migrated
+database.
+
+The `RESTRICT` is right. A venue's retention means a deleted fill may be gone for good, and
+failing loudly is better than deleting quietly. The defect is in `--replace`, which already
+deletes every wallet and its history through the `wallets` cascade. It is **#69**, and it
+must land before #15 writes the first fill. **Before adding an `ON DELETE` rule, find every
+statement that deletes a row of the parent table, including deletes that cascade into it.**
+
+### Departures agreed during implementation
+
+- `multiply` returns the exact product. The spec's "multiply under the money context" would
+  have rounded twice.
+- `RateLimit` validates itself.
+- `venue_code_of` applies the ten-digit bound to integers as well as strings.
+- `clamp_to_retention` caps `effective_since` at `now`, so a retention shorter than the margin
+  stays legal.
+- `encode_raw_payload` writes a `Decimal` whose exponent is zero as `15E0`, so it decodes back
+  as a `Decimal`. What survives the round trip is the value and its exponent, not the literal
+  text: `1.5e1` comes back as `15E0`.
+- A malformed `retry_after_ms` raises `ValueError`, because only our own parser can produce
+  one.
+- `assemble_fill_page` refuses a fill for another symbol when a symbol was requested. The
+  spec's table had no row for it.
+- SQLite's unique-violation message names the columns, not the constraint. The tests assert
+  the columns, and a reflection test checks that the named constraint covers exactly those
+  columns.
+
+### Handed on
+
+- **#13 and #14:**
+  - Never call `raise_for_status()`, and never chain from `httpx.HTTPStatusError`. Its message
+    carries the full signed URL.
+  - Map the in-band auth codes. An unmapped one is a schema error, and the account is not
+    marked `auth_failed`.
+  - Do not map a "timestamp expired" code to auth. The transport can replay a signed request
+    for up to 30 s of backoff.
+  - #14 only: check whether BingX trade ids are unique per symbol.
+- **#15:**
+  - #69 has to land first.
+  - Build window bounds with `floor_to_millisecond`.
+  - Detect cursor cycles across pages.
