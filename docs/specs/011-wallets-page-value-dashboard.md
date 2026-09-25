@@ -120,7 +120,7 @@ log records *which chain failed and whose fault it was*, so the rule reads that:
 | `outcome.status` is `success` and `observed_at` is at or after `settled.started_at` | fresh | "Up to date" |
 | `outcome.status` is `failed` | failed | the error kind's sentence, then "showing the balance from" and the reading's age |
 | `settled.status` is `interrupted`, and the reading is at or after `settled.started_at` | fresh | "Up to date" |
-| `settled.status` is `interrupted` otherwise | interrupted | the last sync was interrupted before it read this chain |
+| `settled.status` is `interrupted` otherwise | interrupted | the last sync was interrupted before it read this wallet |
 | anything else | not covered | not covered by the last sync |
 
 **An interrupted run has no chain outcomes, ever**, and the first draft of this table assumed
@@ -152,6 +152,15 @@ microseconds.
 When the runs query fails, the balances still render. A notice says freshness could not be
 determined, and no row claims to be fresh.
 
+**The same holds when the balances query is the one failing a poll**, which was added in the
+second review. Suppose a new run lands, `/runs` refreshes, and `/current` does not. Judging the
+readings still on screen against the newer run would call every row "not covered", and would
+make the total claim balances the sync did in fact refresh.
+
+The interrupted sentence names the *wallet*, not the chain. When a restored wallet's reading
+predates an interrupted run that did read its chain, "before it read this chain" was false while
+its siblings said "Up to date".
+
 This logic lives in one pure module, `src/lib/freshness.ts`, with no React in it.
 
 ### Never a silent zero
@@ -165,7 +174,7 @@ This logic lives in one pure module, `src/lib/freshness.ts`, with no React in it
 | unpriced asset | the asset row, and the "missing" list | the reason's sentence; value "—" |
 | `complete: false` | the total | labelled partial, followed by what is missing |
 | `complete: false` and no wallet has a value | the total | "—" in place of the amount: the backend's `"0"` is then an empty sum, not a value |
-| a `running` first run | the status line | when that run started and that it has not finished. It does **not** disable Refresh |
+| a `running` first run | the status line, which is not a live region: its clock ticks | when that run started and that it has not finished. It does **not** disable Refresh |
 | runs query failed | a notice | sync status unavailable; balances still shown |
 | wallets query failed | a notice | addresses unavailable; rows fall back to label, or chain name and id |
 | current query failed, nothing loaded yet | the page | `ErrorState` with retry, the only whole-page failure |
