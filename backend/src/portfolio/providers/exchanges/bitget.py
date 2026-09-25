@@ -16,6 +16,8 @@ Sources, each read on that date -- `docs/providers.md` carries the full table:
 * REST error codes: `https://www.bitget.com/docs/classic/error-code/restapi`
 * the Classic introduction, Get Symbol Info, the UTA upgrade guide and the FAQ
 
+What they say, and what this module relies on:
+
 * `GET /api/v2/spot/trade/fills` on `https://api.bitget.com`. Parameters `symbol`, `orderId`,
   `startTime`, `endTime`, `limit`, `idLessThan`, all optional. `limit` defaults to 100 and
   is at most 100. `idLessThan` takes a **`tradeId`** and pages to older data. The range
@@ -33,6 +35,13 @@ Sources, each read on that date -- `docs/providers.md` carries the full table:
   and `status`.
 * Every error code in `BITGET_ERROR_MAP`, with the meaning its row gives. The documentation
   ties no code to an HTTP status.
+* Classic is the account system this API serves. A Unified Trading Account reads fills from
+  `GET /api/v3/trade/fills` instead, and the owner's account was confirmed Classic on
+  2026-09-25; `docs/providers.md` records the finding, and UTA support is a follow-up.
+
+**None of this has met the real venue.** Measuring a signed endpoint needs a key, and rule 3
+keeps every key out of this repository. The owner's first sync is the first measurement, and
+every guess below is written to fail loudly, as a typed error naming a field.
 
 ## Not documented, and treated as not known
 
@@ -210,7 +219,8 @@ _SYMBOL: Final = re.compile(r"\A[A-Z0-9]{1,40}\Z")
 Checked **before** a symbol is used to build the symbol-info request, so nothing a venue
 sends can put a `/`, a `?`, a `&` or a character that needs encoding into a URL this
 provider builds. Every symbol in the documentation's examples matches. Forty is a bound
-chosen here, several times the longest symbol listed.
+chosen here, well past any symbol those examples show. **Assumed, not documented**: that
+every symbol is upper-case letters and digits. One that is not fails its page loudly.
 """
 
 _SIDES: Final[Mapping[str, FillSide]] = {"buy": FillSide.BUY, "sell": FillSide.SELL}
@@ -341,12 +351,14 @@ def build_fills_query(window: FillWindow, *, cursor: str | None) -> str:
     sorted, so the two cannot disagree. Every value is ASCII digits, so nothing needs
     encoding and nothing an HTTP library does can change the bytes.
 
-    **The window is widened by a millisecond at the start.** Whether `startTime` and
-    `endTime` are inclusive is not documented, so the request asks for
-    `[since - 1 ms, until]` as sent: `startTime = epoch_ms(since) - 1` and
-    `endTime = epoch_ms(until)`. Under any of the four readings that covers `[since, until)`,
-    and `parse_fills_page` drops the two edge milliseconds a fully inclusive venue would add.
-    A window starting at the epoch sends `startTime=0`, never `-1`.
+    **The window is widened by a millisecond at each end.** Whether `startTime` and
+    `endTime` are inclusive is not documented. The window is `[since, until)`, whose last
+    millisecond is `until - 1`, and the request sends `startTime = epoch_ms(since) - 1` and
+    `endTime = epoch_ms(until)`: one millisecond past each end. Under any of the four
+    readings that covers `[since, until)` -- an exclusive `startTime` still admits `since`,
+    an exclusive `endTime` still admits `until - 1` -- and `parse_fills_page` drops the two
+    edge milliseconds an inclusive venue adds. A window starting at the epoch sends
+    `startTime=0`, never `-1`.
 
     Raises:
         ValueError: `cursor` is not a canonical trade id, or the window ends at or before the
