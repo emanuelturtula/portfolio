@@ -2,8 +2,8 @@
 
 Day-two tasks on the running instance: creating the account, tuning the password hash to the
 hardware, changing the password, understanding when a session ends, pointing the application
-at the chain index it reads balances from, and refreshing the prices that turn a balance into
-a value.
+at the chain index it reads balances from, refreshing the prices that turn a balance into
+a value, and connecting the Bitget account whose trades say what each asset cost.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -617,6 +617,124 @@ a future command that did would sweep the server's live run.
 Snapshots are committed per chain as the run goes, so an interrupted run keeps whatever it had
 already read.
 
+## 12. Connecting the Bitget account
+
+The application reads your Bitget **spot fills** -- every buy and sell execution -- with a
+read-only API key, to know what you paid for each asset. The provider that reads them landed
+with #13; the sync that runs it and stores the fills lands with #15. Until then, setting the
+variables below has one visible effect: the container checks them at startup.
+
+### Keep the account Classic: do not accept the Unified Trading Account upgrade
+
+Bitget has two account systems, **Classic** and the **Unified Trading Account (UTA)**, and
+the app offers the upgrade with a banner. **Do not accept it.** This application reads fills
+through the Classic (v2) API. A UTA account reads them through a different API, with a
+different cursor, window and field names, and Bitget's notice to broker partners states that
+a UTA key cannot call Classic endpoints at all. After an upgrade, every sync would fail. It
+would fail loudly, as an auth or invalid-request error rather than as an empty history, but
+it would fail every time until the account is switched back. Support for UTA is a follow-up
+issue.
+
+Two facts from Bitget's documentation, read on 2026-09-25:
+
+- **Since 2026-09-15 Bitget has been moving eligible Classic accounts to UTA automatically.
+  An account with an API key linked is not eligible**, so the read-only key below also keeps
+  the account where it is.
+- **A main account can switch back** to Classic after an upgrade; a sub-account cannot.
+
+To check which one you have: a Classic account shows separate Spot, Futures and Margin tabs,
+and a banner offering the upgrade. The owner's account was Classic on 2026-09-25.
+
+### Creating a read-only key
+
+In Bitget's API management page, create a new API key:
+
+1. If Bitget offers a choice of key type, choose the **system-generated (HMAC)** one. This
+   application signs with HMAC-SHA256; it does not use RSA keys.
+2. Set a **passphrase**. Bitget asks you to choose one when the key is created, and it is the
+   third of the three values below, so keep it with the other two. Use printable ASCII with no
+   space at either end -- the application refuses anything else at startup.
+3. Grant **read-only** permission and nothing else. The application only ever reads fills
+   and symbol information; it never places, cancels or transfers anything, and a key that
+   cannot is a key that cannot be misused. **Never grant trade, transfer or withdrawal.**
+4. An IP allowlist is optional. If you set one, it must include the address the host's
+   requests reach the internet from, or every sync is refused as an auth error (venue code
+   `40018` or `40038`). Do not write that address into this repository.
+5. Copy the **API key** and the **secret key** straight into `secrets.env`. Assume the
+   secret is shown only once.
+
+### The three variables, in `secrets.env` and nowhere else
+
+| Variable | What it is |
+|---|---|
+| `PORTFOLIO_BITGET_API_KEY` | the API key |
+| `PORTFOLIO_BITGET_API_SECRET` | the secret key |
+| `PORTFOLIO_BITGET_API_PASSPHRASE` | the passphrase you chose for the key |
+
+They go in the host-local secrets file -- the same file as section 1, at mode 0600, never
+through GitHub, never in this repository, never in any other file:
+
+```bash
+$EDITOR <deploy-root>/secrets.env
+```
+
+```
+PORTFOLIO_BITGET_API_KEY=<the API key>
+PORTFOLIO_BITGET_API_SECRET=<the secret key>
+PORTFOLIO_BITGET_API_PASSPHRASE=<the passphrase you chose>
+```
+
+Then recreate the container, because `env_file` is read at creation:
+
+```bash
+docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml up --force-recreate app
+```
+
+**All three, or none.** With none set, Bitget is not configured and the provider is not built
+at all -- nothing in the process holds a credential and nothing can reach the venue. The
+container **refuses to start** if:
+
+- only some of the three are set -- the log names the ones that are missing;
+- any of them is set but blank;
+- the key or the passphrase holds a character an HTTP header cannot carry: a space or tab at
+  either end, a line break or another control character, or anything outside printable
+  ASCII. **A trailing space pasted along with the value is the usual cause.** The secret is
+  not checked this way; it is never sent, only used to sign.
+
+No refusal ever prints a value, only the variable's name. The credentials are never written
+to the database, never returned by any endpoint and never logged: they travel in request
+headers on the one call that needs them, and the log names that call
+`https://api.bitget.com/exchange_fills` and nothing more.
+
+### What a Bitget error means
+
+An exchange error carries Bitget's own code, as `venue code NNNNN`, and never the text of
+Bitget's message. The ones worth knowing:
+
+| Venue code | Reported as | Means | What to do |
+|---|---|---|---|
+| `40008`, `40005` | unavailable | **the host clock**: Bitget refuses a request whose timestamp is more than 30 seconds from its own clock | check the clock is synchronised -- `timedatectl` should say `System clock synchronized: yes`. One `40008` right after a throttle is harmless: the transport resent a signed request late, and the next run signs a fresh one |
+| `40006`, `40037`, `40041`, `40012`, `40036`, `40009` | auth | the key, the secret or the passphrase is wrong, or the key was deleted | check the three variables; create a new key if in doubt |
+| `40018`, `40038` | auth | the request came from an address the key's IP allowlist does not include | update the allowlist, or remove it |
+| `40014`, `40025`, `40040` | insufficient scope | the key lacks read permission | edit the key's permissions |
+| `429` | rate limited | too many requests. Bitget's overall per-address limit takes five minutes to recover | nothing; the next run asks again |
+| `40704` | retention window | a window older than Bitget keeps: "the last three months" | nothing; the sync starts later |
+| `45001`, `40725`, `40808`, `40015` | unavailable | Bitget is deploying (Tuesdays and Thursdays) | nothing; the next run asks again |
+
+Two refusals come from this application rather than from Bitget, and both name a field:
+
+- **`feeDetail.deduction`**: the fill's fee was paid in **BGB**. What Bitget's fee fields hold
+  then is not documented, so such a fill is refused rather than recorded with a guessed fee.
+  If Bitget is set to pay fees with BGB, turn that off; fills from before that stay refused
+  until support for BGB fees is written from a real example.
+- **`feeDetail.totalFee`** "is positive": Bitget reported a fee with the opposite sign from
+  its documentation. Refused rather than recorded as income. Report it; it needs a rule
+  written from the real fill.
+
+A sync that starts failing with an auth or invalid-request error right after you accepted
+something in the Bitget app is most likely the UTA upgrade. Switch the main account back to
+Classic.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -659,3 +777,7 @@ already read.
 | Prices are all flagged stale | The last refresh is over an hour old. The price is still shown; it is the age that is being reported — section 10 |
 | KAS/EUR is the only pair that ever fails | Kraken is the only key-free source for it. CoinGecko is the only fallback — section 10 |
 | A pair reports `every_source_failed` while the vendor is plainly up | A vendor can be refused for what it *sent*: a price of zero or below, a non-finite number, or one too large or too small for the column. Failover treats that like any other refusal — section 10 |
+| Container refuses to start naming a `PORTFOLIO_BITGET_*` variable | Only some of the three are set, one is blank, or the key or passphrase has a character a header cannot carry — usually a trailing space from pasting — section 12 |
+| A Bitget error says venue code `40008` or `40005` | The host clock is more than 30 seconds off. Check `timedatectl`. A single one right after a throttle is harmless — section 12 |
+| A Bitget error names `feeDetail.deduction` | Fees paid in BGB are not supported yet. Turn off paying fees with BGB in Bitget — section 12 |
+| Bitget errors start right after accepting something in the Bitget app | Most likely the Unified Trading Account upgrade. Switch the main account back to Classic — section 12 |
