@@ -151,15 +151,19 @@ the host:
 docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio create-user --replace
 ```
 
-The command asks for confirmation, then for the new password twice. It updates the account
-in place: the password, and the username — the one you pass with `--username`, otherwise
-`PORTFOLIO_BOOTSTRAP_USERNAME` (default `owner`), so pass `--username` if you signed in under a
-different name. The account keeps its identity, so **wallets, balance history, exchange
+The command asks for confirmation, then for the new password twice. It changes the password
+on the existing account in place and **keeps its username**, so the command above is safe to
+copy as it is. The account keeps its identity, so **wallets, balance history, exchange
 accounts and imported fills are all kept**. Every session is signed out in the same
 transaction, exactly as a password change through the application does, so a cookie stolen
-before the recovery stops working the moment it completes.
+before the recovery stops working the moment it completes. The last line of output names
+the account that was changed.
 
-With no account yet, the command creates one. With more than one account — which the
+To rename the account at the same time, add `--username <new-name>`. Without that flag the
+username is never changed.
+
+With no account yet, the command creates one, named by `--username` or, without it, by
+`PORTFOLIO_BOOTSTRAP_USERNAME` (default `owner`). With more than one account — which the
 application cannot produce, only hand-written SQL can — it refuses and changes nothing,
 rather than guessing which one you mean.
 
