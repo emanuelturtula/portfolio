@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { addMoney, formatMoney, money } from '@/lib/money';
+import { addMoney, formatMoney, fromBaseUnits, money } from '@/lib/money';
 
 describe('money', () => {
   it('keeps all eighteen decimals of a base-unit amount', () => {
@@ -226,4 +226,86 @@ describe('formatMoney', () => {
       formatMoney(money('1'), { minimumFractionDigits: 4, maximumFractionDigits: 2 }),
     ).toThrow(RangeError);
   });
+});
+
+/**
+ * Base units to asset quantity.
+ *
+ * Every expected string is written out by hand: moving a decimal point is
+ * exactly the kind of operation a test must not re-derive with the code it
+ * is checking.
+ */
+describe('fromBaseUnits', () => {
+  it.each([
+    ['150000000', 8, '1.50000000'],
+    ['12345678', 8, '0.12345678'],
+    ['1', 8, '0.00000001'],
+    ['0', 8, '0.00000000'],
+    ['100000000', 8, '1.00000000'],
+    ['123', 0, '123'],
+    ['5', 2, '0.05'],
+  ])('converts %j base units at %i decimals to %j', (units, decimals, expected) => {
+    expect(fromBaseUnits(units, decimals)).toBe(expected);
+  });
+
+  it('converts a balance past MAX_SAFE_INTEGER without losing a digit', () => {
+    // 2870000000000000123 is above Number.MAX_SAFE_INTEGER (9007199254740991).
+    // Through a JavaScript number it becomes 2870000000000000000: the last three
+    // digits vanish and nothing fails. About the whole Kaspa supply, in sompi.
+    expect(fromBaseUnits('2870000000000000123', 8)).toBe('28700000000.00000123');
+  });
+
+  it('converts the largest integer the database can store exactly', () => {
+    // 2^63 - 1, SQLite's INTEGER ceiling: the widest value the backend can send.
+    expect(fromBaseUnits('9223372036854775807', 8)).toBe('92233720368.54775807');
+    expect(fromBaseUnits('9223372036854775807', 18)).toBe('9.223372036854775807');
+  });
+
+  it('stays exact past the forty significant digits decimal.js is set to', () => {
+    // Not reachable from today's backend, whose base units are 64-bit integers,
+    // but the function's contract is that moving the decimal point is exact for
+    // any integer. A division at precision 40 rounds this to
+    // "1111111111111111111111111111111111111111000000000000.00000000", padding
+    // the damage with zeros where it looks like data.
+    const units = '1'.repeat(60);
+
+    expect(fromBaseUnits(units, 8)).toBe(`${'1'.repeat(52)}.${'1'.repeat(8)}`);
+  });
+
+  it.each([
+    ['-12000', 8, '-0.00012000'],
+    ['-150000000', 8, '-1.50000000'],
+    ['-1', 8, '-0.00000001'],
+  ])('keeps the sign of a negative pending amount: %j -> %j', (units, decimals, expected) => {
+    // `pending` is signed: an outgoing unconfirmed transaction is a negative
+    // number of base units, and dropping the sign reports money arriving that
+    // is in fact leaving.
+    expect(fromBaseUnits(units, decimals)).toBe(expected);
+  });
+
+  it('round-trips: the digits of the quantity are the digits of the base units', () => {
+    // Removing the decimal point and the leading zeros must give back exactly
+    // the integer that went in, for values on both sides of the safe-integer
+    // ceiling.
+    for (const units of ['1', '12000', '9007199254740993', '2870000000000000123']) {
+      const quantity = fromBaseUnits(units, 8);
+
+      expect(quantity.replace('.', '').replace(/^0+(?=\d)/, '')).toBe(units);
+      expect(quantity.split('.')[1]).toHaveLength(8);
+    }
+  });
+
+  it('returns a value the other money helpers accept', () => {
+    const quantity = fromBaseUnits('2870000000000000123', 8);
+
+    expect(() => money(quantity)).not.toThrow();
+    expect(addMoney(quantity, money('0.00000001'))).toBe('28700000000.00000124');
+  });
+
+  it.each(['1.5', '1e3', '', ' 1', '1 ', '+1', '0x10', 'NaN', 'Infinity', '--1', '1,000', '٣'])(
+    'refuses %j, which is not an integer string',
+    (units) => {
+      expect(() => fromBaseUnits(units, 8)).toThrow(TypeError);
+    },
+  );
 });

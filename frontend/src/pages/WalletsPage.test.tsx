@@ -1,0 +1,962 @@
+import { screen, waitFor, within } from '@testing-library/react';
+import userEvent, { type UserEvent } from '@testing-library/user-event';
+import { http, HttpResponse, type HttpHandler } from 'msw';
+import { describe, expect, it } from 'vitest';
+
+import {
+  ADDRESS_REJECTIONS,
+  DUPLICATE_ARCHIVED_DETAIL,
+  DUPLICATE_DETAIL,
+  fakePortfolio,
+  LABEL_TOO_LONG,
+  validationProblem,
+  WALLET_NOT_FOUND_DETAIL,
+  WALLET_PATH,
+  WALLETS_PATH,
+  type FakePortfolio,
+  type FakePortfolioOptions,
+} from '@/test/fakePortfolio';
+import { ADDRESSES, wallet, type WalletResponse } from '@/test/fixtures';
+import { renderApp, settle } from '@/test/render';
+import { fakeSession, problem, server, TEST_USERNAME } from '@/test/server';
+
+/**
+ * The owner's registry for most tests: two Bitcoin wallets, one labelled and
+ * one not, and a Kaspa wallet.
+ */
+function threeWallets(): WalletResponse[] {
+  return [
+    wallet({ id: 1, chain_key: 'bitcoin', address: ADDRESSES.btcSegwit, label: 'Cold storage' }),
+    wallet({ id: 2, chain_key: 'bitcoin', address: ADDRESSES.btcLegacy, label: null }),
+    wallet({ id: 3, chain_key: 'kaspa', address: ADDRESSES.kasPrimary, label: 'Mining payouts' }),
+  ];
+}
+
+interface Setup {
+  readonly user: UserEvent;
+  readonly fake: FakePortfolio;
+}
+
+/**
+ * Signs in, installs the fake backend and opens `/wallets`.
+ *
+ * `overrides` are installed after the fake and so take precedence over it,
+ * and they are in place before the first render: an override registered after
+ * `renderApp` only wins because the session read happens to come first.
+ */
+function openWalletsPage(
+  options: FakePortfolioOptions = {},
+  overrides: readonly HttpHandler[] = [],
+): Setup {
+  const user = userEvent.setup();
+  const fake = fakePortfolio(options);
+  server.use(...fakeSession({ initialUser: TEST_USERNAME }).handlers, ...fake.handlers);
+  server.use(...overrides);
+
+  renderApp(['/wallets']);
+
+  return { user, fake };
+}
+
+/** An empty registry, with the page loaded and the form ready. */
+async function openEmptyWalletsPage(overrides: readonly HttpHandler[] = []): Promise<Setup> {
+  const setup = openWalletsPage({ wallets: [] }, overrides);
+  await screen.findByRole('heading', { name: /no wallets yet/i });
+  return setup;
+}
+
+/** The list region, once it has loaded. */
+async function walletList(): Promise<HTMLElement> {
+  const region = await screen.findByRole('region', { name: 'Your wallets' });
+  return within(region).findByRole('list');
+}
+
+/** The list item whose text contains `text`. Fails loudly when there is none. */
+async function rowFor(text: string): Promise<HTMLElement> {
+  const list = await walletList();
+  const row = within(list)
+    .getAllByRole('listitem')
+    .find((item) => within(item).queryByText(text) !== null);
+
+  if (row === undefined) {
+    throw new Error(`No wallet row contains "${text}". List was: ${list.textContent}`);
+  }
+
+  return row;
+}
+
+/** The truncated address `<Address>` renders, by the full address in its title. */
+function shownAddress(container: HTMLElement, address: string): HTMLElement {
+  return within(container).getByTitle(address);
+}
+
+function addForm(): HTMLElement {
+  return screen.getByRole('form', { name: 'Add a wallet' });
+}
+
+function addressInput(): HTMLElement {
+  return within(addForm()).getByLabelText('Address');
+}
+
+function labelInput(): HTMLElement {
+  return within(addForm()).getByLabelText('Label');
+}
+
+function chainSelect(): HTMLElement {
+  return within(addForm()).getByLabelText('Chain');
+}
+
+function submitButton(): HTMLElement {
+  return within(addForm()).getByRole('button', { name: 'Add wallet' });
+}
+
+/** Every `POST /api/wallets` the fake saw. */
+function creates(fake: FakePortfolio) {
+  return fake.writes('POST', WALLETS_PATH);
+}
+
+/**
+ * Asserts that `message` is rendered as `input`'s own error: marked invalid,
+ * and reachable through `aria-describedby`, which is what a screen reader
+ * reads out on focus.
+ */
+function expectFieldError(input: HTMLElement, message: string | RegExp): void {
+  expect(input).toHaveAttribute('aria-invalid', 'true');
+  expect(input).toHaveAccessibleDescription(
+    typeof message === 'string' ? expect.stringContaining(message) : message,
+  );
+}
+
+function expectNoFieldError(input: HTMLElement, message: string): void {
+  expect(input).not.toHaveAttribute('aria-invalid', 'true');
+  expectNotDescribedBy(input, message);
+}
+
+/** `message` is not part of `input`'s accessible description. */
+function expectNotDescribedBy(input: HTMLElement, message: string): void {
+  expect(input).not.toHaveAccessibleDescription(expect.stringContaining(message));
+}
+
+describe('WalletsPage: list', () => {
+  it("lists the owner's wallets with chain, label and address", async () => {
+    openWalletsPage({ wallets: threeWallets() });
+
+    const list = await walletList();
+    expect(within(list).getAllByRole('listitem')).toHaveLength(3);
+
+    const cold = await rowFor('Cold storage');
+    expect(cold).toHaveTextContent('Bitcoin');
+    expect(shownAddress(cold, ADDRESSES.btcSegwit)).toHaveTextContent('tb1qw508…xpjzsx');
+
+    const mining = await rowFor('Mining payouts');
+    expect(mining).toHaveTextContent('Kaspa');
+    expect(shownAddress(mining, ADDRESSES.kasPrimary)).toHaveTextContent('kaspatest:qxaqrl…gdmpks');
+
+    // The unlabelled wallet is still listed, recognisable by its address.
+    const unlabelled = within(list)
+      .getAllByRole('listitem')
+      .find((item) => within(item).queryByTitle(ADDRESSES.btcLegacy) !== null);
+    expect(unlabelled).toBeDefined();
+    expect(unlabelled).toHaveTextContent('Bitcoin');
+    expect(unlabelled).not.toHaveTextContent('null');
+
+    // Active wallets offer archive, not restore.
+    expect(within(cold).getByRole('button', { name: 'Archive' })).toBeInTheDocument();
+    expect(within(cold).queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
+    expect(within(cold).queryByText('Archived')).not.toBeInTheDocument();
+  });
+
+  it('shows the full address nowhere but in the title until the owner asks', async () => {
+    openWalletsPage({ wallets: threeWallets() });
+
+    await walletList();
+
+    for (const address of [ADDRESSES.btcSegwit, ADDRESSES.btcLegacy, ADDRESSES.kasPrimary]) {
+      expect(screen.queryByText(address)).not.toBeInTheDocument();
+    }
+  });
+
+  it('asks for the active wallets only, until archived ones are requested', async () => {
+    const { fake } = openWalletsPage({ wallets: threeWallets() });
+
+    await walletList();
+
+    const reads = fake.requests.filter((entry) => entry.method === 'GET');
+    expect(reads.length).toBeGreaterThan(0);
+    for (const read of reads) {
+      expect(new URL(read.url).searchParams.get('include_archived')).toBeNull();
+    }
+  });
+});
+
+describe('WalletsPage: states', () => {
+  it('announces that the list is loading', async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    openWalletsPage({ wallets: threeWallets() }, [
+      http.get(WALLETS_PATH, async () => {
+        await gate;
+        return undefined;
+      }),
+    ]);
+
+    expect(await screen.findByText('Loading wallets…')).toHaveAttribute('role', 'status');
+    // Not an empty state while it is still loading: "no wallets yet" would be a
+    // claim about data that has not arrived.
+    expect(screen.queryByText(/no wallets yet/i)).not.toBeInTheDocument();
+
+    release();
+
+    expect(await rowFor('Cold storage')).toBeInTheDocument();
+    expect(screen.queryByText('Loading wallets…')).not.toBeInTheDocument();
+  });
+
+  it('no wallets: an empty state points at the add form', async () => {
+    openWalletsPage({ wallets: [] });
+
+    const region = await screen.findByRole('region', { name: 'Your wallets' });
+    expect(
+      await within(region).findByRole('heading', { name: /no wallets yet/i }),
+    ).toBeInTheDocument();
+    expect(within(region).queryByRole('list')).not.toBeInTheDocument();
+    // An empty state is not a failure.
+    expect(within(region).queryByRole('alert')).not.toBeInTheDocument();
+    // And the form it points at is there.
+    expect(submitButton()).toBeEnabled();
+  });
+
+  it('a failed list load shows the reason and a retry, not an empty list', async () => {
+    let failing = true;
+    const { user } = openWalletsPage({ wallets: threeWallets() }, [
+      // Falls through to the fake once `failing` is cleared.
+      http.get(WALLETS_PATH, () =>
+        failing ? problem(503, 'Service Unavailable', 'The database is not reachable.') : undefined,
+      ),
+    ]);
+
+    const region = await screen.findByRole('region', { name: 'Your wallets' });
+    const alert = await within(region).findByRole('alert');
+    expect(alert).toHaveTextContent('Could not load your wallets');
+    expect(alert).toHaveTextContent('The database is not reachable.');
+    // A failure to read the list is not an empty list.
+    expect(screen.queryByText(/no wallets yet/i)).not.toBeInTheDocument();
+
+    failing = false;
+    await user.click(within(alert).getByRole('button', { name: 'Try again' }));
+
+    expect(await rowFor('Cold storage')).toBeInTheDocument();
+    expect(within(region).queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('a list the backend cannot be reached for says so in words, not a status code', async () => {
+    openWalletsPage({ wallets: threeWallets() }, [
+      http.get(WALLETS_PATH, () => HttpResponse.error()),
+    ]);
+
+    const region = await screen.findByRole('region', { name: 'Your wallets' });
+    const alert = await within(region).findByRole('alert');
+    expect(alert).toHaveTextContent(/could not be reached/i);
+    expect(alert).not.toHaveTextContent(/failed to fetch/i);
+  });
+
+  it('the add form still works when the list fails to load', async () => {
+    const { user, fake } = openWalletsPage({ wallets: [] }, [
+      http.get(WALLETS_PATH, () => problem(500, 'Internal Server Error', 'Boom.')),
+    ]);
+
+    const region = await screen.findByRole('region', { name: 'Your wallets' });
+    await within(region).findByRole('alert');
+
+    await user.type(addressInput(), ADDRESSES.btcRegtest);
+    await user.type(labelInput(), 'Test rig');
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(fake.wallets()).toHaveLength(1);
+    });
+    expect(fake.wallets()[0]).toMatchObject({
+      chain_key: 'bitcoin',
+      address: ADDRESSES.btcRegtest,
+      label: 'Test rig',
+    });
+    // The form took the success: it cleared, and it says nothing went wrong.
+    await waitFor(() => {
+      expect(addressInput()).toHaveValue('');
+    });
+    expect(within(addForm()).queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('a failed archive leaves the row in place and says why', async () => {
+    const { user, fake } = openWalletsPage({ wallets: threeWallets() }, [
+      http.delete(WALLET_PATH, () =>
+        problem(500, 'Internal Server Error', 'The server encountered an unexpected condition.'),
+      ),
+    ]);
+
+    const row = await rowFor('Cold storage');
+    await user.click(within(row).getByRole('button', { name: 'Archive' }));
+    await user.click(within(row).getByRole('button', { name: 'Confirm archive' }));
+
+    expect(await within(row).findByRole('alert')).toHaveTextContent(
+      'The server encountered an unexpected condition.',
+    );
+    await settle();
+    // Still listed, still active, and the owner can try again.
+    expect(await rowFor('Cold storage')).toBeInTheDocument();
+    expect(fake.wallets().find((entry) => entry.id === 1)?.archived).toBe(false);
+    expect(within(row).getByRole('button', { name: 'Confirm archive' })).toBeEnabled();
+  });
+
+  it('a failed archive that never reached the server says so in words', async () => {
+    const { user } = openWalletsPage({ wallets: threeWallets() }, [
+      http.delete(WALLET_PATH, () => HttpResponse.error()),
+    ]);
+
+    const row = await rowFor('Cold storage');
+    await user.click(within(row).getByRole('button', { name: 'Archive' }));
+    await user.click(within(row).getByRole('button', { name: 'Confirm archive' }));
+
+    const alert = await within(row).findByRole('alert');
+    expect(alert).toHaveTextContent(/could not archive/i);
+    expect(alert).not.toHaveTextContent(/failed to fetch/i);
+  });
+});
+
+describe('WalletsPage: add', () => {
+  it('adds a wallet and shows it in the list', async () => {
+    const { user, fake } = openWalletsPage({ wallets: threeWallets() });
+    await walletList();
+
+    await user.selectOptions(chainSelect(), 'kaspa');
+    await user.type(addressInput(), ADDRESSES.kasSecondary);
+    await user.type(labelInput(), 'Faucet');
+    await user.click(submitButton());
+
+    const row = await rowFor('Faucet');
+    expect(row).toHaveTextContent('Kaspa');
+    expect(shownAddress(row, ADDRESSES.kasSecondary)).toBeInTheDocument();
+
+    expect(creates(fake)).toHaveLength(1);
+    expect(creates(fake)[0]?.body).toEqual({
+      chain_key: 'kaspa',
+      address: ADDRESSES.kasSecondary,
+      label: 'Faucet',
+    });
+    expect(creates(fake)[0]?.contentType).toBe('application/json');
+    // Ready for the next one.
+    expect(addressInput()).toHaveValue('');
+    expect(labelInput()).toHaveValue('');
+  });
+
+  it('sends no label rather than an empty one', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+
+    await user.type(addressInput(), ADDRESSES.btcScript);
+    await user.type(labelInput(), '   ');
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(creates(fake)).toHaveLength(1);
+    });
+    expect(creates(fake)[0]?.body).toMatchObject({ chain_key: 'bitcoin', label: null });
+  });
+
+  it('disables the submit button while the request is in flight', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+    const release = fake.hold('create');
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(submitButton()).toBeDisabled();
+    });
+    // A second press while the first is in flight sends nothing.
+    await user.click(submitButton());
+    expect(creates(fake)).toHaveLength(1);
+
+    release();
+
+    await waitFor(() => {
+      expect(submitButton()).toBeEnabled();
+    });
+    expect(within(await walletList()).getByTitle(ADDRESSES.btcSegwit)).toBeInTheDocument();
+    expect(creates(fake)).toHaveLength(1);
+  });
+
+  it('a double click sends one request', async () => {
+    // The client half of #5's double-click finding: the button disables
+    // itself before a second click can land.
+    const { user, fake } = await openEmptyWalletsPage();
+    const release = fake.hold('create');
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.dblClick(submitButton());
+    await settle();
+
+    expect(creates(fake)).toHaveLength(1);
+    release();
+    await waitFor(() => {
+      expect(submitButton()).toBeEnabled();
+    });
+  });
+
+  it('an empty address is refused without a request', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+
+    await user.click(submitButton());
+
+    expectFieldError(addressInput(), 'An address is required.');
+
+    // Whitespace is empty too.
+    await user.type(addressInput(), '   ');
+    await user.click(submitButton());
+    expectFieldError(addressInput(), 'An address is required.');
+
+    await settle();
+    expect(creates(fake)).toHaveLength(0);
+  });
+
+  it('clears the local refusal once an address is typed', async () => {
+    const { user } = await openEmptyWalletsPage();
+
+    await user.click(submitButton());
+    expectFieldError(addressInput(), 'An address is required.');
+
+    await user.type(addressInput(), 't');
+
+    expectNoFieldError(addressInput(), 'An address is required.');
+  });
+});
+
+describe('WalletsPage: hints', () => {
+  it("shows the selected chain's format hint while the address is empty", async () => {
+    const { user } = await openEmptyWalletsPage();
+
+    expect(addressInput()).toHaveAccessibleDescription(expect.stringContaining('tb1'));
+
+    await user.selectOptions(chainSelect(), 'kaspa');
+
+    expect(addressInput()).toHaveAccessibleDescription(expect.stringContaining('kaspatest:'));
+  });
+
+  it('a hint never disables submission', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+    fake.rejectAddress(ADDRESSES.kasPrimary, 'malformed');
+
+    // A Kaspa address with Bitcoin selected: the hint says so...
+    await user.type(addressInput(), ADDRESSES.kasPrimary);
+    expect(addressInput()).toHaveAccessibleDescription(
+      expect.stringMatching(/looks like a kaspa/i),
+    );
+    // ...and the owner can still send it. The server is the only validator.
+    expect(submitButton()).toBeEnabled();
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(creates(fake)).toHaveLength(1);
+    });
+    expect(creates(fake)[0]?.body).toMatchObject({
+      chain_key: 'bitcoin',
+      address: ADDRESSES.kasPrimary,
+    });
+    // And the server's verdict lands under the field.
+    await waitFor(() => {
+      expectFieldError(addressInput(), ADDRESS_REJECTIONS.malformed);
+    });
+  });
+
+  it('an extended key is hinted at and still sent', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+    const tpub =
+      'tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp';
+    fake.rejectAddress(tpub, 'extended_key');
+
+    await user.type(addressInput(), tpub);
+
+    expect(addressInput()).toHaveAccessibleDescription(
+      expect.stringMatching(/only single addresses are supported/i),
+    );
+    expect(submitButton()).toBeEnabled();
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expectFieldError(addressInput(), ADDRESS_REJECTIONS.extended_key);
+    });
+    expect(creates(fake)).toHaveLength(1);
+  });
+
+  it('the switch-chain control changes the selected chain', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+
+    await user.type(addressInput(), ADDRESSES.kasSecondary);
+    await user.click(within(addForm()).getByRole('button', { name: 'Use Kaspa instead' }));
+
+    expect(chainSelect()).toHaveValue('kaspa');
+    // The hint has nothing left to say, so the control is gone.
+    expect(
+      within(addForm()).queryByRole('button', { name: /use .* instead/i }),
+    ).not.toBeInTheDocument();
+    // The address the owner typed is kept.
+    expect(addressInput()).toHaveValue(ADDRESSES.kasSecondary);
+
+    await user.click(submitButton());
+    await waitFor(() => {
+      expect(creates(fake)).toHaveLength(1);
+    });
+    expect(creates(fake)[0]?.body).toMatchObject({
+      chain_key: 'kaspa',
+      address: ADDRESSES.kasSecondary,
+    });
+  });
+
+  it('switches back to Bitcoin the same way', async () => {
+    const { user } = await openEmptyWalletsPage();
+
+    await user.selectOptions(chainSelect(), 'kaspa');
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(within(addForm()).getByRole('button', { name: 'Use Bitcoin instead' }));
+
+    expect(chainSelect()).toHaveValue('bitcoin');
+  });
+
+  it('the switch-chain control does not submit the form', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+
+    await user.type(addressInput(), ADDRESSES.kasSecondary);
+    await user.click(within(addForm()).getByRole('button', { name: 'Use Kaspa instead' }));
+    await settle();
+
+    expect(creates(fake)).toHaveLength(0);
+  });
+});
+
+describe('WalletsPage: field errors', () => {
+  it('a 422 on the address renders under the address field', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+    fake.rejectAddress(ADDRESSES.btcSegwit, 'bad_checksum');
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.type(labelInput(), 'Typo');
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expectFieldError(addressInput(), ADDRESS_REJECTIONS.bad_checksum);
+    });
+    expectNoFieldError(labelInput(), ADDRESS_REJECTIONS.bad_checksum);
+    // Under the field, not also at form level as a generic failure.
+    expect(within(addForm()).queryByText(/failed validation/i)).not.toBeInTheDocument();
+    // What the owner typed is kept, so they can fix one character.
+    expect(addressInput()).toHaveValue(ADDRESSES.btcSegwit);
+    expect(labelInput()).toHaveValue('Typo');
+  });
+
+  it('a 422 on the label renders under the label field', async () => {
+    const { user } = await openEmptyWalletsPage();
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.type(labelInput(), 'x'.repeat(101));
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expectFieldError(labelInput(), LABEL_TOO_LONG.msg);
+    });
+    expectNoFieldError(addressInput(), LABEL_TOO_LONG.msg);
+  });
+
+  it('a 422 on the chain renders under the chain field', async () => {
+    const { user } = await openEmptyWalletsPage();
+    server.use(
+      http.post(WALLETS_PATH, () =>
+        validationProblem([
+          { loc: ['body', 'chain_key'], msg: "Input should be 'bitcoin' or 'kaspa'", type: 'enum' },
+        ]),
+      ),
+    );
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expectFieldError(chainSelect(), "Input should be 'bitcoin' or 'kaspa'");
+    });
+    expectNoFieldError(addressInput(), "Input should be 'bitcoin' or 'kaspa'");
+  });
+
+  it('errors on two fields render under both', async () => {
+    const { user } = await openEmptyWalletsPage();
+    server.use(
+      http.post(WALLETS_PATH, () =>
+        validationProblem([
+          {
+            loc: ['body', 'address'],
+            msg: ADDRESS_REJECTIONS.wrong_network,
+            type: 'wrong_network',
+          },
+          { loc: ['body', 'label'], ...LABEL_TOO_LONG },
+        ]),
+      ),
+    );
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expectFieldError(addressInput(), ADDRESS_REJECTIONS.wrong_network);
+    });
+    expectFieldError(labelInput(), LABEL_TOO_LONG.msg);
+    // Each message under its own field only.
+    expectNotDescribedBy(addressInput(), LABEL_TOO_LONG.msg);
+    expectNotDescribedBy(labelInput(), ADDRESS_REJECTIONS.wrong_network);
+  });
+
+  it('a 422 at an unknown location renders at form level', async () => {
+    const { user } = await openEmptyWalletsPage();
+    server.use(
+      http.post(WALLETS_PATH, () =>
+        validationProblem([
+          { loc: ['body'], msg: 'Extra inputs are not permitted', type: 'extra_forbidden' },
+          {
+            loc: ['query', 'dry_run'],
+            msg: 'Input should be a valid boolean',
+            type: 'bool_parsing',
+          },
+        ]),
+      ),
+    );
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+
+    const form = addForm();
+    expect(await within(form).findByText('Extra inputs are not permitted')).toHaveAttribute(
+      'role',
+      'alert',
+    );
+    expect(within(form).getByText('Input should be a valid boolean')).toBeInTheDocument();
+    // Not pinned on a field it has nothing to do with.
+    for (const input of [addressInput(), labelInput(), chainSelect()]) {
+      expectNoFieldError(input, 'Extra inputs are not permitted');
+      expect(input).not.toHaveAttribute('aria-invalid', 'true');
+    }
+  });
+
+  it('a 422 whose errors cannot be read still says the request was refused', async () => {
+    const { user } = await openEmptyWalletsPage();
+    server.use(
+      http.post(WALLETS_PATH, () =>
+        validationProblem([{ loc: 'body', msg: 7, type: 'x' }] as never),
+      ),
+    );
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+
+    expect(await within(addForm()).findByRole('alert')).toHaveTextContent(
+      'The request parameters failed validation.',
+    );
+  });
+
+  it.each([
+    ['active', false, DUPLICATE_DETAIL],
+    ['archived', true, DUPLICATE_ARCHIVED_DETAIL],
+  ])('a 409 renders under the address field (%s duplicate)', async (_state, archived, detail) => {
+    const { user } = openWalletsPage({
+      wallets: [wallet({ id: 1, address: ADDRESSES.btcSegwit, label: 'Existing', archived })],
+    });
+    await screen.findByRole('region', { name: 'Your wallets' });
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expectFieldError(addressInput(), detail);
+    });
+    // A duplicate is not a failure of the page.
+    expect(within(addForm()).getAllByRole('alert')).toHaveLength(1);
+  });
+
+  it('a server failure on add renders at form level with the server sentence', async () => {
+    const { user } = await openEmptyWalletsPage();
+    server.use(
+      http.post(WALLETS_PATH, () =>
+        problem(500, 'Internal Server Error', 'The server encountered an unexpected condition.'),
+      ),
+    );
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+
+    expect(await within(addForm()).findByRole('alert')).toHaveTextContent(
+      'The server encountered an unexpected condition.',
+    );
+    expect(addressInput()).not.toHaveAttribute('aria-invalid', 'true');
+    expect(submitButton()).toBeEnabled();
+  });
+
+  it('an add that never reached the server says so and keeps the input', async () => {
+    const { user } = await openEmptyWalletsPage();
+    server.use(http.post(WALLETS_PATH, () => HttpResponse.error()));
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+
+    const alert = await within(addForm()).findByRole('alert');
+    expect(alert).toHaveTextContent(/could not add the wallet/i);
+    expect(alert).not.toHaveTextContent(/failed to fetch/i);
+    expect(addressInput()).toHaveValue(ADDRESSES.btcSegwit);
+  });
+
+  it('a server error under the address clears once the address is edited', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+    fake.rejectAddress(ADDRESSES.btcSegwit, 'bad_checksum');
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+    await waitFor(() => {
+      expectFieldError(addressInput(), ADDRESS_REJECTIONS.bad_checksum);
+    });
+
+    // Fixing the typo: the old verdict is about a value no longer in the box.
+    await user.type(addressInput(), '{Backspace}');
+
+    expectNoFieldError(addressInput(), ADDRESS_REJECTIONS.bad_checksum);
+    expect(screen.queryByText(ADDRESS_REJECTIONS.bad_checksum)).not.toBeInTheDocument();
+  });
+
+  it('a duplicate refusal clears once the address is edited', async () => {
+    const { user } = openWalletsPage({
+      wallets: [wallet({ id: 1, address: ADDRESSES.btcSegwit, label: 'Existing' })],
+    });
+    await rowFor('Existing');
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+    await waitFor(() => {
+      expectFieldError(addressInput(), DUPLICATE_DETAIL);
+    });
+
+    await user.clear(addressInput());
+    await user.type(addressInput(), ADDRESSES.btcLegacy);
+
+    expectNoFieldError(addressInput(), DUPLICATE_DETAIL);
+  });
+
+  it('a server error under the label clears once the label is edited', async () => {
+    const { user } = await openEmptyWalletsPage();
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.type(labelInput(), 'x'.repeat(101));
+    await user.click(submitButton());
+    await waitFor(() => {
+      expectFieldError(labelInput(), LABEL_TOO_LONG.msg);
+    });
+
+    await user.type(labelInput(), '{Backspace}');
+
+    expectNoFieldError(labelInput(), LABEL_TOO_LONG.msg);
+  });
+
+  it('a field error clears once the resubmission succeeds', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+    fake.rejectAddress(ADDRESSES.btcSegwit, 'bad_checksum');
+
+    await user.type(addressInput(), ADDRESSES.btcSegwit);
+    await user.click(submitButton());
+    await waitFor(() => {
+      expectFieldError(addressInput(), ADDRESS_REJECTIONS.bad_checksum);
+    });
+
+    // The fake refuses an address once; the second attempt goes through.
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(fake.wallets()).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expectNoFieldError(addressInput(), ADDRESS_REJECTIONS.bad_checksum);
+    });
+  });
+});
+
+describe('WalletsPage: archive and restore', () => {
+  it('archiving asks for confirmation first', async () => {
+    const { user, fake } = openWalletsPage({ wallets: threeWallets() });
+
+    const row = await rowFor('Cold storage');
+    await user.click(within(row).getByRole('button', { name: 'Archive' }));
+
+    // The consequence, in words, before anything is sent.
+    expect(row).toHaveTextContent(/stop being read/i);
+    expect(row).toHaveTextContent(/leave the total/i);
+    expect(within(row).getByRole('button', { name: 'Confirm archive' })).toBeInTheDocument();
+    await settle();
+    expect(fake.writes('DELETE', '/api/wallets/1')).toHaveLength(0);
+    expect(fake.requests.filter((entry) => entry.method !== 'GET')).toHaveLength(0);
+
+    // Cancel sends nothing and puts the row back.
+    await user.click(within(row).getByRole('button', { name: 'Cancel' }));
+    expect(within(row).getByRole('button', { name: 'Archive' })).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: 'Confirm archive' })).not.toBeInTheDocument();
+    await settle();
+    expect(fake.requests.filter((entry) => entry.method !== 'GET')).toHaveLength(0);
+  });
+
+  it('confirming one row does not arm the others', async () => {
+    const { user } = openWalletsPage({ wallets: threeWallets() });
+
+    const cold = await rowFor('Cold storage');
+    await user.click(within(cold).getByRole('button', { name: 'Archive' }));
+
+    const mining = await rowFor('Mining payouts');
+    expect(
+      within(mining).queryByRole('button', { name: 'Confirm archive' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('archiving removes the wallet from the active list', async () => {
+    const { user, fake } = openWalletsPage({ wallets: threeWallets() });
+
+    const row = await rowFor('Cold storage');
+    await user.click(within(row).getByRole('button', { name: 'Archive' }));
+    await user.click(within(row).getByRole('button', { name: 'Confirm archive' }));
+
+    await waitFor(() => {
+      expect(screen.queryByText('Cold storage')).not.toBeInTheDocument();
+    });
+    const list = await walletList();
+    expect(within(list).getAllByRole('listitem')).toHaveLength(2);
+
+    // By id, as a DELETE, carrying the header the write guard requires.
+    const deletes = fake.writes('DELETE', '/api/wallets/1');
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]?.contentType).toBe('application/json');
+    expect(fake.wallets().find((entry) => entry.id === 1)?.archived).toBe(true);
+  });
+
+  it('archiving the last wallet leaves the empty state', async () => {
+    const { user } = openWalletsPage({
+      wallets: [wallet({ id: 1, address: ADDRESSES.btcSegwit, label: 'Only one' })],
+    });
+
+    const row = await rowFor('Only one');
+    await user.click(within(row).getByRole('button', { name: 'Archive' }));
+    await user.click(within(row).getByRole('button', { name: 'Confirm archive' }));
+
+    expect(await screen.findByRole('heading', { name: /no wallets yet/i })).toBeInTheDocument();
+  });
+
+  it('show archived lists archived wallets with a restore button', async () => {
+    const wallets = [
+      ...threeWallets(),
+      wallet({
+        id: 4,
+        chain_key: 'bitcoin',
+        address: ADDRESSES.btcScript,
+        label: 'Old exchange',
+        archived: true,
+      }),
+    ];
+    const { user, fake } = openWalletsPage({ wallets });
+
+    await rowFor('Cold storage');
+    expect(screen.queryByText('Old exchange')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+
+    const archived = await rowFor('Old exchange');
+    // Marked in text, not by colour alone.
+    expect(within(archived).getByText('Archived')).toBeInTheDocument();
+    expect(within(archived).getByRole('button', { name: 'Restore' })).toBeInTheDocument();
+    expect(within(archived).queryByRole('button', { name: 'Archive' })).not.toBeInTheDocument();
+
+    // The active ones are still there, unmarked, with no restore.
+    const cold = await rowFor('Cold storage');
+    expect(within(cold).queryByText('Archived')).not.toBeInTheDocument();
+    expect(within(cold).queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
+
+    expect(
+      fake.requests.some(
+        (entry) => new URL(entry.url).searchParams.get('include_archived') === 'true',
+      ),
+    ).toBe(true);
+  });
+
+  it('restoring returns the wallet to the active list', async () => {
+    const wallets = [
+      ...threeWallets(),
+      wallet({
+        id: 4,
+        chain_key: 'bitcoin',
+        address: ADDRESSES.btcScript,
+        label: 'Old exchange',
+        archived: true,
+      }),
+    ];
+    const { user, fake } = openWalletsPage({ wallets });
+
+    await rowFor('Cold storage');
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+    const archived = await rowFor('Old exchange');
+
+    await user.click(within(archived).getByRole('button', { name: 'Restore' }));
+
+    await waitFor(() => {
+      expect(fake.wallets().find((entry) => entry.id === 4)?.archived).toBe(false);
+    });
+    const patches = fake.writes('PATCH', '/api/wallets/4');
+    expect(patches).toHaveLength(1);
+    // Only `archived`: sending the label along would be a rename nobody asked for.
+    expect(patches[0]?.body).toEqual({ archived: false });
+
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+
+    const restored = await rowFor('Old exchange');
+    expect(within(restored).getByRole('button', { name: 'Archive' })).toBeInTheDocument();
+    expect(within(restored).queryByText('Archived')).not.toBeInTheDocument();
+  });
+
+  it('a failed restore says why and keeps the wallet archived', async () => {
+    const { user, fake } = openWalletsPage({
+      wallets: [
+        wallet({ id: 4, address: ADDRESSES.btcScript, label: 'Old exchange', archived: true }),
+      ],
+    });
+    server.use(http.patch(WALLET_PATH, () => problem(404, 'Not Found', WALLET_NOT_FOUND_DETAIL)));
+
+    await screen.findByRole('heading', { name: /no wallets yet/i });
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+    const archived = await rowFor('Old exchange');
+    await user.click(within(archived).getByRole('button', { name: 'Restore' }));
+
+    expect(await within(archived).findByRole('alert')).toHaveTextContent(WALLET_NOT_FOUND_DETAIL);
+    expect(fake.wallets()[0]?.archived).toBe(true);
+    expect(within(archived).getByText('Archived')).toBeInTheDocument();
+  });
+
+  it('the archived duplicate sentence and the restore control are on one page', async () => {
+    // The 409 tells the owner to restore; the page has to make that possible
+    // without a trip to curl.
+    const { user, fake } = openWalletsPage({
+      wallets: [
+        wallet({ id: 4, address: ADDRESSES.btcScript, label: 'Old exchange', archived: true }),
+      ],
+    });
+    await screen.findByRole('heading', { name: /no wallets yet/i });
+
+    await user.type(addressInput(), ADDRESSES.btcScript);
+    await user.click(submitButton());
+    await waitFor(() => {
+      expectFieldError(addressInput(), DUPLICATE_ARCHIVED_DETAIL);
+    });
+
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+    await user.click(within(await rowFor('Old exchange')).getByRole('button', { name: 'Restore' }));
+
+    await waitFor(() => {
+      expect(fake.wallets()[0]?.archived).toBe(false);
+    });
+  });
+});

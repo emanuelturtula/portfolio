@@ -1,14 +1,16 @@
-import { screen, waitFor } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 
+import { fakePortfolio, recordRequestUrls } from '@/test/fakePortfolio';
 import { currentPath, renderApp, settle, visitedPaths } from '@/test/render';
 import {
   fakeSession,
   HEALTH_PATH,
   LOGOUT_PATH,
   server,
+  TEST_PASSWORD,
   TEST_USERNAME,
   unauthorized,
 } from '@/test/server';
@@ -17,6 +19,12 @@ import {
 function loginFormIsShown(): boolean {
   return screen.queryByLabelText(/password/i) !== null;
 }
+
+beforeEach(() => {
+  // The dashboard reads the portfolio as soon as a session exists. An empty
+  // one is the first-time owner; tests that need data register their own.
+  server.use(...fakePortfolio().handlers);
+});
 
 describe('App', () => {
   it('redirects an unauthenticated visit to a protected route to the login page', async () => {
@@ -48,18 +56,91 @@ describe('App', () => {
     expect(loginFormIsShown()).toBe(false);
   });
 
-  it('renders the dashboard placeholder rather than a blank page', async () => {
+  it('renders the dashboard empty state rather than a blank page', async () => {
     server.use(...fakeSession({ initialUser: TEST_USERNAME }).handlers);
 
     renderApp(['/']);
 
     const main = await screen.findByRole('main');
-    await waitFor(() => {
-      expect(main.textContent.trim().length).toBeGreaterThan(0);
-    });
-    // A placeholder, not a failure and not a permanent loading state.
+    expect(
+      await within(main).findByRole('heading', { name: /no wallets yet/i }),
+    ).toBeInTheDocument();
+    // An empty state, not a failure and not a permanent loading state.
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('the header links to the dashboard and the wallets page', async () => {
+    const user = userEvent.setup();
+    server.use(...fakeSession({ initialUser: TEST_USERNAME }).handlers);
+
+    renderApp(['/']);
+
+    const nav = await screen.findByRole('navigation', { name: 'Main' });
+    const dashboard = within(nav).getByRole('link', { name: 'Dashboard' });
+    const wallets = within(nav).getByRole('link', { name: 'Wallets' });
+    expect(dashboard).toHaveAttribute('href', '/');
+    expect(wallets).toHaveAttribute('href', '/wallets');
+    // The current page is marked for assistive technology, not by colour alone.
+    expect(dashboard).toHaveAttribute('aria-current', 'page');
+    expect(wallets).not.toHaveAttribute('aria-current');
+
+    await user.click(wallets);
+
+    expect(await screen.findByRole('form', { name: 'Add a wallet' })).toBeInTheDocument();
+    expect(currentPath()).toBe('/wallets');
+    expect(within(nav).getByRole('link', { name: 'Wallets' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+    // `end` on the dashboard link: `/` must not also match `/wallets`.
+    expect(within(nav).getByRole('link', { name: 'Dashboard' })).not.toHaveAttribute(
+      'aria-current',
+    );
+
+    await user.click(within(nav).getByRole('link', { name: 'Dashboard' }));
+
+    expect(await screen.findByRole('heading', { name: /no wallets yet/i })).toBeInTheDocument();
+    expect(currentPath()).toBe('/');
+  });
+
+  it('shows no navigation while signed out', async () => {
+    renderApp(['/login']);
+
+    await screen.findByLabelText(/username/i);
+    expect(screen.queryByRole('navigation', { name: 'Main' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Wallets' })).not.toBeInTheDocument();
+  });
+
+  it('/wallets requires a session', async () => {
+    const urls = recordRequestUrls();
+
+    renderApp(['/wallets']);
+
+    await waitFor(() => {
+      expect(currentPath()).toBe('/login');
+    });
+    await settle();
+    expect(currentPath()).toBe('/login');
+    expect(loginFormIsShown()).toBe(true);
+    // The guard decides before the page mounts: nothing about wallets was
+    // even asked for.
+    expect(urls.filter((url) => new URL(url).pathname.startsWith('/api/wallets'))).toEqual([]);
+    expect(screen.queryByRole('form', { name: 'Add a wallet' })).not.toBeInTheDocument();
+  });
+
+  it('returns to /wallets after signing in from a redirect', async () => {
+    const user = userEvent.setup();
+    server.use(...fakeSession().handlers);
+
+    renderApp(['/wallets']);
+    await user.type(await screen.findByLabelText(/username/i), TEST_USERNAME);
+    await user.type(screen.getByLabelText(/password/i), TEST_PASSWORD);
+    await user.click(screen.getByRole('button', { name: /sign in/i }));
+
+    expect(await screen.findByRole('form', { name: 'Add a wallet' })).toBeInTheDocument();
+    await settle();
+    expect(currentPath()).toBe('/wallets');
   });
 
   it('keeps the health page reachable, behind the guard', async () => {
