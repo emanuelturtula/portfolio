@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent, { type UserEvent } from '@testing-library/user-event';
 import { http, HttpResponse, type HttpHandler } from 'msw';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   ADDRESS_REJECTIONS,
@@ -17,7 +17,7 @@ import {
   type FakePortfolioOptions,
 } from '@/test/fakePortfolio';
 import { ADDRESSES, wallet, type WalletResponse } from '@/test/fixtures';
-import { renderApp, settle } from '@/test/render';
+import { currentPath, renderApp, settle } from '@/test/render';
 import { fakeSession, problem, server, TEST_USERNAME } from '@/test/server';
 
 /**
@@ -1009,6 +1009,47 @@ describe('WalletsPage: archive and restore', () => {
     await settle();
 
     expect(toggle).toHaveFocus();
+  });
+
+  describe('when the session dies between an archive and its refetch', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('lands on the login page with nothing thrown', async () => {
+      // The archive is answered 204; the refetch it triggers finds the session
+      // gone and is answered 401, which purges every cached query - including
+      // the wallet list the focus hand-off reads to decide where focus goes.
+      // That read comes back empty; it must degrade, not throw, and the owner
+      // must end up on the sign-in form.
+      const consoleErrors = vi.spyOn(console, 'error');
+      const user = userEvent.setup();
+      const session = fakeSession({ initialUser: TEST_USERNAME });
+      const fake = fakePortfolio({ wallets: threeWallets(), session });
+      server.use(...session.handlers, ...fake.handlers);
+      server.use(
+        http.delete(WALLET_PATH, () => {
+          session.signOut();
+          return new HttpResponse(null, { status: 204 });
+        }),
+      );
+      renderApp(['/wallets']);
+      await walletList();
+
+      await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+      await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+
+      expect(await screen.findByLabelText(/username/i)).toBeInTheDocument();
+      await settle();
+      expect(currentPath()).toBe('/login');
+      // The refetch really was refused, so this is the path under test.
+      expect(
+        fake.requests.some(
+          (entry) => entry.method === 'GET' && new URL(entry.url).pathname === WALLETS_PATH,
+        ),
+      ).toBe(true);
+      expect(consoleErrors).not.toHaveBeenCalled();
+    });
   });
 
   it('archive then restore with archived shown brings back Archive, not the confirm step', async () => {
