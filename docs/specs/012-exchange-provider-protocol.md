@@ -136,8 +136,9 @@ classifies and constructs. It takes no body, no message and no URL, by signature
 ### A venue code is carried only if it cannot be anything else
 
 The code comes out of a response body, which a venue fills as it likes. `venue_code_of(raw)`
-returns a string only for an `int` (not a `bool`) or a string matching `\A-?[0-9]{1,10}\Z`,
-and `None` for everything else; `ExchangeError.__init__` passes its `venue_code` through the
+returns a string only for an `int` (not a `bool`) or a string whose text matches
+`\A-?[0-9]{1,10}\Z` -- the digit bound applies to an `int` too, since a long integer could be
+an account id -- and `None` for everything else; `ExchangeError.__init__` passes its `venue_code` through the
 same function, so a code that reached the constructor by another route is held to the same
 rule. Both target venues are believed to use numeric codes (unconfirmed; see Risks). A
 digits-only string of ten characters cannot be an API key, a signature or an address, which
@@ -208,9 +209,13 @@ denominated in wei and leave twenty integer digits, more than any fill needs.
 **`quote_quantity` is stored as reported.** When a venue omits it,
 `derive_quote_quantity(quantity, price)` returns `quantize(multiply(quantity, price),
 FILL_SCALE)` and the provider sets `quote_quantity_derived=True`. `multiply` is new in
-`domain/money.py` and multiplies under `_MONEY_CONTEXT` rather than the calling thread's
-context, whose default precision is 28 and would round a product before it was quantized.
-The derived value is rounded, necessarily; that is what the flag says.
+`domain/money.py` and returns the **exact** product, assembled from the two coefficients as
+integers the way `from_base_units` is -- not `left * right`, which rounds under the calling
+thread's context (default precision 28), and not a multiply under `_MONEY_CONTEXT` either,
+which would round a product past 38 digits and then let `quantize` round it a second time:
+two half-even roundings in a row can land one unit off in the last place. `quantize` is the
+only rounding, and it is where the 38-digit ceiling is enforced. The derived value is rounded,
+necessarily; that is what the flag says.
 
 **`external_trade_id` must be unique per account across every symbol.** A venue whose ids are
 unique only per symbol must namespace them (for example `BTC-USDT:12345`), or the unique
@@ -263,8 +268,10 @@ class ExchangeCapabilities:
     requires_symbol: bool
 ```
 
-`__post_init__` refuses a page size below one, a non-positive query window or retention, and
-a rate limit with either field below one (`ValueError`). Which `CursorKind` each venue uses is
+`ExchangeCapabilities.__post_init__` refuses a page size below one and a non-positive query
+window or retention; `RateLimit` validates itself, refusing either field below one or not a
+plain `int`, because `RateLimit(0, 1000).min_interval_ms` would otherwise divide by zero
+(`ValueError`). Which `CursorKind` each venue uses is
 #13's and #14's to confirm; the enum lists the shapes both are believed to have.
 
 `clamp_to_retention(requested_since, *, now, capabilities) -> RetentionClamp` returns both
@@ -477,7 +484,7 @@ positive companion proving the thing searched was real.
 | 8 | by signature | `...::test_refusal_constructors_accept_no_message` | `inspect.signature` of each non-schema class and of `exchange_error` has no parameter that takes free text |
 | 8 | logged | `...::test_a_logged_auth_error_carries_nothing_from_the_body` | `logger.exception` through the real pipeline |
 | -- | domain | `tests/domain/test_exchanges.py` | enum values pinned |
-| -- | domain | `tests/domain/test_money.py::test_multiply_uses_the_money_context` | 30+ significant digits exact |
+| -- | domain | `tests/domain/test_money.py::test_multiply_is_exact` | a product past 38 significant digits exact, and unchanged inside `localcontext(prec=10)` |
 | -- | column message | `tests/db/test_money_types.py` update | the too-large refusal no longer contains the amount; it still names the scale |
 
 **Mutations the verification must kill**, stated before the run so a survivor is judged
