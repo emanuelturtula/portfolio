@@ -106,6 +106,8 @@ __all__ = [
     "ENDPOINT_EXTENSION",
     "ENDPOINT_LABEL",
     "ENDPOINT_LABELS",
+    "EXCHANGE_FILLS",
+    "EXCHANGE_SYMBOL",
     "HTTP_ERROR_FLOOR",
     "IDEMPOTENT_EXTENSION",
     "MAX_HEADER_DIGITS",
@@ -262,8 +264,36 @@ prices on a request path -- the failure `backend/.importlinter`'s price contract
 make impossible, observed from the other side.
 """
 
+EXCHANGE_FILLS: Final = "exchange_fills"
+"""A signed read of one page of an account's fills: Bitget's `GET /api/v2/spot/trade/fills`.
+
+**This is the label that stands between a signature and a log line.** The request carries
+the key, the passphrase and a signature in its headers and the account's time window and
+paging cursor in its query string; the log carries the scheme, the host and these two words.
+It says which kind of call failed -- the one an operator needs to tell a sync failure from a
+market-data failure -- and nothing about whose account it was or which page.
+"""
+
+EXCHANGE_SYMBOL: Final = "exchange_symbol"
+"""An unsigned read of what one pair is made of: Bitget's `GET /api/v2/spot/public/symbols`.
+
+Separate from `EXCHANGE_FILLS` because it is a different kind of call: public market data,
+no credential on it, asked once per new symbol. A log that shows these without fills
+lines, or many of them, is a symbol cache not doing its job. The label does not carry the
+symbol, for the reason `ASSET_PRICE` does not carry the pair.
+"""
+
 ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
-    {ADDRESS_BALANCE, ADDRESS_BALANCES, ASSET_PRICE, ASSET_PRICES, BLOCK_TIP_HEIGHT, NODE_HEALTH}
+    {
+        ADDRESS_BALANCE,
+        ADDRESS_BALANCES,
+        ASSET_PRICE,
+        ASSET_PRICES,
+        BLOCK_TIP_HEIGHT,
+        EXCHANGE_FILLS,
+        EXCHANGE_SYMBOL,
+        NODE_HEALTH,
+    }
 )
 """Every label that may reach a log. Membership is the gate; the shape is not.
 
@@ -275,8 +305,8 @@ closes that, because a string that is not a member renders as `UNLABELLED` no ma
 well it is shaped.
 
 Two labels on #7; four since #8 added Kaspa's batch read and its health report; six since
-#9 added the two price reads. The set grows one deliberate line at a time, which is the
-whole mechanism.
+#9 added the two price reads; eight since #13 added the exchange fills read and the symbol
+lookup beside it. The set grows one deliberate line at a time, which is the whole mechanism.
 
 Same shape as `PUBLIC_API_PATHS`: adding an endpoint protects it, and saying more about
 one is a visible edit to a named constant rather than a value computed at a call site.

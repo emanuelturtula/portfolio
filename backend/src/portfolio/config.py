@@ -99,6 +99,37 @@ def provider_url_violation(url: str) -> str | None:
     return None
 
 
+def exchange_credentials_violation(
+    variables: tuple[tuple[str, SecretStr | None], ...],
+) -> str | None:
+    """Why one venue's credential variables cannot be used, or `None` if they can.
+
+    `variables` is the venue's `(environment variable, value)` pairs. Two rules, checked in
+    this order:
+
+    1. **No value is blank.** An empty or whitespace credential is a variable somebody set
+       and got wrong, and `Credentials` would refuse it anyway -- on the first sync, where it
+       looks like any other failure, instead of at startup, where it is a rollback.
+    2. **All or none.** `None` for every variable means the venue is not configured and is
+       not built. Some set and some not is a credential that cannot sign, and the reason
+       names every variable that is missing.
+
+    **The reason names variables and never a value**, and never a length or a prefix either:
+    a partial credential in a log line is still part of a credential.
+    """
+    for name, value in variables:
+        if value is not None and not value.get_secret_value().strip():
+            return f"{name} is set but blank. Set it to the credential, or unset the variable."
+    missing = [name for name, value in variables if value is None]
+    if missing and len(missing) < len(variables):
+        verb = "is" if len(missing) == 1 else "are"
+        return (
+            f"{' and '.join(missing)} {verb} not set while the other credential variables of "
+            "the same venue are. Set all of them, or none."
+        )
+    return None
+
+
 class Settings(BaseSettings):
     """Runtime configuration for the backend."""
 
@@ -241,6 +272,28 @@ class Settings(BaseSettings):
     # credential format, which is exactly what the paragraph above refuses to do.
     coingecko_api_key: SecretStr | None = None
 
+    # The Bitget API key, its secret and its passphrase: the credentials the spot fills import
+    # signs with. **Read-only**, created by the owner on the venue, and `docs/operations.md`
+    # says how. `SecretStr` for the reason `bootstrap_password` is one, and the API key and the
+    # passphrase are secrets too -- rule 3 names API keys, and the three together are what
+    # reads the owner's trading history. Never persisted, never returned by an endpoint, never
+    # logged: they travel in request headers on the one call that uses them.
+    #
+    # **All three or none.** `None` for all three means the venue is not configured, and
+    # `providers.exchanges.registry.exchange_providers` then does not build it -- absent, not
+    # built and skipped, the rule the CoinGecko key set. Some set and some not is refused at
+    # startup, naming the missing variables.
+    #
+    # **A blank value is refused at startup, unlike the CoinGecko key.** A blank CoinGecko key
+    # reaches its vendor and comes back as a 401 the transport logs, which is the diagnosable
+    # outcome that setting chose. A blank Bitget credential never reaches the venue:
+    # `Credentials` refuses it at construction, so the failure would surface on the first sync
+    # instead of at the start. Refusing it here is the same fact, reported where the
+    # deployment pipeline rolls back.
+    bitget_api_key: SecretStr | None = None
+    bitget_api_secret: SecretStr | None = None
+    bitget_api_passphrase: SecretStr | None = None
+
     # The balance scheduler. Three settings, and each answers a question an operator
     # actually has.
     #
@@ -313,8 +366,11 @@ class Settings(BaseSettings):
           often. The per-host rate limiter would pace the requests, so the symptom is not a
           burst -- it is a process that never stops making them, quietly, for as long as it
           is up.
+        * a partial or blank set of Bitget credentials cannot sign a request, and would be
+          discovered on the first exchange sync rather than here. `exchange_credentials_violation`
+          says which variable, and never what it holds.
 
-        Refusing to start turns all seven into a container that fails its health check,
+        Refusing to start turns all eight into a container that fails its health check,
         which is a failure the deployment pipeline already knows how to roll back.
 
         **Unconditional, not gated on `prod`.** A URL that cannot be requested is wrong in
@@ -415,6 +471,15 @@ class Settings(BaseSettings):
             if reason is not None:
                 message = f"{name} is not usable: {reason}"
                 raise ValueError(message)
+        reason = exchange_credentials_violation(
+            (
+                ("PORTFOLIO_BITGET_API_KEY", self.bitget_api_key),
+                ("PORTFOLIO_BITGET_API_SECRET", self.bitget_api_secret),
+                ("PORTFOLIO_BITGET_API_PASSPHRASE", self.bitget_api_passphrase),
+            )
+        )
+        if reason is not None:
+            raise ValueError(reason)
         return self
 
 
