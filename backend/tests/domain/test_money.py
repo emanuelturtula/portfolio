@@ -642,3 +642,46 @@ def test_multiply_refuses_what_is_not_a_finite_decimal(
     """The `require_amount` guard, on both operands."""
     with pytest.raises(raised):
         multiply(left, right)  # type: ignore[arg-type]
+
+
+#: Past CPython's int/str conversion limit of 4300 digits (`sys.get_int_max_str_digits`).
+#: The first `multiply` built its product through `int(str)` and escaped with a bare
+#: `ValueError` here; the contract since is "exact on any operand".
+OVERLONG_ONES: Final = 5000
+
+
+def test_multiply_is_exact_past_the_int_str_digit_limit() -> None:
+    """1.111... (5000 ones) doubled is 2.222... (5000 twos): exact, and context-free.
+
+    Asserted on the digit tuple and on the fixed-point rendering, both built by hand from
+    the same counts; the squaring below checks a 10001-digit coefficient the same way.
+    """
+    long_amount = Decimal("1." + "1" * OVERLONG_ONES)
+
+    doubled = multiply(long_amount, Decimal(2))
+    with decimal.localcontext() as context:
+        context.prec = 10
+        doubled_inside = multiply(long_amount, Decimal(2))
+
+    assert doubled.as_tuple() == (0, (2,) * (OVERLONG_ONES + 1), -OVERLONG_ONES)
+    assert format(doubled, "f") == "2." + "2" * OVERLONG_ONES
+    assert doubled_inside.as_tuple() == doubled.as_tuple()
+
+
+def test_multiply_squares_a_coefficient_past_the_digit_limit() -> None:
+    """`(10**5000 + 1) ** 2` is `10**10000 + 2 * 10**5000 + 1`: a 1, a 2 and a 1, zeros between."""
+    operand = Decimal((0, (1,) + (0,) * 4999 + (1,), 0))
+    expected_digits = (1,) + (0,) * 4999 + (2,) + (0,) * 4999 + (1,)
+
+    squared = multiply(operand, operand)
+
+    assert len(operand.as_tuple().digits) == 5001
+    assert squared.as_tuple() == (0, expected_digits, 0)
+
+
+def test_multiply_refuses_a_product_whose_exponent_decimal_cannot_hold() -> None:
+    """The documented edge: an exponent past what `Decimal` represents at all."""
+    enormous = Decimal("1E+999999999999999999")
+
+    with pytest.raises(decimal.InvalidOperation):
+        multiply(enormous, enormous)

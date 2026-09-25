@@ -32,6 +32,8 @@ from portfolio.domain.exchanges import ExchangeKey, FillSide
 from portfolio.providers.base import decode_json
 from portfolio.providers.errors import ProviderResponseError
 from portfolio.providers.exchanges.base import (
+    MAX_AMOUNT_DIGITS,
+    MAX_RAW_PAYLOAD_DEPTH,
     RETENTION_MARGIN,
     CursorKind,
     ExchangeCapabilities,
@@ -1193,3 +1195,113 @@ def test_the_shortest_window_is_accepted() -> None:
     window = FillWindow(since=SINCE, until=SINCE + ONE_MICROSECOND)
 
     assert window.until - window.since == ONE_MICROSECOND
+
+
+# --------------------------------------------------------------------------------------
+# The bounds a venue cannot push past, pinned by hand, and their remaining refusals
+# --------------------------------------------------------------------------------------
+
+
+def test_the_two_bounds_are_the_pinned_values() -> None:
+    """Pinned by hand; the boundary tests below write 100 and 32 into their inputs."""
+    assert MAX_AMOUNT_DIGITS == 100
+    assert MAX_RAW_PAYLOAD_DEPTH == 32
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("9" * 100, id="one hundred integer digits"),
+        pytest.param("0." + "1" * 98, id="ninety-eight places"),
+        pytest.param("0." + "0" * 50 + "1", id="a small amount written in full"),
+    ],
+)
+def test_an_amount_up_to_one_hundred_digits_is_accepted(value: str) -> None:
+    assert require_fill_amount(value, field="price") == Decimal(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("9" * 101, id="one hundred and one integer digits"),
+        pytest.param("0." + "1" * 101, id="one hundred and one places"),
+        pytest.param("1e999999999999999999", id="a huge exponent"),
+        pytest.param("1e-999999999999999999", id="a tiny exponent"),
+        pytest.param(Decimal("9" * 101), id="an over-long Decimal"),
+        pytest.param(10**100, id="an over-long int"),
+        # `Decimal()` itself refuses this exponent, with `InvalidOperation`.
+        pytest.param("1e99999999999999999999", id="an exponent Decimal cannot hold"),
+    ],
+)
+def test_an_amount_longer_than_one_hundred_digits_is_a_schema_error(value: object) -> None:
+    with pytest.raises(ExchangeSchemaError) as caught:
+        require_fill_amount(value, field="price")
+
+    assert type(caught.value) is ExchangeSchemaError
+    assert "price" in str(caught.value)
+    assert "999999999" not in f"{caught.value}{caught.value!r}"
+
+
+def test_a_derived_product_too_large_for_the_column_is_a_schema_error() -> None:
+    """1E+15 x 1E+6 is 1E+21: twenty-two integer digits, two more than a fill column holds."""
+    with pytest.raises(ExchangeSchemaError) as caught:
+        derive_quote_quantity(Decimal("1E+15"), Decimal("1E+6"))
+
+    assert type(caught.value) is ExchangeSchemaError
+    assert "quote_quantity" in str(caught.value)
+    # The companion: twenty integer digits is still a quote quantity.
+    assert derive_quote_quantity(Decimal("1E+13"), Decimal("1E+6")) == Decimal("1E+19")
+
+
+def test_a_payload_thirty_two_deep_encodes_and_thirty_three_is_refused() -> None:
+    thirty_two = decode_json(nesting(32))
+    thirty_three = decode_json(nesting(33))
+
+    assert decode_json(encode_raw_payload(thirty_two)) == thirty_two
+    with pytest.raises(ExchangeSchemaError) as caught:
+        encode_raw_payload(thirty_three)
+    assert type(caught.value) is ExchangeSchemaError
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param({"qty": Decimal("NaN")}, id="a NaN the decoder refuses"),
+        pytest.param({1: "x"}, id="a key that is not a string"),
+    ],
+)
+def test_encode_raw_payload_refuses_other_shapes_the_decoder_cannot_produce(
+    document: object,
+) -> None:
+    with pytest.raises(TypeError):
+        encode_raw_payload(document)
+
+
+@pytest.mark.parametrize("flag", [1, 0, "true", None], ids=["one", "zero", "text", "none"])
+def test_the_derived_flag_must_be_a_bool(flag: object) -> None:
+    """`1` would store and read back as `True`; the column is not where the type is decided."""
+    error = refusal(quote_quantity_derived=flag)
+
+    assert "quote_quantity_derived" in str(error)
+
+
+@pytest.mark.parametrize(
+    "payload", ["", "   ", None, b"{}"], ids=["empty", "blank", "none", "bytes"]
+)
+def test_the_raw_payload_must_be_a_non_blank_string(payload: object) -> None:
+    error = refusal(raw_payload=payload)
+
+    assert "raw_payload" in str(error)
+
+
+def test_capabilities_refuse_a_rate_limit_that_is_not_one() -> None:
+    with pytest.raises(TypeError, match="rate_limit"):
+        ExchangeCapabilities(
+            exchange_key=ExchangeKey.BITGET,
+            retention=None,
+            max_query_window=timedelta(days=7),
+            page_size=3,
+            cursor_kind=CursorKind.TIME,
+            rate_limit=(10, 1000),  # type: ignore[arg-type]
+            requires_symbol=False,
+        )

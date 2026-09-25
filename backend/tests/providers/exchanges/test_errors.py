@@ -607,3 +607,29 @@ def test_the_http_import_scan_can_fail(tmp_path: Path) -> None:
     nested.write_text("def f():\n    import httpx\n", encoding="utf-8")
     assert "httpx" in imported_roots(nested)
     assert ast.parse(nested.read_text(encoding="utf-8"))
+
+
+# --------------------------------------------------------------------------------------
+# The remaining refusals: a status that is not a number, a key that is not a pair
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cls", TAXONOMY, ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize("status", ["401", True, 401.0], ids=["str", "bool", "float"])
+def test_a_status_that_is_not_an_int_is_refused(cls: ErrorClass, status: object) -> None:
+    """A string status would be rendered into the message: the free text criterion 8 refuses."""
+    with pytest.raises(TypeError):
+        build(cls, status=status)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param(401, id="a bare status"),
+        pytest.param((401,), id="a one-tuple"),
+        pytest.param((401, "40001", "extra"), id="a three-tuple"),
+    ],
+)
+def test_build_error_map_refuses_a_key_that_is_not_a_pair(key: object) -> None:
+    with pytest.raises(ValueError):  # noqa: PT011 - each case is its own parametrised row
+        build_error_map({key: ExchangeAuthError})  # type: ignore[dict-item]
