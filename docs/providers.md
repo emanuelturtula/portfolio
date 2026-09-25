@@ -1341,7 +1341,19 @@ non-blank `baseCoin` and `quoteCoin`; an answer about another symbol is refused,
 `"00000"`. Any other status is `exchange_error(status, code)`, with the code read from the body
 only when the body is a JSON object -- a 502 carrying HTML is unavailable, not a schema error.
 A 200 whose body does not parse is a schema error; a 200 with any other code goes through the
-map, and an unmapped one is a schema error. `raise_for_status()` is never called.
+map, and an unmapped one is a schema error. `raise_for_status()` is never called. A response
+that declares `Content-Encoding: gzip` or `deflate` and whose body does not decompress makes
+`client.get` raise `httpx.DecodingError` -- a `RequestError`, **not** a `TransportError` --
+before any status is known; it is `ExchangeUnavailableError` with no cause and no context,
+since a corrupt compressed body from an intermediary is most plausibly transient. (The chain
+and price providers still let it escape; that is its own issue.)
+
+**An empty fills page may arrive as `null`, and is accepted as one -- a tolerance chosen, not a
+documented fact.** The documented empty result is `"data": []`. A success whose `data` is
+`null` can only mean "nothing", and if Bitget spells an empty result that way, refusing it
+would fail every window without a trade in it, which for this owner is most of them. It cannot
+hide a fill. It applies to the fills answer only: a symbol-info answer whose `data` is `null`
+is still refused, because that question was about a symbol a fill named.
 
 | Codes | Class | Why |
 |---|---|---|

@@ -510,11 +510,12 @@ def fill_symbols(data: object) -> tuple[str, ...]:
     The first thing read from a page, and the only thing read before the symbol cache is
     consulted: each `symbol` is matched against `\\A[A-Z0-9]{1,40}\\Z` **before** any URL is
     built from it. The page's shape is checked on the way -- an array, of objects, of at most
-    `PAGE_LIMIT` -- so a page the parser would refuse costs no symbol request.
+    `PAGE_LIMIT` -- so a page the parser would refuse costs no symbol request. A `data` of
+    `null` is an empty page, with no symbols; see `parse_fills_page`.
 
     Raises:
-        ExchangeSchemaError: the page is not an array of at most `PAGE_LIMIT` objects, or a
-            fill's `symbol` is missing or not a safe symbol.
+        ExchangeSchemaError: the page is neither `null` nor an array of at most `PAGE_LIMIT`
+            objects, or a fill's `symbol` is missing or not a safe symbol.
     """
     items = _fill_items(data)
     return tuple(dict.fromkeys(_require_symbol(item) for item in items))
@@ -601,6 +602,11 @@ def parse_fills_page(
 
     Steps 5 to 7 of the spec's page, in order:
 
+    0. **A `data` of `null` is an empty page** -- no fills, no next cursor. A tolerance chosen
+       here, not a documented fact: the documented empty result is `[]`, but `null` under a
+       success code can only mean "nothing", refusing it would fail every window without a
+       trade in it, and it cannot hide a fill. Fills only; a `null` symbol-info answer is
+       still refused. Any other `data` that is not an array is refused.
     1. **The raw count.** More than `PAGE_LIMIT` fills is refused *before* anything is
        parsed or dropped, so a 101-fill page cannot hide behind a dropped edge fill.
     2. **Every fill is parsed**, the two edge milliseconds included, so a malformed fill on
@@ -806,23 +812,42 @@ class BitgetProvider:
         it is raised after the `except` block has closed. The constructor's header-safe check
         makes this unreachable except through a bug, which is when a leak is least expected.
 
+        **An `httpx.DecodingError` is unavailable, with no cause and no context.** A response
+        declaring `Content-Encoding: gzip` or `deflate` whose body does not decompress makes
+        `client.get` raise it while reading the body -- above the transport, and it is a
+        `RequestError` but **not** a `TransportError`, so the arm below never saw it and it
+        escaped the seven classes (measured by the tech lead through `build_http_client`, on a
+        200 and on a 500). The answer could not be read, and its status is not known, because
+        the error comes before the response is returned; a corrupt compressed body from an
+        intermediary is most plausibly transient, so the next run asks again. It is not
+        linked either: the decompressor's message says nothing useful, and whether it ever
+        quotes the bytes is not this module's to guarantee. Named as the one class it is,
+        like the other arms -- not widened to `httpx.RequestError`, which would also swallow
+        failures nobody has measured.
+
         Raises:
             ExchangeInvalidRequestError: h11 refused the request before sending it.
             ExchangeUnavailableError: the request got no answer, chained `from` the
-                `httpx.TransportError`, whose message carries no query.
+                `httpx.TransportError`, whose message carries no query; or its body could
+                not be decompressed, with no cause.
             ExchangeError: whatever `unwrap_envelope` makes of the answer.
         """
         refused_locally = False
+        undecodable = False
         try:
             response = await self._client.get(
                 url, headers=headers, extensions={ENDPOINT_EXTENSION: label}
             )
         except httpx.LocalProtocolError:
             refused_locally = True
+        except httpx.DecodingError:
+            undecodable = True
         except httpx.TransportError as error:
             raise ExchangeUnavailableError from error
         if refused_locally:
             raise ExchangeInvalidRequestError
+        if undecodable:
+            raise ExchangeUnavailableError
         retry_after_ms = None
         if response.status_code != HTTP_OK:
             retry_after_ms = parse_retry_after(response.headers.get("retry-after"), self._clock())
@@ -890,7 +915,18 @@ def _decoded(body: str | bytes) -> tuple[bool, object]:
 
 
 def _fill_items(data: object) -> list[dict[str, object]]:
-    """The fill objects of a page, after its shape and its **raw** count are checked."""
+    """The fill objects of a page, after its shape and its **raw** count are checked.
+
+    **A `data` of `null` is an empty page -- a tolerance chosen here, not a documented fact.**
+    The documented empty result is `[]`. But `null` under `code == "00000"` can only mean
+    "nothing", and if Bitget spells an empty result that way, refusing it would fail every
+    window without a trade in it -- for an owner who rarely trades on this venue, most of
+    them. It cannot hide a fill: there is nothing in a `null` to drop. It applies to the
+    fills answer only; a symbol-info answer whose `data` is `null` is still refused, because
+    that question was about a symbol a fill named, and "no such symbol" is an anomaly there.
+    """
+    if data is None:
+        return []
     if not isinstance(data, list):
         detail = "data must be an array of fills"
         raise ExchangeSchemaError(detail)
