@@ -1,4 +1,4 @@
-import { type SubmitEvent, useState } from 'react';
+import { type SubmitEvent, useRef, useState } from 'react';
 
 import { ApiError, describeApiError } from '@/api/client';
 import { useCreateWallet, type ChainKey } from '@/api/wallets';
@@ -71,6 +71,7 @@ export function WalletForm() {
   const [address, setAddress] = useState('');
   const [label, setLabel] = useState('');
   const [localAddressError, setLocalAddressError] = useState<string | undefined>(undefined);
+  const addressInputRef = useRef<HTMLInputElement | null>(null);
 
   const mutation = useCreateWallet();
 
@@ -143,6 +144,7 @@ export function WalletForm() {
         <label htmlFor="wallet-address">Address</label>
         <input
           id="wallet-address"
+          ref={addressInputRef}
           type="text"
           value={address}
           aria-invalid={addressError !== undefined ? true : undefined}
@@ -164,6 +166,13 @@ export function WalletForm() {
                 type="button"
                 onClick={() => {
                   setChainKey(switchTarget);
+                  // Same reason the chain select and the address field reset it on their
+                  // own change: an error from the chain just left behind must not linger,
+                  // attached to a field the owner no longer means for it to describe.
+                  mutation.reset();
+                  // The address the owner already typed is what triggered this control, so
+                  // focus returns to it rather than to the chain select they never touched.
+                  addressInputRef.current?.focus();
                 }}
               >
                 Use {chainDisplayName(switchTarget)} instead

@@ -13,6 +13,8 @@
  */
 import type { components } from '@/api/generated/schema';
 
+import { parseInstant } from '@/lib/time';
+
 export type SyncRunSummary = components['schemas']['SyncRunResponse'];
 export type SyncErrorKind = components['schemas']['SyncErrorKind'];
 
@@ -21,6 +23,15 @@ export interface SettledRun {
   readonly settled: SyncRunSummary | undefined;
   /** Whether the newest run (necessarily not `settled` itself, in that case) is in flight. */
   readonly inProgress: boolean;
+  /**
+   * The in-flight run itself, when `inProgress` is true - a live run the coordinator is
+   * still working through, or an orphan a crashed close-out left behind with nothing
+   * actually running server-side. Both look identical from here: a `running` row with no
+   * newer settled run in front of it. Either way, clicking refresh is the right move - it
+   * joins a live run, or it is what sweeps the orphan - so the UI does not try to tell them
+   * apart, only reports that a run started and has not finished.
+   */
+  readonly runningRun: SyncRunSummary | undefined;
 }
 
 /**
@@ -36,12 +47,12 @@ export function selectSettledRun(runs: readonly SyncRunSummary[]): SettledRun {
   const [first, second] = runs;
 
   if (first === undefined) {
-    return { settled: undefined, inProgress: false };
+    return { settled: undefined, inProgress: false, runningRun: undefined };
   }
   if (first.status !== 'running') {
-    return { settled: first, inProgress: false };
+    return { settled: first, inProgress: false, runningRun: undefined };
   }
-  return { settled: second, inProgress: true };
+  return { settled: second, inProgress: true, runningRun: first };
 }
 
 export type FreshnessStatus = 'fresh' | 'never_synced' | 'failed' | 'interrupted' | 'not_covered';
@@ -53,18 +64,36 @@ export interface Freshness {
 }
 
 /**
- * Judges one wallet row's reading against the settled run.
- *
- * A row is fresh when both hold: the settled run's outcome for `chainKey` is `'success'`,
- * and `observedAt` is at or after `settled.started_at`. The second half is not decoration -
- * a restored wallet brings back a reading from before it was archived, whose chain can
- * still show `'success'` in the latest run because *other* wallets on that chain were read;
- * without the timestamp half, that stale reading would be called fresh.
+ * Whether `observedAt` is at or after `settled.started_at` - the timestamp half of the
+ * fresh test, shared by the ordinary path and the interrupted-run path below.
  *
  * `observed_at` is stamped when a chain's read begins inside a run, so it is never earlier
- * than that run's `started_at` - comparing at millisecond precision (via `Date`, not a
- * string comparison that would assume a shared timestamp format) cannot make a fresh
- * reading look older than it is.
+ * than that run's `started_at` - comparing at millisecond precision (via `parseInstant`,
+ * not a string comparison that would assume a shared timestamp format or a shared number
+ * of fractional digits) cannot make a fresh reading look older than it is.
+ */
+function readAtOrAfterStart(observedAt: string | null, settled: SyncRunSummary): boolean {
+  return observedAt !== null && parseInstant(observedAt) >= parseInstant(settled.started_at);
+}
+
+/**
+ * Judges one wallet row's reading against the settled run, in the order below. Verified
+ * against the backend: `finish_run` writes a run's chain outcomes in the same transaction
+ * as its final status, and the sweep that closes out an orphaned run only flips the status
+ * column - so **an interrupted run always has `chains: []`**, even for a chain whose
+ * snapshots it did commit before the process died, because a snapshot commits per chain,
+ * well before the close-out that never ran. Step 4 exists because of that: a chain-outcome
+ * lookup can never confirm an interrupted run actually read this chain, so the timestamp
+ * comparison is the only evidence left, and it is reliable - see {@link readAtOrAfterStart}.
+ *
+ * 1. No settled run at all -> `never_synced`.
+ * 2. This chain's outcome is `'success'` and the reading is at or after the run's start ->
+ *    `fresh`.
+ * 3. This chain's outcome is `'failed'` -> `failed`, with the reason.
+ * 4. The settled run is `interrupted`, and the reading is at or after its start -> `fresh`.
+ *    Read literally: this run reached this chain before it stopped.
+ * 5. The settled run is `interrupted` otherwise -> `interrupted`.
+ * 6. Anything else -> `not_covered`.
  */
 export function assessFreshness(
   settled: SyncRunSummary | undefined,
@@ -77,11 +106,7 @@ export function assessFreshness(
 
   const outcome = settled.chains.find((chain) => chain.chain_key === chainKey);
 
-  if (
-    outcome?.status === 'success' &&
-    observedAt !== null &&
-    new Date(observedAt).getTime() >= new Date(settled.started_at).getTime()
-  ) {
+  if (outcome?.status === 'success' && readAtOrAfterStart(observedAt, settled)) {
     return { status: 'fresh' };
   }
 
@@ -89,14 +114,16 @@ export function assessFreshness(
     return { status: 'failed', errorKind: outcome.error_kind };
   }
 
-  if (outcome === undefined && settled.status === 'interrupted') {
-    return { status: 'interrupted' };
+  if (settled.status === 'interrupted') {
+    return readAtOrAfterStart(observedAt, settled)
+      ? { status: 'fresh' }
+      : { status: 'interrupted' };
   }
 
   return { status: 'not_covered' };
 }
 
-export const NEVER_SYNCED_MESSAGE = 'No sync has run yet.';
+export const NEVER_SYNCED_MESSAGE = 'No sync has finished yet.';
 export const INTERRUPTED_MESSAGE = 'The last sync was interrupted before it read this chain.';
 export const NOT_COVERED_MESSAGE = 'Not covered by the last sync.';
 /** Shown for a `'failed'` status whose outcome carries no `error_kind` (should not happen). */

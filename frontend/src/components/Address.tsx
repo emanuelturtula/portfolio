@@ -4,6 +4,14 @@ import { truncateAddress } from '@/lib/addresses';
 
 interface AddressProps {
   readonly value: string;
+  /**
+   * What owns this address - a wallet's label, or a chain name plus its truncated address -
+   * folded into the copy button's accessible name as "Copy address of {name}". A page with
+   * more than one address on screen otherwise gives every "Copy address" button the same
+   * accessible name, which a screen reader user cannot tell apart. Omitted, the button's
+   * name stays the plain "Copy address" its visible text already gives it.
+   */
+  readonly name?: string;
 }
 
 type CopyState = 'idle' | 'copied' | 'failed';
@@ -21,7 +29,7 @@ type CopyState = 'idle' | 'copied' | 'failed';
  * The full address never leaves this component for a route, a query string or a log: it is
  * rendered and, on request, handed to `navigator.clipboard` alone.
  */
-export function Address({ value }: AddressProps) {
+export function Address({ value, name }: AddressProps) {
   const [copyState, setCopyState] = useState<CopyState>('idle');
 
   async function handleCopy() {
@@ -40,6 +48,7 @@ export function Address({ value }: AddressProps) {
       </span>
       <button
         type="button"
+        aria-label={name !== undefined ? `Copy address of ${name}` : undefined}
         onClick={() => {
           void handleCopy();
         }}

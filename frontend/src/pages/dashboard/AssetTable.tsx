@@ -5,6 +5,14 @@ import { addMoney, money, type Money as MoneyValue } from '@/lib/money';
 import { PRICE_UNAVAILABLE_MESSAGES, type PriceUnavailable } from '@/lib/prices';
 
 const FIAT_OPTIONS = { minimumFractionDigits: 2, maximumFractionDigits: 2 };
+/**
+ * A unit price is not a value: KAS at 0.084912345678 EUR rounds to "0.08" under
+ * `FIAT_OPTIONS`, and a value column built from that rounded price no longer multiplies
+ * out to what "Value" shows. Prices get more room - up to 8 fractional digits, the same
+ * ceiling `formatMoney` defaults to - while values and the total stay at 2, because a
+ * value is the thing a person reads at face value.
+ */
+const PRICE_OPTIONS = { minimumFractionDigits: 2, maximumFractionDigits: 8 };
 
 interface AssetRow {
   readonly assetSymbol: string;
@@ -120,7 +128,7 @@ export function AssetTable({ data }: AssetTableProps) {
               <td>
                 {row.price !== null ? (
                   <>
-                    <Money value={money(row.price.amount)} options={FIAT_OPTIONS} />{' '}
+                    <Money value={money(row.price.amount)} options={PRICE_OPTIONS} />{' '}
                     {data.quote_currency}
                     {row.price.stale && (
                       <>

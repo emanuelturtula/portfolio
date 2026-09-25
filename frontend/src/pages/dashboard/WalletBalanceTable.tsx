@@ -39,11 +39,12 @@ function unreadReason(
  * The signed pending amount after the quantity, e.g. "(+0.00012 BTC pending)". `null` when
  * there is nothing to show: no pending, a zero pending, or a wallet with no decimals yet.
  *
- * Rendered through `<Money>`, not a hand-formatted string, so it carries its own exact
- * `<data value>` - AC8 ("amounts render from strings at full precision") applies to every
- * amount on the page, not only to the quantity next to it. The sign is kept outside the
- * `<Money>` element and applied to the unsigned magnitude, so the two - the explicit `+`
- * this row wants, and `formatMoney`'s own `-` for a negative amount - never disagree.
+ * Rendered through `<Money>` with the *signed* amount, not a hand-formatted string, so its
+ * `<data value>` carries the exact signed decimal - "-0.00012000" for a negative pending,
+ * not the unsigned magnitude - which is what AC8 ("amounts render from strings at full
+ * precision") means applied to this amount. `formatMoney` already renders a negative sign
+ * on its own; only a *positive* amount needs a visible prefix added here, since positive is
+ * otherwise indistinguishable from an unsigned quantity.
  */
 function renderPending(wallet: WalletBalance) {
   if (wallet.pending === null || wallet.pending === '0' || wallet.decimals === null) {
@@ -51,14 +52,13 @@ function renderPending(wallet: WalletBalance) {
   }
 
   const amount = fromBaseUnits(wallet.pending, wallet.decimals);
-  const negative = amount.startsWith('-');
-  const magnitude = money(negative ? amount.slice(1) : amount);
+  const positive = !amount.startsWith('-');
 
   return (
     <span className="pending">
       {' '}
-      ({negative ? '-' : '+'}
-      <Money value={magnitude} /> {wallet.asset_symbol} pending)
+      ({positive && '+'}
+      <Money value={amount} /> {wallet.asset_symbol} pending)
     </span>
   );
 }
@@ -134,7 +134,15 @@ function WalletBalanceRow({
       <td>
         <div className="wallet-chain">{chainDisplayName(wallet.chain_key)}</div>
         {heading !== undefined && <div className="wallet-name">{heading}</div>}
-        {walletRecord !== undefined && <Address value={walletRecord.address} />}
+        {walletRecord !== undefined && (
+          <Address
+            value={walletRecord.address}
+            name={
+              wallet.label ??
+              `${chainDisplayName(wallet.chain_key)} wallet #${String(wallet.wallet_id)}`
+            }
+          />
+        )}
       </td>
       <td>
         {reading === undefined ? (

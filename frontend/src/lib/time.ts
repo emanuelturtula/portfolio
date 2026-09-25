@@ -36,12 +36,36 @@ export function useNow(intervalMs: number): number {
 }
 
 /**
+ * Matches a fractional-seconds part longer than milliseconds - `.123456`, not `.123` - and
+ * captures the first three digits, so {@link parseInstant} can drop the rest.
+ */
+const EXCESS_FRACTIONAL_SECONDS_PATTERN = /(\.\d{3})\d+/;
+
+/**
+ * Parses an ISO-8601 instant into milliseconds since the epoch, truncating a fractional
+ * part longer than milliseconds before handing it to `Date`.
+ *
+ * The backend stamps `observed_at` and the run log's timestamps with microsecond
+ * precision (`.123456Z`), but the ECMAScript specification only guarantees `Date` parsing
+ * for *its own* format, which carries exactly three fractional digits - what an engine
+ * does with six is implementation-defined. Truncating rather than rounding is deliberate:
+ * rounding `.123999` up to `.124` could move an instant a millisecond later than it really
+ * is, which is exactly backwards for the one comparison this exists to keep correct -
+ * `observed_at >= started_at` - since a chain's read is stamped at or after its run's
+ * start and must never be made to look earlier than it, nor pushed past a boundary it
+ * did not actually cross.
+ */
+export function parseInstant(iso: string): number {
+  return new Date(iso.replace(EXCESS_FRACTIONAL_SECONDS_PATTERN, '$1')).getTime();
+}
+
+/**
  * Renders the gap between `iso` and `nowMs` as a short phrase, for example "5 minutes ago".
  * A negative gap - clock skew, or a timestamp stamped a moment after `nowMs` was read - is
  * floored to zero rather than printed as a time in the future.
  */
 export function formatRelativeTime(iso: string, nowMs: number): string {
-  const diffMs = Math.max(0, nowMs - new Date(iso).getTime());
+  const diffMs = Math.max(0, nowMs - parseInstant(iso));
 
   if (diffMs < JUST_NOW_THRESHOLD_MS) {
     return 'just now';
@@ -63,7 +87,7 @@ export function formatRelativeTime(iso: string, nowMs: number): string {
 
 /** The absolute instant `iso` names, for a `title` attribute alongside the relative text. */
 export function formatAbsoluteTime(iso: string): string {
-  return new Date(iso).toLocaleString('en', {
+  return new Date(parseInstant(iso)).toLocaleString('en', {
     dateStyle: 'medium',
     timeStyle: 'short',
   });

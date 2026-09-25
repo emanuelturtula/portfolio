@@ -48,6 +48,15 @@ const WALLETS_UNAVAILABLE_FALLBACK = 'The wallet list could not be read.';
 const RUNS_UNAVAILABLE_FALLBACK = 'The run log could not be read.';
 
 /**
+ * Fallback for a background poll of `GET /api/balances/current` that fails after the page
+ * already has data - a container restart mid-poll is routine (every deploy does one), and
+ * with `data` still on hand there is nothing to fall back to blank for. See `isRefetchError`
+ * below: TanStack Query keeps the last successful `data` across a subsequent failed fetch,
+ * which is what lets this stay a notice instead of losing the page.
+ */
+const BALANCES_REFETCH_FALLBACK = 'The server could not be reached.';
+
+/**
  * The portfolio value dashboard: total, per-asset and per-wallet value, a refresh button
  * and a "last updated" indicator. See docs/specs/011-wallets-page-value-dashboard.md.
  *
@@ -65,7 +74,12 @@ export function DashboardPage() {
     return <Skeleton label="Loading your portfolio…" />;
   }
 
-  if (balances.isError) {
+  // Whole-page only when there is nothing to show at all - the first load failed, or every
+  // load has. `isLoadingError` (as opposed to `isError`) is what tells the two apart: a
+  // background poll that fails *after* a successful load leaves `data` populated with the
+  // last good reading (see `isRefetchError` below), and blanking a loaded dashboard because
+  // one poll missed is worse than leaving it stale - the container restarts on every deploy.
+  if (balances.isLoadingError) {
     return (
       <ErrorState
         title="Could not load your portfolio"
@@ -93,13 +107,20 @@ export function DashboardPage() {
   }
 
   const freshnessKnown = runs.isSuccess;
-  const { settled, inProgress } = freshnessKnown
+  const { settled, inProgress, runningRun } = freshnessKnown
     ? selectSettledRun(runs.data)
-    : { settled: undefined, inProgress: false };
+    : { settled: undefined, inProgress: false, runningRun: undefined };
   const walletsById = new Map((wallets.data ?? []).map((wallet) => [wallet.id, wallet]));
 
   return (
     <div className="dashboard">
+      {balances.isError && (
+        <p role="alert">
+          Could not refresh the portfolio:{' '}
+          {describeApiError(balances.error, BALANCES_REFETCH_FALLBACK)} Showing what was last
+          loaded.
+        </p>
+      )}
       {wallets.isError && (
         <p role="alert">
           Addresses are unavailable: {describeApiError(wallets.error, WALLETS_UNAVAILABLE_FALLBACK)}{' '}
@@ -119,14 +140,18 @@ export function DashboardPage() {
           onClick={() => {
             syncMutation.mutate();
           }}
-          disabled={syncMutation.isPending || inProgress}
+          disabled={syncMutation.isPending}
         >
           Refresh
         </button>
         {syncMutation.isPending && (
           <p role="status">Refreshing balances… this can take a minute.</p>
         )}
-        {inProgress && <p role="status">A sync is running…</p>}
+        {inProgress && runningRun !== undefined && (
+          <p role="status">
+            A sync started <RelativeTime value={runningRun.started_at} /> and has not finished.
+          </p>
+        )}
         <p className="last-updated">
           Balances as of {data.as_of === null ? 'never' : <RelativeTime value={data.as_of} />}.{' '}
           {freshnessKnown &&

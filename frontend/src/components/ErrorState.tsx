@@ -1,8 +1,15 @@
+import { HEADING_TAGS, type HeadingLevel } from '@/components/EmptyState';
+
 interface ErrorStateProps {
   readonly title?: string;
   readonly description: string;
   readonly onRetry?: () => void;
   readonly retryLabel?: string;
+  /**
+   * The heading's level, defaulting to `h2`. See {@link HeadingLevel} and the same prop on
+   * `EmptyState` - both states are reused inside sections already headed by an `h3`.
+   */
+  readonly headingLevel?: HeadingLevel;
 }
 
 /**
@@ -18,10 +25,13 @@ export function ErrorState({
   description,
   onRetry,
   retryLabel = 'Try again',
+  headingLevel = 2,
 }: ErrorStateProps) {
+  const Heading = HEADING_TAGS[headingLevel];
+
   return (
     <div className="state state-error" role="alert">
-      <h2>{title}</h2>
+      <Heading>{title}</Heading>
       <p>{description}</p>
       {onRetry !== undefined && (
         <button type="button" onClick={onRetry}>
