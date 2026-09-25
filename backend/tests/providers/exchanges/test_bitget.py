@@ -350,6 +350,23 @@ async def test_each_request_is_labelled_for_the_log() -> None:
     assert request_target(fake.symbol_requests[0]) == "https://api.bitget.com/exchange_symbol"
 
 
+async def test_the_documented_content_type_and_locale_are_sent() -> None:
+    """The REST introduction lists `Content-Type: application/json` and `locale` beside the
+    four access headers. The symbol call is public and unsigned, and still sends `locale`.
+
+    Literals written from the documentation, not read off the provider's constants.
+    """
+    fake = FakeBitget(spread_fills(1))
+
+    await fetch_page(fake)
+
+    (fills_request,) = fake.fill_requests
+    (symbol_request,) = fake.symbol_requests
+    assert fills_request.headers.get("Content-Type") == "application/json"
+    assert fills_request.headers.get("locale") == "en-US"
+    assert symbol_request.headers.get("locale") == "en-US"
+
+
 async def test_the_fake_venue_refuses_a_request_signed_with_another_secret() -> None:
     """The control on the verifier: it can say no, so its yes above means something."""
     fake = FakeBitget(spread_fills(3), signing_key="another-secret-entirely-not-real")
@@ -839,19 +856,30 @@ async def test_a_success_status_with_a_body_of_the_wrong_shape_is_a_schema_error
 
 
 @pytest.mark.parametrize("cursor", [None, "7654321"], ids=["first page", "with a cursor"])
-async def test_a_null_data_on_the_fills_call_is_an_empty_page(cursor: str | None) -> None:
-    """A success saying "no fills" as `null` rather than `[]` is still "no fills".
+async def test_a_null_data_on_the_fills_call_is_refused(cursor: str | None) -> None:
+    """The documented empty result is `[]`. `null` is not documented, so it is not guessed at.
 
-    An empty page: nothing to page after, and no symbol to ask about.
+    Read as an empty page, a `null` would end a window's walk as "no more fills" -- the one
+    reading that can silently lose history if the venue ever means something else by it.
+    A schema error is loud, and the companion below shows `[]` is the empty page.
     """
     fake = FakeBitget(fill_replies=[Reply(body=envelope("null"))])
 
-    page = await fetch_page(fake, cursor=cursor)
+    error = await refused(fake, cursor=cursor)
+
+    assert type(error) is ExchangeSchemaError
+    assert fake.symbol_requests == []
+    assert len(fake.fill_requests) == 1, "the positive companion: the page was fetched"
+
+
+async def test_an_empty_array_on_the_fills_call_is_an_empty_page() -> None:
+    fake = FakeBitget(fill_replies=[Reply(body=envelope("[]"))])
+
+    page = await fetch_page(fake)
 
     assert page.fills == ()
     assert page.next_cursor is None
     assert fake.symbol_requests == []
-    assert len(fake.fill_requests) == 1, "the positive companion: the page was fetched"
 
 
 async def test_a_null_data_on_the_symbol_call_is_still_refused() -> None:
@@ -1205,6 +1233,47 @@ async def test_the_interpreter_limits_are_schema_errors(case: str) -> None:
     assert type(error) is ExchangeSchemaError
 
 
+#: A lone surrogate as the JSON text a venue sends: valid JSON, and no UTF-8 encoding.
+LONE_SURROGATE: Final = '"\\ud800"'
+
+
+@pytest.mark.parametrize(
+    ("where", "venue_field", "our_field"),
+    [
+        ("orderId", "orderId", "external_order_id"),
+        ("feeDetail.feeCoin", "feeDetail.feeCoin", "fee_asset"),
+        ("baseCoin", "baseCoin", "base_asset"),
+        ("quoteCoin", "quoteCoin", "quote_asset"),
+    ],
+)
+async def test_unencodable_text_is_refused_by_the_provider_naming_the_venues_field(
+    where: str, venue_field: str, our_field: str
+) -> None:
+    """The provider checks UTF-8 itself, where it still knows the venue's name for the field.
+
+    Left to `NormalizedFill`, the refusal would name `fee_asset` rather than
+    `feeDetail.feeCoin`, and carry the `UnicodeEncodeError` as its context -- whose `args`
+    hold the whole string.
+    """
+    if where in {"baseCoin", "quoteCoin"}:
+        base = "\\ud800" if where == "baseCoin" else "BTC"
+        quote = "\\ud800" if where == "quoteCoin" else "USDT"
+        fake = FakeBitget(
+            spread_fills(1),
+            symbol_replies=[Reply(body=symbols_body(symbol_entry("BTCUSDT", base, quote)))],
+        )
+    else:
+        fake = one_fill_fake(**{where.replace(".", "__"): LONE_SURROGATE})
+
+    error = await refused(fake)
+
+    assert type(error) is ExchangeSchemaError
+    assert venue_field in str(error)
+    assert our_field not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
 REQUIRED_FIELDS: Final = (
     "tradeId",
     "symbol",
@@ -1363,10 +1432,9 @@ async def test_a_symbol_answer_about_another_symbol_is_refused(body: str) -> Non
         (Reply(status=500, body=HTML_BODY), ExchangeUnavailableError),
         (Reply(status=429, body=error_body("429")), ExchangeRateLimitedError),
         (Reply(status=400, body=error_body("40102")), ExchangeInvalidRequestError),
-        (Reply(status=403, body=HTML_BODY), ExchangeAuthError),
         (Reply(error=httpx.ReadTimeout("the fake venue timed out")), ExchangeUnavailableError),
     ],
-    ids=["500", "429", "unknown symbol", "403", "transport"],
+    ids=["500", "429", "unknown symbol", "transport"],
 )
 async def test_a_refused_symbol_lookup_is_classified_like_the_fills_call(
     reply: Reply, expected: type[ExchangeError]
@@ -1376,6 +1444,56 @@ async def test_a_refused_symbol_lookup_is_classified_like_the_fills_call(
     error = await refused(fake)
 
     assert type(error) is expected
+
+
+#: Every auth-shaped answer: the two statuses on an HTML page, and each auth and scope code
+#: of the map on a 400. The status and the code each answer must keep.
+AUTH_SHAPED: Final = [
+    pytest.param(401, HTML_BODY, None, id="401"),
+    pytest.param(403, HTML_BODY, None, id="403"),
+    pytest.param(200, error_body("40009"), "40009", id="200 40009, in-band"),
+    *(
+        pytest.param(400, error_body(code), code, id=f"400 {code}")
+        for code, cls in sorted(DOCUMENTED_CODES.items())
+        if issubclass(cls, ExchangeAuthError)
+    ),
+]
+
+
+@pytest.mark.parametrize(("status", "body", "code"), AUTH_SHAPED)
+async def test_an_auth_refusal_of_the_public_symbol_call_is_unavailable(
+    status: int, body: str, code: str | None
+) -> None:
+    """No credential is sent to the symbol endpoint, so a refusal there says nothing of the key.
+
+    Marking the account `auth_failed` for it would send the owner to fix a key that works.
+    It is unavailable -- a CDN, a region block, the venue having a bad minute -- and it keeps
+    the status and the code, so the log still says what the venue answered.
+    """
+    fake = FakeBitget(spread_fills(1), symbol_replies=[Reply(status=status, body=body)])
+
+    error = await refused(fake)
+
+    assert type(error) is ExchangeUnavailableError
+    assert error.status == status
+    assert error.venue_code == code
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert len(fake.symbol_requests) == 1, "the positive companion: the refusal was the symbol's"
+
+
+@pytest.mark.parametrize(("status", "body", "code"), AUTH_SHAPED)
+async def test_the_same_refusal_of_the_signed_fills_call_is_still_auth(
+    status: int, body: str, code: str | None
+) -> None:
+    """The companion: the fills call carries the key, so there the refusal is about the key."""
+    fake = FakeBitget(fill_replies=[Reply(status=status, body=body)])
+
+    error = await refused(fake)
+
+    assert isinstance(error, ExchangeAuthError)
+    assert error.status == status
+    assert error.venue_code == code
 
 
 @pytest.mark.parametrize(
@@ -1491,6 +1609,95 @@ async def test_the_page_size_is_checked_before_the_edge_is_dropped() -> None:
     assert over.symbol_requests == [], "refused on the raw count, before anything else"
     assert len(page.fills) == 99
     assert page.next_cursor == "1000000"
+
+
+# -- the raw page is checked before the edge is dropped ----------------------------------
+#
+# The edge drop removes the two fills a fully inclusive venue adds, and nothing else it does
+# may hide a page the rules refuse: a malformed fill, a fill the cursor excludes, or two
+# fills sharing a trade id are still refused when one of them sits on an edge millisecond.
+
+#: The two edge milliseconds, and the fill inside the window each page pairs them with.
+EDGES: Final = {"since - 1 ms": WINDOW_SINCE_MS - 1, "until": WINDOW_UNTIL_MS}
+INSIDE_MS: Final = WINDOW_SINCE_MS + 60_000
+
+
+def edge_page(*fills: VenueFill) -> FakeBitget:
+    return FakeBitget(fill_replies=[Reply(body=fills_body(list(fills)))])
+
+
+@pytest.mark.parametrize("edge", sorted(EDGES))
+async def test_two_fills_sharing_a_trade_id_are_refused_even_when_one_is_on_the_edge(
+    edge: str,
+) -> None:
+    """Checked on the raw page: dropping the edge copy would silently merge two fills."""
+    fake = edge_page(
+        VenueFill(trade_id=1_000_003, executed_ms=INSIDE_MS),
+        VenueFill(trade_id=1_000_003, executed_ms=EDGES[edge]),
+    )
+
+    error = await refused(fake)
+
+    assert type(error) is ExchangeSchemaError
+
+
+@pytest.mark.parametrize("edge", sorted(EDGES))
+async def test_two_distinct_trade_ids_with_one_on_the_edge_are_accepted(edge: str) -> None:
+    """The companion: the same page with two ids keeps the inside fill and drops the edge one."""
+    fake = edge_page(
+        VenueFill(trade_id=1_000_003, executed_ms=INSIDE_MS),
+        VenueFill(trade_id=1_000_006, executed_ms=EDGES[edge]),
+    )
+
+    page = await fetch_page(fake)
+
+    assert [fill.external_trade_id for fill in page.fills] == ["1000003"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"size": '"not a number"'}, id="a size that is not a number"),
+        pytest.param({"tradeId": None}, id="no tradeId"),
+        pytest.param({"feeDetail.totalFee": '"0.0000007"'}, id="a positive fee"),
+        pytest.param({"side": '"hold"'}, id="a side that is neither"),
+    ],
+)
+@pytest.mark.parametrize("edge", sorted(EDGES))
+async def test_a_malformed_fill_on_the_edge_still_fails_the_page(
+    edge: str, overrides: dict[str, str | None]
+) -> None:
+    """The spec: "the drop happens after parsing, so a malformed fill on the edge still fails
+    the page". A drop before parsing would discard exactly the fill that says the venue sent
+    something this code cannot read."""
+    fake = edge_page(
+        VenueFill(trade_id=1_000_003, executed_ms=INSIDE_MS),
+        VenueFill(trade_id=1_000_006, executed_ms=EDGES[edge], overrides=overrides),
+    )
+
+    error = await refused(fake)
+
+    assert type(error) is ExchangeSchemaError
+
+
+@pytest.mark.parametrize("offending_id", [7_654_321, 7_654_322], ids=["equal", "above"])
+@pytest.mark.parametrize("edge", sorted(EDGES))
+async def test_a_fill_at_or_above_the_cursor_is_refused_even_on_the_edge(
+    edge: str, offending_id: int
+) -> None:
+    """Termination rests on every fill of the raw page being below the cursor.
+
+    Checked after the drop, an edge fill that ignored `idLessThan` would pass unseen, and a
+    venue whose every repeat landed on an edge millisecond could page forever.
+    """
+    fake = edge_page(
+        VenueFill(trade_id=7_654_000, executed_ms=INSIDE_MS),
+        VenueFill(trade_id=offending_id, executed_ms=EDGES[edge]),
+    )
+
+    error = await refused(fake, cursor="7654321")
+
+    assert type(error) is ExchangeSchemaError
 
 
 async def test_a_window_at_the_epoch_sends_zero() -> None:
