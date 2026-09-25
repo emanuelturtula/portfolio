@@ -521,6 +521,15 @@ Disjoint. Nobody edits a file on another row.
   is only HMAC input and stays unconstrained.
 - **A trade id is the pattern and `int(value) <= 2**63 - 1`.** The pattern alone admits
   19-digit values above the signed 64-bit maximum, which the rule claims to exclude.
+- **A corrupt compressed body escaped as `httpx.DecodingError`.** The tech lead measured it
+  with the real client: `Content-Encoding: gzip` over a body that does not decompress raises
+  while the client reads the body, above the transport, and `DecodingError` is not a
+  `TransportError`. The provider now translates it to `ExchangeUnavailableError`. The same
+  escape predates this issue in the chain and price providers (Esplora `health()`, Kraken
+  `fetch`), and is filed as #75.
+- **A success whose fills `data` is `null` is an empty page.** The documented form is `[]`.
+  `null` under `"00000"` can only mean "nothing", and refusing it would fail every empty
+  window if the venue spells empty that way. The symbol-info `data` stays strict.
 
 ## Handed on
 
@@ -529,3 +538,4 @@ Disjoint. Nobody edits a file on another row.
   fill. That covers a venue whose trade ids turn out not to be one sequence per account,
   whichever venue it is.
 - **A follow-up issue for UTA** (`GET /api/v3/trade/fills`), filed with the pull request.
+- **#75:** `httpx.DecodingError` in the chain and price providers.
