@@ -10,9 +10,11 @@ chosen for.
 
 The workflows are read with a small line parser rather than PyYAML, because this suite
 runs with nothing installed. The parser relies on the two-space indentation every
-workflow here already uses. One test feeds it a sample with a missing timeout, to show
-the check can fail at all: a guard nobody has seen fail is a guard nobody knows the
-state of.
+workflow here already uses, and it refuses any job line it cannot read -- an anchor, a
+flow mapping -- rather than guessing. A guess is how a parser credits one job's timeout
+to the job above it. Tests feed it samples with a missing timeout and with an
+unreadable job, to show the check can fail at all: a guard nobody has seen fail is a
+guard nobody knows the state of.
 
 Plain ``unittest``, no dependencies.
 """
@@ -36,16 +38,19 @@ BACKEND_PYPROJECT = REPO_ROOT / "backend" / "pyproject.toml"
 # a runner for six hours, so the check has to be about size as well as presence.
 MAX_TIMEOUT_MINUTES = 30
 
-# How much longer the deploy job must be allowed to run than the SSH call it wraps. Before
-# that call, remote_deploy.py spends up to 60 s on scp, and the job has already checked
-# out and joined the tailnet, each under 10 s in every measured run. After it, the
-# script's `finally` needs one more short SSH call to remove the registry credential.
+# How much longer the deploy job must be allowed to run than the SSH call it wraps.
+# Around that call, the job checks out, joins the tailnet, and runs a `mkdir` over SSH,
+# an scp (its own 60 s timeout) and a `docker login` over SSH. After it, the script's
+# `finally` runs one more SSH call to remove the registry credential. The whole job has
+# never taken more than 48 s, so 2 minutes is comfortable. It is a floor on the margin,
+# not a proof: the short SSH calls are bounded only by SSH_TIMEOUT_SECONDS each.
 DEPLOY_JOB_HEADROOM_SECONDS = 120
 
 # The job that runs pytest, and so the one whose timeout the per-test ceiling must beat.
 BACKEND_TEST_JOB = ("ci.yml", "test-backend")
 DEPLOY_JOB = ("remote-deploy.yml", "deploy")
 
+JOB_LINE = re.compile(r"^  \S")
 JOB_ID = re.compile(r"^  (?P<id>[A-Za-z_][A-Za-z0-9_-]*):\s*(?:#.*)?$")
 JOB_KEY = re.compile(r"^    (?P<key>[A-Za-z_][A-Za-z0-9_-]*):\s*(?P<value>[^#]*?)\s*(?:#.*)?$")
 
@@ -55,7 +60,8 @@ def workflow_jobs(text: str) -> dict[str, dict[str, str]]:
 
     Only the keys directly on the job are collected, which is all the checks below need.
     Anything nested deeper, such as ``steps`` or ``with``, has a deeper indent and is
-    skipped.
+    skipped. A line at job indentation that is not a plain ``id:`` raises, so a job this
+    parser cannot read fails the suite instead of vanishing into the job above it.
     """
     jobs: dict[str, dict[str, str]] = {}
     current: dict[str, str] | None = None
@@ -69,7 +75,10 @@ def workflow_jobs(text: str) -> dict[str, dict[str, str]]:
             continue
         if not in_jobs:
             continue
-        if match := JOB_ID.match(line):
+        if JOB_LINE.match(line):
+            match = JOB_ID.match(line)
+            if match is None:
+                raise ValueError(f"cannot read this job line: {line.strip()!r}")
             current = jobs.setdefault(match["id"], {})
         elif current is not None and (match := JOB_KEY.match(line)):
             current[match["key"]] = match["value"]
@@ -160,6 +169,14 @@ class ParserTests(unittest.TestCase):
         self.assertNotIn("timeout-minutes", jobs["unbounded"])
         self.assertEqual(jobs["reusable"]["uses"], "./.github/workflows/ci.yml")
 
+    def test_refuses_a_job_line_it_cannot_read(self) -> None:
+        # An anchor is valid YAML, and GitHub accepts it. Read naively, the anchored job
+        # vanishes and its keys are credited to the job above it, so the job with no
+        # timeout passes as bounded.
+        sample = SAMPLE.replace("  six-hours:\n", "  six-hours: &defaults\n")
+        with self.assertRaisesRegex(ValueError, "six-hours: &defaults"):
+            workflow_jobs(sample)
+
     def test_reports_a_missing_bound_and_an_oversized_one(self) -> None:
         self.assertEqual(
             unbounded_jobs("sample.yml", SAMPLE),
@@ -217,6 +234,12 @@ class PerTestCeilingTests(unittest.TestCase):
 
     def test_every_backend_test_has_a_ceiling(self) -> None:
         self.assertGreater(self.ceiling_seconds(), 0, "a pytest timeout of 0 disables it")
+
+    def test_the_ceiling_ends_the_process_rather_than_raising_in_it(self) -> None:
+        # The `signal` method raises inside whatever the main thread is running. In a
+        # background asyncio task that kills the task and the test can pass; in Hypothesis
+        # it is caught, and the replay hangs with no alarm left. See backend/pyproject.toml.
+        self.assertEqual(pytest_ini_options().get("timeout_method"), "thread")
 
     def test_the_ceiling_cannot_be_dropped_silently(self) -> None:
         # With --strict-config, a `timeout` option and no plugin to claim it is a startup

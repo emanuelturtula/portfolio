@@ -101,9 +101,9 @@ jobs:
     needs: secrets-scan
     runs-on: ubuntu-latest
     # Slowest: 157 s, 148 s of it in pytest, and that step grows with every issue. The
-    # 30 s per-test ceiling in backend/pyproject.toml stops a hang inside a test sooner
-    # and names the test. This bounds everything outside a test: installing, collecting,
-    # and a process that never exits because something left a thread running.
+    # 30 s per-test ceiling in backend/pyproject.toml ends a hang inside a test sooner,
+    # with every thread's stack. This bounds everything outside a test: installing,
+    # collecting, and a process that never exits because something left a thread running.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -192,10 +192,10 @@ jobs:
     name: Docker build (arm64)
     needs: [lint, test-backend, test-frontend]
     runs-on: ubuntu-24.04-arm
-    # Slowest: 84 s, and 101 s for the same Dockerfile in Delivery. Every measured build
-    # started from a warm layer cache. An evicted cache rebuilds every layer, so this
-    # rounds up one step further than the rule above.
-    timeout-minutes: 15
+    # Slowest: 84 s, and that was a build with no layer cache at all (every layer ran), so
+    # an evicted cache is already inside the measurement. Delivery's build of the same
+    # Dockerfile peaked at 101 s.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

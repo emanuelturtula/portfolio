@@ -54,9 +54,7 @@ jobs:
     name: Build arm64 image
     needs: version
     runs-on: ubuntu-24.04-arm
-    # Slowest: 101 s. One step past the rule, like ci.yml's Docker build, because every
-    # measured build started from a warm layer cache.
-    timeout-minutes: 15
+    timeout-minutes: 10 # slowest: 101 s; ci.yml's cold build of the same Dockerfile, 84 s
     permissions:
       contents: read
       packages: write
