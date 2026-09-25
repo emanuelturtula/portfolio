@@ -5,6 +5,7 @@ image can run in development and in production without a rebuild. Nothing in thi
 carries a default that would be unsafe if it survived into production.
 """
 
+import re
 from functools import lru_cache
 from typing import Final, Literal, Self
 
@@ -99,6 +100,81 @@ def provider_url_violation(url: str) -> str | None:
     return None
 
 
+def exchange_credentials_violation(
+    variables: tuple[tuple[str, SecretStr | None], ...],
+) -> str | None:
+    """Why one venue's credential variables cannot be used, or `None` if they can.
+
+    `variables` is the venue's `(environment variable, value)` pairs. Two rules, checked in
+    this order:
+
+    1. **No value is blank.** An empty or whitespace credential is a variable somebody set
+       and got wrong, and `Credentials` would refuse it anyway -- on the first sync, where it
+       looks like any other failure, instead of at startup, where it is a rollback.
+    2. **All or none.** `None` for every variable means the venue is not configured and is
+       not built. Some set and some not is a credential that cannot sign, and the reason
+       names every variable that is missing.
+
+    **The reason names variables and never a value**, and never a length or a prefix either:
+    a partial credential in a log line is still part of a credential.
+    """
+    for name, value in variables:
+        if value is not None and not value.get_secret_value().strip():
+            return f"{name} is set but blank. Set it to the credential, or unset the variable."
+    missing = [name for name, value in variables if value is None]
+    if missing and len(missing) < len(variables):
+        verb = "is" if len(missing) == 1 else "are"
+        return (
+            f"{' and '.join(missing)} {verb} not set while the other credential variables of "
+            "the same venue are. Set all of them, or none."
+        )
+    return None
+
+
+HEADER_SAFE_TEXT: Final = re.compile(r"\A[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?\Z")
+"""Text an HTTP header can carry as it is: printable ASCII, no whitespace at either end.
+
+An interior space is allowed -- it is a legal header value, and a user-chosen passphrase may
+hold one. A control character, a line break, a leading or trailing space or tab, and any
+character outside ASCII are not.
+
+**The reason is a leak, measured on #13 with httpx 0.28.1.** A header value h11 refuses
+raises `httpx.LocalProtocolError("Illegal header value b'...'")`, and the message is the
+whole value. That is a `TransportError`, and an exchange provider chains its unavailable
+error `from` a transport error, so the credential would reach any log that renders the
+traceback. A non-ASCII character fails earlier and differently, as a bare
+`UnicodeEncodeError` out of `client.get` -- outside every exchange error class. A trailing
+space pasted into `secrets.env` is the realistic way to get either.
+"""
+
+
+def is_header_safe(value: str) -> bool:
+    """Whether `value` can travel in an HTTP header unchanged. See `HEADER_SAFE_TEXT`."""
+    return HEADER_SAFE_TEXT.match(value) is not None
+
+
+def credential_header_violation(
+    variables: tuple[tuple[str, SecretStr | None], ...],
+) -> str | None:
+    """Why a credential sent in a header cannot be sent, or `None` if every one can.
+
+    `variables` is the `(environment variable, value)` pairs of the credentials a venue
+    sends as header values -- for Bitget the API key and the passphrase, and **not** the
+    secret, which only ever enters an HMAC and may hold anything. An unset variable passes.
+
+    **The reason names the variable and the rule, and never the value**, nor which
+    character or where: the position of a stray character is part of the credential too.
+    """
+    for name, value in variables:
+        if value is not None and not is_header_safe(value.get_secret_value()):
+            return (
+                f"{name} holds a character an HTTP header cannot carry: whitespace at either "
+                "end, a line break or another control character, or a character outside "
+                "printable ASCII. Look for a stray space or line break where it was pasted."
+            )
+    return None
+
+
 class Settings(BaseSettings):
     """Runtime configuration for the backend."""
 
@@ -108,6 +184,16 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         frozen=True,
+        # Keep every environment value out of a validation error's `str()` and `repr()`,
+        # which is what reaches the log when the container refuses to start. Pydantic elides
+        # the *middle* of the echoed input and keeps both ends. Measured on #13: with the
+        # Bitget key and secret set and the passphrase missing, `str(exc)` carried the key's
+        # first five characters and the secret's last twenty; a passphrase with a trailing
+        # space showed its own tail, which for a short passphrase is most of it. This drops
+        # `input_value` and `input_type` from both renderings. It does **not** change
+        # `errors()` or `json()`, which still carry the whole input -- see the docstring of
+        # `_refuse_unsafe_configuration`.
+        hide_input_in_errors=True,
     )
 
     environment: Literal["dev", "prod"] = "dev"
@@ -241,6 +327,33 @@ class Settings(BaseSettings):
     # credential format, which is exactly what the paragraph above refuses to do.
     coingecko_api_key: SecretStr | None = None
 
+    # The Bitget API key, its secret and its passphrase: the credentials the spot fills import
+    # signs with. **Read-only**, created by the owner on the venue, and `docs/operations.md`
+    # says how. `SecretStr` for the reason `bootstrap_password` is one, and the API key and the
+    # passphrase are secrets too -- rule 3 names API keys, and the three together are what
+    # reads the owner's trading history. Never persisted, never returned by an endpoint, never
+    # logged: they travel in request headers on the one call that uses them.
+    #
+    # **All three or none.** `None` for all three means the venue is not configured, and
+    # `providers.exchanges.registry.exchange_providers` then does not build it -- absent, not
+    # built and skipped, the rule the CoinGecko key set. Some set and some not is refused at
+    # startup, naming the missing variables.
+    #
+    # **A blank value is refused at startup, unlike the CoinGecko key.** A blank CoinGecko key
+    # reaches its vendor and comes back as a 401 the transport logs, which is the diagnosable
+    # outcome that setting chose. A blank Bitget credential never reaches the venue:
+    # `Credentials` refuses it at construction, so the failure would surface on the first sync
+    # instead of at the start. Refusing it here is the same fact, reported where the
+    # deployment pipeline rolls back.
+    #
+    # **The key and the passphrase must also be text a header can carry** (`HEADER_SAFE_TEXT`):
+    # printable ASCII with no whitespace at either end. Both are sent as header values, and a
+    # value h11 refuses comes back as a transport error whose message is the value itself.
+    # The secret is exempt; it only ever enters an HMAC.
+    bitget_api_key: SecretStr | None = None
+    bitget_api_secret: SecretStr | None = None
+    bitget_api_passphrase: SecretStr | None = None
+
     # The balance scheduler. Three settings, and each answers a question an operator
     # actually has.
     #
@@ -313,8 +426,13 @@ class Settings(BaseSettings):
           often. The per-host rate limiter would pace the requests, so the symptom is not a
           burst -- it is a process that never stops making them, quietly, for as long as it
           is up.
+        * a partial or blank set of Bitget credentials cannot sign a request, and would be
+          discovered on the first exchange sync rather than here. `exchange_credentials_violation`
+          says which variable, and never what it holds. Nor can a key or passphrase holding a
+          character no HTTP header can carry -- and that one would also write the value into
+          a transport error's message. `credential_header_violation` says which.
 
-        Refusing to start turns all seven into a container that fails its health check,
+        Refusing to start turns all eight into a container that fails its health check,
         which is a failure the deployment pipeline already knows how to roll back.
 
         **Unconditional, not gated on `prod`.** A URL that cannot be requested is wrong in
@@ -327,11 +445,19 @@ class Settings(BaseSettings):
         Measured, and it is not what the `SecretStr` on `bootstrap_password` leads anyone
         to expect:
 
-        | Rendering | Carries `PORTFOLIO_BOOTSTRAP_PASSWORD`? |
+        | Rendering | Carries a `PORTFOLIO_*` value? |
         |---|---|
-        | `str(exc)` | no -- pydantic elides the middle of the input |
+        | `str(exc)`, `repr(exc)` | no, since #13 -- `hide_input_in_errors` drops the input |
         | `exc.errors()` | **yes, in plaintext** |
         | `exc.json()` | **yes, in plaintext** |
+
+        **Before #13 the first row was wrong, and it said "no" anyway.** Pydantic elides the
+        *middle* of the echoed input and keeps both ends, so `str(exc)` carried the start of
+        the first variable in the dict and the end of the last. Measured on #13: with the
+        Bitget key and secret set and the passphrase missing, the message held the key's
+        first five characters and the secret's last twenty. `hide_input_in_errors=True` on
+        `model_config` now removes `input_value` and `input_type` from `str()` and `repr()`
+        entirely. It does not touch the other two rows.
 
         Each error entry carries an `input` dict holding every `PORTFOLIO_*` variable as
         the raw environment string -- which is to say *before* pydantic coerced it into the
@@ -339,7 +465,8 @@ class Settings(BaseSettings):
         been parsed; it cannot protect the copy of the input that failed to parse.
 
         Two things keep that off stdout today, and neither is a rule anybody stated. Only
-        `str(exc)` reaches the log when the process refuses to start, and the one caller of
+        `str(exc)` reaches the log when the process refuses to start -- and since #13 it
+        carries no input at all -- and the one caller of
         `.errors()` in this application -- `api/errors.py` -- is registered for a
         `RequestValidationError` from a request body and projects each entry down to
         `loc`, `msg` and `type`, dropping `input` before anything is rendered. So the
@@ -415,6 +542,23 @@ class Settings(BaseSettings):
             if reason is not None:
                 message = f"{name} is not usable: {reason}"
                 raise ValueError(message)
+        reason = exchange_credentials_violation(
+            (
+                ("PORTFOLIO_BITGET_API_KEY", self.bitget_api_key),
+                ("PORTFOLIO_BITGET_API_SECRET", self.bitget_api_secret),
+                ("PORTFOLIO_BITGET_API_PASSPHRASE", self.bitget_api_passphrase),
+            )
+        )
+        if reason is not None:
+            raise ValueError(reason)
+        reason = credential_header_violation(
+            (
+                ("PORTFOLIO_BITGET_API_KEY", self.bitget_api_key),
+                ("PORTFOLIO_BITGET_API_PASSPHRASE", self.bitget_api_passphrase),
+            )
+        )
+        if reason is not None:
+            raise ValueError(reason)
         return self
 
 

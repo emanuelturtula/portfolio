@@ -320,9 +320,11 @@ of a residual #6 recorded and #7 closed: the gate used to be a *pattern*, and a 
 address is lower-case, alphanumeric and under 32 characters, so it matched the pattern and
 reached the log. Membership in a frozen set cannot be satisfied by accident.
 
-The set this release ships is exactly four: `address_balance` for a single balance read,
+The set this release ships is exactly eight: `address_balance` for a single balance read,
 `address_balances` for Kaspa's batch read, `block_tip_height` for the tip-height call
-Esplora's `health()` makes, and `node_health` for the health document Kaspa's reads.
+Esplora's `health()` makes, `node_health` for the health document Kaspa's reads,
+`asset_price` and `asset_prices` for the price reads (#9), and `exchange_fills` and
+`exchange_symbol` for Bitget's signed fills read and its public symbol lookup (#13).
 
 So a new endpoint is two lines, not one: the constant, and its name in `ENDPOINT_LABELS`.
 The same shape as `PUBLIC_API_PATHS` in rule 8 -- the default says nothing, and saying more
@@ -897,11 +899,12 @@ every writer; the second keeps a vendor's mistake on the vendor's error path.
 
 ## Exchange providers, which sign their requests and fail in more ways
 
-**Landed in #12 as a seam with nothing on the other side of it yet.** Bitget arrives with #13,
-BingX with #14, and the sync that drives both with #15. What exists is the vocabulary all
-three need before any of them can be written without inventing its own: what a fill is, what
-a venue can do, and why a call failed. Read `providers/exchanges/base.py` and
-`providers/exchanges/errors.py` alongside this; the docstrings there are the reasoning.
+**The seam landed in #12, and Bitget is the first venue behind it (#13).** BingX arrives with
+#14, and the sync that drives both with #15. The seam is the vocabulary every venue needs
+before it can be written without inventing its own: what a fill is, what a venue can do, and
+why a call failed. Read `providers/exchanges/base.py` and `providers/exchanges/errors.py`
+alongside this; the docstrings there are the reasoning. The Bitget section below records
+what its documentation confirmed and what it left open.
 
 An exchange differs from the other two kinds in the ways that shape everything below:
 
@@ -1181,23 +1184,278 @@ Three decisions worth knowing before adding a column:
 `NumericText`'s too-large refusal stopped quoting the amount in the same change: it named the
 value while the type only held prices, and a fill quantity is the owner's holdings.
 
+### Bitget, the first venue (#13)
+
+`providers/exchanges/bitget.py` holds `BitgetProvider`, which reads the owner's spot fills
+through Bitget's **Classic (v2) API** with a signed, read-only key, and
+`providers/exchanges/registry.py` holds `exchange_providers(client, *, settings=None)`, the
+table of configured venues. The module docstring is the reasoning; this section is the record.
+
+#### Confirmed against Bitget's documentation on 2026-09-25
+
+Every old `https://www.bitget.com/api-doc/...` URL now redirects to the UTA introduction. The
+Classic documentation lives under `/docs/catalog/classic-*` and `/docs/classic/*`, with a
+static copy under `/legacy-docs/classic/...` whose content matches.
+
+| Fact | Documented as | Source |
+|---|---|---|
+| endpoint | `GET /api/v2/spot/trade/fills` on `https://api.bitget.com` | Get Fills, REST intro |
+| parameters | `symbol`, `orderId`, `startTime`, `endTime`, `limit`, `idLessThan`, **all optional** (`symbol` "changed from required to optional" on 2025-03-27, per the classic changelog) | Get Fills |
+| cursor | `idLessThan` takes the **`tradeId`** and "requests the content on the page before this ID (older data)" | Get Fills |
+| filters compose | "the verification order for returned results is: `id` > `startTime` + `endTime` > `idLessThan`": the range narrows first, the cursor pages inside it | Classic intro |
+| page size | `limit` defaults to 100, at most 100 | Get Fills |
+| span | "The interval between startTime and endTime must not exceed 90 days" | Get Fills |
+| retention | "It only supports to get the data within 90days" -- 90 days, older data only as a download from the website | Get Fills |
+| rate limit | 10 requests/s per UID (1/s for a copy-trading trader); 6000/min per IP overall, and exceeding that "takes 5 minutes to recover" | Get Fills, REST intro, FAQ Q9 |
+| envelope | `{"code": "00000", "msg": "success", "requestTime": ..., "data": [...]}`; `data` an array, no cursor object | Get Fills |
+| fill fields | all strings: `userId`, `symbol`, `orderId`, `tradeId`, `orderType`, `side`, `priceAvg`, `size`, `amount`, `feeDetail{deduction, feeCoin, totalDeductionFee, totalFee}`, `tradeScope`, `cTime`, `uTime` | Get Fills |
+| headers | `ACCESS-KEY`, `ACCESS-SIGN`, `ACCESS-TIMESTAMP` (epoch milliseconds), `ACCESS-PASSPHRASE`, `Content-Type: application/json`, `locale` (`en-US` or `zh-CN`) | REST intro |
+| signature | pre-hash `timestamp + METHOD + requestPath + "?" + queryString + body`, body empty for a GET; HMAC-SHA256, **Base64** | REST intro |
+| clock | the timestamp must be "within 30 seconds of the API server time"; `40008` expired, `40005` invalid | REST intro, error codes |
+| error codes | every code in `BITGET_ERROR_MAP`, with its message; **no code is tied to an HTTP status** | error codes |
+| deploy errors | `45001`, `40725`, `40808`, `40015` occur during the Tuesday and Thursday releases, and "users can retry" | FAQ Q13 |
+| symbol info | `GET /api/v2/spot/public/symbols?symbol=X`, public, 20 requests/s per IP, answering `baseCoin`, `quoteCoin` and `status` (`offline`, `gray`, `online`, `halt`) | Get Symbol Info |
+
+Sources, each read on 2026-09-25:
+
+- Get Fills: https://www.bitget.com/docs/catalog/classic-spot-trade/classic-spot-trade#get-fills
+  (static copy: https://www.bitget.com/legacy-docs/classic/spot/trade/Get-Fills)
+- REST intro: https://www.bitget.com/docs/classic/rest-api
+- error codes: https://www.bitget.com/docs/classic/error-code/restapi
+- Classic intro: https://www.bitget.com/docs/classic/Introduction
+- Get Symbol Info: https://www.bitget.com/docs/catalog/classic-spot-market/classic-spot-market#get-symbol-info
+- UTA upgrade guide: https://www.bitget.com/docs/classic/uta-api-upgrade-guide
+- UTA auto-migration notice: https://www.bitget.com/support/articles/12560603893840
+- FAQ: https://www.bitget.com/docs/classic/faq
+
+#### Not documented, and treated as not known
+
+Each of these is a question the documentation leaves open. The provider is written so that
+every one of them either cannot matter or fails loudly, never so that a guess decides it.
+
+| Not documented | What the provider does |
+|---|---|
+| whether `startTime` and `endTime` are **inclusive** | widens the request by a millisecond and drops the two edge milliseconds after parsing: right under all four readings |
+| the order of fills **within a page** | the next cursor is the smallest `tradeId` on the page, which is right under any order |
+| that `tradeId` is numeric, or unique across symbols | requires canonical digits of at most 64 bits; anything else fails the page. A collision within a page is refused; across windows it is #15's |
+| what `size` and `amount` are measured in | base and quote, as the example's arithmetic shows (`13000 x 0.0007 = 9.1`) |
+| **the fee's sign** | the REST example is negative for a fee paid; the WebSocket fill channel reports it positive. Negated, and a positive `totalFee` refused |
+| what `totalFee` and `totalDeductionFee` mean when the fee is paid in **BGB** | a `deduction` other than `"no"` is refused |
+| `cTime`'s unit | described as "Unix second timestamp" while the example is thirteen-digit milliseconds. Read as milliseconds; a seconds value lands in 1970 and the page is refused |
+| whether a delisted pair is still answered by the symbol endpoint | `status` lists `offline`, which suggests it is. If not, that page fails |
+| any golden signature vector | the documentation's samples use an empty secret and print no output. The tests' vectors are computed outside this code, with `openssl` and the pre-hash of Bitget's official Python SDK |
+
+#### v2 against the Unified Trading Account (UTA)
+
+Bitget has two account systems, and an API key belongs to one of them.
+
+- **Classic "is in maintenance mode and receives only essential updates"** (Classic intro). No
+  retirement notice or date for v2 was found. v1 is gone: "we will officially discontinue
+  external access to the V1 API on November 28, 2025" (V1 deprecation notice, 2025-09-25).
+- **A UTA account reads fills from `GET /api/v3/trade/fills`**, which differs in every
+  dimension that matters: `category=SPOT`, an opaque `cursor` taken from the previous response
+  in place of `idLessThan`, "the time range between startTime and endTime must not exceed 30
+  days", 20 requests/s per UID, and differently named fields. The UTA upgrade guide maps v2
+  fills to it and says an existing v2 key "automatically gains UTA access".
+- **Whether a UTA account's key can still call v2 is stated only for brokers.** "API Keys for
+  UTA Unified Trading Accounts cannot access Classic Account API endpoints" is in a notice
+  addressed to broker partners and their clients (Broker UTA API upgrade notice, 2026-06-17).
+  For a retail UTA account the documentation implies v3, through the upgrade guide, and does
+  not state that v2 is refused. **What a v2 call with such a key returns is not documented**:
+  a refusal is expected, but an empty success would be indistinguishable from a window with no
+  trades, and would let #15 advance past history it never read. It does not change the
+  decision below: the owner's account is Classic, and v2 is documented for Classic. It is why
+  the operator is told to stay Classic, and why a `null` fills `data` is refused.
+- **Since 2026-09-15 Bitget has been migrating eligible Classic accounts to UTA
+  automatically**, and an account linked to an API key is not eligible. A main account can
+  switch back; a sub-account cannot (the auto-migration notice).
+- **The owner's account was confirmed Classic on 2026-09-25**, from the app: separate Spot,
+  Futures and Margin tabs, and a banner offering the upgrade.
+
+So v2 is right for this owner, and v2 is all this provider speaks. UTA support is #76, and `docs/operations.md` section 12 tells the operator not to accept the upgrade.
+
+The three sources below were read on 2026-09-25 by the tech lead for spec 014, not re-read
+for this section; everything else in this section was:
+
+- V1 deprecation notice: https://www.bitget.com/support/articles/12560603838361
+- Broker UTA API upgrade notice: https://www.bitget.com/support/articles/12560603886018
+- UTA Get Fill History: https://www.bitget.com/docs/catalog/trading/order-management#get-fill-history
+  (static copy: https://www.bitget.com/legacy-docs/uta/trade/Get-Order-Fills)
+
+#### Decisions
+
+**Capabilities.** `retention` is the documented 90 days. **`max_query_window` is 30 days,
+below the documented 90, on purpose**: the request is widened by a millisecond, so a 90-day
+window would be sent as 90 days and a millisecond, and a venue that states its limit in days
+may measure it by the calendar. Thirty days is also UTA's limit, so the follow-up does not
+change the number #15 plans around. `page_size` 100, `cursor_kind` `trade_id_before`,
+`rate_limit` 10 per 1000 ms (declarative; the transport's floor of one request a second per
+host is stricter), `requires_symbol` false and `candidate_symbols()` empty -- `symbol` is
+optional, so one query covers every symbol. If "90 days" turns out to be three calendar
+months, the oldest window is refused with `40704`, which is `ExchangeRetentionWindowError`,
+and #15 clamps further.
+
+**The request.** Query keys in ascending order -- `endTime`, `idLessThan` (only with a
+cursor), `limit=100`, `startTime` -- every value ASCII digits, and the URL sent with exactly
+the string that was signed, never through `params=`. `startTime = epoch_ms(since) - 1` (never
+below 0) and `endTime = epoch_ms(until)`. The fills call sends the four `ACCESS-*` headers,
+`Content-Type` and `locale: en-US`; the symbol call sends only `locale` and no credential.
+
+**The window is widened, then filtered.** Sending `[since, until)` as it stands loses the fills
+at `since` if `startTime` is exclusive; sending `until - 1` loses the ones at `until - 1` if
+`endTime` is exclusive -- the same fills, at the same boundary, on every run. Asking for a
+millisecond more on each side covers `[since, until)` under all four readings. After parsing,
+a fill at exactly `since - 1 ms` or exactly `until` is dropped: under an inclusive reading it
+belongs to a neighbouring window, which fetches it. A fill anywhere else outside the window is
+not dropped, and `assemble_fill_page` refuses the page. The page-size check counts the
+**raw** page, before the drop, so a 101-fill page cannot hide behind a dropped edge fill.
+
+**The cursor is the smallest trade id, and it must strictly decrease.** `idLessThan` takes a
+`tradeId`, never an `orderId`. `next_cursor` is the smallest `tradeId` on a raw page of 100
+fills and `None` on a shorter page. With a cursor, every fill must have `tradeId < cursor`, or
+the page is an `ExchangeSchemaError`: the venue ignored the cursor. Each cursor is then strictly
+below the one before it, and a strictly decreasing sequence of positive integers is finite,
+so **pagination terminates by construction** -- a repeated cursor and a cycle alike, which
+`require_cursor_advanced` alone cannot promise. A `tradeId` must match `\A[1-9][0-9]{0,18}\Z`
+and be at most `2**63 - 1`, so string and numeric identity agree and `int()` never sees more
+than nineteen digits.
+
+**The fee is negated.** The documented example buys 0.0007 BTC with `totalFee` `-0.0000007`
+BTC -- 0.1%, a fee paid, reported negative -- and `NormalizedFill` counts a fee paid as
+positive, so `fee_amount = -totalFee`, computed with `copy_negate()` so the calling thread's
+decimal context cannot round it, and a zero fee is a positive zero. **A positive `totalFee` is
+refused**: the WebSocket channel reports the field positive, and if REST ever did, reading it
+as a rebate would record every fee as income without a word. A real rebate needs a rule
+written from a real fill.
+
+**BGB deduction is refused.** A `feeDetail.deduction` other than `"no"` fails the page, naming
+the field. An owner who pays fees in BGB sees every page fail until a real fill shows what the
+fields hold then; a loud failure is the intended direction.
+
+**The symbol cache.** `NormalizedFill` needs a base and a quote asset, and `"BTCUSDT"` does not
+say where one ends. Splitting it with a list of quote coins is a guess that fails on the first
+new one, so the public symbol endpoint is asked -- once per distinct symbol per provider
+instance, labelled `exchange_symbol`. A symbol must match `\A[A-Z0-9]{1,40}\Z` **before** a
+URL is built from it. The answer must hold exactly one entry, for the symbol asked, with
+non-blank `baseCoin` and `quoteCoin`; an answer about another symbol is refused, not used.
+**An auth refusal from this endpoint is reported as `ExchangeUnavailableError`**, with its
+status and venue code kept: the answer is classified like the fills call's, so a 401 or 403
+would otherwise be `ExchangeAuthError`, and #15 marks the account `auth_failed` for that. No
+credential is sent to this public endpoint, so the refusal cannot be about the key; a CDN or
+firewall block is the plausible cause, and it is transient.
+
+**Classification.** A success is HTTP 200 **and** a JSON object whose `code` is the string
+`"00000"`. Any other status is `exchange_error(status, code)`, with the code read from the body
+only when the body is a JSON object -- a 502 carrying HTML is unavailable, not a schema error.
+A 200 whose body does not parse is a schema error; a 200 with any other code goes through the
+map, and an unmapped one is a schema error. `raise_for_status()` is never called. A response
+that declares `Content-Encoding: gzip` or `deflate` and whose body does not decompress makes
+`client.get` raise `httpx.DecodingError` -- a `RequestError`, **not** a `TransportError` --
+before any status is known; it is `ExchangeUnavailableError` with no cause and no context,
+since a corrupt compressed body from an intermediary is most plausibly transient. (The chain
+and price providers still let it escape; that is its own issue.)
+
+**A fills answer whose `data` is `null` is refused, and that was decided twice.** The
+documented empty result is `"data": []`; `null` under `"00000"` is not documented. Reading it
+as an empty page was tried and reversed on review. If the venue ever answered that way to a
+call it should have refused -- a key on an account upgraded to UTA is the plausible case, and
+what v2 returns to one is not documented -- every window would read as empty, #15 would
+advance its checkpoints past them, and once they aged out of the 90-day retention the history
+would be gone. A refusal costs one fix after the first real sync; a silent empty history is
+permanent. The symbol-info answer is refused for a `null` `data` as well.
+
+| Codes | Class | Why |
+|---|---|---|
+| `40006`, `40037`, `40041`, `40012`, `40036`, `40009`, `40038`, `40018` | `ExchangeAuthError` | the key, the passphrase, the signature or the IP allowlist: the owner fixes the key |
+| `40014`, `40025`, `40040` | `ExchangeInsufficientScopeError` | the key lacks read permission |
+| `40008`, `40005` | `ExchangeUnavailableError` | **not auth**: a replayed request or a skewed host clock is not a bad key |
+| `429` | `ExchangeRateLimitedError` | the in-band spelling of the throttle |
+| `40704` | `ExchangeRetentionWindowError` | "only the last three months": #15 clamps further |
+| `00001`, `40705`, `40707`, `40017`, `40019`, `40020`, `40034`, `40102` | `ExchangeInvalidRequestError` | a request built wrongly, mapped so it is not a schema error on a 200 |
+| `45001`, `40725`, `40808`, `40015` | `ExchangeUnavailableError` | the FAQ says these occur during releases, and to retry |
+
+The header-missing codes (`40001`, `40002`, `40003`, `40011`) are deliberately **not** mapped:
+the provider always sends every header, so one of them is a bug here, and the status fallback
+says "needs a person" without marking a working key `auth_failed`.
+
+**The transport replays a signed request, and that is accepted.** `RetryingTransport` resends
+a GET that got a 429, a 5xx or no answer unchanged -- same timestamp, same signature. Without a
+`Retry-After` the backoff is well inside the 30-second window; with one near the transport's
+30-second cap the replay can arrive expired, is refused with `40008`, and that is
+`ExchangeUnavailableError`, so the next run signs a fresh request. Re-signing per attempt would
+need a transport that knows about signing or retries owned by the provider, for a 429 the FAQ
+says takes five minutes to clear anyway.
+
+**Credentials.** `PORTFOLIO_BITGET_API_KEY`, `PORTFOLIO_BITGET_API_SECRET` and
+`PORTFOLIO_BITGET_API_PASSPHRASE`, all `SecretStr`, **all or none**. The application refuses to
+start with a partial set (naming the missing variables), a blank value, or a key or passphrase
+holding a character no HTTP header can carry -- whitespace at either end, a control character,
+anything outside printable ASCII -- because h11 refuses such a header with a transport error
+whose message is the whole value. No refusal names a value. With none set, `exchange_providers`
+holds no Bitget provider at all: absent, not built. `BitgetProvider` refuses `Credentials`
+without a passphrase, or with an unsendable key or passphrase, and reads the key and the
+passphrase out of their `SecretStr` only while the headers are built; the secret is unwrapped
+only inside `signing.py`.
+
+**Logging.** The provider has no log call. The transport logs
+`https://api.bitget.com/exchange_fills` or `.../exchange_symbol`, never a path, a query or a
+header, and every exception the provider raises is built by the taxonomy, which carries no
+body, no URL and no header. **No exception it raises has a cause or a context that could hold
+one**: an `httpx.LocalProtocolError` -- whose message is the illegal header value, which here
+would be the key -- becomes an `ExchangeInvalidRequestError` raised after the `except` block
+has closed, since `from None` still leaves the suppressed `__context__` for a debugger or an
+error tracker to walk. A transport failure is `ExchangeUnavailableError` chained from the
+`httpx.TransportError`, whose message carries no query.
+
+#### The interpreter's limits, and the three `http.py` escapes they found
+
+Spec 012's lesson, applied to every boundary that takes text the venue controls, and probed
+against the implementation rather than assumed:
+
+| Input the venue chooses | Where it is stopped |
+|---|---|
+| an amount of 5000 digits, as a string or a JSON number | `require_fill_amount`'s 100-digit bound, or `decode_json` for a JSON integer |
+| a `tradeId` of 5000 digits | the trade-id pattern, before `int()` |
+| a `cTime` of 4000 digits, or past `datetime`'s range | `datetime_from_epoch_ms` |
+| `1e1000000000000000000`, as a string or a number | `require_fill_amount`, or `decode_json` |
+| a fill object nested 1500 levels deep | `encode_raw_payload`'s depth of 32 |
+| `"\ud800"` in `symbol`, `tradeId`, `side`, `orderId`, `feeCoin` or `baseCoin` | the ASCII patterns, or an explicit UTF-8 check naming the field |
+| a `side`, `feeCoin` or `deduction` that is a list or an object | a type check before any lookup that would hash it |
+
+Every one is an `ExchangeSchemaError` naming the field. The same probes found three defects in
+the shared transport that no provider could have caught, because each escaped `client.get`
+itself -- and `parse_rate_limit` runs on **every** response:
+
+- a `Retry-After` or `ratelimit-*` value of 5000 ASCII digits passed the grammar check and
+  reached `int()`, which raises a bare `ValueError` past 4300 digits. Now a run longer than
+  `MAX_HEADER_DIGITS` (10) is unusable, like any other unparseable value;
+- a `Retry-After` HTTP-date with a twenty-digit year, hour or zone offset raised
+  `OverflowError` from the date parser, which is not a `ValueError`. Now caught and read as
+  absent;
+- a credential with an illegal header character, above.
+
 ### Not confirmed, and who confirms it
 
-Nothing vendor-specific is in #12, by design. Each of these is belief, and the issue named
-beside it replaces the belief with the venue's documentation:
+Nothing vendor-specific is in #12, by design. Each of these was belief, and the issue named
+beside it replaces the belief with the venue's documentation. #13 has done so for Bitget,
+**from documentation alone**: no request has been made to the signed endpoint, because that
+needs a key this repository must not contain. The owner's first sync after #15 is the first
+measurement.
 
-| Belief | Owner |
-|---|---|
-| both venues report errors as numeric codes (`venue_code_of` drops anything else, and classification falls back to the status) | #13, #14 |
-| BingX reports some failures, auth included, on a 200 -- an unmapped code there is a schema error, so the account is **not** marked `auth_failed` until #14 maps its auth codes | #14 |
-| timestamps are epoch milliseconds | #13, #14 |
-| each venue pages in one of the four `CursorKind` shapes | #13, #14 |
-| each venue's retention, maximum query window, page size and rate limit | #13, #14 |
-| trade ids are unique per account across symbols | #14 |
-| which string each venue signs, and in which encoding | #13, #14 |
-| `RETENTION_MARGIN` of five minutes is enough | #13 |
-| `FILL_SCALE` of 18 covers every fee a venue reports; a 19th place fails its page loudly | whichever venue meets it |
-| a zero `quote_quantity` for a dust trade never happens; if it does, the page fails loudly | whichever venue meets it |
+| Belief | Bitget, after #13 | Still open for |
+|---|---|---|
+| venues report errors as numeric codes (`venue_code_of` drops anything else, and classification falls back to the status) | **confirmed**: five-digit strings, `"00000"` on success, plus `429` | #14 |
+| BingX reports some failures, auth included, on a 200 -- an unmapped code there is a schema error, so the account is **not** marked `auth_failed` until #14 maps its auth codes | Bitget's map is keyed by code under any status, so a mapped code on a 200 is classified too | #14 |
+| timestamps are epoch milliseconds | **confirmed** for `ACCESS-TIMESTAMP`, `startTime` and `endTime`; `cTime` is documented both ways and read as milliseconds (a seconds value fails the page) | #14 |
+| each venue pages in one of the four `CursorKind` shapes | **confirmed**: `trade_id_before`, over `idLessThan` | #14 |
+| each venue's retention, maximum query window, page size and rate limit | **confirmed**: 90 days, 90 days (30 declared, on purpose), 100, 10/s per UID | #14 |
+| trade ids are unique per account across symbols | **not documented**. One cursor pages every symbol, which only works if they are; a collision within a page is refused, across windows it is #15's to detect | #14, #15 |
+| which string each venue signs, and in which encoding | **confirmed**: `timestamp + "GET" + path + "?" + query`, HMAC-SHA256, Base64. No published vector; the tests compute theirs outside the code | #14 |
+| `RETENTION_MARGIN` of five minutes is enough | **not measurable without a key.** "The last three months" in `40704` may be 89 days; if so the oldest window is refused as `ExchangeRetentionWindowError` and #15 clamps further | #15's first sync |
+| whether `startTime` and `endTime` are inclusive, and the order within a page | **not documented**, and made not to matter: the window is widened and filtered, the cursor is the smallest id | -- |
+| the sign of a fee, and the fields of a fee paid in BGB | **not documented**. A positive fee and a BGB deduction are refused loudly | the first real fill that shows either |
+| `FILL_SCALE` of 18 covers every fee a venue reports; a 19th place fails its page loudly | unmeasured | whichever venue meets it |
+| a zero `quote_quantity` for a dust trade never happens; if it does, the page fails loudly | unmeasured | whichever venue meets it |
 
 ## Who calls a provider, and when
 
@@ -1265,14 +1523,22 @@ it by returning a stale number that looks exactly like a fresh one, which is the
 
 ## Not done yet, and who owns it
 
-- **Every exchange venue.** #12 landed the seam and nothing on the other side of it.
-  #13 (Bitget) and #14 (BingX) each bring their endpoint paths, cursor parameters, error
-  codes and retention, confirmed against the venue's documentation and recorded here with
-  the date; their `PORTFOLIO_BITGET_*` and `PORTFOLIO_BINGX_*` settings; and their endpoint
-  labels in `ENDPOINT_LABELS`, which land with the call site that uses them. **The exchange
-  provider registry arrives with #13**, the first provider that registers: the chain
-  registry's factory takes one argument and an exchange factory also needs `Credentials`,
-  so the first real caller shapes it.
+- **BingX.** #13 landed Bitget and the registry, `exchange_providers(client, *,
+  settings=None)`, a read-only mapping from `ExchangeKey` to provider in which a venue
+  without credentials is absent rather than built. #14 brings BingX the same way: its
+  endpoint paths, cursor parameters, error codes and retention confirmed against its
+  documentation and recorded here with the date, its `PORTFOLIO_BINGX_*` settings, its
+  endpoint labels in `ENDPOINT_LABELS`, and one line in `registry.py`.
+- **Bitget on a Unified Trading Account.** The provider speaks the Classic v2 API only, which
+  is right for the owner's Classic account. `GET /api/v3/trade/fills` differs in its cursor,
+  its window, its rate and its field names, so supporting a UTA account is a second provider
+  or a second mode, written from its own documentation. That is #76. Until then the operator keeps the account Classic (`docs/operations.md`
+  section 12).
+- **The Bitget provider has never met its venue.** Like CoinGecko's parser, it is written
+  from documentation, because measuring a signed endpoint needs a key this repository must
+  not contain. Every guess in the Bitget section is written to fail loudly, as a typed error
+  naming a field, rather than to guess; the owner's first sync after #15 is the first
+  measurement, and a refusal there is the evidence to act on.
 - **The exchange sync.** #15 owns the loop and everything that needs its history: sync state
   on `exchange_accounts` (status, `auth_failed`, checkpoints, the requested and effective
   start), the fills repository with `ON CONFLICT DO NOTHING` and its `seen` against
@@ -1283,18 +1549,20 @@ it by returning a stale number that looks exactly like a fresh one, which is the
 - **A signed request replayed by the transport can arrive expired.** `RetryingTransport`
   retries a `GET` that got a 429, a 5xx or no answer by sending **the same request
   again** -- same timestamp, same signature -- for up to `RetryPolicy.max_attempts` (3)
-  attempts, with backoff up to `max_backoff_ms` (30 seconds). A venue that checks a request's timestamp
-  against a receive window can refuse the replay as expired. Two consequences for #13 and
-  #14: **never map a venue's "timestamp expired" code to `ExchangeAuthError`**, because #15
-  marks the account `auth_failed` for that class and the key is not what failed; and decide,
-  against the venue's documented receive window, whether it tolerates the transport's
-  backoff or whether signed calls must be re-signed per attempt instead of replayed.
+  attempts, with backoff up to `max_backoff_ms` (30 seconds). A venue that checks a
+  request's timestamp against a receive window can refuse the replay as expired. **Decided
+  for Bitget in #13**: its window is 30 seconds, the replay is accepted, and `40008` and
+  `40005` are `ExchangeUnavailableError`, never auth, so the next run signs afresh. #14 makes
+  the same decision for BingX against its own receive window, and must not map its
+  "timestamp expired" code to `ExchangeAuthError` either: #15 marks the account
+  `auth_failed` for that class, and the key is not what failed.
 - **Tuning settings.** Every number in the first table above is still a module constant.
   Promoting one to a `PORTFOLIO_PROVIDER_*` setting is a change an operator's measurement
   should drive, not a guess made before anything has ever made a request.
 - **The source-walk test over `providers/`, and now over the sync.**
   `backend/tests/security/test_address_logging.py` walks the wallet modules and fails on a
-  log call that could carry an address. Neither provider has a log call at all --
+  log call that could carry an address. No chain provider has a log call at all, and
+  neither does the Bitget provider --
   deliberately, since the transport's contract is the only one that is enforced rather than
   remembered -- so the walk is worth extending the day a provider needs one.
 

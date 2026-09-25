@@ -11,12 +11,17 @@ parser raises on a spelling the RFC requires a recipient to accept.
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Final
 
 import pytest
 
-from portfolio.providers.http import MILLISECONDS_PER_SECOND, parse_retry_after
+from portfolio.providers.http import (
+    MAX_HEADER_DIGITS,
+    MILLISECONDS_PER_SECOND,
+    parse_retry_after,
+)
 
 #: A fixed instant with a timezone, because `parse_retry_after` compares against an aware
 #: datetime and a naive one raises. Chosen rather than generated: a test that computes its
@@ -262,3 +267,69 @@ def test_zero_and_no_header_stay_different_answers_at_the_parser() -> None:
     assert zero == 0
     assert zero is not None
     assert absent is None
+
+
+# --------------------------------------------------------------------------------------
+# A value the interpreter would refuse, which used to escape as a bare exception (#13)
+# --------------------------------------------------------------------------------------
+#
+# `1*DIGIT` has no length limit, and `int()` refuses more than 4300 digits with a
+# `ValueError`. The transport reads `Retry-After` on every retryable response, so a vendor
+# header of five thousand digits made `client.get` raise past every provider's
+# `except httpx.TransportError`. `MAX_HEADER_DIGITS` is the bound this application chose;
+# past it, the header says nothing usable.
+
+#: Ten nines: the longest run the bound admits, written out rather than derived from it.
+AT_THE_BOUND: Final = "9999999999"
+
+
+def test_the_header_digit_bound_is_ten() -> None:
+    """Pinned as a literal: ten digits of seconds is over three centuries of waiting."""
+    assert MAX_HEADER_DIGITS == 10
+    assert len(AT_THE_BOUND) == MAX_HEADER_DIGITS
+
+
+def test_the_five_thousand_digit_case_is_one_the_interpreter_refuses() -> None:
+    """The premise: without the bound, this is what `int()` does with such a header."""
+    assert sys.get_int_max_str_digits() < 5000
+    with pytest.raises(ValueError, match="digits"):
+        int("1" * 5000)
+
+
+@pytest.mark.parametrize(
+    ("header", "expected_ms"),
+    [
+        pytest.param(AT_THE_BOUND, 9_999_999_999_000, id="ten nines"),
+        pytest.param("0000000001", 1_000, id="ten digits, leading zeros"),
+    ],
+)
+def test_a_delay_at_the_digit_bound_is_read(header: str, expected_ms: int) -> None:
+    assert parse_retry_after(header, NOW) == expected_ms
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        pytest.param("1" * 11, id="eleven digits"),
+        pytest.param("0" * 10 + "1", id="eleven digits, leading zeros"),
+        pytest.param("1" * 5000, id="five thousand digits"),
+        pytest.param("1" * (sys.get_int_max_str_digits() + 1), id="past the interpreter's limit"),
+    ],
+)
+def test_a_delay_past_the_digit_bound_is_unusable(header: str) -> None:
+    """`None`, with a cap and without one: the bound is on the text, before `int()`."""
+    assert parse_retry_after(header, NOW) is None
+    assert parse_retry_after(header, NOW, cap_ms=30_000) is None
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        pytest.param("Sun, 06 Nov 99999999999999999999 08:49:37 GMT", id="a twenty-digit year"),
+        pytest.param("Sun, 06 Nov 1994 99999999999999999999:49:37 GMT", id="a twenty-digit hour"),
+        pytest.param("Sun, 06 Nov 1994 08:49:37 +99999999999999999999", id="a twenty-digit zone"),
+    ],
+)
+def test_a_date_whose_fields_overflow_is_unusable(header: str) -> None:
+    """`parsedate_to_datetime` raises `OverflowError` for these, which is not a `ValueError`."""
+    assert parse_retry_after(header, NOW) is None

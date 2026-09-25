@@ -38,6 +38,7 @@ import pytest
 
 from portfolio.providers.http import (
     DEFAULT_RETRY_POLICY,
+    MAX_HEADER_DIGITS,
     RateLimitHint,
     parse_rate_limit,
 )
@@ -375,3 +376,68 @@ def test_every_parsed_number_is_an_integer_and_never_a_bool() -> None:
     for value in (hint.limit, hint.remaining, hint.reset_ms):
         assert isinstance(value, int)
         assert not isinstance(value, bool)
+
+
+# --------------------------------------------------------------------------------------
+# A value the interpreter would refuse, which used to escape every request (#13)
+# --------------------------------------------------------------------------------------
+#
+# This parser runs on **every** response inside `RetryingTransport`, so a vendor header of
+# five thousand digits made `int()` raise a bare `ValueError` out of `client.get` -- past
+# every provider's `except httpx.TransportError`, and past a chain `health()` whose contract
+# is that it never raises. `MAX_HEADER_DIGITS` bounds the text before `int()` sees it.
+
+HEADER_NAMES: Final = (
+    "ratelimit-limit",
+    "ratelimit-remaining",
+    "ratelimit-reset",
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+)
+
+
+def field_of(hint: RateLimitHint, name: str) -> int | None:
+    """The hint field one header name fills."""
+    if name.endswith("-limit"):
+        return hint.limit
+    if name.endswith("-remaining"):
+        return hint.remaining
+    return hint.reset_ms
+
+
+@pytest.mark.parametrize("name", HEADER_NAMES)
+def test_a_value_at_the_digit_bound_is_read(name: str) -> None:
+    """Ten nines, the longest run `MAX_HEADER_DIGITS` admits, read exactly and uncapped."""
+    assert MAX_HEADER_DIGITS == 10
+
+    hint = parse_rate_limit(httpx.Headers({name: "9999999999"}))
+
+    assert hint is not None
+    expected = 9_999_999_999_000 if name.endswith("-reset") else 9_999_999_999
+    assert field_of(hint, name) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("1" * 11, id="eleven digits"),
+        pytest.param("0" * 10 + "1", id="eleven digits, leading zeros"),
+        pytest.param("1" * 5000, id="five thousand digits"),
+    ],
+)
+@pytest.mark.parametrize("name", HEADER_NAMES)
+def test_a_value_past_the_digit_bound_is_unusable(name: str, value: str) -> None:
+    """Treated as absent, like any other unusable value: never raised."""
+    assert parse_rate_limit(httpx.Headers({name: value})) is None
+
+
+def test_one_overlong_field_does_not_take_the_readable_ones_with_it() -> None:
+    """The bound is per field: the other two in the block are still read."""
+    hint = parse_rate_limit(
+        httpx.Headers(
+            {"ratelimit-limit": "60", "ratelimit-remaining": "1" * 5000, "ratelimit-reset": "2"}
+        )
+    )
+
+    assert hint == RateLimitHint(limit=60, remaining=None, reset_ms=2_000)

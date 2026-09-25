@@ -1445,3 +1445,46 @@ def test_the_scripted_handler_repeats_its_last_outcome() -> None:
 
     assert statuses == [503, 200, 200]
     assert len(requests) == 3
+
+
+# --------------------------------------------------------------------------------------
+# A hostile header reaches the caller as a response, never as an exception (#13)
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "headers"),
+    [
+        pytest.param(200, {"ratelimit-remaining": "1" * 5000}, id="200, ratelimit-remaining"),
+        pytest.param(200, {"x-ratelimit-reset": "1" * 5000}, id="200, x-ratelimit-reset"),
+        pytest.param(429, {"ratelimit-reset": "1" * 5000}, id="429, ratelimit-reset"),
+        pytest.param(429, {"Retry-After": "1" * 5000}, id="429, Retry-After"),
+        pytest.param(503, {"Retry-After": "1" * 5000}, id="503, Retry-After"),
+        pytest.param(
+            503,
+            {"Retry-After": "Sun, 06 Nov 99999999999999999999 08:49:37 GMT"},
+            id="503, Retry-After with a twenty-digit year",
+        ),
+    ],
+)
+async def test_a_header_the_interpreter_cannot_convert_still_reaches_the_caller(
+    status: int, headers: dict[str, str]
+) -> None:
+    """The transport reads these headers on every response, before any decision about it.
+
+    Before `MAX_HEADER_DIGITS`, `int()` refused the value with a bare `ValueError` -- and a
+    year of twenty digits made the date parser raise `OverflowError` -- out of `client.get`,
+    past every `except httpx.TransportError` a provider has. Now the header is unusable and
+    the response arrives: retried as usual when the status is retryable, returned as it
+    stands otherwise.
+    """
+    inner, requests = scripted_transport((status, headers))
+    client = retrying_client(inner)
+
+    async with client:
+        outcome = await perform(client)
+
+    assert isinstance(outcome, httpx.Response), f"raised {outcome!r} instead of answering"
+    assert outcome.status_code == status
+    expected_attempts = 1 if status == 200 else 3
+    assert len(requests) == expected_attempts

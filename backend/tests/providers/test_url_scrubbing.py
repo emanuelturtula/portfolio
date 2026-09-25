@@ -27,6 +27,8 @@ from portfolio.providers.http import (
     BLOCK_TIP_HEIGHT,
     ENDPOINT_EXTENSION,
     ENDPOINT_LABELS,
+    EXCHANGE_FILLS,
+    EXCHANGE_SYMBOL,
     NODE_HEALTH,
     UNLABELLED,
     request_target,
@@ -376,6 +378,12 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     something began fetching prices on a request path. That is the failure
     `backend/.importlinter`'s price contract exists to make impossible, observed from the
     other side, and it only works because the two labels are distinguishable.
+
+    Eight at #13. `exchange_fills` is Bitget's signed fills read and `exchange_symbol` its
+    public symbol-info lookup. Two labels because they are two kinds of call: a line saying
+    `exchange_fills` failed is about the key or the account, one saying `exchange_symbol`
+    failed is about a pair the venue no longer lists, and an operator needs to tell which
+    from the log alone, since the path is never in it.
     """
     assert sorted(ENDPOINT_LABELS) == [
         "address_balance",
@@ -383,6 +391,8 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
         "asset_price",
         "asset_prices",
         "block_tip_height",
+        "exchange_fills",
+        "exchange_symbol",
         "node_health",
     ]
     assert ADDRESS_BALANCE == "address_balance"
@@ -390,7 +400,11 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     assert ASSET_PRICE == "asset_price"
     assert ASSET_PRICES == "asset_prices"
     assert BLOCK_TIP_HEIGHT == "block_tip_height"
+    assert EXCHANGE_FILLS == "exchange_fills"
+    assert EXCHANGE_SYMBOL == "exchange_symbol"
     assert NODE_HEALTH == "node_health"
+    for label in (EXCHANGE_FILLS, EXCHANGE_SYMBOL):
+        assert ENDPOINT_LABEL_PATTERN.match(label), f"{label} does not have a label's shape"
     assert ENDPOINT_LABELS, "an empty allowlist makes every request <unlabelled>"
     assert isinstance(ENDPOINT_LABELS, frozenset), (
         "a mutable set would let any module widen what may be logged at import time, "

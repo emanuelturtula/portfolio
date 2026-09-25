@@ -34,7 +34,9 @@ from tests.security.conftest import PRODUCTION_ORIGIN
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-type LoggingInstaller = Callable[[], None]
+#: `Callable[..., None]` because the installer takes an optional `log_level`. The two
+#: original callers pass nothing, and the Bitget logging tests pass `"DEBUG"`.
+type LoggingInstaller = Callable[..., None]
 
 
 @pytest.fixture
@@ -49,14 +51,21 @@ def restored_logging() -> Iterator[None]:
 
 @pytest.fixture
 def production_logging(restored_logging: None) -> LoggingInstaller:
-    """Hand back an installer for the JSON pipeline the Raspberry Pi runs. Do not install here."""
+    """Hand back an installer for the JSON pipeline the Raspberry Pi runs. Do not install here.
+
+    `log_level` exists for the same reason as in `tests/security/conftest.py`: the
+    transport logs a successful request at debug, so a test about what a success writes has
+    to turn debug on. The default is the production default, so a caller that passes
+    nothing gets the level it always got.
+    """
     del restored_logging  # The fixture's value is its teardown.
 
-    def install() -> None:
+    def install(log_level: str = "INFO") -> None:
         configure_logging(
             Settings(
                 environment="prod",
                 allowed_origin=PRODUCTION_ORIGIN,
+                log_level=log_level,
                 argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
                 argon2_time_cost=OWASP_MINIMUM_TIME_COST,
             )

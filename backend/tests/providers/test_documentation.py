@@ -531,3 +531,107 @@ def test_building_the_documented_sources_reaches_no_vendor() -> None:
     )
 
     assert fake.requests == []
+
+
+# --------------------------------------------------------------------------------------
+# Criterion 1 of #13: the Bitget facts, confirmed against the live documentation
+# --------------------------------------------------------------------------------------
+#
+# Searched inside the Bitget section rather than the whole document: "90" and "order" are
+# in the document a dozen times over, and a substring that is true of the file is not a
+# statement about the venue.
+
+#: A link into Bitget's own documentation, current or the static legacy copy.
+BITGET_DOCS_URL: Final = re.compile(r"https://www\.bitget\.com/(?:legacy-)?docs/\S+")
+
+
+def heading_level(line: str) -> int:
+    return len(line) - len(line.lstrip("#"))
+
+
+def bitget_section() -> str:
+    """From the first heading naming Bitget to the next heading at its level or above.
+
+    Fenced code is skipped when looking for headings, so a `# comment` in a shell example
+    is not mistaken for one.
+    """
+    headings: list[tuple[int, str]] = []
+    fenced = False
+    lines = document().splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("```"):
+            fenced = not fenced
+        elif not fenced and line.startswith("#"):
+            headings.append((index, line))
+    start = next((index for index, line in headings if "Bitget" in line), None)
+    assert start is not None, "docs/providers.md has no heading naming Bitget"
+    level = heading_level(lines[start])
+    end = next(
+        (index for index, line in headings if index > start and heading_level(line) <= level),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def flattened(text: str) -> str:
+    """Whitespace collapsed: Markdown wraps at a column, and a phrase can break anywhere."""
+    return " ".join(text.split())
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "/api/v2/spot/trade/fills",
+        "idLessThan",
+        "tradeId",
+        "UTA",
+        "/api/v3/trade/fills",
+        "2026-09-25",
+        "Classic",
+    ],
+)
+def test_the_document_records_the_confirmed_bitget_facts(phrase: str) -> None:
+    """The endpoint, the cursor and what it takes, the UTA finding, and the date read.
+
+    Criterion 1 of #13 is that these were confirmed against the live documentation before
+    any code, and recorded. A fact with no date is one nobody can tell has expired, and
+    this venue's documentation moved once already: every old `api-doc` URL now redirects.
+    """
+    assert phrase in flattened(bitget_section())
+
+
+def test_the_bitget_section_links_the_documentation_and_says_what_is_confirmed() -> None:
+    section = flattened(bitget_section())
+
+    assert BITGET_DOCS_URL.search(section), "no link into bitget.com/docs"
+    assert re.search(r"\b90[ -]days?\b", section), "the retention is not stated in days"
+    assert "confirmed" in section.lower(), "the owner's account type is recorded as confirmed"
+
+
+@pytest.mark.parametrize(
+    ("what", "pattern"),
+    [
+        ("that these are undocumented at all", r"not documented|undocumented"),
+        ("whether startTime and endTime are inclusive", r"inclusive"),
+        ("the order of fills within a page", r"within a page"),
+        ("the fee's sign", r"fee'?s sign|fee sign|sign of the fee"),
+        ("BGB fee deduction", r"\bbgb\b"),
+    ],
+)
+def test_the_document_lists_what_bitget_does_not_document(what: str, pattern: str) -> None:
+    """Each gap the provider was written around, named as a gap rather than as a fact.
+
+    Stated flatly, any one of these would turn a guess into a fact #15 builds on: the window
+    is widened because inclusivity is unknown, the cursor is the smallest id because the
+    order is unknown, and a positive fee and BGB deduction are refused because their meaning
+    is unknown.
+    """
+    assert re.search(pattern, flattened(bitget_section()).lower()), f"not named: {what}"
+
+
+def test_the_document_assigns_no_value_to_a_bitget_variable() -> None:
+    """Rule 3: the variable names are documentation; a value beside one is a leak or a lure."""
+    text = document()
+
+    assert "PORTFOLIO_BITGET_API_KEY" in text, "the positive companion: the names are there"
+    assert not re.search(r"PORTFOLIO_BITGET_API_(?:KEY|SECRET|PASSPHRASE)\s*=\s*\S", text)

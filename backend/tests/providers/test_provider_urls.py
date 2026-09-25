@@ -259,8 +259,15 @@ def test_pydantics_structured_errors_carry_the_whole_environment_and_ours_does_n
 
     Found by a mutation sweep over this file's own subject, and it is wider than #7.
     `str(ValidationError)` -- the form that reaches stdout when the container refuses to
-    start -- elides the middle of the input it echoes, so no secret survives it. That is
-    the artifact, and the test above asserts on it.
+    start -- carries no input at all, because `Settings` sets `hide_input_in_errors`. That
+    is the artifact, and the test above asserts on it.
+
+    **It did not always.** Until #13, pydantic echoed the input in that string and elided
+    only its middle, which was taken to mean no secret survived. Both ends survive an
+    elision: #13 measured the start of the first value and the last twenty or so
+    characters of the last one -- a Bitget secret's tail -- in the rendered message.
+    `tests/providers/exchanges/test_bitget_settings.py` now asserts that no five-character
+    window of any credential reaches `str` or `repr`.
 
     `ValidationError.errors()` does **not** elide. Its `input` key carries the entire dict
     the model was built from, which for `get_settings()` is every `PORTFOLIO_*` variable

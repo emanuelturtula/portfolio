@@ -106,8 +106,11 @@ __all__ = [
     "ENDPOINT_EXTENSION",
     "ENDPOINT_LABEL",
     "ENDPOINT_LABELS",
+    "EXCHANGE_FILLS",
+    "EXCHANGE_SYMBOL",
     "HTTP_ERROR_FLOOR",
     "IDEMPOTENT_EXTENSION",
+    "MAX_HEADER_DIGITS",
     "NODE_HEALTH",
     "RETRYABLE_STATUSES",
     "UNLABELLED",
@@ -261,8 +264,36 @@ prices on a request path -- the failure `backend/.importlinter`'s price contract
 make impossible, observed from the other side.
 """
 
+EXCHANGE_FILLS: Final = "exchange_fills"
+"""A signed read of one page of an account's fills: Bitget's `GET /api/v2/spot/trade/fills`.
+
+**This is the label that stands between a signature and a log line.** The request carries
+the key, the passphrase and a signature in its headers and the account's time window and
+paging cursor in its query string; the log carries the scheme, the host and these two words.
+It says which kind of call failed -- the one an operator needs to tell a sync failure from a
+market-data failure -- and nothing about whose account it was or which page.
+"""
+
+EXCHANGE_SYMBOL: Final = "exchange_symbol"
+"""An unsigned read of what one pair is made of: Bitget's `GET /api/v2/spot/public/symbols`.
+
+Separate from `EXCHANGE_FILLS` because it is a different kind of call: public market data,
+no credential on it, asked once per new symbol. A log that shows these without fills
+lines, or many of them, is a symbol cache not doing its job. The label does not carry the
+symbol, for the reason `ASSET_PRICE` does not carry the pair.
+"""
+
 ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
-    {ADDRESS_BALANCE, ADDRESS_BALANCES, ASSET_PRICE, ASSET_PRICES, BLOCK_TIP_HEIGHT, NODE_HEALTH}
+    {
+        ADDRESS_BALANCE,
+        ADDRESS_BALANCES,
+        ASSET_PRICE,
+        ASSET_PRICES,
+        BLOCK_TIP_HEIGHT,
+        EXCHANGE_FILLS,
+        EXCHANGE_SYMBOL,
+        NODE_HEALTH,
+    }
 )
 """Every label that may reach a log. Membership is the gate; the shape is not.
 
@@ -274,8 +305,8 @@ closes that, because a string that is not a member renders as `UNLABELLED` no ma
 well it is shaped.
 
 Two labels on #7; four since #8 added Kaspa's batch read and its health report; six since
-#9 added the two price reads. The set grows one deliberate line at a time, which is the
-whole mechanism.
+#9 added the two price reads; eight since #13 added the exchange fills read and the symbol
+lookup beside it. The set grows one deliberate line at a time, which is the whole mechanism.
 
 Same shape as `PUBLIC_API_PATHS`: adding an endpoint protects it, and saying more about
 one is a visible edit to a named constant rather than a value computed at a call site.
@@ -318,6 +349,25 @@ DEFAULT_TIMEOUT: Final = httpx.Timeout(
 
 HTTP_ERROR_FLOOR: Final = 400
 """The status at and above which a response is a failure worth logging at error."""
+
+MAX_HEADER_DIGITS: Final = 10
+"""The longest run of digits a `Retry-After` or `ratelimit-*` value may have and still be read.
+
+**A bound this application chooses, the same on every platform**, rather than the one the
+interpreter happens to impose. Before it existed, `"1" * 5000` passed the `isascii()` and
+`isdigit()` grammar check and then reached `int()`, which refuses a string of more than
+4300 digits with a bare `ValueError` (CPython's integer conversion limit, which is per
+process and settable by environment). `parse_rate_limit` runs on **every** response inside
+`RetryingTransport`, through `HostRateLimiter.observe`, so one header of that shape from any
+vendor made `client.get` itself raise a `ValueError` -- past every provider's
+`except httpx.TransportError`, past chain `health()`, whose contract is that it never raises,
+and outside the seven exchange error classes. Measured on #13.
+
+Ten, because ten digits of seconds is over three hundred years and ten digits of a request
+budget is ten billion: no real value is longer. A longer run is treated exactly as any other
+unusable value -- as absent -- which is the rule both parsers already state for a header they
+cannot read.
+"""
 
 RETRYABLE_STATUSES: Final = frozenset({429, *range(500, 600)})
 """429 and every 5xx, and nothing else.
@@ -540,8 +590,18 @@ def _delay_seconds_ms(candidate: str) -> int | None:
 
     `isascii()` before `isdigit()`: see `parse_retry_after` for the two Unicode digits
     that make the difference between a crash and a wrong answer.
+
+    **A run longer than `MAX_HEADER_DIGITS` is not one either**, and the length is checked
+    before `int()` sees the string: five thousand digits is valid `1*DIGIT` and used to
+    reach `int()`, which refused it with a bare `ValueError` out of the transport. See
+    `MAX_HEADER_DIGITS`.
     """
-    if not candidate or not candidate.isascii() or not candidate.isdigit():
+    if (
+        not candidate
+        or len(candidate) > MAX_HEADER_DIGITS
+        or not candidate.isascii()
+        or not candidate.isdigit()
+    ):
         return None
     return int(candidate) * MILLISECONDS_PER_SECOND
 
@@ -553,10 +613,17 @@ def _http_date_ms(candidate: str, now: datetime) -> int | None:
     `total_seconds()`, which returns a float. Nothing here would be corrupted by that
     float, but the rule in this package is that durations are integers, and a single
     exception is how a rule becomes a suggestion.
+
+    **`OverflowError` is caught beside `TypeError` and `ValueError`**, measured on #13:
+    `Sun, 06 Nov 99999999999999999999 08:49:37 GMT` -- a twenty-digit year, or hour, or zone
+    offset -- makes the parser hand an integer to a C field that cannot hold it, and
+    `OverflowError` is an `ArithmeticError`, not a `ValueError`. It escaped this function,
+    and through `_response_delay_ms` it escaped `client.get` on any retryable response
+    that carried it. A fuzz of two hundred thousand token combinations found no fourth type.
     """
     try:
         parsed = parsedate_to_datetime(candidate)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     # RFC 9110 section 5.6.7: an HTTP-date is always GMT, and the asctime spelling has no
     # zone to say so. Without this the subtraction below raises.
@@ -671,12 +738,22 @@ def _rate_limit_value(headers: httpx.Headers, name: str) -> int | None:
     cheerfully returns 2. It also settles the signed and fractional spellings -- `"-1"`,
     `"+1"` and `"1.5"` are none of them a run of digits, so all three are ignored, which
     is what "a negative or non-numeric value is ignored" means in practice.
+
+    **So is a run longer than `MAX_HEADER_DIGITS`**, checked before `int()` sees it. This
+    function runs on every response the transport receives, so a five-thousand-digit value
+    here used to turn *any* response -- a 200 included -- into a bare `ValueError` out of
+    `client.get`, by way of `int()`'s 4300-digit limit. See `MAX_HEADER_DIGITS`.
     """
     value = headers.get(name)
     if value is None:
         return None
     candidate = value.strip()
-    if not candidate or not candidate.isascii() or not candidate.isdigit():
+    if (
+        not candidate
+        or len(candidate) > MAX_HEADER_DIGITS
+        or not candidate.isascii()
+        or not candidate.isdigit()
+    ):
         return None
     return int(candidate)
 
