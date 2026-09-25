@@ -630,10 +630,17 @@ Bitget has two account systems, **Classic** and the **Unified Trading Account (U
 the app offers the upgrade with a banner. **Do not accept it.** This application reads fills
 through the Classic (v2) API. A UTA account reads them through a different API, with a
 different cursor, window and field names, and Bitget's notice to broker partners states that
-a UTA key cannot call Classic endpoints at all. After an upgrade, every sync would fail. It
-would fail loudly, as an auth or invalid-request error rather than as an empty history, but
-it would fail every time until the account is switched back. Support for UTA is a follow-up
-issue.
+a UTA key cannot call Classic endpoints at all.
+
+**What a Classic call made with a UTA account's key returns is not documented.** A refusal is
+expected -- an auth or invalid-request error on every sync until the account is switched
+back, which is loud and costs nothing but time. But it is expected, not documented. If the
+venue answered with an empty success instead, it would be indistinguishable from a period in
+which you made no trades: nothing would fail, the sync would move on, and once those weeks
+aged past Bitget's 90-day retention the trades would be gone for good. That is one more
+reason not to accept the upgrade. The application refuses the one undocumented empty shape it
+can recognise, a `null` in place of the list of fills, but it cannot tell a documented empty
+list from a real one. Support for UTA is a follow-up issue.
 
 Two facts from Bitget's documentation, read on 2026-09-25:
 
@@ -733,7 +740,9 @@ Two refusals come from this application rather than from Bitget, and both name a
 
 A sync that starts failing with an auth or invalid-request error right after you accepted
 something in the Bitget app is most likely the UTA upgrade. Switch the main account back to
-Classic.
+Classic. The same goes for a schema error saying `data must be an array of fills` -- and, since
+the documentation does not say what a UTA account's key gets back, for syncs that suddenly
+find no trades at all after an upgrade.
 
 ## Troubleshooting
 
@@ -780,4 +789,4 @@ Classic.
 | Container refuses to start naming a `PORTFOLIO_BITGET_*` variable | Only some of the three are set, one is blank, or the key or passphrase has a character a header cannot carry — usually a trailing space from pasting — section 12 |
 | A Bitget error says venue code `40008` or `40005` | The host clock is more than 30 seconds off. Check `timedatectl`. A single one right after a throttle is harmless — section 12 |
 | A Bitget error names `feeDetail.deduction` | Fees paid in BGB are not supported yet. Turn off paying fees with BGB in Bitget — section 12 |
-| Bitget errors start right after accepting something in the Bitget app | Most likely the Unified Trading Account upgrade. Switch the main account back to Classic — section 12 |
+| Bitget errors start, or Bitget syncs stop finding trades, right after accepting something in the Bitget app | Most likely the Unified Trading Account upgrade. What a Classic call returns then is not documented. Switch the main account back to Classic — section 12 |

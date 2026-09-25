@@ -1261,8 +1261,11 @@ Bitget has two account systems, and an API key belongs to one of them.
   UTA Unified Trading Accounts cannot access Classic Account API endpoints" is in a notice
   addressed to broker partners and their clients (Broker UTA API upgrade notice, 2026-06-17).
   For a retail UTA account the documentation implies v3, through the upgrade guide, and does
-  not state that v2 is refused. It does not change the decision below: the owner's account is
-  Classic, and v2 is documented for Classic. It is why the operator is told to stay Classic.
+  not state that v2 is refused. **What a v2 call with such a key returns is not documented**:
+  a refusal is expected, but an empty success would be indistinguishable from a window with no
+  trades, and would let #15 advance past history it never read. It does not change the
+  decision below: the owner's account is Classic, and v2 is documented for Classic. It is why
+  the operator is told to stay Classic, and why a `null` fills `data` is refused.
 - **Since 2026-09-15 Bitget has been migrating eligible Classic accounts to UTA
   automatically**, and an account linked to an API key is not eligible. A main account can
   switch back; a sub-account cannot (the auto-migration notice).
@@ -1348,12 +1351,14 @@ before any status is known; it is `ExchangeUnavailableError` with no cause and n
 since a corrupt compressed body from an intermediary is most plausibly transient. (The chain
 and price providers still let it escape; that is its own issue.)
 
-**An empty fills page may arrive as `null`, and is accepted as one -- a tolerance chosen, not a
-documented fact.** The documented empty result is `"data": []`. A success whose `data` is
-`null` can only mean "nothing", and if Bitget spells an empty result that way, refusing it
-would fail every window without a trade in it, which for this owner is most of them. It cannot
-hide a fill. It applies to the fills answer only: a symbol-info answer whose `data` is `null`
-is still refused, because that question was about a symbol a fill named.
+**A fills answer whose `data` is `null` is refused, and that was decided twice.** The
+documented empty result is `"data": []`; `null` under `"00000"` is not documented. Reading it
+as an empty page was tried and reversed on review. If the venue ever answered that way to a
+call it should have refused -- a key on an account upgraded to UTA is the plausible case, and
+what v2 returns to one is not documented -- every window would read as empty, #15 would
+advance its checkpoints past them, and once they aged out of the 90-day retention the history
+would be gone. A refusal costs one fix after the first real sync; a silent empty history is
+permanent. The symbol-info answer is refused for a `null` `data` as well.
 
 | Codes | Class | Why |
 |---|---|---|

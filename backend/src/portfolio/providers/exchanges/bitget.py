@@ -511,11 +511,11 @@ def fill_symbols(data: object) -> tuple[str, ...]:
     consulted: each `symbol` is matched against `\\A[A-Z0-9]{1,40}\\Z` **before** any URL is
     built from it. The page's shape is checked on the way -- an array, of objects, of at most
     `PAGE_LIMIT` -- so a page the parser would refuse costs no symbol request. A `data` of
-    `null` is an empty page, with no symbols; see `parse_fills_page`.
+    `null` is refused like any other non-array; see `_fill_items`.
 
     Raises:
-        ExchangeSchemaError: the page is neither `null` nor an array of at most `PAGE_LIMIT`
-            objects, or a fill's `symbol` is missing or not a safe symbol.
+        ExchangeSchemaError: the page is not an array of at most `PAGE_LIMIT` objects -- a
+            `null` included -- or a fill's `symbol` is missing or not a safe symbol.
     """
     items = _fill_items(data)
     return tuple(dict.fromkeys(_require_symbol(item) for item in items))
@@ -602,11 +602,9 @@ def parse_fills_page(
 
     Steps 5 to 7 of the spec's page, in order:
 
-    0. **A `data` of `null` is an empty page** -- no fills, no next cursor. A tolerance chosen
-       here, not a documented fact: the documented empty result is `[]`, but `null` under a
-       success code can only mean "nothing", refusing it would fail every window without a
-       trade in it, and it cannot hide a fill. Fills only; a `null` symbol-info answer is
-       still refused. Any other `data` that is not an array is refused.
+    0. **`data` must be an array.** `null` included: the documented empty page is `[]`, and
+       reading an undocumented `null` as "no fills" could turn a refusal the venue spelled
+       oddly into a silently empty history. See `_fill_items`.
     1. **The raw count.** More than `PAGE_LIMIT` fills is refused *before* anything is
        parsed or dropped, so a 101-fill page cannot hide behind a dropped edge fill.
     2. **Every fill is parsed**, the two edge milliseconds included, so a malformed fill on
@@ -932,16 +930,15 @@ def _decoded(body: str | bytes) -> tuple[bool, object]:
 def _fill_items(data: object) -> list[dict[str, object]]:
     """The fill objects of a page, after its shape and its **raw** count are checked.
 
-    **A `data` of `null` is an empty page -- a tolerance chosen here, not a documented fact.**
-    The documented empty result is `[]`. But `null` under `code == "00000"` can only mean
-    "nothing", and if Bitget spells an empty result that way, refusing it would fail every
-    window without a trade in it -- for an owner who rarely trades on this venue, most of
-    them. It cannot hide a fill: there is nothing in a `null` to drop. It applies to the
-    fills answer only; a symbol-info answer whose `data` is `null` is still refused, because
-    that question was about a symbol a fill named, and "no such symbol" is an anomaly there.
+    **A `data` of `null` is refused, like any other `data` that is not an array.** The
+    documented empty result is `[]`, and `null` under `"00000"` is not documented. Reading it
+    as "no fills" was tried and reversed on review: if the venue ever answered that way to a
+    call it should have refused -- a key on an account upgraded to UTA is the plausible
+    case, and what v2 returns to one is not documented -- every window would read as empty,
+    the sync would advance its checkpoints past them, and once they aged out of the 90-day
+    retention the history would be gone for good. A refusal costs one fix after the first
+    real sync; a silent empty history is permanent.
     """
-    if data is None:
-        return []
     if not isinstance(data, list):
         detail = "data must be an array of fills"
         raise ExchangeSchemaError(detail)
