@@ -166,6 +166,16 @@ describe('WalletsPage: list', () => {
     expect(within(cold).queryByText('Archived')).not.toBeInTheDocument();
   });
 
+  it('lists a wallet on a chain this build does not know by its raw key', async () => {
+    openWalletsPage({
+      wallets: [wallet({ id: 9, chain_key: 'litecoin', address: 'tltc1qexample', label: 'Other' })],
+    });
+
+    const row = await rowFor('Other');
+    expect(row).toHaveTextContent('litecoin');
+    expect(within(row).getByRole('button', { name: 'Archive' })).toBeInTheDocument();
+  });
+
   it('shows the full address nowhere but in the title until the owner asks', async () => {
     openWalletsPage({ wallets: threeWallets() });
 

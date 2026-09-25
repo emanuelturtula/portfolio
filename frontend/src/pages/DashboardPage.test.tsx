@@ -179,11 +179,35 @@ function expectNoRenderedZero(element: HTMLElement): void {
   expect(element.textContent).not.toMatch(ZERO_AMOUNT);
 }
 
+/**
+ * A decimal string without the trailing zeros of its fractional part, so that
+ * "0.30000000" and "0.3" compare equal and "30" stays "30". Only the
+ * representation is normalised; a wrong digit still fails.
+ */
+function withoutTrailingZeros(value: string | null | undefined): string | undefined {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+  return value.includes('.') ? value.replace(/0+$/, '').replace(/\.$/, '') : value;
+}
+
 /** A cell that renders "—" and no amount at all. */
 function expectDash(element: HTMLElement): void {
   expect(element.textContent.trim()).toBe('—');
   expect(element.querySelector('data')).toBeNull();
 }
+
+/**
+ * The refresh-failure wording. The trailing sentence is the one the spec's
+ * Risks section asks for: a failed request does not mean the sync did not run.
+ */
+const REFRESH_PREFIX = 'Refresh did not complete:';
+const REFRESH_MAY_STILL_RUN =
+  'A sync may still be running on the server; this page updates when it finishes.';
+const REFRESH_PENDING = 'Refreshing balances… this can take a minute.';
+
+/** Two full stops in a row: a detail sentence glued to a template's own ".". */
+const DOUBLE_PERIOD = /\.\s*\./;
 
 /** The "last updated" line. */
 async function lastUpdated(): Promise<HTMLElement> {
@@ -313,8 +337,8 @@ describe('DashboardPage: values', () => {
     const [value] = dataValues(cell(btc, 'Value'));
 
     expect(quantity).not.toContain('0000000000004');
-    expect(quantity?.replace(/0+$/, '')).toBe('0.3');
-    expect(value?.replace(/0+$/, '')).toBe('15600.03');
+    expect(withoutTrailingZeros(quantity)).toBe('0.3');
+    expect(withoutTrailingZeros(value)).toBe('15600.03');
     expect(cell(btc, 'Value')).toHaveTextContent('15,600.03 EUR');
     // One asset row, not one per wallet.
     expect(within(await assetsRegion()).getAllByRole('rowheader')).toHaveLength(1);
@@ -375,7 +399,7 @@ describe('DashboardPage: precision', () => {
     const cold = await walletRow('Cold storage');
     const values = dataValues(cell(cold, 'Quantity'));
     expect(values).toHaveLength(2);
-    expect(values[1]?.replace(/0+$/, '')).toBe('0.00012');
+    expect(withoutTrailingZeros(values[1])).toBe('0.00012');
   });
 
   it('a pending amount past MAX_SAFE_INTEGER base units keeps every digit', async () => {
@@ -617,7 +641,7 @@ describe('DashboardPage: refresh', () => {
       expect(refresh).toBeDisabled();
     });
     // A sync can take tens of seconds; a disabled button alone is silence.
-    expect(await screen.findByRole('status')).toHaveTextContent(/sync|refresh/i);
+    expect(await screen.findByRole('status')).toHaveTextContent(REFRESH_PENDING);
     await user.click(refresh);
     expect(fake.writes('POST', BALANCES_SYNC_PATH)).toHaveLength(1);
 
@@ -641,8 +665,11 @@ describe('DashboardPage: refresh', () => {
     await user.click(screen.getByRole('button', { name: 'Refresh' }));
 
     const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(/refresh failed/i);
-    expect(alert).toHaveTextContent('The server encountered an unexpected condition.');
+    expect(alert).toHaveTextContent(
+      `${REFRESH_PREFIX} The server encountered an unexpected condition. ${REFRESH_MAY_STILL_RUN}`,
+    );
+    // The backend's detail already ends in a full stop; the template must not add another.
+    expect(alert.textContent).not.toMatch(DOUBLE_PERIOD);
     // The data already on screen stays.
     expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
     expect(dataValues(cell(await walletRow('Cold storage'), 'Value'))).toEqual([
@@ -672,10 +699,51 @@ describe('DashboardPage: refresh', () => {
     await user.click(screen.getByRole('button', { name: 'Refresh' }));
 
     const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(/refresh failed/i);
+    expect(alert).toHaveTextContent(
+      `${REFRESH_PREFIX} The server could not be reached. ${REFRESH_MAY_STILL_RUN}`,
+    );
     expect(alert).not.toHaveTextContent(/gateway/i);
     expect(alert).not.toHaveTextContent(/could not .*start|did not (start|run)|was not started/i);
+    expect(alert.textContent).not.toMatch(DOUBLE_PERIOD);
     expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+  });
+
+  it('a refresh that never reached the server says the same, in words', async () => {
+    const { user } = openDashboard(healthyPortfolio(), [
+      http.post(BALANCES_SYNC_PATH, () => HttpResponse.error()),
+    ]);
+    await loaded();
+
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      `${REFRESH_PREFIX} The server could not be reached. ${REFRESH_MAY_STILL_RUN}`,
+    );
+    expect(alert).not.toHaveTextContent(/failed to fetch/i);
+  });
+
+  it('a second refresh after a failed one clears the failure', async () => {
+    let failing = true;
+    const { user, fake } = openDashboard(healthyPortfolio(), [
+      http.post(BALANCES_SYNC_PATH, () =>
+        failing ? problem(503, 'Service Unavailable', 'Try again shortly.') : undefined,
+      ),
+    ]);
+    await loaded();
+
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Try again shortly.');
+
+    failing = false;
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    await waitFor(() => {
+      expect(fake.writes('POST', BALANCES_SYNC_PATH)).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
   });
 });
 
@@ -976,7 +1044,8 @@ describe('DashboardPage: a total with nothing in it', () => {
     const total = await totalRegion();
     expectNoRenderedZero(total);
     expect(total.querySelector('data')).toBeNull();
-    expect(total).toHaveTextContent(/—|not available yet/i);
+    expect(total).toHaveTextContent(/^Total value\s*— - Partial/);
+    // The spec's own rule: a dash in place of the amount, not a sentence and not 0.00.
     expect(total).toHaveTextContent(/2 wallets not yet read/i);
   });
 
@@ -1032,6 +1101,7 @@ describe('DashboardPage: a total with nothing in it', () => {
     expect(dataValues(total)).toEqual(['0.0000000000']);
     expect(total).toHaveTextContent('0.00 EUR');
     expect(total).not.toHaveTextContent(/partial|not available/i);
+    expect(total).not.toHaveTextContent('—');
   });
 });
 
@@ -1051,9 +1121,62 @@ describe('DashboardPage: partial failure', () => {
     // it is a balance the last sync could not refresh.
     const total = await totalRegion();
     expect(dataValues(total)).toContain(HEALTHY.total);
-    expect(total).toHaveTextContent(/could not (be )?refresh/i);
+    expect(total).toHaveTextContent(
+      'This total includes 1 balance the last sync could not refresh.',
+    );
     // Not the whole page: no whole-page error.
     expect(screen.queryByRole('heading', { name: /could not load/i })).not.toBeInTheDocument();
+  });
+
+  it('the total counts every balance the last sync could not refresh', async () => {
+    // Kaspa failed, and Bitcoin wallet 1 carries a reading from before the run
+    // (restored after being archived): two stale balances in one total.
+    openDashboard(withWalletRow(kaspaDownPortfolio(), 1, { observed_at: PREVIOUS_OBSERVED_AT }));
+
+    expect(await totalRegion()).toHaveTextContent(
+      'This total includes 2 balances the last sync could not refresh.',
+    );
+  });
+
+  it('a fully refreshed total says nothing about unrefreshed balances', async () => {
+    openDashboard();
+
+    expect(await totalRegion()).not.toHaveTextContent(/could not refresh/i);
+  });
+
+  it('an unread wallet is not counted as an unrefreshed balance', async () => {
+    // It is not in the total at all; the "not yet read" sentence covers it.
+    const scenario = healthyPortfolio();
+    const added = wallet({
+      id: 4,
+      chain_key: 'kaspa',
+      address: ADDRESSES.kasSecondary,
+      label: 'New',
+    });
+    openDashboard({
+      ...scenario,
+      wallets: [...scenario.wallets, added],
+      current: {
+        ...scenario.current,
+        complete: false,
+        wallets: [...scenario.current.wallets, unreadBalance(added, price({ amount: '0.08' }))],
+        unread: [unreadEntry(added)],
+      },
+      runs: [
+        syncRun({
+          status: 'partial',
+          chains: [chainOutcome({ chain_key: 'bitcoin' }), failedOutcome('kaspa', 'unavailable')],
+        }),
+        previousRun(),
+      ],
+    });
+
+    const total = await totalRegion();
+    // Only the Kaspa wallet that has a value, not the one that has none.
+    expect(total).toHaveTextContent(
+      'This total includes 1 balance the last sync could not refresh.',
+    );
+    expect(total).toHaveTextContent(/1 wallet not yet read/i);
   });
 
   it('balances render when the runs request fails', async () => {
@@ -1064,17 +1187,29 @@ describe('DashboardPage: partial failure', () => {
     ]);
 
     const notice = await screen.findByRole('alert');
-    expect(notice).toHaveTextContent(/sync status is unavailable/i);
-    expect(notice).toHaveTextContent('The run log is locked.');
+    expect(notice).toHaveTextContent(
+      'Sync status is unavailable: The run log is locked. Balances are still shown below.',
+    );
+    expect(notice.textContent).not.toMatch(DOUBLE_PERIOD);
 
     expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
-    // With no run log, nothing can be called fresh.
+    // With no run log, nothing can be called fresh - and nothing can be called
+    // stale or never synced either: the page does not know, and says only that.
     for (const label of ['Cold storage', 'Spending', ADDRESSES.kasPrimary]) {
       const row = await walletRow(label);
+      const freshness = cell(row, 'Freshness');
       expect(dataValues(cell(row, 'Value')).length).toBe(1);
-      expect(cell(row, 'Freshness')).not.toHaveTextContent(/up to date/i);
+      expect(freshness).not.toHaveTextContent(/up to date/i);
+      expect(freshness).not.toHaveTextContent(NEVER_SYNCED_MESSAGE);
+      expect(freshness).not.toHaveTextContent(NOT_COVERED_MESSAGE);
+      // The reading's own age is still true, so it is still shown.
+      expect(freshness.querySelector('time')).not.toBeNull();
     }
     expect(screen.queryByText(/up to date/i)).not.toBeInTheDocument();
+    expect(await lastUpdated()).not.toHaveTextContent(NEVER_SYNCED_MESSAGE);
+    expect(await lastUpdated()).not.toHaveTextContent(/last sync/i);
+    // Nor does the total claim to know what the last sync could not refresh.
+    expect(await totalRegion()).not.toHaveTextContent(/could not (be )?refresh/i);
   });
 
   it('balances render when the wallets request fails', async () => {
@@ -1107,9 +1242,104 @@ describe('DashboardPage: partial failure', () => {
       expect(screen.getAllByRole('alert')).toHaveLength(2);
     });
     expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+    const [first, second] = screen.getAllByRole('alert');
+    expect(first).toHaveTextContent(
+      'Addresses are unavailable: The wallet list could not be read. Wallet rows show their label, or chain and id, instead.',
+    );
+    expect(second).toHaveTextContent(
+      'Sync status is unavailable: The run log could not be read. Balances are still shown below.',
+    );
     for (const alert of screen.getAllByRole('alert')) {
       expect(alert).not.toHaveTextContent(/failed to fetch/i);
+      expect(alert.textContent).not.toMatch(DOUBLE_PERIOD);
     }
+  });
+});
+
+describe('DashboardPage: a backend that misbehaves', () => {
+  /** A 200 whose body was cut off mid-document, as a dropped proxy connection leaves it. */
+  function truncated(): Response {
+    return new HttpResponse('{"quote_currency":"EUR","total":"12', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  it('a truncated balances response is the whole-page error, not a crash', async () => {
+    openDashboard(healthyPortfolio(), [http.get(BALANCES_CURRENT_PATH, truncated)]);
+
+    const alert = await screen.findByRole('alert');
+    expect(within(alert).getByRole('heading')).toHaveTextContent(/could not load your portfolio/i);
+    // The client's own sentence, not the parser's.
+    expect(alert).not.toHaveTextContent(/unexpected (end|token)|syntaxerror/i);
+    expect(screen.queryByRole('region', { name: 'Total value' })).not.toBeInTheDocument();
+  });
+
+  it('a truncated runs response degrades to the notice', async () => {
+    openDashboard(healthyPortfolio(), [http.get(BALANCES_RUNS_PATH, truncated)]);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/sync status is unavailable/i);
+    expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+  });
+
+  it('a truncated wallets response degrades to the notice', async () => {
+    openDashboard(healthyPortfolio(), [http.get(WALLETS_PATH, truncated)]);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/addresses are unavailable/i);
+    expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+  });
+
+  it('ignores fields the backend adds later', async () => {
+    // A newer backend in front of an older frontend is the normal order of a
+    // deploy. Extra members must not break or change anything.
+    const scenario = healthyPortfolio();
+    openDashboard({
+      ...scenario,
+      current: {
+        ...scenario.current,
+        ...{ generated_at: NOW, schema_version: 2 },
+        wallets: scenario.current.wallets.map((row) => ({ ...row, ...{ spendable: '999' } })),
+      },
+      runs: scenario.runs.map((run) => ({ ...run, ...{ host: 'redacted' } })),
+    });
+
+    expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+    expect(dataValues(cell(await walletRow('Cold storage'), 'Value'))).toEqual([
+      '78000.0000000000',
+    ]);
+    expect(await walletsRegion()).not.toHaveTextContent('999');
+  });
+
+  it('a chain this build does not know renders by its raw key', async () => {
+    // `chain_key` is typed `string` on the wire. A chain the backend added
+    // before this build ships still renders, by its key, and is still judged
+    // by the run log.
+    openDashboard({
+      wallets: [wallet({ id: 9, chain_key: 'litecoin', address: 'tltc1qexample', label: 'Other' })],
+      current: currentBalances({
+        total: '10.0000000000',
+        as_of: BTC_OBSERVED_AT,
+        wallets: [
+          walletBalance({
+            wallet_id: 9,
+            chain_key: 'litecoin',
+            label: 'Other',
+            asset_symbol: 'LTC',
+            confirmed: '100000000',
+            quantity: '1.00000000',
+            value: '10.0000000000',
+            price: price({ amount: '10.00' }),
+          }),
+        ],
+      }),
+      runs: [syncRun({ chains: [chainOutcome({ chain_key: 'litecoin' })] })],
+    });
+
+    const row = await walletRow('Other');
+    expect(row).toHaveTextContent('litecoin');
+    expect(cell(row, 'Freshness')).toHaveTextContent(/up to date/i);
+    const [ltc] = dataValues(cell(await assetRow('LTC'), 'Quantity'));
+    expect(withoutTrailingZeros(ltc)).toBe('1');
   });
 });
 

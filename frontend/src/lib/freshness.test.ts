@@ -198,6 +198,19 @@ describe('assessFreshness', () => {
     expect(assessFreshness(settled, 'kaspa', null)).toEqual({ status: 'interrupted' });
   });
 
+  it('calls an old reading on a chain an interrupted run did read not covered, not interrupted', () => {
+    // The run got to Bitcoin and read it successfully, then died. A Bitcoin
+    // reading older than the run (a restored wallet) was skipped by it, not
+    // cut off by the interruption, so "interrupted before it read this chain"
+    // would be false.
+    const settled = interruptedRun({ chains: [chainOutcome({ chain_key: 'bitcoin' })] });
+
+    expect(assessFreshness(settled, 'bitcoin', PREVIOUS_OBSERVED_AT)).toEqual({
+      status: 'not_covered',
+    });
+    expect(assessFreshness(settled, 'bitcoin', null)).toEqual({ status: 'not_covered' });
+  });
+
   it('still calls a chain an interrupted run did read fresh', () => {
     // Interrupted after Bitcoin: Bitcoin's rows are as current as they get.
     const settled = interruptedRun({ chains: [chainOutcome({ chain_key: 'bitcoin' })] });
@@ -292,8 +305,21 @@ describe('freshnessMessage', () => {
   it('does not blame the provider for an address the owner registered', () => {
     // `address_rejected` is the owner's configuration and `internal` is ours;
     // neither is the vendor being down.
-    expect(SYNC_ERROR_MESSAGES.address_rejected).not.toMatch(/could not be reached/i);
+    expect(SYNC_ERROR_MESSAGES.address_rejected).not.toMatch(/could not be reached|provider/i);
     expect(SYNC_ERROR_MESSAGES.internal).not.toMatch(/provider/i);
+  });
+
+  it("describes a refused address as the whole chain's problem", () => {
+    // One refused address aborts the chain's read (until #54), so the sentence
+    // is shown on every wallet of that chain. Worded about "this address", it
+    // would accuse each of them in turn.
+    expect(SYNC_ERROR_MESSAGES.address_rejected).toMatch(/chain/i);
+    expect(SYNC_ERROR_MESSAGES.address_rejected).toMatch(/none of its wallets/i);
+    expect(SYNC_ERROR_MESSAGES.address_rejected).not.toMatch(/this address/i);
+  });
+
+  it('sends an internal failure to the server log', () => {
+    expect(SYNC_ERROR_MESSAGES.internal).toMatch(/server log/i);
   });
 
   it('still says the read failed when the kind is missing', () => {
