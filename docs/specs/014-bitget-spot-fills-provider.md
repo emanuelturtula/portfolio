@@ -527,6 +527,17 @@ Disjoint. Nobody edits a file on another row.
   `TransportError`. The provider now translates it to `ExchangeUnavailableError`. The same
   escape predates this issue in the chain and price providers (Esplora `health()`, Kraken
   `fetch`), and is filed as #75.
+- **A settings refusal printed both ends of a credential.** Measured by the tech lead: when
+  the new refusals fire, `str(ValidationError)`, which is what reaches the log when the
+  container refuses to start, carried
+  `input_value={'bitget_api_key': 'SENTI...ETBBBBBBBBBBBBBBBBBBBB'}`. That is the first five
+  characters of the key and the last twenty of the secret. Pydantic elides the middle of the
+  echoed input and keeps both ends, so `config.py`'s docstring claim that `str(exc)` carries
+  no secret was false. It had been measured only against a value that fit in the elided part.
+  `Settings` now sets `hide_input_in_errors=True`, which drops `input_value` from `str()` and
+  `repr()`. `errors()` and `json()` still carry the whole input, which is #53's pinned hazard.
+  The behaviour predates this issue for any refusal, but this issue adds three credentials,
+  and refusals that fire exactly when they are set.
 - **A success whose fills `data` is `null` is an empty page.** The documented form is `[]`.
   `null` under `"00000"` can only mean "nothing", and refusing it would fail every empty
   window if the venue spells empty that way. The symbol-info `data` stays strict.
