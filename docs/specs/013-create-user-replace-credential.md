@@ -137,7 +137,7 @@ Added by this spec:
 
 | Agent | Owns |
 |---|---|
-| backend-dev | `backend/src/portfolio/services/auth.py`, `backend/src/portfolio/repositories/users.py`, `backend/src/portfolio/cli.py`, `docs/operations.md` |
+| backend-dev | `backend/src/portfolio/services/auth.py`, `backend/src/portfolio/repositories/users.py`, `backend/src/portfolio/cli.py`, `docs/operations.md`, and in `docs/providers.md` only the "Not done yet" bullet #12 left about `--replace` and the fills' `RESTRICT` |
 | tester | `backend/tests/**` |
 | tech-lead | `docs/specs/013-*.md`, `backend/pyproject.toml` |
 | reviewer | nothing |
