@@ -1,7 +1,7 @@
 # 013 — `create-user --replace` replaces the credential, not the owner
 
 Issue: #69
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -152,3 +152,46 @@ Added by this spec:
   throttle lives in the application's own process and the CLI cannot reach it. That was already
   true of the old implementation, and it is harmless: throttling a username the operator just
   reset errs on the safe side.
+
+## What the plan got wrong
+
+### "Sets the new username" was read as "always sets a username"
+
+The issue said `--replace` "sets the new username and password hash", and this spec copied that
+without asking where the username comes from when the operator gives none. The CLI resolves a
+missing `--username` to `PORTFOLIO_BOOTSTRAP_USERNAME` before it knows whether an account exists.
+So the example in `docs/operations.md`, copied verbatim, renamed an owner called `alice` to
+`owner`, in the middle of a recovery and under stress. The reviewer reproduced it.
+
+It contradicted the principle the whole spec is built on: replace the credential, keep the
+identity. `--replace` now keeps the existing username unless `--username` is passed, and the
+confirmation names a rename only when one was asked for. **A default that was harmless while
+the command created an account became a silent rename once it updated one.** When a command's
+effect changes from creating to updating, every default it resolves needs re-checking against
+the row it now changes.
+
+### The test plan had no test for "in the same transaction"
+
+Criterion 1 says the credential change and the revoke happen in one transaction, and no row of
+the test plan checked it. The tester ran the mutation that commits between the two and it
+survived every final-state test. `test_replace_is_one_transaction_so_a_failure_changes_nothing`
+now fails each step in turn. **A property about atomicity cannot be seen in the end state**, so
+it needs a test that makes a step fail partway through.
+
+### Two assertions proved less than they said
+
+- `after.user_id == before.user_id` passes against the old implementation, because SQLite hands
+  a re-inserted row the same rowid 1. The CLI tests had already avoided this by pinning the
+  owner's id to 42; the service test had not.
+- "A refusal never pays for an Argon2id hash" was a docstring promise with nothing behind it.
+  Hashing before the refusals kept every test green. A spy hasher now counts the calls.
+
+### Handed on
+
+- **#72:** a login or `change_password` that is between verifying and writing when `--replace`
+  commits survives the recovery, or overwrites the recovered hash. This already happens on
+  `origin/main` and is not a regression. The fix is a conditional write.
+- **#73:** `create-user` accepts a blank username or one longer than the login request allows.
+  This already applies to account creation; `--replace --username` now reaches it as well.
+- **#57** (already open): `test_last_seen_is_not_written_on_every_request` depends on the
+  host's clock resolution, and it showed up as a stray "killer" in this issue's mutation sweep.
