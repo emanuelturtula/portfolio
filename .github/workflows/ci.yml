@@ -5,6 +5,14 @@ name: CI
 #
 # The job names below are the required status check contexts in the `main` ruleset, so
 # renaming one silently disables a merge gate. Change them together or not at all.
+#
+# Every job sets timeout-minutes. Without it, a hang runs until GitHub's default of 360
+# minutes, so the run fails six hours late and holds a runner the whole time. The backend
+# hang found while reviewing #10 would have done exactly that. Each number is at least
+# five times the slowest run of its job across every completed CI and Delivery run from
+# 2026-09-20 to 2026-09-25 (54 runs), rounded up to a multiple of five minutes. The
+# measured maximum sits beside each one. When a job outgrows its number, measure again
+# and raise both. tests/deploy/test_workflow_timeouts.py fails any job that has none.
 
 on:
   pull_request:
@@ -17,6 +25,7 @@ jobs:
   secrets-scan:
     name: Secrets scan
     runs-on: ubuntu-latest
+    timeout-minutes: 5 # slowest: 11 s
     env:
       GITLEAKS_VERSION: 8.30.1
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
@@ -43,6 +52,7 @@ jobs:
     name: Lint & types
     needs: secrets-scan
     runs-on: ubuntu-latest
+    timeout-minutes: 5 # slowest: 54 s
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,6 +100,11 @@ jobs:
     name: Backend tests
     needs: secrets-scan
     runs-on: ubuntu-latest
+    # Slowest: 157 s, 148 s of it in pytest, and that step grows with every issue. The
+    # 30 s per-test ceiling in backend/pyproject.toml ends a hang inside a test sooner,
+    # with every thread's stack. This bounds everything outside a test: installing,
+    # collecting, and a process that never exits because something left a thread running.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -116,6 +131,7 @@ jobs:
     name: Frontend tests
     needs: secrets-scan
     runs-on: ubuntu-latest
+    timeout-minutes: 5 # slowest: 52 s
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -138,6 +154,7 @@ jobs:
     name: OpenAPI drift
     needs: secrets-scan
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # slowest: 125 s, an outlier; the median is 18 s
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -175,6 +192,10 @@ jobs:
     name: Docker build (arm64)
     needs: [lint, test-backend, test-frontend]
     runs-on: ubuntu-24.04-arm
+    # Slowest: 84 s, and that was a build with no layer cache at all (every layer ran), so
+    # an evicted cache is already inside the measurement. Delivery's build of the same
+    # Dockerfile peaked at 101 s.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

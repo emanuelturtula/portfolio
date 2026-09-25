@@ -36,6 +36,8 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
+    # The per-test ceiling configured under [tool.pytest.ini_options] below.
+    "pytest-timeout",
     "mypy",
     "ruff",
     "import-linter",
@@ -126,6 +128,34 @@ testpaths = ["tests"]
 addopts = ["--strict-markers", "--strict-config", "-ra"]
 asyncio_mode = "auto"
 pythonpath = ["src"]
+# A ceiling on each test, setup and teardown included, so that a hang ends the run 30 s
+# in, with every thread's stack, instead of as an anonymous CI job timeout. Two hangs
+# found while reviewing #10 ran forever: `rich` spinning inside a SQLAlchemy `__getattr__`
+# while it rendered frame locals, and a mutation that made the scheduler tick catch
+# `BaseException`. Finding the first took `-o faulthandler_timeout=12` by hand; this is
+# that, automated, plus the exit.
+#
+# 30 s is sized against the slowest tests and against the tests that wait on purpose. No
+# test has been measured above 2.2 s, with coverage or without. Which test is slowest
+# changes between runs: a cold mypy run in `tests/providers/test_protocol.py`, the
+# Hypothesis codec test in `tests/domain/test_addresses.py`, or one of the lifespan
+# tests. The tests that wait on purpose bound their own waits at 5 to 10 s, so they
+# still fail first, with a better message. The ceiling cuts a hang, not a slow runner.
+#
+# `thread`, on every platform, and never the `signal` default that Linux would otherwise
+# get. `signal` raises the timeout inside whatever the main thread is running, and in
+# this suite that is often not the test. Raised inside a background asyncio task, such as
+# the balance scheduler's tick, it kills the task, and the test can pass. Raised inside a
+# Hypothesis test, it is caught as an ordinary failure, and the input is replayed with
+# the one alarm already spent, so the replay hangs with nothing left to stop it. `thread`
+# does neither: it dumps every stack and ends the process from outside, whatever the
+# test was doing. The price is that the run stops at the first hang, which is the right
+# response to a hang.
+#
+# `--strict-config` above means that losing the plugin fails the run rather than silently
+# dropping these lines.
+timeout = 30
+timeout_method = "thread"
 
 [tool.coverage.run]
 # A directory, not the package name. Coverage matches a package source against the

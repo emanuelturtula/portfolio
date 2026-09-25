@@ -6,6 +6,10 @@ name: Delivery
 # There is deliberately no staging environment: this project runs a single production
 # instance. The consequence is that no check proves the artifact runs on real hardware
 # before merge, so the host-side deploy script must roll back on its own, and it does.
+#
+# Every job is time-bounded, sized by the rule stated in ci.yml from the same 54 runs.
+# `validate` and `deploy-prod` call reusable workflows, where GitHub does not accept
+# timeout-minutes; the jobs inside ci.yml and remote-deploy.yml carry their own.
 
 on:
   push:
@@ -32,6 +36,7 @@ jobs:
     name: Compute version
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 5 # slowest: 7 s
     permissions:
       contents: read
     outputs:
@@ -49,6 +54,7 @@ jobs:
     name: Build arm64 image
     needs: version
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10 # slowest: 101 s; ci.yml's cold build of the same Dockerfile, 84 s
     permissions:
       contents: read
       packages: write
@@ -112,6 +118,9 @@ jobs:
     name: Publish release
     needs: [version, build, deploy-prod]
     runs-on: ubuntu-latest
+    # Slowest: 32 s. A timeout here leaves production running an untagged image, which is
+    # safe: re-running the job retags the same digest and skips an existing release.
+    timeout-minutes: 5
     permissions:
       contents: write
       packages: write
@@ -150,6 +159,7 @@ jobs:
     needs: build
     if: vars.DEPLOY_ENABLED != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5 # never run in the measured window; it only writes a summary
     steps:
       - name: Explain why nothing was deployed
         run: |
