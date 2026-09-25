@@ -1339,6 +1339,11 @@ new one, so the public symbol endpoint is asked -- once per distinct symbol per 
 instance, labelled `exchange_symbol`. A symbol must match `\A[A-Z0-9]{1,40}\Z` **before** a
 URL is built from it. The answer must hold exactly one entry, for the symbol asked, with
 non-blank `baseCoin` and `quoteCoin`; an answer about another symbol is refused, not used.
+**An auth refusal from this endpoint is reported as `ExchangeUnavailableError`**, with its
+status and venue code kept: the answer is classified like the fills call's, so a 401 or 403
+would otherwise be `ExchangeAuthError`, and #15 marks the account `auth_failed` for that. No
+credential is sent to this public endpoint, so the refusal cannot be about the key; a CDN or
+firewall block is the plausible cause, and it is transient.
 
 **Classification.** A success is HTTP 200 **and** a JSON object whose `code` is the string
 `"00000"`. Any other status is `exchange_error(status, code)`, with the code read from the body

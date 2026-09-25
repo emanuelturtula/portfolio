@@ -801,12 +801,33 @@ class BitgetProvider:
 
         `symbol` has already matched `_SYMBOL` in `fill_symbols`, so it is ASCII letters and
         digits and needs no encoding.
+
+        **An auth refusal here is reported as unavailable**, the scope subclass included, with
+        the same `status` and `venue_code`. The answer is classified like the fills call's, so
+        a 401 or a 403 would otherwise be an `ExchangeAuthError` -- and #15 marks the account
+        `auth_failed` for that class. But no credential is sent to this endpoint, so the
+        refusal cannot be about the key: a public endpoint refusing us is most plausibly a
+        CDN or firewall block, which is transient, and marking a working key failed for it
+        would stop the sync until a person looked. Raised after the `except` block has
+        closed, so it carries no context.
+
+        Raises:
+            ExchangeUnavailableError: the endpoint could not be reached, or refused us in a
+                way the taxonomy calls auth.
+            ExchangeError: any other classification of the answer, or a schema error from
+                `parse_symbol_info`.
         """
-        data = await self._get(
-            f"{BITGET_API_URL}{SYMBOLS_PATH}?symbol={symbol}",
-            EXCHANGE_SYMBOL,
-            {LOCALE_HEADER: LOCALE},
-        )
+        refused: ExchangeAuthError | None = None
+        try:
+            data = await self._get(
+                f"{BITGET_API_URL}{SYMBOLS_PATH}?symbol={symbol}",
+                EXCHANGE_SYMBOL,
+                {LOCALE_HEADER: LOCALE},
+            )
+        except ExchangeAuthError as error:
+            refused = error
+        if refused is not None:
+            raise ExchangeUnavailableError(status=refused.status, venue_code=refused.venue_code)
         return parse_symbol_info(data, symbol=symbol)
 
     async def _get(self, url: str, label: str, headers: Mapping[str, str]) -> object:
