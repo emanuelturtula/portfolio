@@ -31,6 +31,7 @@ from portfolio.domain.money import (
     MONEY_PRECISION,
     MONEY_ROUNDING,
     from_base_units,
+    multiply,
     quantize,
     require_amount,
     to_base_units,
@@ -499,3 +500,188 @@ def test_the_negative_decimals_message_no_longer_blames_the_amount() -> None:
     message = str(caught.value)
     assert "non-negative number of decimals" in message
     assert "carries more than" not in message
+
+
+# --------------------------------------------------------------------------------------
+# `multiply` (#12): the exact product, with no rounding at all.
+# --------------------------------------------------------------------------------------
+#
+# `derive_quote_quantity` is `quantize(multiply(quantity, price), FILL_SCALE)`, and
+# `quantize` must be the only rounding in it. `Decimal.__mul__` rounds to the calling
+# thread's precision -- 28 by default, lower inside any `localcontext` a caller opened -- and
+# even a multiply under the 38-digit money context rounds a product past 38 digits, which
+# `quantize` would then round a second time. Two half-even roundings in a row can land one
+# unit away from one rounding; `tests/providers/exchanges/test_base.py` has the fill that
+# shows it.
+
+#: 29 significant digits, one past the `decimal` default of 28. Doubled by hand: each
+#: ten-digit group `1234567890` doubles to `2469135780`, and `12345678.9` doubles to
+#: `24691357.8`.
+TWENTY_NINE_DIGITS: Final = Decimal("1234567890123456789012345678.9")
+TWENTY_NINE_DIGITS_DOUBLED: Final = "2469135780246913578024691357.8"
+
+#: `10**20 + 1`, squared by hand: `10**40 + 2 * 10**20 + 1`. 41 significant digits, three
+#: past `MONEY_PRECISION`, so any multiply that rounds -- under any context -- loses the
+#: final `1`.
+TEN_TO_THE_TWENTY_PLUS_ONE: Final = Decimal("100000000000000000001")
+ITS_SQUARE: Final = "1" + "0" * 19 + "2" + "0" * 19 + "1"
+
+#: A fill-shaped product, 39 significant digits: `124.499999999999999995` times
+#: `1.000000000000000001` is the price plus the price shifted 18 places right, which adds
+#: `124` into the eighteenth place and appends the price's own fractional digits after it.
+FILL_PRICE: Final = Decimal("124.499999999999999995")
+FILL_QUANTITY: Final = Decimal("1.000000000000000001")
+FILL_PRODUCT: Final = "124.500000000000000119499999999999999995"
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        pytest.param(TWENTY_NINE_DIGITS, Decimal(2), TWENTY_NINE_DIGITS_DOUBLED, id="29 digits"),
+        pytest.param(
+            TEN_TO_THE_TWENTY_PLUS_ONE, TEN_TO_THE_TWENTY_PLUS_ONE, ITS_SQUARE, id="41 digits"
+        ),
+        pytest.param(FILL_QUANTITY, FILL_PRICE, FILL_PRODUCT, id="39 digits, fill-shaped"),
+    ],
+)
+def test_multiply_is_exact(left: Decimal, right: Decimal, expected: str) -> None:
+    """Exact past 38 significant digits, in this thread and inside a narrowed context alike.
+
+    The expected strings are written by hand (see the constants). The control computes the
+    same product with `*` inside the narrowed context and shows it is *not* exact there, so
+    the assertion on `multiply` is about how it multiplies and not about numbers too small
+    to round.
+    """
+    assert len(ITS_SQUARE) == 41
+    assert str(multiply(left, right)) == expected
+    assert str(multiply(right, left)) == expected
+
+    with decimal.localcontext() as context:
+        context.prec = 10
+        inside = multiply(left, right)
+        ambient = left * right
+
+    assert str(inside) == expected
+    assert str(ambient) != expected, "the control did not round; the test proves nothing"
+
+
+def test_multiply_is_exact_past_the_money_precision_where_a_money_context_would_round() -> None:
+    """The departure from a multiply under the 38-digit context, pinned on its own.
+
+    `Decimal.multiply` under a 38-digit context is the obvious implementation and it rounds
+    the 41-digit square to `1.0000000000000000000200000000000000000E+40`, losing the final
+    unit. Computed here as the control, so the exact answer is seen to differ from it.
+    """
+    rounded_at_38 = decimal.Context(prec=MONEY_PRECISION).multiply(
+        TEN_TO_THE_TWENTY_PLUS_ONE, TEN_TO_THE_TWENTY_PLUS_ONE
+    )
+
+    exact = multiply(TEN_TO_THE_TWENTY_PLUS_ONE, TEN_TO_THE_TWENTY_PLUS_ONE)
+
+    assert exact == Decimal(ITS_SQUARE)
+    assert exact != rounded_at_38
+    assert exact - rounded_at_38 == 1
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        pytest.param("-1.5", "2", "-3.0", id="negative left"),
+        pytest.param("1.5", "-2", "-3.0", id="negative right"),
+        pytest.param("-1.5", "-2", "3.0", id="both negative"),
+        pytest.param("0.1", "0.1", "0.01", id="a product smaller than either factor"),
+        pytest.param("0", "-7.25", "0", id="zero"),
+        pytest.param("2.50", "4", "10.00", id="trailing zeros are kept as places"),
+    ],
+)
+def test_multiply_gets_the_sign_and_the_places_right(left: str, right: str, expected: str) -> None:
+    """An exact product assembled from coefficients has two easy bugs: the sign and the exponent.
+
+    Compared by value, and by places through `as_tuple().exponent` where it is not zero: the
+    exact product of an `m`-place and an `n`-place number has `m + n` places.
+    """
+    product = multiply(Decimal(left), Decimal(right))
+
+    assert product == Decimal(expected)
+    if not product.is_zero():
+        assert product.as_tuple().exponent == Decimal(expected).as_tuple().exponent
+
+
+def test_multiply_is_exact_in_a_worker_thread_at_the_decimal_default() -> None:
+    """A thread whose context is the library default of 28 still gets the exact product.
+
+    `DefaultContext` is raised to 38 at import, so a fresh thread would not show the defect.
+    This thread lowers its own context to the library default first, which is the state any
+    thread that materialised its context before the import would be in.
+    """
+    results: list[Decimal] = []
+
+    def compute() -> None:
+        decimal.getcontext().prec = DEFAULT_DECIMAL_PRECISION
+        results.append(multiply(TWENTY_NINE_DIGITS, Decimal(2)))
+
+    thread = threading.Thread(target=compute)
+    thread.start()
+    thread.join()
+
+    assert [str(result) for result in results] == [TWENTY_NINE_DIGITS_DOUBLED]
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "raised"),
+    [
+        pytest.param(1.5, Decimal(2), TypeError, id="float left"),
+        pytest.param(Decimal(2), True, TypeError, id="bool right"),
+        pytest.param(Decimal("NaN"), Decimal(2), ValueError, id="nan"),
+        pytest.param(Decimal(2), Decimal("Infinity"), ValueError, id="infinity"),
+    ],
+)
+def test_multiply_refuses_what_is_not_a_finite_decimal(
+    left: object, right: object, raised: type[Exception]
+) -> None:
+    """The `require_amount` guard, on both operands."""
+    with pytest.raises(raised):
+        multiply(left, right)  # type: ignore[arg-type]
+
+
+#: Past CPython's int/str conversion limit of 4300 digits (`sys.get_int_max_str_digits`).
+#: The first `multiply` built its product through `int(str)` and escaped with a bare
+#: `ValueError` here; the contract since is "exact on any operand".
+OVERLONG_ONES: Final = 5000
+
+
+def test_multiply_is_exact_past_the_int_str_digit_limit() -> None:
+    """1.111... (5000 ones) doubled is 2.222... (5000 twos): exact, and context-free.
+
+    Asserted on the digit tuple and on the fixed-point rendering, both built by hand from
+    the same counts; the squaring below checks a 10001-digit coefficient the same way.
+    """
+    long_amount = Decimal("1." + "1" * OVERLONG_ONES)
+
+    doubled = multiply(long_amount, Decimal(2))
+    with decimal.localcontext() as context:
+        context.prec = 10
+        doubled_inside = multiply(long_amount, Decimal(2))
+
+    assert doubled.as_tuple() == (0, (2,) * (OVERLONG_ONES + 1), -OVERLONG_ONES)
+    assert format(doubled, "f") == "2." + "2" * OVERLONG_ONES
+    assert doubled_inside.as_tuple() == doubled.as_tuple()
+
+
+def test_multiply_squares_a_coefficient_past_the_digit_limit() -> None:
+    """`(10**5000 + 1) ** 2` is `10**10000 + 2 * 10**5000 + 1`: a 1, a 2 and a 1, zeros between."""
+    operand = Decimal((0, (1,) + (0,) * 4999 + (1,), 0))
+    expected_digits = (1,) + (0,) * 4999 + (2,) + (0,) * 4999 + (1,)
+
+    squared = multiply(operand, operand)
+
+    assert len(operand.as_tuple().digits) == 5001
+    assert squared.as_tuple() == (0, expected_digits, 0)
+
+
+def test_multiply_refuses_a_product_whose_exponent_decimal_cannot_hold() -> None:
+    """The documented edge: an exponent past what `Decimal` represents at all."""
+    enormous = Decimal("1E+999999999999999999")
+
+    with pytest.raises(decimal.InvalidOperation):
+        multiply(enormous, enormous)

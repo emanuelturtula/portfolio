@@ -36,6 +36,7 @@ from portfolio.logging import configure_logging
 from tests import test_logging_redaction
 from tests.db import conftest as db_conftest
 from tests.logging_harness import logging_state, preserved_logging
+from tests.providers.exchanges import conftest as exchanges_conftest
 from tests.security import conftest as security_conftest
 from tests.security.conftest import PRODUCTION_ORIGIN
 
@@ -52,6 +53,7 @@ LOGGING_FIXTURES: Final[dict[str, Callable[..., Iterator[None]]]] = {
     "tests/security/conftest.py::restored_logging": security_conftest.restored_logging,
     "tests/db/conftest.py::restored_logging": db_conftest.restored_logging,
     "tests/test_logging_redaction.py::restore_logging": test_logging_redaction.restore_logging,
+    "tests/providers/exchanges/conftest.py::restored_logging": exchanges_conftest.restored_logging,
 }
 
 #: The one module allowed to call `structlog.reset_defaults()`, because it does so on

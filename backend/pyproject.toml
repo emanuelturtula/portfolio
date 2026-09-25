@@ -250,6 +250,14 @@ concurrency = ["thread", "greenlet"]
 # partial branch, and the two engine guards. Every module #10 added is fully covered, and it
 # got there because the first measurement was 99.44% against a 99.6 floor: the tester added
 # tests for eight uncovered #10 branches rather than anyone asking for the floor to move.
+#
+# **99.7 held at the exchange provider seam (#12)**, measured 99.93% over 4572 statements and
+# 830 branches. 0.23 points of 5402 units is about twelve units of headroom. 99.8 would leave
+# under seven, below the nine-unit standard, so the floor waits for the base to grow, as it did
+# at #7 and #8. The misses are the same four units as at #10. The whole of
+# `providers/exchanges/` is fully covered, including every refusal arm review added. The first
+# measurement was 99.48% against this floor, and the tester closed it by writing tests for the
+# eighteen uncovered lines.
 fail_under = 99.7
 show_missing = true
 skip_covered = true

@@ -397,18 +397,33 @@ def test_the_usable_integer_range_is_precision_minus_scale(scale: int) -> None:
         column.process_bind_param(one_too_wide, DIALECT)
 
 
-def test_an_over_magnitude_value_names_the_value_the_scale_and_the_ceiling() -> None:
-    """The old failure was `decimal.InvalidOperation: [<class 'decimal.InvalidOperation'>]`.
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(Decimal(10**36), id="one past the ceiling"),
+        pytest.param(Decimal("4242424242424242424242424242424242424.2"), id="distinctive digits"),
+    ],
+)
+def test_an_over_magnitude_value_names_the_scale_and_the_ceiling_but_not_the_amount(
+    value: Decimal,
+) -> None:
+    """The scale and the ceiling are what an operator can act on; the amount is the owner's.
 
-    That message contains no value, no column and no number, and SQLAlchemy wraps it in a
-    `StatementError` at INSERT time, so the person reading the traceback learns only that
-    a decimal operation somewhere was invalid.
+    The old failure was `decimal.InvalidOperation: [<class 'decimal.InvalidOperation'>]`,
+    which names no column and no number. The message that replaced it used to quote the
+    amount as well, and #12 -- the first issue to put a *quantity* in a `NumericText`
+    column -- is where that stopped: a fill quantity is the owner's holdings, and this
+    message reaches a log through any `logger.exception`.
     """
     with pytest.raises(ValueError, match="NumericText cannot store") as caught:
-        NumericText(2).process_bind_param(Decimal(10**36), DIALECT)
+        NumericText(2).process_bind_param(value, DIALECT)
 
     message = str(caught.value)
-    assert "1000000000000000000000000000000000000" in message
+    rendered = f"{caught.value}{caught.value!r}{caught.value.args}"
+    # The amount, in every spelling a formatter could have chosen.
+    for spelling in (str(value), format(value, "f"), value.to_eng_string(), "4242", "1E+36"):
+        assert spelling not in rendered, spelling
+    # The positive companion: the message still says everything else it used to.
     assert "a scale of 2" in message
     assert "36 digits before the decimal point" in message
     assert str(MONEY_PRECISION) in message
@@ -708,10 +723,9 @@ def test_the_refusal_names_the_scale_and_never_the_amount() -> None:
     """The scale is what an operator can act on; the amount is the owner's data.
 
     `prices.amount` holds public market data, so quoting a price would be harmless today.
-    This type is the one every future money column is built from, and the next one holds a
+    This type is the one every future money column is built from, and since #12 one holds a
     **quantity** -- which is the owner's holdings. The sibling refusal for an over-large
-    amount does quote its value; this one does not, and the asymmetry is deliberate rather
-    than an oversight, so it is asserted.
+    amount stopped quoting its value in #12 as well; both are asserted.
     """
     with pytest.raises(ValueError, match=r"finer than its scale") as caught:
         NumericText(12).process_bind_param(Decimal("0.0000000000005"), DIALECT)

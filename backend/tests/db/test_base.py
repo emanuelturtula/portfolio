@@ -78,6 +78,25 @@ EXPECTED_NAMES = {
         "fk_balance_snapshots_sync_run_id_sync_runs",
         "ix_balance_snapshots_wallet_observed",
     },
+    # #12. Both unique constraints are named explicitly: the convention would render
+    # `uq_exchange_accounts_user_id_exchange_key` and
+    # `uq_exchange_fills_exchange_account_id_external_trade_id`. **No index on either table**,
+    # and the absence is part of the pin: `uq_exchange_fills_account_trade` leads with
+    # `exchange_account_id`, and the reader that needs an index arrives with #15 or later.
+    "exchange_accounts": {
+        "pk_exchange_accounts",
+        "uq_exchange_accounts_user_exchange",
+        "ck_exchange_accounts_exchange_key",
+        "fk_exchange_accounts_user_id_users",
+    },
+    "exchange_fills": {
+        "pk_exchange_fills",
+        "uq_exchange_fills_account_trade",
+        "ck_exchange_fills_external_trade_id",
+        "ck_exchange_fills_side",
+        "ck_exchange_fills_quote_quantity_derived",
+        "fk_exchange_fills_exchange_account_id_exchange_accounts",
+    },
 }
 
 

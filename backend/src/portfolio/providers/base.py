@@ -456,8 +456,9 @@ def decode_json(body: str | bytes) -> object:
     #8 needed the same boundary for a second vendor -- the same argument
     `providers/endpoints.py` makes about the failover loop.
 
-    **`ValueError` and `RecursionError`, not `JSONDecodeError` and `UnicodeDecodeError`**,
-    and that is a correction rather than defensive breadth. Measured:
+    **`ValueError`, `RecursionError` and `ArithmeticError`, not `JSONDecodeError` and
+    `UnicodeDecodeError`**, and that is a correction rather than defensive breadth.
+    Measured:
 
     | Body | What `json.loads` raises |
     |---|---|
@@ -465,12 +466,26 @@ def decode_json(body: str | bytes) -> object:
     | bytes that are not UTF-8 | `UnicodeDecodeError` |
     | an integer past the digit limit | `ValueError: Exceeds the limit (4300 digits)` |
     | arrays nested past the scanner's depth | `RecursionError` |
+    | `1e1000000000000000000`, an exponent `Decimal` cannot hold | `decimal.InvalidOperation` |
 
     The first two are `ValueError` subclasses, so naming `ValueError` subsumes them and
-    catches the integer-limit case that the narrower pair let escape untyped. The last one
-    is not a `ValueError` at all and has to be named. Both escaping arms reached every
-    parser in `chains/bitcoin.py`, which is to say they reached `health()`, whose contract
-    is that it never raises -- from a body a hostile or broken instance chooses freely.
+    catches the integer-limit case that the narrower pair let escape untyped. The fourth is
+    not a `ValueError` at all and has to be named. Both escaping arms reached every parser
+    in `chains/bitcoin.py`, which is to say they reached `health()`, whose contract is that
+    it never raises -- from a body a hostile or broken instance chooses freely.
+
+    **The last row arrived with `parse_float=Decimal`** and escaped for as long as the
+    catch named only the first two types -- measured by review in #12, where exchange
+    providers are told to rely on this function raising nothing but
+    `ProviderResponseError`. `Decimal` accepts an exponent up to `decimal.MAX_EMAX`
+    (999999999999999999) and refuses one past it with `InvalidOperation`, which is a
+    `decimal.DecimalException` and therefore an `ArithmeticError`, not a `ValueError`.
+    **`ArithmeticError` is caught rather than `InvalidOperation` by name** because the hook
+    is `Decimal()` and every signal it can raise is a `DecimalException`: today only
+    `InvalidOperation` fires, but whether another does depends on the calling thread's
+    decimal traps, which this function does not own. Nothing else `json.loads` calls raises
+    an `ArithmeticError`, so the wider name catches no failure that is not "this body
+    cannot be decoded".
 
     `CPython` sets the digit limit and the recursion limit; neither is something this
     application configures, and both are the kind of boundary a vendor can cross by
@@ -538,12 +553,13 @@ def decode_json(body: str | bytes) -> object:
     token, which is a fixed word from a closed set of three and discloses nothing.
 
     Raises:
-        ProviderResponseError: the body is not JSON, is JSON the decoder cannot finish, or
-            carries one of JSON's three non-finite extensions.
+        ProviderResponseError: the body is not JSON, is JSON the decoder cannot finish,
+            carries a number `Decimal` cannot represent, or carries one of JSON's three
+            non-finite extensions.
     """
     try:
         return json.loads(body, parse_float=Decimal, parse_constant=_refuse_json_constant)
-    except (ValueError, RecursionError) as error:
+    except (ValueError, RecursionError, ArithmeticError) as error:
         message = "The response body is not JSON."
         raise ProviderResponseError(message) from error
 
