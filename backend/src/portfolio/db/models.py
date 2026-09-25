@@ -21,6 +21,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     ForeignKey,
     Index,
@@ -109,6 +110,29 @@ _SYNC_RUN_CHAIN_ERROR_KIND_CHECK: Final = (
 # the ordinary case.
 _BALANCE_SNAPSHOT_CONFIRMED_CHECK: Final = "confirmed >= 0"
 
+# The venues an exchange account may name, carrying the same duplication hazard as the
+# constants above -- the text is repeated verbatim in `0006_exchanges` and nothing mechanical
+# compares the two -- and covered the same way, by a reflection test. The values are the
+# `domain.exchanges.ExchangeKey` members, so adding a venue is a migration, as adding a chain
+# is.
+_EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK: Final = "exchange_key IN ('bingx', 'bitget')"
+
+# **The constraint that makes `uq_exchange_fills_account_trade` mean anything.** Two fills
+# with an empty trade id collide under the unique constraint, and under #15's
+# `ON CONFLICT DO NOTHING` the second is dropped without a word. `NormalizedFill` refuses an
+# empty or blank id; this refuses one again for a writer that bypasses it. Whitespace is not
+# refused here: `trim()` in a `CHECK` is a function call SQLite evaluates per row, and the
+# empty string is the value a missing field actually defaults to.
+_EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK: Final = "external_trade_id <> ''"
+
+# The `domain.exchanges.FillSide` members, with the same duplication and the same test.
+_EXCHANGE_FILL_SIDE_CHECK: Final = "side IN ('buy', 'sell')"
+
+# `Boolean` on SQLite is an `INTEGER`, and since SQLAlchemy 1.4 it no longer emits a `CHECK`
+# of its own (`create_constraint` defaults to `False`), so without this the column would
+# accept `2` from any writer that is not the ORM. Named, like every other constraint here.
+_EXCHANGE_FILL_QUOTE_QUANTITY_DERIVED_CHECK: Final = "quote_quantity_derived IN (0, 1)"
+
 PRICE_SCALE: Final = 12
 """Decimal places `prices.amount` rounds to and stores. Public, because a test pins it.
 
@@ -121,6 +145,22 @@ of a crypto asset will ever need.
 `NumericText` takes no default scale on purpose -- a money column without a declared scale
 has no defined rounding -- so this is a decision with a number behind it rather than a
 value that got omitted.
+"""
+
+FILL_SCALE: Final = 18
+"""Decimal places every amount column of `exchange_fills` rounds to and stores.
+
+**Eighteen covers every token denominated in wei**, the finest unit any venue this product
+could plausibly import quotes in, and leaves `MONEY_PRECISION - 18` = 20 digits in front of
+the point -- more than any quantity, price, quote amount or fee a spot fill will carry.
+
+**It is also a refusal boundary, not only a rounding one.** `NumericText` rounds an amount
+finer than its scale, which is right for a price and wrong for a fill whose `quote_quantity`
+is stored "as reported": a value the column would change is not the value the venue
+reported. So `providers.exchanges.base.NormalizedFill` refuses any amount with more than
+eighteen fractional digits before it reaches the column, and a venue that reports one fails
+its page loudly. That is a guess about fee precision recorded as one; if a venue ever does
+it, the scale moves with the evidence.
 """
 
 
@@ -471,6 +511,126 @@ class BalanceSnapshot(Base):
     pending: Mapped[int | None] = mapped_column(BaseUnits, nullable=True)
     decimals: Mapped[int] = mapped_column(Integer, nullable=False)
     observed_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
+class ExchangeAccount(Base):
+    """One venue the owner imports spot fills from.
+
+    **No column holds a credential, and none ever will.** The API key, its secret and the
+    passphrase come from environment variables into `SecretStr` and are never persisted
+    (rule 3); a database file that leaks must not hand the reader a working key. What this
+    row records is that the owner *has* an account at a venue, so that the fills imported
+    from it have something to belong to.
+
+    `UNIQUE (user_id, exchange_key)`: credentials are one set per venue, read from the
+    environment, so one account per venue is the only configuration that can exist.
+    Relaxing it -- two sub-accounts at one venue -- needs a credential story first, and a
+    migration then.
+
+    Sync state -- status, `auth_failed`, checkpoints, the requested and effective start of
+    the history -- is #15's and arrives with the loop that writes it.
+    """
+
+    __tablename__ = "exchange_accounts"
+    __table_args__ = (
+        UniqueConstraint("user_id", "exchange_key", name="uq_exchange_accounts_user_exchange"),
+        # Named, because a batch rebuild cannot re-create an anonymous CHECK.
+        CheckConstraint(_EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK, name="exchange_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No index of its own: `uq_exchange_accounts_user_exchange` leads with it, which serves
+    # both the only lookup there is and the cascade.
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    exchange_key: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
+class ExchangeFill(Base):
+    """One spot trade execution, as the venue reported it. An immutable event log.
+
+    **`UNIQUE (exchange_account_id, external_trade_id)` is criterion 7**, and it is what
+    #15's `ON CONFLICT DO NOTHING` will stand on: the sync re-reads overlapping windows on
+    purpose, and the database, not the loop, is what makes a fill counted once. Two
+    consequences are written down here because nothing in the schema can say them:
+
+    * **The trade id must be unique per account across every symbol.** A venue whose ids
+      are unique only within a symbol must namespace them -- `BTC-USDT:12345` -- or this
+      constraint turns two different fills into one and silently drops the second. #14
+      must check its venue.
+    * **An empty id would collide with every other empty id**, which is why
+      `ck_exchange_fills_external_trade_id` exists beside the unique constraint.
+
+    **Amounts are `NumericText(FILL_SCALE)` and carry no `CHECK`, deliberately.**
+    `quantity > 0` on a `TEXT` column is a comparison SQLite performs by numeric affinity --
+    the float coercion rule 2 forbids, applied inside the database. Signs, bounds and scale
+    are enforced by `NormalizedFill`, in Python, where they are exact. `fee_amount` is
+    signed: positive is a fee paid, negative a rebate.
+
+    **`quote_quantity` is stored as reported**, never recomputed as `quantity * price`: a
+    one-unit disagreement with the venue's own rounding would haunt every reconciliation
+    after it. When a venue omits it, the provider derives it and sets
+    `quote_quantity_derived`, which is what the flag is for.
+
+    **`raw_payload` is the venue's own fill object**, as canonical JSON, kept for forensics
+    -- never the envelope or the request, which is where a key or a signature could be.
+
+    **`ON DELETE RESTRICT` on the account.** Fills are the history a cost basis is computed
+    from; deleting an account must not take that history with it, so the database refuses
+    the delete until someone has decided what happens to the fills.
+
+    Two clocks, and they are not redundant: `executed_at` is the venue's, when the trade
+    happened; `ingested_at` is ours, when this row was written.
+
+    No index beyond the unique constraint, which leads with `exchange_account_id`. The
+    reader that needs one arrives with #15 or later and adds it then, as
+    `balance_snapshots` did.
+    """
+
+    __tablename__ = "exchange_fills"
+    __table_args__ = (
+        UniqueConstraint(
+            "exchange_account_id",
+            "external_trade_id",
+            name="uq_exchange_fills_account_trade",
+        ),
+        # Named, because a batch rebuild cannot re-create an anonymous CHECK.
+        CheckConstraint(_EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK, name="external_trade_id"),
+        CheckConstraint(_EXCHANGE_FILL_SIDE_CHECK, name="side"),
+        CheckConstraint(
+            _EXCHANGE_FILL_QUOTE_QUANTITY_DERIVED_CHECK,
+            name="quote_quantity_derived",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    exchange_account_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("exchange_accounts.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    external_trade_id: Mapped[str] = mapped_column(Text, nullable=False)
+    external_order_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The venue's spelling, e.g. `BTCUSDT`; the assets are split out beside it rather than
+    # parsed back out of it, because no venue promises a separator.
+    symbol: Mapped[str] = mapped_column(Text, nullable=False)
+    base_asset: Mapped[str] = mapped_column(Text, nullable=False)
+    quote_asset: Mapped[str] = mapped_column(Text, nullable=False)
+    side: Mapped[str] = mapped_column(Text, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(NumericText(FILL_SCALE), nullable=False)
+    price: Mapped[Decimal] = mapped_column(NumericText(FILL_SCALE), nullable=False)
+    quote_quantity: Mapped[Decimal] = mapped_column(NumericText(FILL_SCALE), nullable=False)
+    quote_quantity_derived: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    fee_amount: Mapped[Decimal] = mapped_column(NumericText(FILL_SCALE), nullable=False)
+    # Null only when the fee is zero; `NormalizedFill` enforces the pairing.
+    fee_asset: Mapped[str | None] = mapped_column(Text, nullable=True)
+    executed_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    raw_payload: Mapped[str] = mapped_column(Text, nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 # Re-exported so that anything needing the schema -- Alembic's `env.py`, the drift check --

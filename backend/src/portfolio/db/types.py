@@ -96,12 +96,14 @@ class NumericText(TypeDecorator[Decimal]):
     a holding the chain disagrees with -- so the same value can be legal in a column and
     rejected by a conversion.
 
-    **The two refusals word their messages differently, and that is a decision.** The
-    too-large one quotes the amount; the rounds-to-nothing one names only the scale. This
-    type holds a price today, which is public market data, and it will hold a *quantity*
-    eventually -- a balance, a fill -- and a quantity is the owner's holdings. The new
-    message is written to the rule the rest of this application already follows, and the
-    older one is left alone rather than changed under an unrelated issue.
+    **Neither refusal quotes the amount.** Both name the scale and the rule, and the
+    too-large one adds the digit ceiling, which is what a reader needs to act on. This type
+    held only prices until #12, which is public market data, and the too-large message
+    quoted the value; `exchange_fills` puts a *quantity* in it -- a fill is the owner's
+    holdings -- so that message now follows the rule the rest of this application already
+    did, and the one the rounds-to-nothing refusal was written to from the start. The
+    change waited for the first column that could hold a quantity rather than being made
+    under an unrelated issue.
 
     Text does not sort or sum numerically, and that is a feature, not a limitation to
     work around: `SUM()`, `ORDER BY` and `<` on this column would coerce it to a float in
@@ -167,10 +169,12 @@ class NumericText(TypeDecorator[Decimal]):
             # names no value, no column and no reason, and SQLAlchemy wraps it in a
             # StatementError at INSERT time. This is the failure a money column actually
             # hits -- an amount too large for the digits the scale leaves in front of the
-            # point -- so it says which value, which scale and what the ceiling is.
+            # point -- so it says which scale and what the ceiling is. **Never which
+            # value**: `exchange_fills` stores quantities in this type, and a quantity in a
+            # traceback is the owner's holdings in a log.
             integer_digits = MONEY_PRECISION - self.scale
             message = (
-                f"NumericText cannot store {value}: a scale of {self.scale} leaves "
+                f"NumericText cannot store an amount this large: a scale of {self.scale} leaves "
                 f"{integer_digits} digits before the decimal point, out of the "
                 f"{MONEY_PRECISION} this application represents"
             )
