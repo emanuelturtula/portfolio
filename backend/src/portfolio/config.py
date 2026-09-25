@@ -184,6 +184,16 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         frozen=True,
+        # Keep every environment value out of a validation error's `str()` and `repr()`,
+        # which is what reaches the log when the container refuses to start. Pydantic elides
+        # the *middle* of the echoed input and keeps both ends. Measured on #13: with the
+        # Bitget key and secret set and the passphrase missing, `str(exc)` carried the key's
+        # first five characters and the secret's last twenty; a passphrase with a trailing
+        # space showed its own tail, which for a short passphrase is most of it. This drops
+        # `input_value` and `input_type` from both renderings. It does **not** change
+        # `errors()` or `json()`, which still carry the whole input -- see the docstring of
+        # `_refuse_unsafe_configuration`.
+        hide_input_in_errors=True,
     )
 
     environment: Literal["dev", "prod"] = "dev"
@@ -435,11 +445,19 @@ class Settings(BaseSettings):
         Measured, and it is not what the `SecretStr` on `bootstrap_password` leads anyone
         to expect:
 
-        | Rendering | Carries `PORTFOLIO_BOOTSTRAP_PASSWORD`? |
+        | Rendering | Carries a `PORTFOLIO_*` value? |
         |---|---|
-        | `str(exc)` | no -- pydantic elides the middle of the input |
+        | `str(exc)`, `repr(exc)` | no, since #13 -- `hide_input_in_errors` drops the input |
         | `exc.errors()` | **yes, in plaintext** |
         | `exc.json()` | **yes, in plaintext** |
+
+        **Before #13 the first row was wrong, and it said "no" anyway.** Pydantic elides the
+        *middle* of the echoed input and keeps both ends, so `str(exc)` carried the start of
+        the first variable in the dict and the end of the last. Measured on #13: with the
+        Bitget key and secret set and the passphrase missing, the message held the key's
+        first five characters and the secret's last twenty. `hide_input_in_errors=True` on
+        `model_config` now removes `input_value` and `input_type` from `str()` and `repr()`
+        entirely. It does not touch the other two rows.
 
         Each error entry carries an `input` dict holding every `PORTFOLIO_*` variable as
         the raw environment string -- which is to say *before* pydantic coerced it into the
@@ -447,7 +465,8 @@ class Settings(BaseSettings):
         been parsed; it cannot protect the copy of the input that failed to parse.
 
         Two things keep that off stdout today, and neither is a rule anybody stated. Only
-        `str(exc)` reaches the log when the process refuses to start, and the one caller of
+        `str(exc)` reaches the log when the process refuses to start -- and since #13 it
+        carries no input at all -- and the one caller of
         `.errors()` in this application -- `api/errors.py` -- is registered for a
         `RequestValidationError` from a request body and projects each entry down to
         `loc`, `msg` and `type`, dropping `input` before anything is rendered. So the
