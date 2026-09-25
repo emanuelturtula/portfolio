@@ -618,8 +618,10 @@ def test_the_http_import_scan_can_fail(tmp_path: Path) -> None:
 @pytest.mark.parametrize("status", ["401", True, 401.0], ids=["str", "bool", "float"])
 def test_a_status_that_is_not_an_int_is_refused(cls: ErrorClass, status: object) -> None:
     """A string status would be rendered into the message: the free text criterion 8 refuses."""
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="status must be an int") as caught:
         build(cls, status=status)
+
+    assert type(caught.value) is TypeError
 
 
 @pytest.mark.parametrize(
@@ -631,5 +633,7 @@ def test_a_status_that_is_not_an_int_is_refused(cls: ErrorClass, status: object)
     ],
 )
 def test_build_error_map_refuses_a_key_that_is_not_a_pair(key: object) -> None:
-    with pytest.raises(ValueError):  # noqa: PT011 - each case is its own parametrised row
+    with pytest.raises(ValueError, match=r"must be a \(status, venue_code\) pair") as caught:
         build_error_map({key: ExchangeAuthError})  # type: ignore[dict-item]
+
+    assert type(caught.value) is ValueError

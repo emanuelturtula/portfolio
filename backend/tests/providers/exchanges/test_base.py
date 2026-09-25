@@ -1220,25 +1220,38 @@ def test_an_amount_up_to_one_hundred_digits_is_accepted(value: str) -> None:
     assert require_fill_amount(value, field="price") == Decimal(value)
 
 
+#: The two reasons `require_fill_amount` gives for an amount it will not hold. Asserted
+#: per row, so a row refused by a *different* rule -- the pattern, the finiteness check --
+#: fails rather than passing on the class alone.
+TOO_LONG: Final = "has more than 100 digits written out in full"
+UNREPRESENTABLE: Final = "is a number this application cannot represent"
+
+
 @pytest.mark.parametrize(
-    "value",
+    ("value", "reason"),
     [
-        pytest.param("9" * 101, id="one hundred and one integer digits"),
-        pytest.param("0." + "1" * 101, id="one hundred and one places"),
-        pytest.param("1e999999999999999999", id="a huge exponent"),
-        pytest.param("1e-999999999999999999", id="a tiny exponent"),
-        pytest.param(Decimal("9" * 101), id="an over-long Decimal"),
-        pytest.param(10**100, id="an over-long int"),
-        # `Decimal()` itself refuses this exponent, with `InvalidOperation`.
-        pytest.param("1e99999999999999999999", id="an exponent Decimal cannot hold"),
+        pytest.param("9" * 101, TOO_LONG, id="one hundred and one integer digits"),
+        pytest.param("0." + "1" * 101, TOO_LONG, id="one hundred and one places"),
+        pytest.param("1e999999999999999999", TOO_LONG, id="a huge exponent"),
+        pytest.param("1e-999999999999999999", TOO_LONG, id="a tiny exponent"),
+        pytest.param(Decimal("9" * 101), TOO_LONG, id="an over-long Decimal"),
+        pytest.param(10**100, TOO_LONG, id="an over-long int"),
+        # `Decimal()` itself refuses this exponent, with `InvalidOperation`: the one input
+        # that reaches that arm, since the pattern has refused every other malformed string.
+        pytest.param(
+            "1e99999999999999999999", UNREPRESENTABLE, id="an exponent Decimal cannot hold"
+        ),
     ],
 )
-def test_an_amount_longer_than_one_hundred_digits_is_a_schema_error(value: object) -> None:
+def test_an_amount_longer_than_one_hundred_digits_is_a_schema_error(
+    value: object, reason: str
+) -> None:
     with pytest.raises(ExchangeSchemaError) as caught:
         require_fill_amount(value, field="price")
 
     assert type(caught.value) is ExchangeSchemaError
-    assert "price" in str(caught.value)
+    # The field and the reason together, so a refusal of some other field cannot pass.
+    assert f"price {reason}" in str(caught.value), str(caught.value)
     assert "999999999" not in f"{caught.value}{caught.value!r}"
 
 
@@ -1249,6 +1262,8 @@ def test_a_derived_product_too_large_for_the_column_is_a_schema_error() -> None:
 
     assert type(caught.value) is ExchangeSchemaError
     assert "quote_quantity" in str(caught.value)
+    # The reason, with the column's integer room written by hand: 38 - 18 = 20.
+    assert "more than 20 digits before the decimal point" in str(caught.value)
     # The companion: twenty integer digits is still a quote quantity.
     assert derive_quote_quantity(Decimal("1E+13"), Decimal("1E+6")) == Decimal("1E+19")
 
@@ -1261,20 +1276,24 @@ def test_a_payload_thirty_two_deep_encodes_and_thirty_three_is_refused() -> None
     with pytest.raises(ExchangeSchemaError) as caught:
         encode_raw_payload(thirty_three)
     assert type(caught.value) is ExchangeSchemaError
+    assert "more than 32 levels deep" in str(caught.value), str(caught.value)
 
 
 @pytest.mark.parametrize(
-    "document",
+    ("document", "reason"),
     [
-        pytest.param({"qty": Decimal("NaN")}, id="a NaN the decoder refuses"),
-        pytest.param({1: "x"}, id="a key that is not a string"),
+        pytest.param({"qty": Decimal("NaN")}, "non-finite Decimal", id="a NaN"),
+        pytest.param({1: "x"}, "every object key to be a str", id="a key that is not a str"),
     ],
 )
 def test_encode_raw_payload_refuses_other_shapes_the_decoder_cannot_produce(
-    document: object,
+    document: object, reason: str
 ) -> None:
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError) as caught:
         encode_raw_payload(document)
+
+    assert type(caught.value) is TypeError
+    assert reason in str(caught.value), str(caught.value)
 
 
 @pytest.mark.parametrize("flag", [1, 0, "true", None], ids=["one", "zero", "text", "none"])
@@ -1282,7 +1301,7 @@ def test_the_derived_flag_must_be_a_bool(flag: object) -> None:
     """`1` would store and read back as `True`; the column is not where the type is decided."""
     error = refusal(quote_quantity_derived=flag)
 
-    assert "quote_quantity_derived" in str(error)
+    assert "quote_quantity_derived must be a bool" in str(error), str(error)
 
 
 @pytest.mark.parametrize(
@@ -1291,11 +1310,11 @@ def test_the_derived_flag_must_be_a_bool(flag: object) -> None:
 def test_the_raw_payload_must_be_a_non_blank_string(payload: object) -> None:
     error = refusal(raw_payload=payload)
 
-    assert "raw_payload" in str(error)
+    assert "raw_payload must be a non-empty string" in str(error), str(error)
 
 
 def test_capabilities_refuse_a_rate_limit_that_is_not_one() -> None:
-    with pytest.raises(TypeError, match="rate_limit"):
+    with pytest.raises(TypeError, match="rate_limit must be a RateLimit, got tuple"):
         ExchangeCapabilities(
             exchange_key=ExchangeKey.BITGET,
             retention=None,
