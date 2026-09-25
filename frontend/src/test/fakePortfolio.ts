@@ -133,6 +133,14 @@ export interface FakePortfolio {
   /** The next create of this address answers a 422 on `["body", "address"]`. */
   rejectAddress(address: string, rejection: AddressRejectionType): void;
   /**
+   * Changes a wallet as another session would: on the server, with no request
+   * from this page, so what the page shows goes stale until it next reads.
+   */
+  changeElsewhere(
+    walletId: number,
+    patch: Partial<Pick<WalletResponse, 'archived' | 'label'>>,
+  ): void;
+  /**
    * Holds every request to `route` until the returned function is called.
    * The request is recorded when it arrives, not when it is released.
    */
@@ -214,6 +222,9 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     },
     rejectAddress: (address, rejection) => {
       rejections.set(address, rejection);
+    },
+    changeElsewhere: (walletId, patch) => {
+      wallets = wallets.map((row) => (row.id === walletId ? { ...row, ...patch } : row));
     },
     hold: (route) => {
       let release: () => void = () => undefined;
