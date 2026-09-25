@@ -583,10 +583,17 @@ def _http_date_ms(candidate: str, now: datetime) -> int | None:
     `total_seconds()`, which returns a float. Nothing here would be corrupted by that
     float, but the rule in this package is that durations are integers, and a single
     exception is how a rule becomes a suggestion.
+
+    **`OverflowError` is caught beside `TypeError` and `ValueError`**, measured on #13:
+    `Sun, 06 Nov 99999999999999999999 08:49:37 GMT` -- a twenty-digit year, or hour, or zone
+    offset -- makes the parser hand an integer to a C field that cannot hold it, and
+    `OverflowError` is an `ArithmeticError`, not a `ValueError`. It escaped this function,
+    and through `_response_delay_ms` it escaped `client.get` on any retryable response
+    that carried it. A fuzz of two hundred thousand token combinations found no fourth type.
     """
     try:
         parsed = parsedate_to_datetime(candidate)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     # RFC 9110 section 5.6.7: an HTTP-date is always GMT, and the asctime spelling has no
     # zone to say so. Without this the subtraction below raises.
