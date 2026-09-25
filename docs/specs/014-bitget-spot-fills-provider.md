@@ -501,7 +501,12 @@ Disjoint. Nobody edits a file on another row.
   provider's `except httpx.TransportError`, and chain `health()`'s never-raise contract.
   Measured by backend-dev and reproduced by the tech lead. It predates this issue, but
   criterion 9 cannot hold while it stands, so it is fixed here in `providers/http.py`: a
-  named digit bound, past which a value is unusable (`None`).
+  named digit bound, past which a value is unusable (`None`). **The HTTP-date form of
+  `Retry-After` had a third escape of the same kind:** a 20-digit year, hour or zone offset
+  makes `parsedate_to_datetime` raise `OverflowError`, an `ArithmeticError`, which the
+  `(TypeError, ValueError)` clause did not catch. That date is now read as absent too.
+  backend-dev fuzzed the parser with 200,000 token combinations and found no fourth
+  exception type.
 - **A credential with an illegal header character leaked through a transport error.** A
   newline, a NUL, or surrounding whitespace in the API key makes h11 raise
   `httpx.LocalProtocolError` quoting the whole header value, and the design chained from
