@@ -91,20 +91,43 @@ def prompt_for_password() -> str:
     return first
 
 
-def confirm_replacement(username: str) -> None:
-    """Make the operator say out loud that an existing account is about to be destroyed.
+def confirm_replacement(username: str, *, rename: bool) -> None:
+    """Make the operator say out loud that the account's credential is about to change.
+
+    `username` is the name a new account would get; `rename` says whether the operator
+    typed it, and so whether an existing account takes it too.
+
+    The confirmation also says what is *not* lost. Anyone who read an older copy of the
+    operations guide expects `--replace` to start from an empty account, and an operator
+    who believes that may not run it when they should -- or may run it expecting a clean
+    slate and be surprised by the wallets still there.
 
     Refused outright when stdin is not a terminal. An unattended `--replace` -- in a
     script, a Dockerfile, a CI job -- is exactly the shape of the accident this guards
-    against, and treating "no terminal" as consent would be the wrong default.
+    against: it signs out every browser and changes the only password the instance has.
+    Treating "no terminal" as consent would be the wrong default.
     """
     if not sys.stdin.isatty():
-        message = "--replace needs a terminal: refusing to replace an account unattended."
+        message = "--replace needs a terminal: refusing to change an account's password unattended."
         raise CommandError(message)
-    # Phrased as what the flag does rather than as a claim about what is in the database.
-    # The check happens later, inside the transaction that does the work, and a database
-    # with no account yet is a perfectly ordinary thing to point this command at.
-    emit(f"--replace deletes any existing account, and every session it holds, for '{username}'.")
+    # Every line is conditional, because nothing has read the database yet: the check
+    # happens later, inside the transaction that does the work, and a database with no
+    # account is a perfectly ordinary thing to point this command at. Reading first would
+    # mean migrating before the operator has agreed to anything, and would still leave the
+    # transaction to decide. So the text says what happens in each case rather than
+    # claiming to know which case this is.
+    emit(
+        "If the account exists, --replace sets a new password on it and signs out every "
+        "session it holds."
+    )
+    if rename:
+        emit(
+            f"Its username becomes '{username}'. "
+            "Its wallets, balances and exchange history are kept."
+        )
+    else:
+        emit("Its username, wallets, balances and exchange history are kept.")
+    emit(f"If no account exists, it creates '{username}'.")
     answer = input(f"Type '{username}' or 'y' to confirm: ").strip()
     if answer != username and answer.casefold() not in CONFIRMATION_WORDS:
         message = "Not confirmed. Nothing was changed."
@@ -120,8 +143,15 @@ def password_hasher_from(settings: Settings) -> PasswordHasher:
     )
 
 
-async def store_user(settings: Settings, username: str, password: str, *, replace: bool) -> None:
-    """Open the database the application uses and write the account into it."""
+async def store_user(
+    settings: Settings,
+    username: str,
+    password: str,
+    *,
+    replace: bool,
+    rename: bool,
+) -> str:
+    """Open the database the application uses, write the account, and return its name."""
     engine = create_database_engine(settings.database_url)
     try:
         factory = create_session_factory(engine)
@@ -135,27 +165,42 @@ async def store_user(settings: Settings, username: str, password: str, *, replac
                 ),
                 throttle=LoginThrottle(),
             )
-            await service.create_user(username, password, replace=replace)
+            return await service.create_user(username, password, replace=replace, rename=rename)
     finally:
         await engine.dispose()
 
 
 def create_user(args: argparse.Namespace) -> int:
-    """`create-user`: prompt for a password and create -- or replace -- the owner account."""
+    """`create-user`: create the owner account, or set a new password on the existing one.
+
+    **Whether `--username` was typed is decided here, the one place that can see it.** A new
+    account needs a name, so an absent flag falls back to `PORTFOLIO_BOOTSTRAP_USERNAME`
+    -- but once it has, the default and a typed name are the same string, and the service
+    cannot tell them apart. So `rename` travels beside the name: with `--replace`, an
+    existing account takes a name the operator typed, and keeps its own otherwise. Copying
+    the recovery command from the operations guide must not rename the account.
+
+    The success line prints the name the service reports rather than the one resolved
+    here, because without `--username` those two differ whenever the account was created
+    under another name.
+    """
     settings = get_settings()
+    # `or`, not `is not None`, on both lines, so that `--username ""` means what it has
+    # always meant -- no name given -- rather than "rename to the default".
     username: str = args.username or settings.bootstrap_username
+    rename = bool(args.username)
     replace: bool = args.replace
 
     if replace:
-        confirm_replacement(username)
+        confirm_replacement(username, rename=rename)
     password = prompt_for_password()
 
     # The schema has to exist before a row can go in it, and an operator recovering a
     # forgotten password on a fresh volume has no other way to create it.
     ensure_database_directory(settings.database_url)
     upgrade_to_head(settings.database_url)
-    asyncio.run(store_user(settings, username, password, replace=replace))
-    emit(f"Account '{username}' is ready.")
+    account = asyncio.run(store_user(settings, username, password, replace=replace, rename=rename))
+    emit(f"Account '{account}' is ready.")
     return 0
 
 
@@ -309,12 +354,18 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument(
         "--username",
         default=None,
-        help="the account name (default: PORTFOLIO_BOOTSTRAP_USERNAME)",
+        help=(
+            "the account name (default for a new account: PORTFOLIO_BOOTSTRAP_USERNAME); "
+            "with --replace, also renames the existing account"
+        ),
     )
     create.add_argument(
         "--replace",
         action="store_true",
-        help="replace the existing account and revoke its sessions (asks for confirmation)",
+        help=(
+            "set a new password on the existing account, keeping its name unless --username "
+            "is given, and sign out every session (asks for confirmation)"
+        ),
     )
     create.set_defaults(handler=create_user)
 

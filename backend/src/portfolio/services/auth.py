@@ -82,7 +82,11 @@ class SessionInvalidError(AuthError):
 
 
 class UserExistsError(AuthError):
-    """An account already exists and the caller did not ask to replace it."""
+    """An account exists and the caller did not ask to replace it, or several exist.
+
+    Several is only reachable through hand-written SQL, and `replace` refuses it rather
+    than choosing which account the operator meant.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,27 +330,85 @@ class AuthService:
         await self._sessions.delete_for_user(user.id)
         await self._session.commit()
 
-    async def create_user(self, username: str, password: str, *, replace: bool = False) -> None:
-        """Create the owner account, optionally replacing the one that is already there.
+    async def create_user(
+        self,
+        username: str,
+        password: str,
+        *,
+        replace: bool = False,
+        rename: bool = False,
+    ) -> str:
+        """Create the owner account, or with `replace` give the existing one a new credential.
+
+        Returns the account's username as it stands afterwards, which is the only way a
+        caller that did not rename can say which account it just changed.
 
         `replace` is the recovery path for a forgotten password: this product has no reset
         flow by design, and the runtime image carries no `sqlite3` binary, so without it a
-        forgotten password would mean a lost instance. The delete and the insert are one
-        transaction, and the delete cascades to the old account's sessions.
+        forgotten password would mean a lost instance.
+
+        **It replaces the credential, never the account.** The row is updated in place --
+        new hash, same `id` and `created_at` -- because every wallet, balance snapshot,
+        exchange account and fill hangs off that `id`. Deleting the user instead, as this
+        once did, cascaded through the wallets and their history, and would fail outright
+        against the fills' `RESTRICT`. An update is correct for every table that references
+        `users.id`, including the ones not written yet.
+
+        **`username` names a new account; it renames an existing one only with `rename`.**
+        The CLI always has a name to hand over, because creating an account needs one, and
+        when the operator gave none it is `PORTFOLIO_BOOTSTRAP_USERNAME`. A name that came
+        from a default is not a request to rename, and treating it as one renamed an
+        account called `alice` to `owner` in the middle of a password recovery. So the
+        decision is a separate argument, made by the one caller that knows whether the name
+        was typed, and it defaults to keeping the name: a caller that forgets it gets the
+        identity-preserving behaviour rather than the surprising one.
+
+        **Every session is revoked explicitly, in the same transaction.** An update fires no
+        cascade, so without the `delete_for_user` a stolen cookie would outlive the very
+        recovery meant to defeat it. It is what `change_password` does, for the same reason.
+
+        With no account, both modes create one: pointing the command at a fresh volume is
+        ordinary. With more than one -- which only hand-written SQL can produce, since this
+        method and `bootstrap_user` both refuse a second -- `replace` refuses and changes
+        nothing. Choosing one would be a guess about which owner is meant; the message says
+        how many there are and names none of them.
+
+        The password is hashed only once both refusals are behind it, so a refusal never
+        pays for an Argon2id hash.
         """
         ensure_meets_policy(password)
-        exists = await self._users.count() > 0
-        if exists and not replace:
+        accounts = await self._users.list_all()
+        if accounts and not replace:
             message = "An account already exists. Use --replace to replace it."
             raise UserExistsError(message)
-        if exists:
-            await self._users.delete_all()
-        await self._users.add(
-            username=username,
-            password_hash=self._hasher.hash(password),
-            created_at=self._clock(),
-        )
+        if len(accounts) > 1:
+            message = (
+                f"--replace found {len(accounts)} accounts and will not guess which one "
+                "to change. Nothing was changed."
+            )
+            raise UserExistsError(message)
+
+        password_hash = self._hasher.hash(password)
+        if accounts:
+            (owner,) = accounts
+            await self._users.set_credentials(
+                owner,
+                username=username if rename else owner.username,
+                password_hash=password_hash,
+            )
+            await self._sessions.delete_for_user(owner.id)
+        else:
+            owner = await self._users.add(
+                username=username,
+                password_hash=password_hash,
+                created_at=self._clock(),
+            )
+        # Read before the commit, so the answer does not depend on how the caller built its
+        # session: under `expire_on_commit=True` the attribute would reload lazily, and a
+        # lazy load on an `AsyncSession` raises rather than querying.
+        resulting_username = owner.username
         await self._session.commit()
+        return resulting_username
 
     async def bootstrap_user(self, username: str, password: str) -> bool:
         """Create the account from the bootstrap password, and report whether it did.

@@ -2,15 +2,21 @@
 
 The repository owns the queries and nothing else: no policy, no hashing, no clock. It is
 handed an `AsyncSession` and it does not commit -- the service that opened the unit of
-work decides when it ends, because `create-user --replace` deletes a user and inserts
-another and those two have to be one transaction or none.
+work decides when it ends, because `create-user --replace` changes the account's
+credential and revokes its sessions, and those two have to be one transaction or none.
+
+**Nothing here deletes an account.** Every row the owner has -- wallets, balance history,
+exchange accounts and their fills -- hangs off `users.id`, some by `ON DELETE CASCADE` and
+some by `RESTRICT`. A delete would either destroy that history or fail on it, so the one
+path that used to delete a user now updates it in place instead, and the query that did the
+deleting is gone rather than left for the next caller to find.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 
 from portfolio.db.models import User
 
@@ -49,6 +55,21 @@ class UserRepository:
         # fallback is here because the type says it can be and mypy is right to insist.
         return total or 0
 
+    async def list_all(self) -> list[User]:
+        """Every account, oldest first.
+
+        What `create-user` asks instead of `count()`, because it has to tell none, one and
+        more than one apart *and* have the one row in hand to update. A count answers only
+        the first half, so it would have to be followed by a fetch; this is both in one
+        query. The product allows a single account, so this is one row or none in every
+        database the application itself has written.
+
+        Ordered by the primary key only so that the result is deterministic. The order
+        does not say which account matters: when there are several, nothing picks one.
+        """
+        found = await self._session.scalars(select(User).order_by(User.id))
+        return list(found)
+
     async def add(self, *, username: str, password_hash: str, created_at: datetime) -> User:
         """Insert an account. The caller has already applied the password policy."""
         user = User(username=username, password_hash=password_hash, created_at=created_at)
@@ -61,12 +82,14 @@ class UserRepository:
         user.password_hash = password_hash
         await self._session.flush()
 
-    async def delete_all(self) -> None:
-        """Remove every account.
+    async def set_credentials(self, user: User, *, username: str, password_hash: str) -> None:
+        """Replace the username and the hash in place, keeping `id` and `created_at`.
 
-        The `ON DELETE CASCADE` on `sessions.user_id` takes every session with it, which
-        is why `create-user --replace` does not have to revoke anything by hand -- and is
-        also why the pragma that enables foreign keys is not optional.
+        Keeping the `id` is the point: it is what every wallet, snapshot and exchange
+        account refers to, so an update leaves all of them attached -- including rows in
+        tables that do not exist yet. It revokes nothing; the service does that explicitly,
+        because an update fires no cascade.
         """
-        await self._session.execute(delete(User))
+        user.username = username
+        user.password_hash = password_hash
         await self._session.flush()

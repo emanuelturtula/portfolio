@@ -1289,12 +1289,6 @@ it by returning a stale number that looks exactly like a fresh one, which is the
   marks the account `auth_failed` for that class and the key is not what failed; and decide,
   against the venue's documented receive window, whether it tolerates the transport's
   backoff or whether signed calls must be re-signed per attempt instead of replayed.
-- **`create-user --replace` and the fills' `ON DELETE RESTRICT`.** `--replace` deletes the
-  user row. `exchange_accounts` cascades from `users`, and `exchange_fills` restricts the
-  delete of an account that has fills, so once #15 writes the first fill, `--replace`
-  fails on a foreign key. Issue #69 owns the fix and **must land before #15**. The
-  `RESTRICT` stays: fills are the history a cost basis is computed from, and replacing a
-  login is not the place to decide to destroy it.
 - **Tuning settings.** Every number in the first table above is still a module constant.
   Promoting one to a `PORTFOLIO_PROVIDER_*` setting is a change an operator's measurement
   should drive, not a guess made before anything has ever made a request.
