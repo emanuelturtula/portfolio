@@ -19,6 +19,7 @@ from __future__ import annotations
 import inspect
 import itertools
 import sys
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
@@ -229,6 +230,118 @@ def test_the_secret_is_not_held_to_the_header_rule() -> None:
 
     assert credentials is not None
     assert credentials.api_secret.get_secret_value() == signing_key
+
+
+# --------------------------------------------------------------------------------------
+# No fragment of a credential in a startup refusal
+# --------------------------------------------------------------------------------------
+#
+# `str(ValidationError)` is what reaches stdout when the container refuses to start. Pydantic
+# used to echo the input dict in it and elide only the middle, so the start of the first
+# value and the last twenty or so characters of the last one survived: measured on #13 as a
+# Bitget secret's tail. A whole-value search cannot see a tail, so these tests search for
+# every five-character window of each credential.
+#
+# The sentinels are two letters repeated: obviously synthetic, low in entropy, and sharing no
+# five-character window with any variable name or with anything `config.py` could write --
+# which `test_the_window_sentinels_occur_nowhere_but_in_the_input` checks, so an absence
+# below cannot be an accident of spelling. They go through the environment, the path the Pi
+# takes, where pydantic's input dict holds the raw strings rather than `SecretStr`s.
+
+WINDOW: Final = 5
+KEY_WINDOW_SENTINEL: Final = "qzqzqzqzqzqzqzqzqzqzqzqz"
+SIGNING_WINDOW_SENTINEL: Final = "vxvxvxvxvxvxvxvxvxvxvxvx"
+PHRASE_WINDOW_SENTINEL: Final = "jwjwjwjwjwjwjwjwjwjwjwjw"
+WINDOW_SENTINELS: Final = {
+    KEY_VARIABLE: KEY_WINDOW_SENTINEL,
+    SIGNING_KEY_VARIABLE: SIGNING_WINDOW_SENTINEL,
+    PHRASE_VARIABLE: PHRASE_WINDOW_SENTINEL,
+}
+CONFIG_SOURCE: Final = Path(inspect.getfile(Settings))
+
+
+def windows(value: str) -> set[str]:
+    """Every run of `WINDOW` characters in `value`."""
+    return {value[start : start + WINDOW] for start in range(len(value) - WINDOW + 1)}
+
+
+def leaked_windows(rendered: str) -> list[str]:
+    """Each sentinel window found in `rendered`, case-insensitively."""
+    lowered = rendered.lower()
+    return sorted(
+        window
+        for sentinel in WINDOW_SENTINELS.values()
+        for window in windows(sentinel)
+        if window in lowered
+    )
+
+
+def test_the_window_sentinels_occur_nowhere_but_in_the_input() -> None:
+    """The premise: a window found in a refusal can only have come from the input."""
+    text = " ".join([*ALL_VARIABLES, "PORTFOLIO_KASPA_API_URL"]).lower()
+    source = CONFIG_SOURCE.read_text(encoding="utf-8").lower()
+
+    for sentinel in WINDOW_SENTINELS.values():
+        assert len(sentinel) > 20, "long enough that a truncated tail would still be a window"
+        for window in windows(sentinel):
+            assert window not in text
+            assert window not in source
+
+
+#: Each refusal, as the environment it is raised from. `None` unsets a variable.
+REFUSALS: Final[dict[str, dict[str, str | None]]] = {
+    "a partial set": {PHRASE_VARIABLE: None},
+    "a blank key": {KEY_VARIABLE: ""},
+    "a key no header can carry": {KEY_VARIABLE: KEY_WINDOW_SENTINEL + " "},
+    "a passphrase no header can carry": {PHRASE_VARIABLE: PHRASE_WINDOW_SENTINEL + "\n"},
+    "an unrelated refusal, all three configured": {"PORTFOLIO_KASPA_API_URL": "not a url"},
+}
+
+#: The variable each refusal must name.
+NAMED: Final = {
+    "a partial set": PHRASE_VARIABLE,
+    "a blank key": KEY_VARIABLE,
+    "a key no header can carry": KEY_VARIABLE,
+    "a passphrase no header can carry": PHRASE_VARIABLE,
+    "an unrelated refusal, all three configured": "PORTFOLIO_KASPA_API_URL",
+}
+
+
+@pytest.mark.parametrize("case", list(REFUSALS))
+def test_no_window_of_a_credential_reaches_a_startup_refusal(
+    case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`str` and `repr` of the refusal carry no five-character run of any credential.
+
+    The last case is the one production will actually meet: every credential configured
+    correctly and something else wrong, so the input echoed is the whole good set.
+
+    The positive companion is `errors()`, which still carries the input (pinned in
+    `tests/providers/test_provider_urls.py`): it proves the sentinels were in what pydantic
+    was given, so their absence from `str` is the redaction and not an empty input.
+    """
+    environment: dict[str, str | None] = {**WINDOW_SENTINELS, **REFUSALS[case]}
+    for variable, value in environment.items():
+        if value is None:
+            monkeypatch.delenv(variable, raising=False)
+        else:
+            monkeypatch.setenv(variable, value)
+
+    with pytest.raises(ValidationError) as caught:
+        Settings()
+
+    rendered = f"{caught.value}\n{caught.value!r}"
+    assert NAMED[case] in str(caught.value)
+    assert leaked_windows(rendered) == []
+    structured = repr(caught.value.errors())
+    carried = [
+        sentinel
+        for variable, sentinel in WINDOW_SENTINELS.items()
+        if sentinel in (environment[variable] or "")
+    ]
+    assert carried, "the case sets no sentinel at all, so the absence above proves nothing"
+    for sentinel in carried:
+        assert sentinel in structured, "a sentinel never reached pydantic's input"
 
 
 # --------------------------------------------------------------------------------------

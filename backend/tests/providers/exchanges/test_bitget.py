@@ -15,6 +15,7 @@ test at the end, where thousands of generated bodies make a round trip through H
 
 from __future__ import annotations
 
+import gzip
 import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -90,6 +91,7 @@ from tests.providers.exchanges.bitget_harness import (
     VenueFill,
     bitget_client,
     bitget_provider,
+    envelope,
     error_body,
     fetch_page,
     fills_body,
@@ -821,7 +823,6 @@ class TickingClock:
         pytest.param('"00000"', id="a string"),
         pytest.param('{"code":"00000","msg":"success","requestTime":1}', id="no data"),
         pytest.param('{"code":"00000","msg":"success","data":{}}', id="data an object"),
-        pytest.param('{"code":"00000","msg":"success","data":null}', id="data null"),
         pytest.param('{"code":0,"msg":"success","data":[]}', id="code a number"),
         pytest.param('{"msg":"success","data":[]}', id="no code"),
         pytest.param('{"code":"00000","data":[1]}', id="a fill that is not an object"),
@@ -835,6 +836,83 @@ async def test_a_success_status_with_a_body_of_the_wrong_shape_is_a_schema_error
 
     assert type(error) is ExchangeSchemaError
     assert error.__cause__ is None
+
+
+@pytest.mark.parametrize("cursor", [None, "7654321"], ids=["first page", "with a cursor"])
+async def test_a_null_data_on_the_fills_call_is_an_empty_page(cursor: str | None) -> None:
+    """A success saying "no fills" as `null` rather than `[]` is still "no fills".
+
+    An empty page: nothing to page after, and no symbol to ask about.
+    """
+    fake = FakeBitget(fill_replies=[Reply(body=envelope("null"))])
+
+    page = await fetch_page(fake, cursor=cursor)
+
+    assert page.fills == ()
+    assert page.next_cursor is None
+    assert fake.symbol_requests == []
+    assert len(fake.fill_requests) == 1, "the positive companion: the page was fetched"
+
+
+async def test_a_null_data_on_the_symbol_call_is_still_refused() -> None:
+    """The symbol call asked about one symbol; `null` is not an answer about it."""
+    fake = FakeBitget(spread_fills(1), symbol_replies=[Reply(body=envelope("null"))])
+
+    error = await refused(fake)
+
+    assert type(error) is ExchangeSchemaError
+    assert len(fake.symbol_requests) == 1
+
+
+# -- a body the client cannot decode -----------------------------------------------------
+#
+# `httpx.DecodingError` is raised by the client reading a body whose `Content-Encoding` it
+# does not honour -- above the transport, so only a test through `build_http_client` sees
+# it -- and it is not an `httpx.TransportError`, so the provider's transport clause does not
+# catch it. It is the venue's (or a proxy's) garbage, on the way to us: unavailable.
+
+UNDECODABLE: Final = b"this is not a compressed body"
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate"])
+@pytest.mark.parametrize("status", [200, 500])
+@pytest.mark.parametrize("call", ["fills", "symbol"])
+async def test_a_body_that_does_not_decompress_is_unavailable_and_carries_nothing(
+    call: str, status: int, encoding: str
+) -> None:
+    reply = Reply(status=status, headers={"Content-Encoding": encoding}, wire=UNDECODABLE)
+    if call == "fills":
+        fake = FakeBitget(fill_replies=[reply])
+    else:
+        fake = FakeBitget(spread_fills(1), symbol_replies=[reply])
+
+    error = await refused(fake)
+
+    assert type(error) is ExchangeUnavailableError
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    requests = fake.fill_requests if call == "fills" else fake.symbol_requests
+    assert requests, "the positive companion: the call was made"
+
+
+async def test_a_body_that_does_decompress_is_read() -> None:
+    """The companion: the same encoding header over a real gzip body parses as usual."""
+    body = gzip.compress(fills_body(spread_fills(2)).encode("ascii"))
+    fake = FakeBitget(fill_replies=[Reply(headers={"Content-Encoding": "gzip"}, wire=body)])
+
+    page = await fetch_page(fake)
+
+    assert len(page.fills) == 2
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate"])
+def test_the_undecodable_body_is_what_httpx_refuses(encoding: str) -> None:
+    """The premise: httpx's own decoder refuses these bytes, with an error no transport
+    clause catches. (`Response(content=...)` decodes eagerly, which is why the fake streams.)
+    """
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(200, headers={"Content-Encoding": encoding}, content=UNDECODABLE)
+    assert not issubclass(httpx.DecodingError, httpx.TransportError)
 
 
 # --------------------------------------------------------------------------------------

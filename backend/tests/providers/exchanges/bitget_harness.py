@@ -61,7 +61,7 @@ from portfolio.providers.exchanges.credentials import Credentials
 from tests.providers.harness import RecordingSleep, retrying_client
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
     from portfolio.providers.exchanges.base import FillPage
 
@@ -302,18 +302,43 @@ class Order(StrEnum):
     SHUFFLED = "shuffled"
 
 
+class WireStream(httpx.AsyncByteStream):
+    """A body handed to the client as raw bytes off the wire, still encoded.
+
+    `httpx.Response(content=...)` reads -- and so decodes -- its body in the constructor,
+    which would raise a `Content-Encoding` failure inside the fake instead of where a real
+    one arises: in the client, reading the body, above every transport. A stream that is not
+    an `httpx.ByteStream` is left for the client to read, as a socket's would be.
+    """
+
+    def __init__(self, raw: bytes) -> None:
+        self._raw = raw
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._raw
+
+
 @dataclass(frozen=True, slots=True)
 class Reply:
-    """One scripted answer: a status, a body and headers, or an exception to raise."""
+    """One scripted answer: a status, a body and headers, or an exception to raise.
+
+    `wire`, when given, is sent instead of `body` as raw, still-encoded bytes (`WireStream`),
+    so a test can script a `Content-Encoding` the body does not honour.
+    """
 
     status: int = 200
     body: str = ""
     headers: Mapping[str, str] = field(default_factory=dict)
     error: BaseException | None = None
+    wire: bytes | None = None
 
     def respond(self) -> httpx.Response:
         if self.error is not None:
             raise self.error
+        if self.wire is not None:
+            return httpx.Response(
+                self.status, headers=dict(self.headers), stream=WireStream(self.wire)
+            )
         return httpx.Response(self.status, headers=dict(self.headers), content=self.body)
 
 
