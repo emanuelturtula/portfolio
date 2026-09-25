@@ -39,11 +39,27 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
  * `type` defaults to `about:blank`, as the RFC prescribes, when the server
  * omits it.
  */
+/**
+ * One entry of a 422's `errors` array that survived the defensive parse in
+ * {@link readProblem}: `loc` is an array of strings and `msg` is a string. `loc`'s last
+ * element is the field name for a body field, e.g. `["body", "address"]`.
+ */
+export interface FieldError {
+  readonly loc: readonly string[];
+  readonly msg: string;
+}
+
 export interface ProblemDetails {
   readonly type: string;
   readonly title: string;
   readonly status: number;
   readonly detail?: string | undefined;
+  /**
+   * Field-level validation errors, present only for a 422 whose body carried a well-formed
+   * `errors` array. `undefined` when the body has no `errors` member at all, or when that
+   * member is not an array; an array (possibly empty) when it is - see {@link readErrors}.
+   */
+  readonly errors?: readonly FieldError[] | undefined;
 }
 
 /** Error thrown for any non-OK API response, carrying the problem document. */
@@ -236,6 +252,7 @@ async function readProblem(response: Response): Promise<ReadProblemResult> {
       title: readString(body, 'title') ?? fallbackTitle,
       status: typeof status === 'number' ? status : response.status,
       detail: readString(body, 'detail'),
+      errors: readErrors(body),
     },
     hasProblemDocument: true,
   };
@@ -248,4 +265,40 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function readString(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
   return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Parses `body.errors` into {@link FieldError}s, keeping only entries whose `loc` is an
+ * array of strings and whose `msg` is a string - `errors()`'s own shape can carry a
+ * numeric `loc` element (an index into a list field), which no field this API refuses
+ * ever produces, and a malformed entry here must not crash the page that renders it.
+ *
+ * Returns `undefined` when `body.errors` is missing or is not an array at all; returns an
+ * array - empty if every entry was malformed - when it is. That distinction is what lets a
+ * caller tell "the server sent no errors array" apart from "it sent one, and none of it
+ * could be trusted".
+ */
+function readErrors(body: Record<string, unknown>): FieldError[] | undefined {
+  const raw = body.errors;
+
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+
+  const errors: FieldError[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const { loc, msg } = entry;
+    if (
+      Array.isArray(loc) &&
+      loc.every((part): part is string => typeof part === 'string') &&
+      typeof msg === 'string'
+    ) {
+      errors.push({ loc, msg });
+    }
+  }
+
+  return errors;
 }

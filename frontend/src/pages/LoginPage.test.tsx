@@ -4,6 +4,7 @@ import { delay, http, HttpResponse } from 'msw';
 import { useNavigate } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { fakePortfolio } from '@/test/fakePortfolio';
 import { currentPath, renderApp, settle, visitedPaths } from '@/test/render';
 import {
   fakeSession,
@@ -56,6 +57,10 @@ vi.mock('react-router-dom', async (importOriginal) => {
 
 beforeEach(() => {
   imperativeNavigations.length = 0;
+  // Signing in lands on the dashboard, which reads the portfolio. An empty one
+  // is the first-time owner, and it keeps those reads answered rather than
+  // failing as unhandled requests that put a second alert on the page.
+  server.use(...fakePortfolio().handlers);
 });
 
 const PROBE_LABEL = 'probe: navigate imperatively';

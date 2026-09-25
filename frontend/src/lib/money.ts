@@ -149,6 +149,42 @@ function trimTrailingZeros(fraction: string, minimumDigits: number): string {
   return fraction.slice(0, end);
 }
 
+/** A plain integer: optional sign, digits only - no fractional part, no exponent. */
+const INTEGER_PATTERN = /^-?\d+$/;
+
+/**
+ * Converts an integer count of base units (satoshis, sompi) into a decimal quantity of the
+ * asset, given how many decimals it uses.
+ *
+ * Implemented as a string shift, deliberately not `Decimal#dividedBy`: that method rounds
+ * its result to the module's 40-digit precision, so a base-unit string longer than 40
+ * digits would come back silently rounded - unreachable from the backend today, where base
+ * units are a SQLite `INTEGER` capped at 19 digits, but this module's whole reason to exist
+ * is not depending on a caller staying inside a limit it does not enforce. Moving the
+ * decimal point across the string is exact at any length and needs no `Decimal` at all.
+ *
+ * `units` may carry a leading `-`, because `pending` is a signed amount.
+ *
+ * @throws {TypeError} When `units` is not a plain integer string.
+ */
+export function fromBaseUnits(units: string, decimals: number): Money {
+  if (!INTEGER_PATTERN.test(units)) {
+    throw new TypeError(`"${units}" is not a valid base-unit integer.`);
+  }
+
+  const negative = units.startsWith('-');
+  const digits = negative ? units.slice(1) : units;
+  // Padded so there is always at least one digit before the split point, even when `units`
+  // has fewer digits than `decimals` - e.g. "12" at 5 decimals becomes "0.00012".
+  const padded = digits.padStart(decimals + 1, '0');
+  const splitAt = padded.length - decimals;
+  const whole = padded.slice(0, splitAt);
+  const fraction = padded.slice(splitAt);
+  const unsigned = fraction.length > 0 ? `${whole}.${fraction}` : whole;
+
+  return money(negative ? `-${unsigned}` : unsigned);
+}
+
 /** Adds two {@link Money} values with no precision loss and returns another. */
 export function addMoney(a: Money, b: Money): Money {
   // `toString` (and `toJSON`/`valueOf`) switch to exponential notation once the

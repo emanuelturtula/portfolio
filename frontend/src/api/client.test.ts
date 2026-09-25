@@ -159,6 +159,163 @@ describe('apiFetch', () => {
   });
 });
 
+/**
+ * The 422 `errors` array `api/errors.py` renders: `{loc, msg, type}` with
+ * `loc = ["body", "<field>"]`. The page maps it onto form fields, so what
+ * survives the parse decides which input an error lands under.
+ */
+describe('problem.errors', () => {
+  /** Fails a POST with a 422 whose body carries `errors` and returns the ApiError. */
+  async function refusedWith(errors: unknown): Promise<ApiError> {
+    server.use(
+      http.post('/api/wallets', () =>
+        HttpResponse.json(
+          {
+            type: 'about:blank',
+            title: 'Unprocessable Entity',
+            status: 422,
+            detail: 'The request parameters failed validation.',
+            instance: '/api/wallets',
+            errors,
+          },
+          { status: 422, headers: { 'content-type': 'application/problem+json' } },
+        ),
+      ),
+    );
+
+    const rejection = await captureRejection(
+      apiFetch('/api/wallets', { method: 'POST', body: { chain_key: 'bitcoin', address: 'x' } }),
+    );
+    expect(rejection).toBeInstanceOf(ApiError);
+    return rejection as ApiError;
+  }
+
+  it('keeps a well-formed errors array', async () => {
+    const error = await refusedWith([
+      { loc: ['body', 'address'], msg: 'The checksum does not match.', type: 'bad_checksum' },
+      {
+        loc: ['body', 'label'],
+        msg: 'String should have at most 100 characters',
+        type: 'string_too_long',
+      },
+    ]);
+
+    expect(error.status).toBe(422);
+    expect(error.problem.errors).toEqual([
+      { loc: ['body', 'address'], msg: 'The checksum does not match.' },
+      { loc: ['body', 'label'], msg: 'String should have at most 100 characters' },
+    ]);
+    // The standard members are still there alongside it.
+    expect(error.problem.detail).toBe('The request parameters failed validation.');
+  });
+
+  it('keeps the order the server sent', async () => {
+    const error = await refusedWith([
+      { loc: ['body', 'label'], msg: 'second field first', type: 't' },
+      { loc: ['body', 'address'], msg: 'first field second', type: 't' },
+    ]);
+
+    expect(error.problem.errors?.map((entry) => entry.msg)).toEqual([
+      'second field first',
+      'first field second',
+    ]);
+  });
+
+  it('drops malformed errors entries', async () => {
+    const error = await refusedWith([
+      { loc: ['body', 'address'], msg: 'kept', type: 'ok' },
+      // A numeric location element: an index into a list field.
+      { loc: ['body', 0], msg: 'numeric loc', type: 'x' },
+      // `loc` that is not an array.
+      { loc: 'body.address', msg: 'string loc', type: 'x' },
+      // `msg` that is not a string.
+      { loc: ['body', 'address'], msg: 42, type: 'x' },
+      // Members missing entirely.
+      { loc: ['body', 'address'] },
+      { msg: 'no loc' },
+      // Not an object at all.
+      'a bare string',
+      null,
+      ['body', 'address'],
+      42,
+      { loc: ['body', 'label'], msg: 'also kept', type: 'ok' },
+    ]);
+
+    // Dropped one at a time, not all or nothing: one bad entry must not take
+    // a good field error down with it.
+    expect(error.problem.errors).toEqual([
+      { loc: ['body', 'address'], msg: 'kept' },
+      { loc: ['body', 'label'], msg: 'also kept' },
+    ]);
+  });
+
+  it('keeps an empty location as an empty location', async () => {
+    // `[]` is an array of strings, vacuously. It maps onto no field, which is
+    // the page's concern; the parse must not invent one.
+    const error = await refusedWith([{ loc: [], msg: 'somewhere', type: 'x' }]);
+
+    expect(error.problem.errors).toEqual([{ loc: [], msg: 'somewhere' }]);
+  });
+
+  it('gives an empty array when every entry is malformed', async () => {
+    const error = await refusedWith([{ loc: 7, msg: null }]);
+
+    expect(error.problem.errors).toEqual([]);
+  });
+
+  it.each([
+    ['an object', { address: 'The checksum does not match.' }],
+    ['a string', 'The checksum does not match.'],
+    ['null', null],
+  ])('ignores an errors member that is %s', async (_label, errors) => {
+    const error = await refusedWith(errors);
+
+    expect(error.problem.errors).toBeUndefined();
+    expect(error.problem.detail).toBe('The request parameters failed validation.');
+  });
+
+  it('has no errors when the problem document carries none', async () => {
+    server.use(
+      http.post('/api/wallets', () =>
+        HttpResponse.json(
+          {
+            type: 'about:blank',
+            title: 'Conflict',
+            status: 409,
+            detail: 'This address is already registered for this chain.',
+          },
+          { status: 409, headers: { 'content-type': 'application/problem+json' } },
+        ),
+      ),
+    );
+
+    const rejection = await captureRejection(
+      apiFetch('/api/wallets', { method: 'POST', body: {} }),
+    );
+
+    expect((rejection as ApiError).problem.errors).toBeUndefined();
+  });
+
+  it('does not copy the extra members of an entry', async () => {
+    // Pydantic can echo the rejected `input` back in an entry. The backend
+    // does not send it for an address, and if it ever did, the parse is what
+    // keeps it off the page.
+    const error = await refusedWith([
+      {
+        loc: ['body', 'address'],
+        msg: 'The checksum does not match.',
+        type: 'bad_checksum',
+        input: 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx',
+      },
+    ]);
+
+    expect(error.problem.errors).toEqual([
+      { loc: ['body', 'address'], msg: 'The checksum does not match.' },
+    ]);
+    expect(JSON.stringify(error.problem)).not.toContain('tb1qw508');
+  });
+});
+
 describe('apiSend', () => {
   it('resolves without a body on 204', async () => {
     server.use(http.post(LOGOUT_PATH, () => new HttpResponse(null, { status: 204 })));
