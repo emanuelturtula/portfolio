@@ -108,6 +108,7 @@ __all__ = [
     "ENDPOINT_LABELS",
     "HTTP_ERROR_FLOOR",
     "IDEMPOTENT_EXTENSION",
+    "MAX_HEADER_DIGITS",
     "NODE_HEALTH",
     "RETRYABLE_STATUSES",
     "UNLABELLED",
@@ -318,6 +319,25 @@ DEFAULT_TIMEOUT: Final = httpx.Timeout(
 
 HTTP_ERROR_FLOOR: Final = 400
 """The status at and above which a response is a failure worth logging at error."""
+
+MAX_HEADER_DIGITS: Final = 10
+"""The longest run of digits a `Retry-After` or `ratelimit-*` value may have and still be read.
+
+**A bound this application chooses, the same on every platform**, rather than the one the
+interpreter happens to impose. Before it existed, `"1" * 5000` passed the `isascii()` and
+`isdigit()` grammar check and then reached `int()`, which refuses a string of more than
+4300 digits with a bare `ValueError` (CPython's integer conversion limit, which is per
+process and settable by environment). `parse_rate_limit` runs on **every** response inside
+`RetryingTransport`, through `HostRateLimiter.observe`, so one header of that shape from any
+vendor made `client.get` itself raise a `ValueError` -- past every provider's
+`except httpx.TransportError`, past chain `health()`, whose contract is that it never raises,
+and outside the seven exchange error classes. Measured on #13.
+
+Ten, because ten digits of seconds is over three hundred years and ten digits of a request
+budget is ten billion: no real value is longer. A longer run is treated exactly as any other
+unusable value -- as absent -- which is the rule both parsers already state for a header they
+cannot read.
+"""
 
 RETRYABLE_STATUSES: Final = frozenset({429, *range(500, 600)})
 """429 and every 5xx, and nothing else.
@@ -540,8 +560,18 @@ def _delay_seconds_ms(candidate: str) -> int | None:
 
     `isascii()` before `isdigit()`: see `parse_retry_after` for the two Unicode digits
     that make the difference between a crash and a wrong answer.
+
+    **A run longer than `MAX_HEADER_DIGITS` is not one either**, and the length is checked
+    before `int()` sees the string: five thousand digits is valid `1*DIGIT` and used to
+    reach `int()`, which refused it with a bare `ValueError` out of the transport. See
+    `MAX_HEADER_DIGITS`.
     """
-    if not candidate or not candidate.isascii() or not candidate.isdigit():
+    if (
+        not candidate
+        or len(candidate) > MAX_HEADER_DIGITS
+        or not candidate.isascii()
+        or not candidate.isdigit()
+    ):
         return None
     return int(candidate) * MILLISECONDS_PER_SECOND
 
@@ -671,12 +701,22 @@ def _rate_limit_value(headers: httpx.Headers, name: str) -> int | None:
     cheerfully returns 2. It also settles the signed and fractional spellings -- `"-1"`,
     `"+1"` and `"1.5"` are none of them a run of digits, so all three are ignored, which
     is what "a negative or non-numeric value is ignored" means in practice.
+
+    **So is a run longer than `MAX_HEADER_DIGITS`**, checked before `int()` sees it. This
+    function runs on every response the transport receives, so a five-thousand-digit value
+    here used to turn *any* response -- a 200 included -- into a bare `ValueError` out of
+    `client.get`, by way of `int()`'s 4300-digit limit. See `MAX_HEADER_DIGITS`.
     """
     value = headers.get(name)
     if value is None:
         return None
     candidate = value.strip()
-    if not candidate or not candidate.isascii() or not candidate.isdigit():
+    if (
+        not candidate
+        or len(candidate) > MAX_HEADER_DIGITS
+        or not candidate.isascii()
+        or not candidate.isdigit()
+    ):
         return None
     return int(candidate)
 
