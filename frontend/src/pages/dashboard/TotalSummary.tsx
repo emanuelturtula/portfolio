@@ -85,7 +85,7 @@ export function TotalSummary({ data, settledRun, freshnessKnown }: TotalSummaryP
       <h2 id="total-heading">Total value</h2>
       <p className="total-amount">
         {!data.complete && !anyValued ? (
-          'Not available yet'
+          '—'
         ) : (
           <>
             <Money value={money(data.total)} options={FIAT_OPTIONS} /> {data.quote_currency}
