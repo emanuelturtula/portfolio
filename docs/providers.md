@@ -1272,8 +1272,7 @@ Bitget has two account systems, and an API key belongs to one of them.
 - **The owner's account was confirmed Classic on 2026-09-25**, from the app: separate Spot,
   Futures and Margin tabs, and a banner offering the upgrade.
 
-So v2 is right for this owner, and v2 is all this provider speaks. UTA support is a follow-up
-issue, and `docs/operations.md` section 12 tells the operator not to accept the upgrade.
+So v2 is right for this owner, and v2 is all this provider speaks. UTA support is #76, and `docs/operations.md` section 12 tells the operator not to accept the upgrade.
 
 The three sources below were read on 2026-09-25 by the tech lead for spec 014, not re-read
 for this section; everything else in this section was:
@@ -1533,8 +1532,7 @@ it by returning a stale number that looks exactly like a fresh one, which is the
 - **Bitget on a Unified Trading Account.** The provider speaks the Classic v2 API only, which
   is right for the owner's Classic account. `GET /api/v3/trade/fills` differs in its cursor,
   its window, its rate and its field names, so supporting a UTA account is a second provider
-  or a second mode, written from its own documentation. A follow-up issue, filed with #13's
-  pull request. Until then the operator keeps the account Classic (`docs/operations.md`
+  or a second mode, written from its own documentation. That is #76. Until then the operator keeps the account Classic (`docs/operations.md`
   section 12).
 - **The Bitget provider has never met its venue.** Like CoinGecko's parser, it is written
   from documentation, because measuring a signed endpoint needs a key this repository must

@@ -640,7 +640,7 @@ which you made no trades: nothing would fail, the sync would move on, and once t
 aged past Bitget's 90-day retention the trades would be gone for good. That is one more
 reason not to accept the upgrade. The application refuses the one undocumented empty shape it
 can recognise, a `null` in place of the list of fills, but it cannot tell a documented empty
-list from a real one. Support for UTA is a follow-up issue.
+list from a real one. Support for UTA is #76.
 
 Two facts from Bitget's documentation, read on 2026-09-25:
 

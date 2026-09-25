@@ -84,7 +84,7 @@ the upgrade.
 
 | Not here | Where it belongs |
 |---|---|
-| UTA (`/api/v3/trade/fills`) | a follow-up issue, filed with the pull request |
+| UTA (`/api/v3/trade/fills`) | #76 |
 | BGB fee deduction (`feeDetail.deduction` other than `"no"`) | refused loudly here; supported when a real fill shows what the fields mean |
 | calling the provider from anything: sync, scheduler, checkpoints, `exchange_accounts` rows | #15 |
 | detecting a trade id that collides across windows | #15 (see Handed on) |
@@ -612,7 +612,7 @@ writes them into the docs.**
   incoming fill's is a collision, not a re-sync, and should raise rather than drop the second
   fill. That covers a venue whose trade ids turn out not to be one sequence per account,
   whichever venue it is.
-- **A follow-up issue for UTA** (`GET /api/v3/trade/fills`), filed with the pull request.
+- **#76:** UTA (`GET /api/v3/trade/fills`).
 - **#75:** `httpx.DecodingError` in the chain and price providers.
 - **#14:** `MAX_HEADER_DIGITS` is ten, so a 13-digit epoch-millisecond `x-ratelimit-reset`, a
   shape some venues use, is now read as absent where it used to cause a 30-second pause.

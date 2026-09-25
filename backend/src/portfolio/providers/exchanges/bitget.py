@@ -37,7 +37,7 @@ What they say, and what this module relies on:
   ties no code to an HTTP status.
 * Classic is the account system this API serves. A Unified Trading Account reads fills from
   `GET /api/v3/trade/fills` instead, and the owner's account was confirmed Classic on
-  2026-09-25; `docs/providers.md` records the finding, and UTA support is a follow-up.
+  2026-09-25; `docs/providers.md` records the finding, and UTA support is #76.
 
 **None of this has met the real venue.** Measuring a signed endpoint needs a key, and rule 3
 keeps every key out of this repository. The owner's first sync is the first measurement, and
