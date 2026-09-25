@@ -421,7 +421,11 @@ describe('freshnessMessage', () => {
 
   it.each([
     ['never_synced', NEVER_SYNCED_MESSAGE, /^No sync has finished yet\.$/],
-    ['interrupted', INTERRUPTED_MESSAGE, /interrupted/i],
+    [
+      'interrupted',
+      INTERRUPTED_MESSAGE,
+      /^The last sync was interrupted before it read this wallet\.$/,
+    ],
     ['not_covered', NOT_COVERED_MESSAGE, /not covered by the last sync/i],
   ] as const)('explains %s', (status, constant, pattern) => {
     expect(freshnessMessage({ status })).toBe(constant);

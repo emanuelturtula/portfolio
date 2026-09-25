@@ -1,4 +1,5 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
+import type { QueryClient } from '@tanstack/react-query';
 import userEvent, { type UserEvent } from '@testing-library/user-event';
 import { http, HttpResponse, type HttpHandler } from 'msw';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -46,6 +47,8 @@ function threeWallets(): WalletResponse[] {
 interface Setup {
   readonly user: UserEvent;
   readonly fake: FakePortfolio;
+  /** The shipped query client the page runs on, for a refetch the page did not ask for. */
+  readonly queryClient: QueryClient;
 }
 
 /**
@@ -64,9 +67,9 @@ function openWalletsPage(
   server.use(...fakeSession({ initialUser: TEST_USERNAME }).handlers, ...fake.handlers);
   server.use(...overrides);
 
-  renderApp(['/wallets']);
+  const { queryClient } = renderApp(['/wallets']);
 
-  return { user, fake };
+  return { user, fake, queryClient };
 }
 
 /** An empty registry, with the page loaded and the form ready. */
@@ -110,6 +113,15 @@ async function rowFor(text: string): Promise<HTMLElement> {
     throw new Error(`No wallet row contains "${text}". List was: ${list.textContent}`);
   }
 
+  return row;
+}
+
+/** The list item for `label`, found synchronously. */
+function rowOf(label: string): HTMLElement {
+  const row = screen.getByText(label).closest('li');
+  if (row === null) {
+    throw new Error(`"${label}" is not inside a list item.`);
+  }
   return row;
 }
 
@@ -906,6 +918,236 @@ describe('WalletsPage: field errors', () => {
   });
 });
 
+/**
+ * Round 3, A. An archive or restore takes a round trip; the owner is free to
+ * move on while it runs. When it settles, focus may only move if it is still
+ * where the action left it - on the page itself, or inside the acted-on row.
+ * Anywhere else, the owner put it there, and moving it loses their keystrokes.
+ */
+describe('WalletsPage: focus after a slow archive or restore', () => {
+  /** Opens the page with Cold storage and Spending active, and Old exchange archived. */
+  async function openWithThree(showArchived: boolean): Promise<Setup> {
+    const setup = openWalletsPage({
+      wallets: [
+        wallet({ id: 1, address: ADDRESSES.btcSegwit, label: 'Cold storage' }),
+        wallet({ id: 2, address: ADDRESSES.btcLegacy, label: 'Spending' }),
+        wallet({ id: 4, address: ADDRESSES.btcScript, label: 'Old exchange', archived: true }),
+      ],
+    });
+    await walletList();
+    if (showArchived) {
+      await setup.user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+      await screen.findByRole('button', { name: 'Restore Old exchange' });
+    }
+    return setup;
+  }
+
+  /** Types into the address field, then checks nothing typed was lost. */
+  async function expectTypingSurvives(user: UserEvent, before: string): Promise<void> {
+    await settle();
+    expect(addressInput()).toHaveFocus();
+    await user.keyboard('w508');
+    expect(addressInput()).toHaveValue(`${before}w508`);
+    expect(addressInput()).toHaveFocus();
+  }
+
+  it('an archive settling in the active view leaves focus in the address field', async () => {
+    const { user, fake } = await openWithThree(false);
+    const release = fake.hold('archive');
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    await user.click(addressInput());
+    await user.keyboard('tb1q');
+    release();
+
+    await waitFor(() => {
+      expect(screen.queryByText('Cold storage')).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole('heading', { name: 'Your wallets' })).not.toHaveFocus();
+    await expectTypingSurvives(user, 'tb1q');
+  });
+
+  it('an archive settling with archived shown leaves focus in the address field', async () => {
+    const { user, fake } = await openWithThree(true);
+    const release = fake.hold('archive');
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    await user.click(addressInput());
+    await user.keyboard('tb1q');
+    release();
+
+    expect(await screen.findByRole('button', { name: 'Restore Cold storage' })).not.toHaveFocus();
+    await expectTypingSurvives(user, 'tb1q');
+  });
+
+  it('a restore settling leaves focus in the address field', async () => {
+    const { user, fake } = await openWithThree(true);
+    const release = fake.hold('restore');
+
+    await user.click(screen.getByRole('button', { name: 'Restore Old exchange' }));
+    await user.click(addressInput());
+    await user.keyboard('tb1q');
+    release();
+
+    expect(await screen.findByRole('button', { name: 'Archive Old exchange' })).not.toHaveFocus();
+    await expectTypingSurvives(user, 'tb1q');
+  });
+
+  it('turning on Show archived during an archive leaves focus on the checkbox', async () => {
+    const { user, fake } = await openWithThree(false);
+    const release = fake.hold('archive');
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    const toggle = screen.getByRole('checkbox', { name: 'Show archived' });
+    await user.click(toggle);
+    release();
+
+    expect(await screen.findByRole('button', { name: 'Restore Cold storage' })).toBeVisible();
+    await settle();
+    expect(toggle).toHaveFocus();
+    expect(screen.getByRole('heading', { name: 'Your wallets' })).not.toHaveFocus();
+  });
+
+  it('an archive settling after Show archived was turned on does not send focus to the heading', async () => {
+    // The archive was confirmed in the active view, then the owner turned on
+    // Show archived and clicked away. When it settles the row stays listed, so
+    // "the row left, focus the heading" is decided from the view as it was at
+    // click time - stale. Focus is on the page, so the no-steal rule does not
+    // hide the mistake.
+    const { user, fake } = await openWithThree(false);
+    const release = fake.hold('archive');
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+    await screen.findByRole('button', { name: 'Restore Old exchange' });
+    await user.click(screen.getByRole('heading', { name: 'Portfolio', level: 1 }));
+    release();
+
+    expect(await screen.findByRole('button', { name: 'Restore Cold storage' })).toBeVisible();
+    await settle();
+    expect(screen.getByRole('heading', { name: 'Your wallets' })).not.toHaveFocus();
+  });
+
+  it('a hand-off armed by an archive and triggered later still does not steal focus', async () => {
+    // With archived shown, the archive is answered 204 but the server state
+    // does not change (a repeat, or another session restored it first), so the
+    // refetch shows no flip and the hand-off stays armed. The owner moves on
+    // and types an address. When the row does flip later - here, another
+    // session archives it and an out-of-band refetch shows that - the armed
+    // hand-off fires. Whether it may move focus is decided then, not when it
+    // was armed.
+    const { user, fake, queryClient } = openWalletsPage(
+      {
+        wallets: [
+          wallet({ id: 1, address: ADDRESSES.btcSegwit, label: 'Cold storage' }),
+          wallet({ id: 2, address: ADDRESSES.btcLegacy, label: 'Spending' }),
+        ],
+      },
+      [http.delete(WALLET_PATH, () => new HttpResponse(null, { status: 204 }))],
+    );
+    await walletList();
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+    await user.click(await screen.findByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    // Settled: nothing flipped, so the row still offers Archive.
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Archive Cold storage' })).toBeEnabled();
+    });
+    await settle();
+
+    await user.click(addressInput());
+    await user.keyboard('tb1q');
+    fake.changeElsewhere(1, { archived: true });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['wallets'] });
+    });
+
+    expect(await screen.findByRole('button', { name: 'Restore Cold storage' })).not.toHaveFocus();
+    await expectTypingSurvives(user, 'tb1q');
+  });
+
+  it('an archive settling with focus on the page moves it to the heading', async () => {
+    // The intended case: nothing else has focus, so the hand-off still runs.
+    const { user, fake } = await openWithThree(false);
+    const release = fake.hold('archive');
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    // The owner clicks into the form, then on the page itself: focus ends on
+    // <body>. (jsdom will not blur the disabled Confirm directly.)
+    await user.click(addressInput());
+    await user.click(screen.getByRole('heading', { name: 'Portfolio', level: 1 }));
+    expect(document.body).toHaveFocus();
+    release();
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Your wallets' })).toHaveFocus();
+    });
+  });
+
+  it('an archive settling with focus on the page moves it to Restore when the row stays', async () => {
+    const { user, fake } = await openWithThree(true);
+    const release = fake.hold('archive');
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    // The owner clicks into the form, then on the page itself: focus ends on
+    // <body>. (jsdom will not blur the disabled Confirm directly.)
+    await user.click(addressInput());
+    await user.click(screen.getByRole('heading', { name: 'Portfolio', level: 1 }));
+    release();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Restore Cold storage' })).toHaveFocus();
+    });
+  });
+
+  it('a restore settling with focus still in its row moves it to Archive', async () => {
+    const { user, fake } = await openWithThree(true);
+    const release = fake.hold('restore');
+
+    await user.click(screen.getByRole('button', { name: 'Restore Old exchange' }));
+    // Focus is still on the pressed (now disabled) Restore, inside the row.
+    expect(screen.getByRole('button', { name: 'Restore Old exchange' })).toHaveFocus();
+    release();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Archive Old exchange' })).toHaveFocus();
+    });
+  });
+
+  it('an archive whose row unmounted first still moves focus to the heading', async () => {
+    // The row is gone before its archive settles: another session archived the
+    // wallet, and a refetch this page did not ask for - a second tab's
+    // invalidation, a remount - showed it. Focus fell to the page with the
+    // row. The hand-off to the heading has to come from somewhere that
+    // outlives the row.
+    const { user, fake, queryClient } = await openWithThree(false);
+    const release = fake.hold('archive');
+
+    await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    fake.changeElsewhere(1, { archived: true });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['wallets'] });
+    });
+    await waitFor(() => {
+      expect(screen.queryByText('Cold storage')).not.toBeInTheDocument();
+    });
+    expect(document.body).toHaveFocus();
+
+    release();
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Your wallets' })).toHaveFocus();
+    });
+  });
+});
+
 describe('WalletsPage: archive and restore', () => {
   it('archiving asks for confirmation first', async () => {
     const { user, fake } = openWalletsPage({ wallets: threeWallets() });
@@ -1131,12 +1373,67 @@ describe('WalletsPage: archive and restore', () => {
     expect(screen.getByRole('button', { name: 'Archive Spending' })).not.toHaveFocus();
   });
 
-  it('an archive whose row another refetch already flipped still lands focus on Restore', async () => {
-    // Two actions in flight. While this row's archive is held, another session
-    // archives the same wallet, and a restore of a different row refetches the
-    // list - so this row already shows as archived by the time its own archive
-    // succeeds. Its success must still hand focus to the row's Restore rather
-    // than wait for a flip that has already happened and will not come again.
+  it('an archive whose row a refetch already flipped still lands focus on Restore', async () => {
+    // Another session archives Cold storage while this page's archive of it is
+    // held, and a refetch the page did not ask for shows the row as archived
+    // first. Confirm unmounts with it, so focus falls to the page. When the
+    // held archive succeeds, the flip has already happened and will not come
+    // again, so the success itself has to hand focus to Restore.
+    const { user, fake, queryClient } = openWalletsPage({ wallets: threeWallets() });
+    await walletList();
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+    await user.click(await screen.findByRole('button', { name: 'Archive Cold storage' }));
+
+    const releaseArchive = fake.hold('archive');
+    await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
+    fake.changeElsewhere(1, { archived: true });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['wallets'] });
+    });
+    expect(await screen.findByRole('button', { name: 'Restore Cold storage' })).toBeVisible();
+    expect(document.body).toHaveFocus();
+
+    releaseArchive();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Restore Cold storage' })).toHaveFocus();
+    });
+  });
+
+  it('a restore whose row a refetch already flipped still lands focus on Archive', async () => {
+    const { user, fake, queryClient } = openWalletsPage({
+      wallets: [
+        ...threeWallets(),
+        wallet({ id: 4, address: ADDRESSES.btcScript, label: 'Old exchange', archived: true }),
+      ],
+    });
+    await walletList();
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived' }));
+
+    const releaseRestore = fake.hold('restore');
+    await user.click(await screen.findByRole('button', { name: 'Restore Old exchange' }));
+    fake.changeElsewhere(4, { archived: false });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['wallets'] });
+    });
+    expect(await screen.findByRole('button', { name: 'Archive Old exchange' })).toBeVisible();
+    // Unlike Confirm, which sits in its own <span>, Restore and Archive are one
+    // <button> slot that React reuses across the flip, so focus stays on the
+    // same node and is still inside the row - which is what lets the held
+    // restore's success keep it there.
+    expect(rowOf('Old exchange')).toContainElement(document.activeElement as HTMLElement);
+
+    releaseRestore();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Archive Old exchange' })).toHaveFocus();
+    });
+  });
+
+  it('an archive settling while the owner works another row leaves focus on that row', async () => {
+    // Cold storage's archive is held; the owner restores Old exchange meanwhile,
+    // and focus goes to its Archive. When Cold storage's archive then settles,
+    // focus is somewhere the owner put it, so it stays.
     const { user, fake } = openWalletsPage({
       wallets: [
         ...threeWallets(),
@@ -1149,26 +1446,19 @@ describe('WalletsPage: archive and restore', () => {
 
     const releaseArchive = fake.hold('archive');
     await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
-    fake.changeElsewhere(1, { archived: true });
     await user.click(screen.getByRole('button', { name: 'Restore Old exchange' }));
-
-    // The restore's refetch has landed: this row shows as archived already.
-    expect(await screen.findByRole('button', { name: 'Restore Cold storage' })).toBeVisible();
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Archive Old exchange' })).toHaveFocus();
     });
 
     releaseArchive();
 
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Restore Cold storage' })).toHaveFocus();
-    });
+    expect(await screen.findByRole('button', { name: 'Restore Cold storage' })).toBeVisible();
+    await settle();
+    expect(screen.getByRole('button', { name: 'Archive Old exchange' })).toHaveFocus();
   });
 
-  it('a restore whose row another refetch already flipped still lands focus on Archive', async () => {
-    // The mirror of the case above: this row's restore is held, another
-    // session restores the same wallet, and an archive of a different row
-    // refetches the list first.
+  it('a restore settling while the owner works another row leaves focus on that row', async () => {
     const { user, fake } = openWalletsPage({
       wallets: [
         ...threeWallets(),
@@ -1180,21 +1470,17 @@ describe('WalletsPage: archive and restore', () => {
 
     const releaseRestore = fake.hold('restore');
     await user.click(await screen.findByRole('button', { name: 'Restore Old exchange' }));
-    fake.changeElsewhere(4, { archived: false });
     await user.click(screen.getByRole('button', { name: 'Archive Cold storage' }));
     await user.click(screen.getByRole('button', { name: 'Confirm archive of Cold storage' }));
-
-    // The archive's refetch has landed: this row shows as active already.
-    expect(await screen.findByRole('button', { name: 'Archive Old exchange' })).toBeVisible();
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Restore Cold storage' })).toHaveFocus();
     });
 
     releaseRestore();
 
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Archive Old exchange' })).toHaveFocus();
-    });
+    expect(await screen.findByRole('button', { name: 'Archive Old exchange' })).toBeVisible();
+    await settle();
+    expect(screen.getByRole('button', { name: 'Restore Cold storage' })).toHaveFocus();
   });
 
   it("a restore moves focus to the row's Archive", async () => {

@@ -697,7 +697,11 @@ describe('DashboardPage: refresh', () => {
       expect(refresh).toBeDisabled();
     });
     // A sync can take tens of seconds; a disabled button alone is silence.
-    expect(await screen.findByRole('status')).toHaveTextContent(REFRESH_PENDING);
+    // The refresh the owner just asked for is still announced: it is a single
+    // transition, not a ticking clock.
+    const pending = await screen.findByRole('status');
+    expect(pending).toHaveTextContent(REFRESH_PENDING);
+    expect(pending.querySelector('time')).toBeNull();
     await user.click(refresh);
     expect(fake.writes('POST', BALANCES_SYNC_PATH)).toHaveLength(1);
 
@@ -1072,6 +1076,25 @@ describe('DashboardPage: stale prices and provider failures', () => {
     for (const label of ['Cold storage', 'Spending']) {
       expect(cell(await walletRow(label), 'Freshness')).toHaveTextContent(/up to date/i);
     }
+  });
+
+  it('a restored wallet on an interrupted run that did read its chain says the sync did not read it', async () => {
+    // D. The interrupted run reached Bitcoin - Spending's reading is from it -
+    // but Cold storage was archived at the time and skipped; restoring it
+    // brought back an older reading. "Interrupted before it read this chain"
+    // would be false beside Spending's "Up to date"; the sentence is about the
+    // wallet.
+    openDashboard({
+      ...withWalletRow(healthyPortfolio(), 1, { observed_at: PREVIOUS_OBSERVED_AT }),
+      runs: [interruptedRun(), previousRun()],
+    });
+
+    const cold = cell(await walletRow('Cold storage'), 'Freshness');
+    expect(cold).toHaveTextContent(
+      'The last sync was interrupted before it read this wallet. - showing the balance from 35 minutes ago',
+    );
+    expect(cold).not.toHaveTextContent(/this chain/i);
+    expect(cell(await walletRow('Spending'), 'Freshness')).toHaveTextContent(/up to date/i);
   });
 
   it('an unread wallet on an interrupted run says it has not been read and renders no zero', async () => {
@@ -1623,6 +1646,51 @@ describe('DashboardPage: states', () => {
     expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
   });
 
+  it('a failed balances poll leaves freshness unknown, even when the run log moved on', async () => {
+    // B. A new run has been written and the runs poll picks it up, but the
+    // balances poll fails, so the readings on screen predate the new run. Judged
+    // against it, every row would read "Not covered by the last sync" and the
+    // total would claim three balances the sync could not refresh - both
+    // false: the sync may well have refreshed them; the page just could not
+    // read the result.
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    vi.setSystemTime(new Date(NOW));
+    let failing = false;
+    const { fake } = openDashboard(healthyPortfolio(), [
+      http.get(BALANCES_CURRENT_PATH, () =>
+        failing ? problem(503, 'Service Unavailable', 'The database is restarting.') : undefined,
+      ),
+    ]);
+    await loaded();
+
+    const newRunAt = '2026-09-24T11:59:30.000Z';
+    fake.setRuns([syncRun({ run_id: 9, started_at: newRunAt, finished_at: newRunAt }), syncRun()]);
+    const runReads = (): number =>
+      fake.requests.filter((entry) => new URL(entry.url).pathname === BALANCES_RUNS_PATH).length;
+    const runReadsBefore = runReads();
+    failing = true;
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/could not refresh the portfolio/i);
+    // The runs poll did land, and the run it read is the new one.
+    await waitFor(() => {
+      expect(runReads()).toBeGreaterThan(runReadsBefore);
+    });
+    // And nothing on the page judges the old readings against it.
+    expect(await lastUpdated()).not.toHaveTextContent(NEVER_SYNCED_MESSAGE);
+    for (const label of ['Cold storage', 'Spending', ADDRESSES.kasPrimary]) {
+      const freshness = cell(await walletRow(label), 'Freshness');
+      expect(freshness).not.toHaveTextContent(NOT_COVERED_MESSAGE);
+      expect(freshness).not.toHaveTextContent(/up to date/i);
+      // The reading's own age is still true, so it is still shown.
+      expect(freshness.querySelector('time')).not.toBeNull();
+    }
+    expect(await totalRegion()).not.toHaveTextContent(/could not refresh/i);
+    expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+  });
+
   it('a poll that never reached the server keeps the dashboard and says so in words', async () => {
     vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
     vi.setSystemTime(new Date(NOW));
@@ -1659,9 +1727,13 @@ describe('DashboardPage: states', () => {
     await loaded();
 
     const status = await screen.findByText(/a sync started/i);
-    expect(status).toHaveAttribute('role', 'status');
     expect(status).toHaveTextContent('A sync started 1 minute ago and has not finished.');
     expect(status.querySelector('time')?.getAttribute('datetime')).toBe(RUNNING_STARTED_AT);
+    // E: not a live region. Its relative time ticks every 30 seconds, and a
+    // status region would re-announce "A sync started N minutes ago" on each
+    // tick for as long as an orphaned run sits there.
+    expect(status.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
     // Judged against the run that finished, not the one with no outcomes yet.
     expect(cell(await walletRow('Cold storage'), 'Freshness')).toHaveTextContent(/up to date/i);
     expect(await lastUpdated()).toHaveTextContent(/last sync succeeded 15 minutes ago/i);
