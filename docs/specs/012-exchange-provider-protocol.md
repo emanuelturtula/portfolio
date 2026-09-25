@@ -312,6 +312,7 @@ hands them here, and the rules follow from the code:
 | the window is longer than `max_query_window` | `ValueError` -- the caller's mistake |
 | `symbol` given and not `requires_symbol`, or missing and required | `ValueError` |
 | a fill executed outside `[since, until)` | `ExchangeSchemaError` -- an answer about something not asked |
+| `symbol` given and a fill for a different symbol | `ExchangeSchemaError` -- the same, for a per-symbol query |
 | two fills in the page share an `external_trade_id` | `ExchangeSchemaError` |
 | more fills than `page_size` | `ExchangeSchemaError` |
 | `next_cursor` equal to `cursor` (and not `None`) | `ExchangeSchemaError` -- pagination stopped advancing |
