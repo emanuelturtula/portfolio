@@ -1,8 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
+import { useQueryClient } from '@tanstack/react-query';
 
 import { describeApiError } from '@/api/client';
-import { useArchiveWallet, useRestoreWallet, useWallets, type Wallet } from '@/api/wallets';
+import {
+  useArchiveWallet,
+  useRestoreWallet,
+  useWallets,
+  walletsQueryKey,
+  type Wallet,
+} from '@/api/wallets';
 import { Address } from '@/components/Address';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
@@ -149,23 +156,23 @@ function WalletRow({ wallet, registerControlRef, notifyActionSettled }: WalletRo
   );
 }
 
-/** What to focus once a settled archive or restore is confirmed by a fresh wallet list. */
-interface PendingFocus {
+/**
+ * A focus decision already made, waiting for the render it forced to commit.
+ *
+ * The decision - whether the wallet is still in the list - is resolved once, synchronously,
+ * inside the mutation's own `onSuccess` (see `notifyActionSettled`), against the query
+ * cache the invalidated refetch just populated. Nothing here is *re-evaluated* later against
+ * a subsequent, unrelated list change: an earlier design instead left a pending request
+ * sitting in a ref until some future `wallets.data` change happened to satisfy it, which is
+ * exactly the bug this shape exists to rule out - a `DELETE` the server no-ops (already
+ * archived, a retried request) never changes the list, so that pending request outlived its
+ * own action and was later consumed by an unrelated "Show archived" toggle, stealing focus
+ * from the checkbox the owner had just pressed. Resolving immediately and never revisiting
+ * the decision removes the "unrelated later change" for a stale request to be mistaken for.
+ */
+interface FocusDecision {
   readonly walletId: number;
-  /**
-   * `wallets.data`'s reference at the moment the action settled - acted on only once
-   * `wallets.data` is a *different* reference, never against the list as it stood before.
-   *
-   * Reference identity, not a timestamp: this used to compare `wallets.dataUpdatedAt`
-   * against a captured wall-clock reading, which breaks two ways - a clock that steps
-   * backwards between the list loading and the action settling leaves focus on `<body>`,
-   * and a clock that does not advance at all, which is how every test in this suite runs
-   * under a fixed `Date`, means focus never moves. TanStack Query's structural sharing
-   * keeps `data` at the same reference across a refetch whose content is unchanged, and
-   * gives it a new one whenever the content differs - which an archive or a restore always
-   * does, since either flips `archived` - so comparing references needs no clock at all.
-   */
-  readonly dataBefore: readonly Wallet[] | undefined;
+  readonly stillShown: boolean;
 }
 
 /**
@@ -180,16 +187,17 @@ interface PendingFocus {
 export function WalletList() {
   const [includeArchived, setIncludeArchived] = useState(false);
   const wallets = useWallets(includeArchived);
+  const queryClient = useQueryClient();
   const headingRef = useRef<HTMLHeadingElement | null>(null);
   const controlRefs = useRef(new Map<number, HTMLButtonElement>());
-  // A ref, not `useState`: nothing here is ever read during render - it only tells the
-  // effect below what to do once the *next* fetch lands - so there is no state for React to
-  // synchronise into the DOM, and driving it through `useState` would mean calling
-  // `setState` from inside the very effect that reacts to it, which `eslint-plugin-react-hooks`
-  // rightly flags as a cascading-render pattern to avoid. The effect still re-runs on its
-  // own, because setting this ref always precedes the query's own state update (the
-  // invalidated refetch) that changes `wallets.data`/`wallets.dataUpdatedAt`.
-  const pendingFocusRef = useRef<PendingFocus | null>(null);
+  // The decision itself lives in a ref, not `useState`: it is written and consumed by the
+  // effect below within the same commit cycle, and calling `setState` from inside that
+  // effect to clear it is exactly what `eslint-plugin-react-hooks` flags as a
+  // cascading-render pattern to avoid. `focusTick` is the real state - its only job is to
+  // force the re-render the effect needs to run against, after `notifyActionSettled` has
+  // written a fresh decision into the ref.
+  const focusDecisionRef = useRef<FocusDecision | null>(null);
+  const [focusTick, setFocusTick] = useState(0);
 
   function registerControlRef(walletId: number, element: HTMLButtonElement | null): void {
     if (element === null) {
@@ -199,32 +207,38 @@ export function WalletList() {
     }
   }
 
+  /**
+   * Called from a mutation's own `onSuccess`, after the hook-level `onSuccess` - which
+   * invalidates and awaits the refetch - has already run. The wallets query's cache entry
+   * for `includeArchived`'s current value should be populated by now: the row that
+   * triggered this call only exists because that entry was already populated when it
+   * rendered, and an invalidated refetch replaces a cache entry, never clears it. `current`
+   * is still checked rather than asserted, though - unlike a value this module derives
+   * itself, a cache read is a boundary this function does not control, and `undefined`
+   * here degrades to "focus the heading" rather than a runtime crash on `.some`.
+   */
   function notifyActionSettled(walletId: number): void {
-    pendingFocusRef.current = { walletId, dataBefore: wallets.data };
+    const current = queryClient.getQueryData<Wallet[]>(walletsQueryKey(includeArchived));
+    const stillShown = current?.some((wallet) => wallet.id === walletId) ?? false;
+    focusDecisionRef.current = { walletId, stillShown };
+    setFocusTick((tick) => tick + 1);
   }
 
   useEffect(() => {
-    const pending = pendingFocusRef.current;
-    const data = wallets.data;
-
-    if (pending === null || data === undefined || data === pending.dataBefore) {
-      // Nothing pending; or a query key switched to one never fetched before - toggling
-      // "Show archived" right after an action lands on `data: undefined` for a beat, and
-      // there is nothing to check presence against yet; or the refetch the action
-      // triggered has not landed yet, which reference equality against `dataBefore` is
-      // what actually detects, with no clock involved (see `PendingFocus.dataBefore`).
-      // Any of the three means: not yet, wait for the next `wallets.data` to come in.
+    const decision = focusDecisionRef.current;
+    if (decision === null) {
       return;
     }
+    focusDecisionRef.current = null;
 
-    const stillShown = data.some((wallet) => wallet.id === pending.walletId);
-    if (stillShown) {
-      controlRefs.current.get(pending.walletId)?.focus();
+    if (decision.stillShown) {
+      controlRefs.current.get(decision.walletId)?.focus();
     } else {
       headingRef.current?.focus();
     }
-    pendingFocusRef.current = null;
-  }, [wallets.data]);
+    // `focusTick` itself is never read here - its only job is to be a *different* number
+    // each time, which is what makes this effect run again after `notifyActionSettled`.
+  }, [focusTick]);
 
   return (
     <section aria-labelledby="wallet-list-heading">
