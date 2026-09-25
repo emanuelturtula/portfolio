@@ -611,19 +611,27 @@ def parse_fills_page(
        parsed or dropped, so a 101-fill page cannot hide behind a dropped edge fill.
     2. **Every fill is parsed**, the two edge milliseconds included, so a malformed fill on
        the edge still fails the page.
-    3. **With a cursor, every fill's `tradeId` must be below it**, or the venue ignored
+    3. **No `tradeId` appears twice on the raw page**, the edge fills included. This is
+       checked here, before the drop, and not only by `assemble_fill_page` after it: two
+       fills sharing an id, one at `since - 1 ms` and one inside the window, would otherwise
+       reach the page check as one fill and be accepted, where the same two inside the
+       window are refused. The duplicate rule was written before the edge drop was placed
+       in front of it -- spec 012's lesson of a rule reasoned about alone -- so every rule
+       about the page as the venue sent it is applied to the raw page: the count, the ids,
+       the cursor. `assemble_fill_page` still checks the kept fills as well.
+    4. **With a cursor, every fill's `tradeId` must be below it**, or the venue ignored
        `idLessThan`. With the next rule, each cursor is strictly below the one before it, and
        a strictly decreasing sequence of positive integers is finite: **pagination
        terminates by construction**, a repeat and a cycle alike.
-    4. **`next_cursor` is the smallest `tradeId` on the raw page** when it holds
+    5. **`next_cursor` is the smallest `tradeId` on the raw page** when it holds
        `PAGE_LIMIT` fills, and `None` otherwise. The smallest, not the last, because the
        order within a page is undocumented: whatever the order, "everything below the
        smallest" is exactly what has not been seen.
-    5. **The two edge milliseconds are dropped**: a fill at exactly `since - 1 ms` or exactly
+    6. **The two edge milliseconds are dropped**: a fill at exactly `since - 1 ms` or exactly
        `until` belongs to a neighbouring window under an inclusive reading, and that window
        fetches it. Anywhere else outside the window is **not** dropped, and
        `assemble_fill_page` refuses it.
-    6. `assemble_fill_page` enforces the rest of the contract.
+    7. `assemble_fill_page` enforces the rest of the contract.
 
     Raises:
         ExchangeSchemaError: the page breaks any rule above or any `parse_fill` rule.
@@ -643,6 +651,13 @@ def parse_fills_page(
             raise ValueError(message)
         fills.append(parse_fill(item, assets=assets))
     trade_ids = [int(fill.external_trade_id) for fill in fills]
+    distinct = len(set(trade_ids))
+    if distinct != len(trade_ids):
+        detail = (
+            f"the page carries {len(trade_ids)} fills but only {distinct} distinct tradeId "
+            "values, counted before the edge fills are dropped"
+        )
+        raise ExchangeSchemaError(detail)
     if cursor is not None:
         bound = int(_require_caller_cursor(cursor))
         at_or_above = sum(1 for trade_id in trade_ids if trade_id >= bound)
