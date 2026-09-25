@@ -47,11 +47,15 @@ timestamp" and the example is 13-digit milliseconds** -- contradictory.
 ### v2 against the Unified Trading Account
 
 - Classic is "in maintenance mode and receives only essential updates". No retirement notice
-  or date exists for v2. (v1 was shut down on 2025-11-28.)
+  or date exists for v2. (v1 was shut down on 2025-11-28, announced on 2025-09-25.)
 - "API Keys for UTA Unified Trading Accounts cannot access Classic Account API endpoints"
-  (Bitget support, 2026-06-17). A UTA account reads fills from `GET /api/v3/trade/fills`,
-  which differs in every dimension that matters: `category=SPOT`, an opaque `cursor`, a
-  30-day window, 20 requests/s, and a `data.list` of differently named fields.
+  appears in the *Bitget Broker UTA API Upgrade Notice* (2026-06-17), **addressed to broker
+  partners and their clients**. For a retail account the docs do not state it outright. The
+  UTA upgrade guide says an existing v2 key "automatically gains UTA access" and maps v2
+  fills to `GET /api/v3/trade/fills`. That endpoint differs in every dimension that matters:
+  `category=SPOT`, an opaque `cursor`, a 30-day window, 20 requests/s, and a `data.list` of
+  differently named fields. (Corrected on 2026-09-25, after backend-dev could not find the
+  sentence in the pages first cited.)
 - Since **2026-09-15** Bitget has been migrating eligible Classic accounts to UTA
   automatically. **An account with an API key linked is not eligible.** A main account can
   switch back.
