@@ -136,3 +136,131 @@ button:disabled {
 .health-details dd {
   margin: 0;
 }
+
+nav[aria-label='Main'] {
+  display: flex;
+  gap: 1rem;
+}
+
+nav[aria-label='Main'] a {
+  color: var(--color-text);
+  text-decoration: none;
+}
+
+nav[aria-label='Main'] a.active {
+  font-weight: 600;
+  text-decoration: underline;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.75rem 0 1.5rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: 1rem;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+
+.address {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.address-short {
+  font-family: monospace;
+}
+
+.address-full {
+  font-family: monospace;
+  user-select: all;
+}
+
+.hint {
+  margin: 0.25rem 0 0;
+  color: var(--color-muted);
+  font-size: 0.875rem;
+}
+
+.hint button {
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+.wallet-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.wallet-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.wallet-row-main {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.wallet-chain {
+  font-weight: 600;
+}
+
+.wallet-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.confirm-archive {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.wallet-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.dashboard-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 1rem;
+}
+
+.total-amount {
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.pending {
+  color: var(--color-muted);
+}

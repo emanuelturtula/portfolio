@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Route, Routes } from 'react-router-dom';
+import { NavLink, Route, Routes } from 'react-router-dom';
 
 import { describeApiError } from '@/api/client';
 import { logout, sessionQueryKey, useSession } from '@/api/session';
@@ -8,6 +8,7 @@ import { DashboardPage } from '@/pages/DashboardPage';
 import { HealthPage } from '@/pages/HealthPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { NotFoundPage } from '@/pages/NotFoundPage';
+import { WalletsPage } from '@/pages/WalletsPage';
 
 /**
  * Application shell: a header plus the route table. The router itself lives in
@@ -15,13 +16,14 @@ import { NotFoundPage } from '@/pages/NotFoundPage';
  *
  * `/login` is the only public route. Everything else - including the
  * catch-all - is wrapped in `RequireSession`, per the route table in
- * docs/specs/004-login-page-and-app-shell.md.
+ * docs/specs/004-login-page-and-app-shell.md, extended by #11 for `/wallets`.
  */
 export function App() {
   return (
     <div className="app">
       <header className="app-header">
         <h1>Portfolio</h1>
+        <MainNav />
         <AccountControls />
       </header>
       <main className="app-main">
@@ -32,6 +34,14 @@ export function App() {
             element={
               <RequireSession>
                 <DashboardPage />
+              </RequireSession>
+            }
+          />
+          <Route
+            path="/wallets"
+            element={
+              <RequireSession>
+                <WalletsPage />
               </RequireSession>
             }
           />
@@ -54,6 +64,28 @@ export function App() {
         </Routes>
       </main>
     </div>
+  );
+}
+
+/**
+ * Links between the dashboard and the wallets page. Renders only when a session exists,
+ * like {@link AccountControls} - a signed-out visitor never reaches either destination, so
+ * showing the links to them would be navigation to nowhere.
+ */
+function MainNav() {
+  const session = useSession();
+
+  if (!session.data) {
+    return null;
+  }
+
+  return (
+    <nav aria-label="Main">
+      <NavLink to="/" end>
+        Dashboard
+      </NavLink>
+      <NavLink to="/wallets">Wallets</NavLink>
+    </nav>
   );
 }
 

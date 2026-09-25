@@ -1,9 +1,11 @@
 # Portfolio frontend
 
-React + TypeScript + Vite walking skeleton for the crypto portfolio tracker. It
-renders one page, which calls `GET /api/health` on the backend and displays the
-result. There is no authentication, no dashboard and no other data fetching yet:
-the point is to prove the toolchain end to end.
+React + TypeScript + Vite frontend for the crypto portfolio tracker.
+
+Signed in, there are two pages: the dashboard at `/`, showing the total portfolio
+value, one row per held asset and one row per wallet with its freshness; and
+`/wallets`, where an address is registered, archived or restored. `/health` is
+still the reference page for the four-state rendering pattern below.
 
 ## Requirements
 
@@ -38,11 +40,19 @@ the script, so generated types are always produced from a real schema.
   and stay strings until a decimal-aware helper handles them. ESLint blocks
   `parseFloat`, `parseInt` and `Number()` in `src/features/**` and `src/lib/**`
   to keep that true; see the comment in `eslint.config.js`.
-- **Every query renders three states.** Pending, error and success are each
-  rendered explicitly, with an accessible live region for the wait and
-  `role="alert"` for the failure. `src/pages/HealthPage.tsx` is the reference.
+- **Every data-driven view renders four states.** Loading, empty, error and
+  success are each rendered explicitly, with an accessible live region for the
+  wait and `role="alert"` for the failure - and empty and error are kept
+  visibly distinct, because "you have not added anything yet" and "the sync
+  failed" mean opposite things. `src/pages/HealthPage.tsx` is the three-state
+  (no empty case) reference; the dashboard and the wallets page are the
+  four-state ones.
+- **A missing value is never rendered as zero.** An unread wallet, an unpriced
+  asset or a stale price is stated in text - never silently shown as `0`. See
+  `docs/specs/011-wallets-page-value-dashboard.md`.
 - **Errors are problem documents.** The backend speaks
   `application/problem+json` (RFC 9457) and `src/api/client.ts` maps it onto a
-  typed `ApiError`.
+  typed `ApiError`, including a defensive parse of a 422's field-level
+  `errors[]`.
 - **Coverage thresholds only ratchet upward.** They start at 60% because the
   skeleton is small; never lower them to make a build pass.
