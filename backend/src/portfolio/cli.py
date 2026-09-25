@@ -92,19 +92,29 @@ def prompt_for_password() -> str:
 
 
 def confirm_replacement(username: str) -> None:
-    """Make the operator say out loud that an existing account is about to be destroyed.
+    """Make the operator say out loud that the account's credential is about to change.
+
+    The confirmation also says what is *not* lost. Anyone who read an older copy of the
+    operations guide expects `--replace` to start from an empty account, and an operator
+    who believes that may not run it when they should -- or may run it expecting a clean
+    slate and be surprised by the wallets still there.
 
     Refused outright when stdin is not a terminal. An unattended `--replace` -- in a
     script, a Dockerfile, a CI job -- is exactly the shape of the accident this guards
-    against, and treating "no terminal" as consent would be the wrong default.
+    against: it signs out every browser and changes the only password the instance has.
+    Treating "no terminal" as consent would be the wrong default.
     """
     if not sys.stdin.isatty():
-        message = "--replace needs a terminal: refusing to replace an account unattended."
+        message = "--replace needs a terminal: refusing to change an account's password unattended."
         raise CommandError(message)
     # Phrased as what the flag does rather than as a claim about what is in the database.
     # The check happens later, inside the transaction that does the work, and a database
     # with no account yet is a perfectly ordinary thing to point this command at.
-    emit(f"--replace deletes any existing account, and every session it holds, for '{username}'.")
+    emit(
+        f"--replace sets the username '{username}' and a new password on the existing "
+        "account, and signs out every session it holds."
+    )
+    emit("Wallets, balances and exchange history are kept.")
     answer = input(f"Type '{username}' or 'y' to confirm: ").strip()
     if answer != username and answer.casefold() not in CONFIRMATION_WORDS:
         message = "Not confirmed. Nothing was changed."
@@ -141,7 +151,7 @@ async def store_user(settings: Settings, username: str, password: str, *, replac
 
 
 def create_user(args: argparse.Namespace) -> int:
-    """`create-user`: prompt for a password and create -- or replace -- the owner account."""
+    """`create-user`: create the owner account, or set a new password on the existing one."""
     settings = get_settings()
     username: str = args.username or settings.bootstrap_username
     replace: bool = args.replace
@@ -314,7 +324,10 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument(
         "--replace",
         action="store_true",
-        help="replace the existing account and revoke its sessions (asks for confirmation)",
+        help=(
+            "set a new password (and username) on the existing account and sign out every "
+            "session (asks for confirmation)"
+        ),
     )
     create.set_defaults(handler=create_user)
 
