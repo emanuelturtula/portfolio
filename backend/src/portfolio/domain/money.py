@@ -129,6 +129,61 @@ def quantize(value: Decimal, scale: int) -> Decimal:
     return value.quantize(_exponent(scale), context=_MONEY_CONTEXT)
 
 
+def multiply(left: Decimal, right: Decimal) -> Decimal:
+    """The exact product of two amounts. Never rounded, whatever the ambient context says.
+
+    **Exact, and unbounded, on purpose.** The result carries every digit of the product --
+    as many significant digits as the two coefficients have between them -- so that
+    `quantize` stays the one place money is rounded. A caller that needs the product at a
+    scale quantizes it, and `quantize` is where the `MONEY_PRECISION` ceiling is enforced:
+    a product with more integer digits than the scale leaves room for raises
+    `decimal.InvalidOperation` there, which is the too-many-integer-digits refusal of
+    whatever the product is about to become.
+
+    Two alternatives were rejected, and each is a real off-by-one rather than a style
+    preference:
+
+    * **`left * right`** evaluates in the calling thread's context. At the interpreter's
+      default precision of 28 -- or inside anyone's `decimal.localcontext()` -- a product
+      of two 18-place amounts is rounded before it ever reaches `quantize`, silently.
+    * **Multiplying under a 38-digit context** fixes the thread dependence and still rounds
+      any product longer than 38 significant digits. Quantizing that result to a scale is a
+      *second* half-even rounding, and two half-even roundings in a row are not one: a
+      product whose digits past the scale read `4999...95` is below the halfway point and
+      should round down, but the first step rounds it up to an exact tie, and the second
+      then rounds that tie to even -- up, one unit off, whenever the last kept digit is
+      odd.
+
+    Built from the coefficients as integers, the way `from_base_units` assembles its
+    result, so neither the context's precision nor its rounding mode can come between the
+    operands and the answer. The sign follows the usual rule, including for a zero: `-0`
+    times a positive amount is `-0`, which `quantize` and `NumericText` normalise.
+
+    Raises:
+        TypeError: either operand is not a `Decimal` (a `bool` or a `float` included).
+        ValueError: either operand is a NaN or an infinity.
+    """
+    require_amount(left, subject="multiply")
+    require_amount(right, subject="multiply")
+    left_sign, left_digits, left_exponent = left.as_tuple()
+    right_sign, right_digits, right_exponent = right.as_tuple()
+    product = _coefficient(left_digits) * _coefficient(right_digits)
+    # Both exponents are `int` on a finite Decimal; the string forms belong to NaN and
+    # infinity, which `require_amount` has already refused.
+    return Decimal(
+        (
+            left_sign ^ right_sign,
+            tuple(int(character) for character in str(product)),
+            int(left_exponent) + int(right_exponent),
+        )
+    )
+
+
+def _coefficient(digits: tuple[int, ...]) -> int:
+    """A Decimal's coefficient digits as the integer they spell. Exact by construction."""
+    return int("".join(str(digit) for digit in digits))
+
+
 def to_base_units(amount: Decimal, decimals: int) -> int:
     """Convert a decimal amount into the integer base units a chain counts in.
 
