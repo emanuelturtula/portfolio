@@ -76,6 +76,7 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
+from portfolio.config import is_header_safe
 from portfolio.domain.exchanges import ExchangeKey, FillSide
 from portfolio.providers.base import decode_json
 from portfolio.providers.errors import ProviderResponseError
@@ -421,8 +422,11 @@ def unwrap_envelope(
     otherwise the status decides alone, so a 502 carrying HTML is unavailable, not a schema
     error. On a 200 a mapped code is its class and an unmapped one is a schema error.
 
-    Every raise is `from None`. A parser error's cause is about the body, and the body is
-    what this provider must not repeat. **`httpx.Response.raise_for_status` is never
+    **Nothing raised here has a cause or a context.** A parser error is about the body, and
+    the body is what this provider must not repeat -- `json.JSONDecodeError` even keeps the
+    whole document on its `doc` attribute. `from None` would still leave it as the suppressed
+    `__context__`, which a debugger or an error tracker walks anyway, so the decode is
+    finished before anything is raised. **`httpx.Response.raise_for_status` is never
     called**: its message carries the full URL.
 
     Raises:
@@ -434,12 +438,11 @@ def unwrap_envelope(
             _code_of(body),
             error_map=BITGET_ERROR_MAP,
             retry_after_ms=retry_after_ms,
-        ) from None
-    try:
-        document = decode_json(body)
-    except ProviderResponseError:
+        )
+    decoded, document = _decoded(body)
+    if not decoded:
         detail = "the response body is not JSON"
-        raise ExchangeSchemaError(detail, status=status) from None
+        raise ExchangeSchemaError(detail, status=status)
     if not isinstance(document, dict):
         detail = "the response body is not a JSON object"
         raise ExchangeSchemaError(detail, status=status)
@@ -450,7 +453,7 @@ def unwrap_envelope(
             code,
             error_map=BITGET_ERROR_MAP,
             retry_after_ms=retry_after_ms,
-        ) from None
+        )
     if "data" not in document:
         detail = "data is missing from a successful response"
         raise ExchangeSchemaError(detail, status=status)
@@ -673,12 +676,32 @@ class BitgetProvider:
         `clock` is read once per signed request for `ACCESS-TIMESTAMP`, and for a
         `Retry-After` written as a date. It must return an aware `datetime`.
 
+        **The API key and the passphrase must be text a header can carry**
+        (`config.HEADER_SAFE_TEXT`): printable ASCII, no whitespace at either end. Both travel
+        as header values, and one h11 refuses comes back as an `httpx.LocalProtocolError`
+        whose message is the whole value. `Settings` refuses such a value at startup; this is
+        the same rule for `Credentials` built any other way. The secret is not checked: it
+        only ever enters an HMAC.
+
         Raises:
-            ValueError: `credentials` carries no passphrase, which every Bitget key has.
+            ValueError: `credentials` carries no passphrase, which every Bitget key has, or
+                its API key or passphrase is not header-safe. The message names the field,
+                never the value.
         """
         if credentials.passphrase is None:
             message = "Bitget requires Credentials.passphrase, and none was given."
             raise ValueError(message)
+        for field, secret in (
+            ("api_key", credentials.api_key),
+            ("passphrase", credentials.passphrase),
+        ):
+            if not is_header_safe(secret.get_secret_value()):
+                message = (
+                    f"Credentials.{field} holds a character an HTTP header cannot carry: "
+                    "whitespace at either end, a control character, or a character outside "
+                    "printable ASCII."
+                )
+                raise ValueError(message)
         self._client = client
         self._api_key: SecretStr = credentials.api_key
         self._api_secret: SecretStr = credentials.api_secret
@@ -761,17 +784,33 @@ class BitgetProvider:
         The URL is passed whole -- never `params=` -- so the query string sent is byte for
         byte the one that was signed.
 
+        **An `httpx.LocalProtocolError` is an invalid request, with no cause and no context.**
+        It means this side built a request h11 would not send -- the venue never saw it, and
+        asking again cannot change it -- so it is not "unavailable", which #15 would retry
+        forever, and it needs a person. It is never linked to what it replaces, not even as
+        the suppressed `__context__` that `from None` still leaves for a debugger or an error
+        tracker to walk: h11's message is `Illegal header value b'...'` with the **whole**
+        header value in it, and the header values here are the API key and the passphrase. So
+        it is raised after the `except` block has closed. The constructor's header-safe check
+        makes this unreachable except through a bug, which is when a leak is least expected.
+
         Raises:
+            ExchangeInvalidRequestError: h11 refused the request before sending it.
             ExchangeUnavailableError: the request got no answer, chained `from` the
                 `httpx.TransportError`, whose message carries no query.
             ExchangeError: whatever `unwrap_envelope` makes of the answer.
         """
+        refused_locally = False
         try:
             response = await self._client.get(
                 url, headers=headers, extensions={ENDPOINT_EXTENSION: label}
             )
+        except httpx.LocalProtocolError:
+            refused_locally = True
         except httpx.TransportError as error:
             raise ExchangeUnavailableError from error
+        if refused_locally:
+            raise ExchangeInvalidRequestError
         retry_after_ms = None
         if response.status_code != HTTP_OK:
             retry_after_ms = parse_retry_after(response.headers.get("retry-after"), self._clock())
@@ -821,11 +860,21 @@ def _code_of(body: str | bytes) -> object:
     A body that does not parse -- an HTML error page from a proxy -- contributes no code, and
     the status decides alone.
     """
-    try:
-        document = decode_json(body)
-    except ProviderResponseError:
-        return None
+    _, document = _decoded(body)
     return document.get("code") if isinstance(document, dict) else None
+
+
+def _decoded(body: str | bytes) -> tuple[bool, object]:
+    """`(True, document)` if the body is JSON, `(False, None)` if it is not. Never raises.
+
+    The caller raises *after* this returns, so its exception has no `__context__`: a
+    `ProviderResponseError` from `decode_json` is chained from the parser's own error, and
+    `json.JSONDecodeError` keeps the whole body on its `doc` attribute.
+    """
+    try:
+        return True, decode_json(body)
+    except ProviderResponseError:
+        return False, None
 
 
 def _fill_items(data: object) -> list[dict[str, object]]:
@@ -879,8 +928,11 @@ def _require_executed_at(value: object) -> datetime:
     try:
         return datetime_from_epoch_ms(value)
     except ExchangeSchemaError:
-        detail = "cTime must be a non-negative count of epoch milliseconds, written in digits"
-        raise ExchangeSchemaError(detail) from None
+        pass
+    # Raised after the handler has closed, so it carries no context: the refusal above says
+    # nothing this one does not, and a context is one more link for something to render.
+    detail = "cTime must be a non-negative count of epoch milliseconds, written in digits"
+    raise ExchangeSchemaError(detail)
 
 
 def _parse_fee(value: object) -> tuple[Decimal, str | None]:
@@ -915,12 +967,22 @@ def _parse_fee(value: object) -> tuple[Decimal, str | None]:
 
 
 def _optional_text(document: Mapping[str, object], key: str) -> str | None:
-    """A text field that may be absent or `null`. `NormalizedFill` checks the encoding."""
+    """A text field that may be absent or `null`, and otherwise a string that encodes as UTF-8.
+
+    `NormalizedFill` would refuse unencodable text too, but it names its own field rather than
+    the venue's, and its refusal carries the `UnicodeEncodeError` as context -- whose `args`
+    hold the whole string.
+    """
     value = document.get(key)
-    if value is None or isinstance(value, str):
-        return value
-    detail = f"{key} must be a string when present"
-    raise ExchangeSchemaError(detail)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        detail = f"{key} must be a string when present"
+        raise ExchangeSchemaError(detail)
+    if not _encodes_as_utf8(value):
+        detail = f"{key} does not encode as UTF-8"
+        raise ExchangeSchemaError(detail)
+    return value
 
 
 def _require_vendor_text(document: Mapping[str, object], key: str, *, field: str) -> str:
@@ -933,9 +995,20 @@ def _require_vendor_text(document: Mapping[str, object], key: str, *, field: str
     if not isinstance(value, str) or not value.strip():
         detail = f"{field} must be a non-blank string"
         raise ExchangeSchemaError(detail)
+    if not _encodes_as_utf8(value):
+        detail = f"{field} does not encode as UTF-8"
+        raise ExchangeSchemaError(detail)
+    return value
+
+
+def _encodes_as_utf8(value: str) -> bool:
+    """Whether `value` encodes as UTF-8 -- in practice, whether it holds a lone surrogate.
+
+    A predicate rather than a raise, so the caller's refusal has no `__context__`: a
+    `UnicodeEncodeError` keeps the whole string in its `args`.
+    """
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
-        detail = f"{field} does not encode as UTF-8"
-        raise ExchangeSchemaError(detail) from None
-    return value
+        return False
+    return True

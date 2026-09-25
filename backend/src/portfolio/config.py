@@ -5,6 +5,7 @@ image can run in development and in production without a rebuild. Nothing in thi
 carries a default that would be unsafe if it survived into production.
 """
 
+import re
 from functools import lru_cache
 from typing import Final, Literal, Self
 
@@ -127,6 +128,50 @@ def exchange_credentials_violation(
             f"{' and '.join(missing)} {verb} not set while the other credential variables of "
             "the same venue are. Set all of them, or none."
         )
+    return None
+
+
+HEADER_SAFE_TEXT: Final = re.compile(r"\A[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?\Z")
+"""Text an HTTP header can carry as it is: printable ASCII, no whitespace at either end.
+
+An interior space is allowed -- it is a legal header value, and a user-chosen passphrase may
+hold one. A control character, a line break, a leading or trailing space or tab, and any
+character outside ASCII are not.
+
+**The reason is a leak, measured on #13 with httpx 0.28.1.** A header value h11 refuses
+raises `httpx.LocalProtocolError("Illegal header value b'...'")`, and the message is the
+whole value. That is a `TransportError`, and an exchange provider chains its unavailable
+error `from` a transport error, so the credential would reach any log that renders the
+traceback. A non-ASCII character fails earlier and differently, as a bare
+`UnicodeEncodeError` out of `client.get` -- outside every exchange error class. A trailing
+space pasted into `secrets.env` is the realistic way to get either.
+"""
+
+
+def is_header_safe(value: str) -> bool:
+    """Whether `value` can travel in an HTTP header unchanged. See `HEADER_SAFE_TEXT`."""
+    return HEADER_SAFE_TEXT.match(value) is not None
+
+
+def credential_header_violation(
+    variables: tuple[tuple[str, SecretStr | None], ...],
+) -> str | None:
+    """Why a credential sent in a header cannot be sent, or `None` if every one can.
+
+    `variables` is the `(environment variable, value)` pairs of the credentials a venue
+    sends as header values -- for Bitget the API key and the passphrase, and **not** the
+    secret, which only ever enters an HMAC and may hold anything. An unset variable passes.
+
+    **The reason names the variable and the rule, and never the value**, nor which
+    character or where: the position of a stray character is part of the credential too.
+    """
+    for name, value in variables:
+        if value is not None and not is_header_safe(value.get_secret_value()):
+            return (
+                f"{name} holds a character an HTTP header cannot carry: whitespace at either "
+                "end, a line break or another control character, or a character outside "
+                "printable ASCII. Look for a stray space or line break where it was pasted."
+            )
     return None
 
 
@@ -290,6 +335,11 @@ class Settings(BaseSettings):
     # `Credentials` refuses it at construction, so the failure would surface on the first sync
     # instead of at the start. Refusing it here is the same fact, reported where the
     # deployment pipeline rolls back.
+    #
+    # **The key and the passphrase must also be text a header can carry** (`HEADER_SAFE_TEXT`):
+    # printable ASCII with no whitespace at either end. Both are sent as header values, and a
+    # value h11 refuses comes back as a transport error whose message is the value itself.
+    # The secret is exempt; it only ever enters an HMAC.
     bitget_api_key: SecretStr | None = None
     bitget_api_secret: SecretStr | None = None
     bitget_api_passphrase: SecretStr | None = None
@@ -368,7 +418,9 @@ class Settings(BaseSettings):
           is up.
         * a partial or blank set of Bitget credentials cannot sign a request, and would be
           discovered on the first exchange sync rather than here. `exchange_credentials_violation`
-          says which variable, and never what it holds.
+          says which variable, and never what it holds. Nor can a key or passphrase holding a
+          character no HTTP header can carry -- and that one would also write the value into
+          a transport error's message. `credential_header_violation` says which.
 
         Refusing to start turns all eight into a container that fails its health check,
         which is a failure the deployment pipeline already knows how to roll back.
@@ -475,6 +527,14 @@ class Settings(BaseSettings):
             (
                 ("PORTFOLIO_BITGET_API_KEY", self.bitget_api_key),
                 ("PORTFOLIO_BITGET_API_SECRET", self.bitget_api_secret),
+                ("PORTFOLIO_BITGET_API_PASSPHRASE", self.bitget_api_passphrase),
+            )
+        )
+        if reason is not None:
+            raise ValueError(reason)
+        reason = credential_header_violation(
+            (
+                ("PORTFOLIO_BITGET_API_KEY", self.bitget_api_key),
                 ("PORTFOLIO_BITGET_API_PASSPHRASE", self.bitget_api_passphrase),
             )
         )
