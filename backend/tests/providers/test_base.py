@@ -13,6 +13,7 @@ address that happens to sort first.
 
 from __future__ import annotations
 
+import decimal
 import json
 import sys
 from decimal import Decimal
@@ -914,6 +915,53 @@ def test_a_refusal_never_quotes_the_body_that_caused_it() -> None:
     rendered = f"{caught.value}{caught.value!r}"
     assert BIP173_TESTNET_P2WPKH not in rendered
     assert "not json" not in rendered
+
+
+# --------------------------------------------------------------------------------------
+# A number `Decimal` cannot hold at all (#12's review)
+# --------------------------------------------------------------------------------------
+#
+# `parse_float=Decimal` hands the literal text to `Decimal()`, which refuses an exponent past
+# `decimal.MAX_EMAX` with `decimal.InvalidOperation` -- an `ArithmeticError`, not a
+# `ValueError`, so it went straight through `decode_json`'s `except (ValueError,
+# RecursionError)` as an untyped error, from a body the vendor chooses.
+
+#: One past the largest exponent a 64-bit `decimal` build holds, and the largest itself.
+#: Written out as the reviewer reproduced them; the premise test below ties both to
+#: `decimal.MAX_EMAX`, so a build with a different limit fails there, legibly.
+EXPONENT_PAST_THE_LIMIT: Final = "1e1000000000000000000"
+EXPONENT_AT_THE_LIMIT: Final = "1e999999999999999999"
+
+
+def test_the_exponent_literals_straddle_this_builds_limit() -> None:
+    assert int(EXPONENT_AT_THE_LIMIT[2:]) == decimal.MAX_EMAX
+    assert int(EXPONENT_PAST_THE_LIMIT[2:]) == decimal.MAX_EMAX + 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(EXPONENT_PAST_THE_LIMIT, id="bare"),
+        pytest.param(f'{{"price": {EXPONENT_PAST_THE_LIMIT}}}', id="inside an object"),
+    ],
+)
+def test_an_exponent_decimal_cannot_hold_is_a_typed_refusal(body: str) -> None:
+    """`ProviderResponseError` exactly, never `decimal.InvalidOperation`."""
+    with pytest.raises(ProviderResponseError) as caught:
+        decode_json(body)
+
+    assert type(caught.value) is ProviderResponseError
+    # The reason: the decimal module refused the exponent, and the cause is kept.
+    assert isinstance(caught.value.__cause__, decimal.InvalidOperation)
+    assert "1000000000000000000" not in f"{caught.value}{caught.value!r}"
+
+
+def test_the_largest_exponent_decimal_holds_still_decodes() -> None:
+    """The companion: the refusal is at the limit, not somewhere short of it."""
+    decoded = decode_json(EXPONENT_AT_THE_LIMIT)
+
+    assert type(decoded) is Decimal
+    assert decoded.as_tuple() == (0, (1,), 999999999999999999)
 
 
 # --------------------------------------------------------------------------------------

@@ -48,6 +48,7 @@ from portfolio.providers.exchanges.base import (
     derive_quote_quantity,
     encode_raw_payload,
     epoch_ms,
+    floor_to_millisecond,
     require_cursor_advanced,
     require_fill_amount,
 )
@@ -67,6 +68,8 @@ SINCE: Final = datetime(2026, 9, 1, tzinfo=UTC)
 UNTIL: Final = datetime(2026, 9, 8, tzinfo=UTC)
 INSIDE: Final = datetime(2026, 9, 3, 15, 30, 0, 123000, tzinfo=UTC)
 ONE_MICROSECOND: Final = timedelta(microseconds=1)
+#: The finest granularity a window or a declared duration may have: venues count in ms.
+ONE_MILLISECOND: Final = timedelta(milliseconds=1)
 
 AMOUNT_FIELDS: Final = ("quantity", "price", "quote_quantity", "fee_amount")
 STRICTLY_POSITIVE_FIELDS: Final = ("quantity", "price", "quote_quantity")
@@ -590,26 +593,56 @@ def test_require_fill_amount_refuses_everything_else(value: object) -> None:
     assert MALFORMED_MARKER not in f"{caught.value}{caught.value!r}"
 
 
-#: Past CPython's default int-to-str digit limit of 4300, which is what an exact product is
-#: built through. Built at run time rather than written out: a literal of five thousand ones
-#: is unreadable, and a long run of base58 digits is what the address scanner looks for.
+#: Past CPython's default int-to-str digit limit of 4300. Built at run time rather than
+#: written out: a literal of five thousand ones is unreadable, and a long run of base58
+#: digits is what the address scanner looks for.
 OVERLONG_PRICE_DIGITS: Final = 5000
 
 
-def test_an_amount_too_long_to_multiply_is_a_schema_error() -> None:
-    """A vendor's 5000-digit price is refused in the taxonomy, not as a bare `ValueError`.
+def test_a_five_thousand_digit_price_is_refused_by_the_parser_bound() -> None:
+    """A vendor's 5000-digit price stops at `require_fill_amount`, in the taxonomy.
 
-    Before the fix this reached `domain.money.multiply`, whose exact product goes through
-    `int(str)` and hit the interpreter's digit limit: `builtins.ValueError`, outside the
-    seven classes the protocol says a provider raises, from a body the vendor chooses.
+    **What this proves, and what it does not.** The refusal is the 100-digit bound on the
+    parser boundary -- asserted by its reason below -- so no arithmetic is ever reached with
+    this input. It says nothing about `multiply` on long operands; that is
+    `test_a_derivation_from_five_thousand_digit_operands_is_exact`, which builds its
+    operands without this function precisely so it cannot be stopped here first.
     """
     long_price = "1." + "1" * OVERLONG_PRICE_DIGITS
 
     with pytest.raises(ExchangeSchemaError) as caught:
-        derive_quote_quantity(Decimal("2"), require_fill_amount(long_price, field="price"))
+        require_fill_amount(long_price, field="price")
 
     assert type(caught.value) is ExchangeSchemaError
+    assert "price has more than 100 digits written out in full" in str(caught.value)
     assert "1111111111" not in f"{caught.value}{caught.value!r}{caught.value.args}"
+
+
+def test_a_derivation_from_five_thousand_digit_operands_is_exact() -> None:
+    """`derive_quote_quantity` reached directly, with coefficients past the 4300-digit limit.
+
+    Built as `Decimal`s, never through `require_fill_amount`, so the parser bound cannot
+    refuse them first. Both coefficients are 5001 digits:
+
+    * quantity `1.111...1` (5000 ones after the point);
+    * price `1.000...01` (4999 zeros, then a 1), which is `1 + 10**-5000`.
+
+    The product is the quantity plus the quantity shifted 5000 places right, and that shift
+    touches nothing before place 5000 -- so to 18 places it is eighteen ones, and the 19th
+    digit is a 1, which rounds down. Written by hand from that argument.
+    """
+    quantity = Decimal("1." + "1" * OVERLONG_PRICE_DIGITS)
+    price = Decimal("1." + "0" * (OVERLONG_PRICE_DIGITS - 1) + "1")
+    assert len(quantity.as_tuple().digits) == len(price.as_tuple().digits) == 5001
+
+    derived = derive_quote_quantity(quantity, price)
+    with decimal.localcontext() as context:
+        context.prec = 10
+        derived_inside = derive_quote_quantity(quantity, price)
+
+    assert format(derived, "f") == "1.111111111111111111"
+    assert derived.as_tuple().exponent == -18
+    assert derived_inside == derived
 
 
 def nesting(depth: int) -> str:
@@ -812,10 +845,15 @@ def test_capabilities_refuse_impossible_declarations(overrides: dict[str, object
 
 
 def test_the_smallest_possible_declarations_are_accepted() -> None:
-    """The companion: one page of one fill, one microsecond of history, is still a venue."""
-    tiny = capabilities(page_size=1, retention=ONE_MICROSECOND, max_query_window=ONE_MICROSECOND)
+    """The companion: one page of one fill, one millisecond of history, is still a venue.
+
+    A millisecond, not a microsecond, since the reviewer's granularity fix: every venue
+    speaks epoch milliseconds, so a duration finer than one cannot be asked for.
+    """
+    tiny = capabilities(page_size=1, retention=ONE_MILLISECOND, max_query_window=ONE_MILLISECOND)
 
     assert tiny.page_size == 1
+    assert tiny.retention == tiny.max_query_window == timedelta(milliseconds=1)
 
 
 @pytest.mark.parametrize(
@@ -892,7 +930,8 @@ def test_a_request_older_than_retention_is_clamped_not_refused() -> None:
             datetime(2026, 6, 27, 12, 4, 59, 999999, tzinfo=UTC), True, id="inside the margin"
         ),
         pytest.param(datetime(2026, 6, 27, 12, 5, tzinfo=UTC), False, id="at the margin"),
-        pytest.param(datetime(2026, 6, 27, 12, 5, 0, 1, tzinfo=UTC), False, id="past it"),
+        # A whole millisecond past, so the floor to the millisecond cannot move it back.
+        pytest.param(datetime(2026, 6, 27, 12, 5, 0, 1000, tzinfo=UTC), False, id="past it"),
     ],
 )
 def test_the_clamp_boundary_is_the_edge_plus_the_margin(requested: datetime, clamped: bool) -> None:
@@ -919,7 +958,7 @@ def test_a_request_inside_retention_and_an_unlimited_venue_are_untouched() -> No
     "retention",
     [
         pytest.param(timedelta(minutes=1), id="one minute kept"),
-        pytest.param(ONE_MICROSECOND, id="one microsecond kept"),
+        pytest.param(ONE_MILLISECOND, id="one millisecond kept"),
         pytest.param(timedelta(minutes=5), id="exactly the margin"),
     ],
 )
@@ -1029,7 +1068,9 @@ OTHER_SYMBOL: Final = "ETHUSDT"
 
 def call_that_breaks(case: str) -> Callable[[], FillPage]:
     """One broken contract per row of the spec's table, as a zero-argument call."""
-    long_window = FillWindow(since=SINCE, until=UNTIL + ONE_MICROSECOND)
+    # One millisecond too long: a microsecond would be refused by the window itself, for
+    # its granularity, and the row would pass without reaching the maximum-length rule.
+    long_window = FillWindow(since=SINCE, until=UNTIL + ONE_MILLISECOND)
     cases: dict[str, Callable[[], FillPage]] = {
         "window longer than the maximum": lambda: assemble([], window=long_window),
         "symbol given but not required": lambda: assemble([], symbol="BTCUSDT"),
@@ -1192,9 +1233,9 @@ def test_a_window_must_be_aware_and_forwards(since: datetime, until: datetime) -
 
 
 def test_the_shortest_window_is_accepted() -> None:
-    window = FillWindow(since=SINCE, until=SINCE + ONE_MICROSECOND)
+    window = FillWindow(since=SINCE, until=SINCE + ONE_MILLISECOND)
 
-    assert window.until - window.since == ONE_MICROSECOND
+    assert window.until - window.since == ONE_MILLISECOND
 
 
 # --------------------------------------------------------------------------------------
@@ -1324,3 +1365,257 @@ def test_capabilities_refuse_a_rate_limit_that_is_not_one() -> None:
             rate_limit=(10, 1000),  # type: ignore[arg-type]
             requires_symbol=False,
         )
+
+
+# --------------------------------------------------------------------------------------
+# Review A: millisecond granularity, end to end
+# --------------------------------------------------------------------------------------
+#
+# The defect the reviewer reproduced: `now` carries microseconds, so the clamp produced an
+# effective start of 12:05:00.123456; a venue answers in whole milliseconds, so the oldest
+# fill it can return is at 12:05:00.123 -- *before* the window's start -- and
+# `assemble_fill_page` refused a legitimate fill as outside the window. The start is now
+# floored to the millisecond (never ceiled, which would skip a real fill), and a window or
+# a declared duration finer than a millisecond is refused outright.
+
+#: The reviewer's clock reading, microseconds and all.
+REVIEWER_NOW: Final = datetime(2026, 9, 25, 12, 0, 0, 123456, tzinfo=UTC)
+#: 90 days before it is 2026-06-27T12:00:00.123456Z; five minutes later is 12:05:00.123456;
+#: floored to the millisecond, 12:05:00.123000. Written by hand, as is every instant here.
+REVIEWER_EFFECTIVE_SINCE: Final = datetime(2026, 6, 27, 12, 5, 0, 123000, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("moment", "floored"),
+    [
+        pytest.param(
+            datetime(2026, 6, 27, 12, 5, 0, 123456, tzinfo=UTC),
+            datetime(2026, 6, 27, 12, 5, 0, 123000, tzinfo=UTC),
+            id="the reviewer's instant",
+        ),
+        pytest.param(
+            datetime(2026, 6, 27, 12, 5, 0, 123999, tzinfo=UTC),
+            datetime(2026, 6, 27, 12, 5, 0, 123000, tzinfo=UTC),
+            id="just under the next millisecond floors, never rounds up",
+        ),
+        pytest.param(
+            datetime(2026, 6, 27, 12, 5, 0, 999, tzinfo=UTC),
+            datetime(2026, 6, 27, 12, 5, 0, 0, tzinfo=UTC),
+            id="under one millisecond floors to the second",
+        ),
+        pytest.param(
+            datetime(2026, 6, 27, 12, 5, 0, 123000, tzinfo=UTC),
+            datetime(2026, 6, 27, 12, 5, 0, 123000, tzinfo=UTC),
+            id="a whole millisecond is unchanged",
+        ),
+    ],
+)
+def test_floor_to_millisecond_floors_and_never_ceils(moment: datetime, floored: datetime) -> None:
+    result = floor_to_millisecond(moment)
+
+    assert result == floored
+    assert result.microsecond % 1000 == 0
+    assert result <= moment
+
+
+def test_the_reviewers_scenario_end_to_end() -> None:
+    """Clamp, window, page: a venue fill at the floored start is accepted.
+
+    Before the fix this failed at the window (a start of .123456) or, with the window
+    unchecked, at `assemble_fill_page`, which refused the fill at .123000 as older than the
+    window it was asked for.
+    """
+    clamp = clamp_to_retention(
+        datetime(2025, 1, 1, tzinfo=UTC), now=REVIEWER_NOW, capabilities=capabilities()
+    )
+    window = FillWindow(
+        since=clamp.effective_since, until=clamp.effective_since + timedelta(days=7)
+    )
+
+    page = assemble([make_fill(executed_at=REVIEWER_EFFECTIVE_SINCE)], window=window)
+
+    assert clamp.effective_since == REVIEWER_EFFECTIVE_SINCE
+    assert clamp.clamped is True
+    assert window.since == REVIEWER_EFFECTIVE_SINCE
+    assert [fill.executed_at for fill in page.fills] == [REVIEWER_EFFECTIVE_SINCE]
+
+
+def test_a_request_that_is_only_floored_is_not_clamped() -> None:
+    """Inside retention, a sub-millisecond start is floored and `clamped` stays False.
+
+    `clamped` means "retention moved the start later"; flooring moves it earlier by less
+    than a millisecond, which asks for more and hides nothing.
+    """
+    requested = datetime(2026, 8, 26, 12, 0, 0, 1, tzinfo=UTC)
+
+    clamp = clamp_to_retention(requested, now=NOW, capabilities=capabilities())
+    unlimited = clamp_to_retention(requested, now=NOW, capabilities=capabilities(retention=None))
+
+    assert clamp.effective_since == datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    assert clamp.clamped is False
+    assert unlimited.effective_since == datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    assert unlimited.clamped is False
+
+
+def test_floor_to_millisecond_keeps_the_zone_and_floors_the_absolute_instant() -> None:
+    """The grid is absolute, so an offset that is itself sub-millisecond still lands on it.
+
+    At UTC+0.5 ms, local 12:05:00.123456 is 12:05:00.122956 UTC; floored, 12:05:00.122000
+    UTC; back in the same zone, 12:05:00.122500. Worked by hand. A floor on the local
+    `microsecond` field would give .123000, which is not on the absolute grid at all.
+    """
+    half_millisecond_east = timezone(timedelta(microseconds=500))
+    minus_three = timezone(timedelta(hours=-3))
+
+    odd = floor_to_millisecond(
+        datetime(2026, 6, 27, 12, 5, 0, 123456, tzinfo=half_millisecond_east)
+    )
+    ordinary = floor_to_millisecond(datetime(2026, 6, 27, 9, 5, 0, 123456, tzinfo=minus_three))
+
+    assert odd == datetime(2026, 6, 27, 12, 5, 0, 122500, tzinfo=half_millisecond_east)
+    assert odd.tzinfo is half_millisecond_east
+    assert ordinary == datetime(2026, 6, 27, 9, 5, 0, 123000, tzinfo=minus_three)
+    assert ordinary.tzinfo is minus_three
+
+
+def test_floor_to_millisecond_refuses_a_naive_instant() -> None:
+    with pytest.raises(ValueError, match="timezone-aware") as caught:
+        floor_to_millisecond(datetime(2026, 6, 27, 12, 5))  # noqa: DTZ001 - naive on purpose
+
+    assert type(caught.value) is ValueError
+
+
+def test_the_clamp_floors_a_start_capped_at_now() -> None:
+    """A retention shorter than the margin caps the start at `now`, floored like any other."""
+    clamp = clamp_to_retention(
+        datetime(2026, 9, 24, tzinfo=UTC),
+        now=REVIEWER_NOW,
+        capabilities=capabilities(retention=timedelta(minutes=1)),
+    )
+
+    assert clamp.effective_since == datetime(2026, 9, 25, 12, 0, 0, 123000, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("since", "until"),
+    [
+        pytest.param(SINCE + ONE_MICROSECOND, UNTIL, id="since a microsecond past a millisecond"),
+        pytest.param(SINCE, UNTIL - ONE_MICROSECOND, id="until a microsecond short of one"),
+        pytest.param(
+            datetime(2026, 9, 1, 0, 0, 0, 123456, tzinfo=UTC), UNTIL, id="the reviewer's shape"
+        ),
+    ],
+)
+def test_a_window_bound_finer_than_a_millisecond_is_refused(
+    since: datetime, until: datetime
+) -> None:
+    with pytest.raises(ValueError, match="must be a whole millisecond") as caught:
+        FillWindow(since=since, until=until)
+
+    assert type(caught.value) is ValueError
+
+
+def test_a_window_on_whole_milliseconds_is_accepted() -> None:
+    window = FillWindow(since=SINCE + ONE_MILLISECOND, until=UNTIL - ONE_MILLISECOND)
+
+    assert window.until - window.since == timedelta(days=7) - 2 * ONE_MILLISECOND
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"max_query_window": ONE_MICROSECOND}, id="a microsecond query window"),
+        pytest.param(
+            {"max_query_window": timedelta(days=7, microseconds=1)},
+            id="seven days and a microsecond",
+        ),
+        pytest.param(
+            {"retention": timedelta(microseconds=1500)}, id="a millisecond and a half kept"
+        ),
+    ],
+)
+def test_capabilities_refuse_a_duration_finer_than_a_millisecond(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="a whole number of milliseconds") as caught:
+        capabilities(**overrides)  # type: ignore[arg-type]
+
+    assert type(caught.value) is ValueError
+
+
+# --------------------------------------------------------------------------------------
+# Review B: a lone surrogate is text no column can store
+# --------------------------------------------------------------------------------------
+#
+# `decode_json` turns the JSON escape `\ud800` into a Python string holding a lone UTF-16
+# surrogate. Python holds it happily; UTF-8 cannot encode it, so the row fails at INSERT with
+# a `UnicodeEncodeError` -- outside the taxonomy, and after the page was accepted. It is
+# refused where the fill is built instead, naming the field and never the text.
+
+#: Built with `chr` and typed `str`, never written as a `Final` literal: mypy caches a
+#: `Final` string's literal type as UTF-8, and a lone surrogate crashes its cache writer
+#: with `UnicodeEncodeError` -- the same defect this section tests, in the type checker.
+LONE_SURROGATE: Final[str] = chr(0xD800)
+MARKED_SURROGATE: Final[str] = f"trade-{LONE_SURROGATE}-4242"
+TEXT_FIELDS: Final = (
+    "external_trade_id",
+    "external_order_id",
+    "symbol",
+    "base_asset",
+    "quote_asset",
+    "fee_asset",
+    "raw_payload",
+)
+
+
+@pytest.mark.parametrize("field", TEXT_FIELDS)
+def test_a_lone_surrogate_in_a_text_field_is_a_schema_error(field: str) -> None:
+    error = refusal(**{field: MARKED_SURROGATE})
+    rendered = f"{error}{error!r}{error.args}"
+
+    assert f"{field} does not encode as UTF-8" in str(error), str(error)
+    assert LONE_SURROGATE not in rendered
+    assert "\\ud800" not in rendered
+    assert "4242" not in rendered
+
+
+@pytest.mark.parametrize("field", TEXT_FIELDS)
+def test_non_ascii_text_that_encodes_is_accepted(field: str) -> None:
+    """The companion: the refusal is about unencodable text, not about text outside ASCII."""
+    fill = make_fill(**{field: "café-€"})
+
+    assert getattr(fill, field) == "café-€"
+
+
+@pytest.mark.parametrize(
+    ("cursor", "next_cursor", "reason"),
+    [
+        pytest.param(
+            MARKED_SURROGATE, None, "cursor does not encode as UTF-8", id="the cursor asked with"
+        ),
+        pytest.param(
+            "c1",
+            MARKED_SURROGATE,
+            "next_cursor does not encode as UTF-8",
+            id="the cursor handed back",
+        ),
+    ],
+)
+def test_a_cursor_holding_a_lone_surrogate_is_a_schema_error(
+    cursor: str | None, next_cursor: str | None, reason: str
+) -> None:
+    """A checkpoint that cannot be stored cannot resume a sync."""
+    with pytest.raises(ExchangeSchemaError) as caught:
+        assemble([], cursor=cursor, next_cursor=next_cursor)
+
+    assert type(caught.value) is ExchangeSchemaError
+    assert reason in str(caught.value), str(caught.value)
+    rendered = f"{caught.value}{caught.value!r}{caught.value.args}"
+    assert LONE_SURROGATE not in rendered
+    assert "4242" not in rendered
+
+
+def test_a_cursor_in_non_ascii_text_that_encodes_is_accepted() -> None:
+    page = assemble([], cursor="café-1", next_cursor="café-2")
+
+    assert (page.cursor, page.next_cursor) == ("café-1", "café-2")
