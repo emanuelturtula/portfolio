@@ -1,15 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
-import { useQueryClient } from '@tanstack/react-query';
 
 import { describeApiError } from '@/api/client';
-import {
-  useArchiveWallet,
-  useRestoreWallet,
-  useWallets,
-  walletsQueryKey,
-  type Wallet,
-} from '@/api/wallets';
+import { useArchiveWallet, useRestoreWallet, useWallets, type Wallet } from '@/api/wallets';
 import { Address } from '@/components/Address';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
@@ -32,21 +25,88 @@ function rowName(wallet: Wallet): string {
 
 interface WalletRowProps {
   readonly wallet: Wallet;
-  /** Registers (or, given `null`, unregisters) this row's current primary control - the
-   * Archive or Restore button, whichever is shown - so the list can return focus to it. */
-  readonly registerControlRef: (walletId: number, element: HTMLButtonElement | null) => void;
-  /** Tells the list an archive or a restore for this wallet just succeeded, so it can move
-   * focus once the refetched list confirms whether the row is still shown. */
-  readonly notifyActionSettled: (walletId: number) => void;
+  /** Whether the list is currently showing archived wallets - what decides whether this
+   * row survives its own archive (stays, and swaps to Restore) or not (leaves the list). */
+  readonly includeArchived: boolean;
+  /** Focuses the wallet list's own heading. Owned by the list, not the row: it is the one
+   * stable element still on screen once an archived row leaves the active-only view. */
+  readonly focusListHeading: () => void;
 }
 
-function WalletRow({ wallet, registerControlRef, notifyActionSettled }: WalletRowProps) {
+/**
+ * One row: its own archive/restore controls, and the focus hand-off for both.
+ *
+ * **Archive in the active-only view is the simple case**: the row always leaves once the
+ * list refetches, so `onSuccess` focuses the list heading directly and does not wait for
+ * anything - the row is still on screen for one more render, which is harmless, because
+ * focus has already moved off it before it goes.
+ *
+ * **Restore, and archive with "Show archived" on, are the case where the row stays** and
+ * swaps which control it shows. Nothing here waits on the wallets query's data at all - by
+ * the time either mutation is fired, the answer to "does this row survive" is already known
+ * from `includeArchived`, and the *right* control to focus is decided from this row's own
+ * `wallet.archived`, watched with a one-row effect instead of any cross-row machinery. See
+ * `focusOnceFlipped` for the one subtlety: `onSuccess` can run before or after the row has
+ * re-rendered with the flipped value, and both orders have to land on the right control.
+ */
+function WalletRow({ wallet, includeArchived, focusListHeading }: WalletRowProps) {
   const [confirming, setConfirming] = useState(false);
   const archiveMutation = useArchiveWallet();
   const restoreMutation = useRestoreWallet();
   const archiveButtonRef = useRef<HTMLButtonElement | null>(null);
   const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
+  const restoreButtonRef = useRef<HTMLButtonElement | null>(null);
   const name = rowName(wallet);
+
+  // Synced after every render (in an effect - a ref may not be written during render
+  // itself), so `onSuccess` - which runs later, off whatever `wallet` its own click closed
+  // over - can read this row's *latest* `archived` rather than a stale one.
+  const archivedRef = useRef(wallet.archived);
+  useEffect(() => {
+    archivedRef.current = wallet.archived;
+  });
+
+  // Set when a focus hand-off is waiting for `wallet.archived` to flip to the value the
+  // action in flight expects. Row-local and consumed only by *this* row's own flip, which
+  // is what keeps it safe from the bug an earlier, cross-row version of this had: an
+  // unrelated list change (toggling "Show archived") never flips a row's `archived` - it
+  // mounts or unmounts rows - so it can never wrongly satisfy this.
+  const focusAfterFlipRef = useRef(false);
+
+  useEffect(() => {
+    if (!focusAfterFlipRef.current) {
+      return;
+    }
+    focusAfterFlipRef.current = false;
+    if (wallet.archived) {
+      restoreButtonRef.current?.focus();
+    } else {
+      archiveButtonRef.current?.focus();
+    }
+  }, [wallet.archived]);
+
+  /**
+   * Arranges to focus whichever control corresponds to `expectArchived`, once the row is
+   * showing it.
+   *
+   * The order between "the refetch has already flipped `wallet.archived`" and "`onSuccess`
+   * runs" is not fixed. If the flip already happened - `archivedRef.current` already reads
+   * `expectArchived` - the effect above already ran for it and found nothing pending, and
+   * `wallet.archived` will not change *again* on its own, so this focuses immediately
+   * instead of arming a hand-off nothing will ever trigger. Otherwise the flip is still
+   * ahead, and the effect is what will catch it.
+   */
+  function focusOnceFlipped(expectArchived: boolean): void {
+    if (archivedRef.current === expectArchived) {
+      if (expectArchived) {
+        restoreButtonRef.current?.focus();
+      } else {
+        archiveButtonRef.current?.focus();
+      }
+    } else {
+      focusAfterFlipRef.current = true;
+    }
+  }
 
   // `flushSync` forces the state update and its re-render to apply synchronously, so the
   // ref below already points at the newly-shown button by the time `.focus()` runs -
@@ -80,14 +140,14 @@ function WalletRow({ wallet, registerControlRef, notifyActionSettled }: WalletRo
         {wallet.archived ? (
           <button
             type="button"
-            ref={(element) => {
-              registerControlRef(wallet.id, element);
-            }}
+            ref={restoreButtonRef}
             aria-label={`Restore ${name}`}
             onClick={() => {
               restoreMutation.mutate(wallet.id, {
                 onSuccess: () => {
-                  notifyActionSettled(wallet.id);
+                  // Restore only ever appears with "Show archived" on, so the row always
+                  // stays - there is no active-only-view case to branch on here.
+                  focusOnceFlipped(false);
                 },
               });
             }}
@@ -105,12 +165,12 @@ function WalletRow({ wallet, registerControlRef, notifyActionSettled }: WalletRo
               onClick={() => {
                 archiveMutation.mutate(wallet.id, {
                   onSuccess: () => {
-                    // The row's own focus handling ends here: whether the row disappears
-                    // (active-only view) or stays and swaps to Restore (archived shown) is
-                    // not known yet - `wallets` has not refetched - so the list, which does
-                    // know once it has, takes over from `notifyActionSettled`.
                     setConfirming(false);
-                    notifyActionSettled(wallet.id);
+                    if (includeArchived) {
+                      focusOnceFlipped(true);
+                    } else {
+                      focusListHeading();
+                    }
                   },
                 });
               }}
@@ -130,10 +190,7 @@ function WalletRow({ wallet, registerControlRef, notifyActionSettled }: WalletRo
         ) : (
           <button
             type="button"
-            ref={(element) => {
-              archiveButtonRef.current = element;
-              registerControlRef(wallet.id, element);
-            }}
+            ref={archiveButtonRef}
             aria-label={`Archive ${name}`}
             onClick={openConfirm}
           >
@@ -157,88 +214,22 @@ function WalletRow({ wallet, registerControlRef, notifyActionSettled }: WalletRo
 }
 
 /**
- * A focus decision already made, waiting for the render it forced to commit.
- *
- * The decision - whether the wallet is still in the list - is resolved once, synchronously,
- * inside the mutation's own `onSuccess` (see `notifyActionSettled`), against the query
- * cache the invalidated refetch just populated. Nothing here is *re-evaluated* later against
- * a subsequent, unrelated list change: an earlier design instead left a pending request
- * sitting in a ref until some future `wallets.data` change happened to satisfy it, which is
- * exactly the bug this shape exists to rule out - a `DELETE` the server no-ops (already
- * archived, a retried request) never changes the list, so that pending request outlived its
- * own action and was later consumed by an unrelated "Show archived" toggle, stealing focus
- * from the checkbox the owner had just pressed. Resolving immediately and never revisiting
- * the decision removes the "unrelated later change" for a stale request to be mistaken for.
- */
-interface FocusDecision {
-  readonly walletId: number;
-  readonly stillShown: boolean;
-}
-
-/**
  * The wallet list, with its own loading, empty, error and success states - independent of
  * {@link WalletForm}, so a failure here never takes the add form down with it.
  *
- * Owns the cross-row half of focus management: a row's own confirm/cancel transitions are
- * self-contained (see `WalletRow`), but where focus lands after an archive or a restore
- * *succeeds* depends on whether the row is still in the list once it has been refetched -
- * a fact only this component can see.
+ * Focus management for an archive or a restore is entirely each row's own concern (see
+ * `WalletRow`); this component's only part in it is the one destination a row cannot own
+ * itself - its own heading, which outlives every row and is where focus goes when an
+ * archive removes a row from the active-only view.
  */
 export function WalletList() {
   const [includeArchived, setIncludeArchived] = useState(false);
   const wallets = useWallets(includeArchived);
-  const queryClient = useQueryClient();
   const headingRef = useRef<HTMLHeadingElement | null>(null);
-  const controlRefs = useRef(new Map<number, HTMLButtonElement>());
-  // The decision itself lives in a ref, not `useState`: it is written and consumed by the
-  // effect below within the same commit cycle, and calling `setState` from inside that
-  // effect to clear it is exactly what `eslint-plugin-react-hooks` flags as a
-  // cascading-render pattern to avoid. `focusTick` is the real state - its only job is to
-  // force the re-render the effect needs to run against, after `notifyActionSettled` has
-  // written a fresh decision into the ref.
-  const focusDecisionRef = useRef<FocusDecision | null>(null);
-  const [focusTick, setFocusTick] = useState(0);
 
-  function registerControlRef(walletId: number, element: HTMLButtonElement | null): void {
-    if (element === null) {
-      controlRefs.current.delete(walletId);
-    } else {
-      controlRefs.current.set(walletId, element);
-    }
+  function focusListHeading(): void {
+    headingRef.current?.focus();
   }
-
-  /**
-   * Called from a mutation's own `onSuccess`, after the hook-level `onSuccess` - which
-   * invalidates and awaits the refetch - has already run. The wallets query's cache entry
-   * for `includeArchived`'s current value should be populated by now: the row that
-   * triggered this call only exists because that entry was already populated when it
-   * rendered, and an invalidated refetch replaces a cache entry, never clears it. `current`
-   * is still checked rather than asserted, though - unlike a value this module derives
-   * itself, a cache read is a boundary this function does not control, and `undefined`
-   * here degrades to "focus the heading" rather than a runtime crash on `.some`.
-   */
-  function notifyActionSettled(walletId: number): void {
-    const current = queryClient.getQueryData<Wallet[]>(walletsQueryKey(includeArchived));
-    const stillShown = current?.some((wallet) => wallet.id === walletId) ?? false;
-    focusDecisionRef.current = { walletId, stillShown };
-    setFocusTick((tick) => tick + 1);
-  }
-
-  useEffect(() => {
-    const decision = focusDecisionRef.current;
-    if (decision === null) {
-      return;
-    }
-    focusDecisionRef.current = null;
-
-    if (decision.stillShown) {
-      controlRefs.current.get(decision.walletId)?.focus();
-    } else {
-      headingRef.current?.focus();
-    }
-    // `focusTick` itself is never read here - its only job is to be a *different* number
-    // each time, which is what makes this effect run again after `notifyActionSettled`.
-  }, [focusTick]);
 
   return (
     <section aria-labelledby="wallet-list-heading">
@@ -288,8 +279,8 @@ export function WalletList() {
             <WalletRow
               key={wallet.id}
               wallet={wallet}
-              registerControlRef={registerControlRef}
-              notifyActionSettled={notifyActionSettled}
+              includeArchived={includeArchived}
+              focusListHeading={focusListHeading}
             />
           ))}
         </ul>
