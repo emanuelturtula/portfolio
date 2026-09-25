@@ -51,7 +51,7 @@ the backend already sent. It is exact; see [Asset rows](#asset-rows-are-sums-of-
 - **Extended public keys** (#24). The hints recognise one, say it is not supported, and
   refuse nothing.
 - **Invested-per-asset and profit and loss** (#20). **Exchanges** (#16).
-- **#46** (`addMoney` rounds past 40 significant digits). The sums here are at most 28
+- **#46** (`addMoney` rounds past 40 significant digits). Realistic sums here are about 33
   digits; see Risks.
 - **#47** (frontend module boundaries). New code follows the existing layout: `api/`, `lib/`,
   `components/`, `pages/`.
@@ -111,18 +111,28 @@ log records *which chain failed and whose fault it was*, so the rule reads that:
 
    Two runs are enough because at most one run is ever `running`. The coordinator runs one at
    a time, and every run sweeps orphaned `running` rows before it opens its own.
-2. For a wallet row on chain `C`, let `outcome` be `settled.chains`' entry for `C`. The row is
-   **fresh** when both of these hold:
-   - `outcome.status` is `success`;
-   - `observed_at` is at or after `settled.started_at`.
-3. Otherwise the row says why, in this order:
+2. For a wallet row on chain `C`, let `outcome` be `settled.chains`' entry for `C`. The rows
+   below are checked in order, and the first match decides:
 
-| Case | Rendered |
-|---|---|
-| no run has ever happened | "No sync has run yet" |
-| `outcome.status` is `failed` | the error kind's sentence, then "showing the balance from" and the reading's age |
-| no `outcome`, and `settled.status` is `interrupted` | the last sync was interrupted before it read this chain |
-| no `outcome`, or a reading older than `settled.started_at` | not covered by the last sync |
+| Case | Status | Rendered |
+|---|---|---|
+| no settled run | never synced | "No sync has finished yet" |
+| `outcome.status` is `success` and `observed_at` is at or after `settled.started_at` | fresh | "Up to date" |
+| `outcome.status` is `failed` | failed | the error kind's sentence, then "showing the balance from" and the reading's age |
+| `settled.status` is `interrupted`, and the reading is at or after `settled.started_at` | fresh | "Up to date" |
+| `settled.status` is `interrupted` otherwise | interrupted | the last sync was interrupted before it read this chain |
+| anything else | not covered | not covered by the last sync |
+
+**An interrupted run has no chain outcomes, ever**, and the first draft of this table assumed
+it did. Review read the backend: `finish_run` writes the outcomes in the same transaction as
+the final status, and the orphan sweep only flips the status. A chain's snapshots commit
+before that close-out, though. So after an interrupted run, a reading stamped at or after its
+start is evidence that the run read that chain before it stopped, and it is fresh. The draft
+called every row "interrupted", including the chains the run did read, and its tests were
+built on a fixture of an interrupted run *with* outcomes, a state the backend cannot write.
+
+"No sync has finished yet" rather than "has run": when the only run is an orphaned `running`
+row, a sync did run, and some of its readings may be on screen.
 
 The second half of the fresh test is not decoration. **This change adds restore**, and a
 restored wallet brings back the reading it had before it was archived. Its chain can succeed
@@ -132,6 +142,12 @@ chain-only test would call that reading fresh.
 `observed_at` is stamped when a chain's read begins inside the run. It is therefore never
 earlier than the run's `started_at`, and comparing at millisecond precision cannot make a
 fresh reading look older.
+
+**Timestamps are parsed through one `parseInstant`, which truncates the fraction to three
+digits**, added in review. The backend sends microseconds, and ECMAScript only guarantees
+`Date` parsing of its own format, which has exactly three fractional digits. Truncating
+rather than rounding keeps `observed_at >= started_at` true whenever it was true in
+microseconds.
 
 When the runs query fails, the balances still render. A notice says freshness could not be
 determined, and no row claims to be fresh.
@@ -149,10 +165,11 @@ This logic lives in one pure module, `src/lib/freshness.ts`, with no React in it
 | unpriced asset | the asset row, and the "missing" list | the reason's sentence; value "—" |
 | `complete: false` | the total | labelled partial, followed by what is missing |
 | `complete: false` and no wallet has a value | the total | "—" in place of the amount: the backend's `"0"` is then an empty sum, not a value |
-| sync in progress | the status line | that a sync is running |
+| a `running` first run | the status line | when that run started and that it has not finished. It does **not** disable Refresh |
 | runs query failed | a notice | sync status unavailable; balances still shown |
 | wallets query failed | a notice | addresses unavailable; rows fall back to label, or chain name and id |
-| current query failed | the page | `ErrorState` with retry, the only whole-page failure |
+| current query failed, nothing loaded yet | the page | `ErrorState` with retry, the only whole-page failure |
+| current query failed on a later poll | a notice | the error; the data already on screen stays |
 | refresh failed | beside the button | the error; the data already on screen stays |
 
 A `null` value never reaches `formatMoney`, and no code path renders the string `0` for a
@@ -185,6 +202,10 @@ The total is **not** recomputed. It renders the backend's `total`, whose own sum
 same wallet values. There is one exception, added in review: when nothing could be valued, the
 backend's `"0"` is an empty sum and renders as "—". Only an incomplete total can hit this. A
 complete portfolio that is genuinely worth nothing still shows `0.00`.
+
+**Prices render with between 2 and 8 fraction digits. Values and the total use exactly 2.**
+The draft gave prices the fiat format too, so KAS at `0.084912345678` read "0.08". That is 6%
+low, and the price column stopped multiplying out to the value beside it.
 
 ### Pending
 
@@ -361,13 +382,13 @@ client. Fixtures use testnet addresses only.
 | 2 | field errors | "a 422 on the address renders under the address field", "a 422 on the label renders under the label field", "a 422 at an unknown location renders at form level", "a 409 renders under the address field", "an empty address is refused without a request". `api/client.test.ts`: "keeps a well-formed errors array", "drops malformed errors entries" |
 | 3 | values | `pages/DashboardPage.test.tsx`: "renders the total, each wallet's value and each asset's quantity and value" |
 | 3 | asset sums | "an asset held in two wallets shows the sum of both" |
-| 4 | refresh | "refresh posts a sync and re-reads the balances", "refresh is disabled while a sync is in flight", "a failed refresh keeps the balances on screen and says why" |
+| 4 | refresh | "refresh posts a sync and re-reads the balances", "refresh is disabled while its own request is in flight", "a running run does not disable refresh", "a failed refresh keeps the balances on screen and says why", "a failed poll keeps the dashboard on screen" |
 | 4 | last updated | "shows balances-as-of and the last sync, relative to now", "the relative time advances without a reload" (fixed clock) |
 | 5 | stale price | "a stale price is labelled stale on the asset and wallet rows" |
 | 5 | unpriced | "an unpriced asset shows its reason and no value", one case per `PriceUnavailable` |
 | 5 | provider failure | "a wallet whose chain failed shows the reason and the age of its reading", one case per `SyncErrorKind` in `lib/freshness.test.ts` |
 | 5 | no silent zero | "a wallet with no value renders no zero", "an unread wallet renders no zero" |
-| 5 | freshness rule | `lib/freshness.test.ts`: fresh; failed; interrupted; not covered; a restored wallet whose reading predates the run; no runs; a running first run falls through to the second |
+| 5 | freshness rule | `lib/freshness.test.ts`: one test per row of the freshness table, including an interrupted run, which has no outcomes, that read the chain; a restored wallet whose reading predates the run; a running first run falling through to the second; and microsecond timestamps within one millisecond |
 | 6 | partial run | "one chain down: the other chain's rows are fresh, the failed chain's rows say so, and the total says what it includes" |
 | 6 | partial requests | "balances render when the runs request fails", "balances render when the wallets request fails" |
 | 7 | empty | "no wallets: the dashboard links to the wallets page" |
@@ -404,9 +425,15 @@ change, it comes back to the tech lead first.
 - **The clipboard API needs a secure context.** Production is HTTPS, since the `__Host-`
   session cookie requires it, and `localhost` counts as secure. The failure path is rendered
   anyway, because an unavailable clipboard is not an exception worth a blank button.
-- **#46 is not reached.** Backend values come out of a 28-digit `Decimal` context, and the
-  largest quantity is KAS supply at 8 decimals, 19 digits. Sums of those stay well under 40
-  significant digits.
+- **#46 is not reached.** Backend values come out of a 38-digit `Decimal` context
+  (`domain/money.py`; the draft said 28, and review corrected it). The margin is therefore
+  narrower than the draft claimed, but it is there. A quantity has 8 decimal places and a
+  price 12, so a value has 20. The largest quantity, KAS supply, is 19 digits. A realistic
+  sum stays near 33 significant digits, under `addMoney`'s 40. #46 is still the fix that makes
+  this a refusal rather than an argument.
+- **Clocks.** `started_at` and `observed_at` both read the backend's wall clock. If NTP steps
+  it backwards between the two, a fresh row reads "not covered". That errs toward saying
+  less than is true, and it is accepted.
 - **100% frontend coverage.** Every branch of the hint table and the freshness rule needs a
   test. That is intended, and it is also where the time will go.
 - **Time in tests.** Relative time is asserted under a fixed system time, faking `Date`
