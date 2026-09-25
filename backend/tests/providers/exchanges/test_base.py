@@ -1619,3 +1619,28 @@ def test_a_cursor_in_non_ascii_text_that_encodes_is_accepted() -> None:
     page = assemble([], cursor="café-1", next_cursor="café-2")
 
     assert (page.cursor, page.next_cursor) == ("café-1", "café-2")
+
+
+def test_an_order_id_that_is_not_text_is_a_schema_error() -> None:
+    """The optional order id skips the blank check, so its type is refused on its own."""
+    error = refusal(external_order_id=5001)
+
+    assert "external_order_id must be a string" in str(error), str(error)
+
+
+@pytest.mark.parametrize(
+    ("cursor", "next_cursor", "reason"),
+    [
+        pytest.param(5, None, "cursor must be a string", id="the cursor asked with"),
+        pytest.param("c1", 5, "next_cursor must be a string", id="the cursor handed back"),
+    ],
+)
+def test_a_cursor_that_is_not_text_is_a_schema_error(
+    cursor: object, next_cursor: object, reason: str
+) -> None:
+    """A venue that sends its cursor as a JSON number: stored and re-sent, it would not match."""
+    with pytest.raises(ExchangeSchemaError) as caught:
+        assemble([], cursor=cursor, next_cursor=next_cursor)  # type: ignore[arg-type]
+
+    assert type(caught.value) is ExchangeSchemaError
+    assert reason in str(caught.value), str(caught.value)
