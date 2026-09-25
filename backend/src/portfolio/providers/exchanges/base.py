@@ -82,12 +82,16 @@ __all__ = [
     "derive_quote_quantity",
     "encode_raw_payload",
     "epoch_ms",
+    "floor_to_millisecond",
     "require_cursor_advanced",
     "require_fill_amount",
 ]
 
 EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 """The instant epoch milliseconds count from, as an aware UTC datetime."""
+
+_ONE_MILLISECOND: Final = timedelta(milliseconds=1)
+"""The granularity of this seam: every window bound and every duration is a multiple of it."""
 
 RETENTION_MARGIN: Final = timedelta(minutes=5)
 """How far inside a venue's retention edge the oldest request is placed. **A guess.**
@@ -246,18 +250,19 @@ class ExchangeCapabilities:
         refused: `clamp_to_retention` never moves a request past `now`, so such a venue
         simply has nothing old enough to ask about.
 
+        Both durations must be whole milliseconds, the granularity of the seam: a window
+        built from millisecond bounds is a whole number of milliseconds long, and a limit
+        off that grid would be one no window could exactly meet.
+
         Raises:
-            ValueError: a page size below one, or a query window or retention that is zero
-                or negative.
+            ValueError: a page size below one, or a query window or retention that is zero,
+                negative or not a whole number of milliseconds.
             TypeError: `rate_limit` is not a `RateLimit`.
         """
         _require_positive_int(self.page_size, field="page_size")
-        if self.max_query_window <= timedelta(0):
-            message = "max_query_window must be a positive duration"
-            raise ValueError(message)
-        if self.retention is not None and self.retention <= timedelta(0):
-            message = "retention must be None (the venue keeps everything) or positive"
-            raise ValueError(message)
+        _require_millisecond_duration(self.max_query_window, field="max_query_window")
+        if self.retention is not None:
+            _require_millisecond_duration(self.retention, field="retention")
         _require_rate_limit(self.rate_limit)
 
 
@@ -274,13 +279,23 @@ class FillWindow:
     until: datetime
 
     def __post_init__(self) -> None:
-        """Refuse a window that cannot be placed in time or contains nothing.
+        """Refuse a window that cannot be placed in time, is off the grid, or is empty.
+
+        **Both bounds must be whole milliseconds**, because milliseconds are the granularity
+        of the seam: a venue is asked in epoch milliseconds (`epoch_ms` floors), and it
+        answers in them (`datetime_from_epoch_ms`). A `since` of `12:00:00.000500` would be
+        sent as `12:00:00.000`, and a venue that correctly returned a fill from `.000200`
+        would have its page refused for answering outside a window it was never actually
+        told about. Build bounds with `floor_to_millisecond`.
 
         Raises:
-            ValueError: either bound is naive, or `since` is not before `until`.
+            ValueError: either bound is naive or not a whole millisecond, or `since` is not
+                before `until`.
         """
         _require_aware(self.since, field="FillWindow.since")
         _require_aware(self.until, field="FillWindow.until")
+        _require_whole_millisecond(self.since, field="FillWindow.since")
+        _require_whole_millisecond(self.until, field="FillWindow.until")
         if self.since >= self.until:
             message = "FillWindow.since must be before FillWindow.until"
             raise ValueError(message)
@@ -310,7 +325,10 @@ class NormalizedFill:
       `quantize(value, FILL_SCALE) != value` so trailing zeros are not a false refusal.
       `NumericText` would round such a value silently -- right for a price, wrong for a
       quote quantity stored "as reported" -- so it is refused before it gets there;
-    * an empty or whitespace `external_trade_id`, `symbol`, `base_asset` or `quote_asset`;
+    * an empty or whitespace `external_trade_id`, `symbol`, `base_asset` or `quote_asset`,
+      and any text field -- those four, `external_order_id`, `fee_asset`, `raw_payload` --
+      that does not encode as UTF-8, which in practice is a lone surrogate from a
+      `\\ud800` escape the JSON parser accepted;
     * a `side` that is not a `FillSide`;
     * a `fee_asset` of `None` beside a non-zero fee, or a blank one;
     * a naive `executed_at`;
@@ -364,6 +382,10 @@ class NormalizedFill:
                 names the field and the rule, never the value.
         """
         _require_text(self.external_trade_id, field="external_trade_id")
+        if self.external_order_id is not None:
+            # Not `_require_text`: whether a venue ever sends a blank order id is unknown,
+            # and blank is not what breaks an insert. Unencodable text is.
+            _require_utf8(self.external_order_id, field="external_order_id")
         _require_text(self.symbol, field="symbol")
         _require_text(self.base_asset, field="base_asset")
         _require_text(self.quote_asset, field="quote_asset")
@@ -492,6 +514,14 @@ def clamp_to_retention(
     instead -- nothing old enough to ask about -- so the result can always open a
     `FillWindow` ending at `now`, or be seen to have nothing to open one over.
 
+    **`effective_since` is always a whole millisecond**, floored after everything above,
+    so it can open a `FillWindow` as it stands. Flooring asks for slightly more history,
+    never less, and moves the instant by under a millisecond -- well inside
+    `RETENTION_MARGIN`, so a floored edge is still inside what the venue keeps. A floor is
+    not a clamp: `clamped` stays `False` for a request that was only floored, because
+    `clamped` means the request was moved *forward* and history the owner asked for is
+    not being fetched.
+
     `now` is an argument, not a clock read, so this is pure and the margin's direction is
     testable to the second.
 
@@ -504,12 +534,33 @@ def clamp_to_retention(
         message = "requested_since must not be after now"
         raise ValueError(message)
     if capabilities.retention is None:
-        return RetentionClamp(requested_since=requested_since, effective_since=requested_since)
-    oldest = now - capabilities.retention + RETENTION_MARGIN
+        effective_since = requested_since
+    else:
+        oldest = now - capabilities.retention + RETENTION_MARGIN
+        effective_since = min(max(requested_since, oldest), now)
     return RetentionClamp(
         requested_since=requested_since,
-        effective_since=min(max(requested_since, oldest), now),
+        effective_since=floor_to_millisecond(effective_since),
     )
+
+
+def floor_to_millisecond(moment: datetime) -> datetime:
+    """`moment` moved back to the start of the millisecond it falls in. Build window bounds with it.
+
+    Milliseconds are the granularity of this seam -- venues are asked and answer in epoch
+    milliseconds -- and `FillWindow` refuses a bound off that grid. Flooring rather than
+    rounding, because for the start of a window it asks for slightly more and never less,
+    and the page check refuses nothing a venue could correctly return.
+
+    The grid is measured from `EPOCH` in absolute time, so the result is on it whatever the
+    offset of `moment`'s zone. The zone itself is kept: this moves an instant, it does not
+    convert one.
+
+    Raises:
+        ValueError: `moment` is naive.
+    """
+    _require_aware(moment, field="moment")
+    return moment - (moment - EPOCH) % _ONE_MILLISECOND
 
 
 def assemble_fill_page(
@@ -533,6 +584,7 @@ def assemble_fill_page(
     | `symbol` given and a fill is for another symbol | `ExchangeSchemaError` |
     | two fills in the page share an `external_trade_id` | `ExchangeSchemaError` |
     | more fills than `page_size` | `ExchangeSchemaError` |
+    | `cursor` or `next_cursor` that does not encode as UTF-8 | `ExchangeSchemaError` |
     | `next_cursor` equal to `cursor` (and not `None`) | `ExchangeSchemaError` |
 
     The first two are `ValueError` because the caller built the request wrongly; the rest
@@ -582,6 +634,9 @@ def assemble_fill_page(
             "external_trade_id values"
         )
         raise ExchangeSchemaError(detail)
+    for name, value in (("cursor", cursor), ("next_cursor", next_cursor)):
+        if value is not None:
+            _require_utf8(value, field=name)
     require_cursor_advanced(cursor, next_cursor)
     return FillPage(
         window=window,
@@ -916,10 +971,37 @@ def _require_flag(value: object, *, field: str) -> None:
 
 
 def _require_text(value: object, *, field: str) -> None:
-    """Refuse a field that is not a non-blank string. Names the field, never the value."""
+    """Refuse a field that is not a non-blank string of UTF-8-encodable text.
+
+    Names the field, never the value.
+    """
     if not isinstance(value, str) or not value.strip():
         detail = f"{field} must be a non-empty string"
         raise ExchangeSchemaError(detail)
+    _require_utf8(value, field=field)
+
+
+def _require_utf8(value: object, *, field: str) -> None:
+    """Refuse text that cannot be encoded as UTF-8 -- in practice, a lone surrogate.
+
+    **`"\\ud800"` is valid JSON** (RFC 8259 escapes code units, not code points, so an
+    unpaired surrogate escape parses), and `json.loads` hands it back as a Python `str`
+    that passes every check a string can be put through -- until something encodes it.
+    That something is the database driver inserting the fill, or the signing helper
+    building the next request from a cursor, and it fails there with a bare
+    `UnicodeEncodeError`: outside the taxonomy, far from the venue that sent it, and in the
+    case of a cursor, halfway through signing a request. Refused here instead, as the
+    schema error it is. The message names the field; the text itself is exactly what
+    cannot be rendered.
+    """
+    if not isinstance(value, str):
+        detail = f"{field} must be a string"
+        raise ExchangeSchemaError(detail)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        detail = f"{field} does not encode as UTF-8"
+        raise ExchangeSchemaError(detail) from None
 
 
 def _is_aware(value: object) -> bool:
@@ -933,6 +1015,23 @@ def _require_aware(value: object, *, field: str) -> None:
     """Refuse a naive datetime, or anything that is not a datetime, with a `ValueError`."""
     if not _is_aware(value):
         message = f"{field} must be a timezone-aware datetime"
+        raise ValueError(message)
+
+
+def _require_whole_millisecond(moment: datetime, *, field: str) -> None:
+    """Refuse an instant that is not on the millisecond grid measured from `EPOCH`."""
+    if (moment - EPOCH) % _ONE_MILLISECOND:
+        message = (
+            f"{field} must be a whole millisecond, the granularity venues are asked in; "
+            "build it with floor_to_millisecond"
+        )
+        raise ValueError(message)
+
+
+def _require_millisecond_duration(duration: timedelta, *, field: str) -> None:
+    """Refuse a duration that is not a positive whole number of milliseconds."""
+    if duration <= timedelta(0) or duration % _ONE_MILLISECOND:
+        message = f"{field} must be a positive duration of a whole number of milliseconds"
         raise ValueError(message)
 
 
