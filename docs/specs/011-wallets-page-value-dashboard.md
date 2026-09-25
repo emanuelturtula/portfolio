@@ -148,6 +148,7 @@ This logic lives in one pure module, `src/lib/freshness.ts`, with no React in it
 | `price.stale` | the asset row and the wallet rows | the price's age, and that it is stale; the total says stale prices were used |
 | unpriced asset | the asset row, and the "missing" list | the reason's sentence; value "—" |
 | `complete: false` | the total | labelled partial, followed by what is missing |
+| `complete: false` and no wallet has a value | the total | "—" in place of the amount: the backend's `"0"` is then an empty sum, not a value |
 | sync in progress | the status line | that a sync is running |
 | runs query failed | a notice | sync status unavailable; balances still shown |
 | wallets query failed | a notice | addresses unavailable; rows fall back to label, or chain name and id |
@@ -181,7 +182,9 @@ give the page two sources for one number: a wallet row and its asset row would c
 different computations, while these rows are the wallet rows added up.
 
 The total is **not** recomputed. It renders the backend's `total`, whose own sum is over the
-same wallet values.
+same wallet values. There is one exception, added in review: when nothing could be valued, the
+backend's `"0"` is an empty sum and renders as "—". Only an incomplete total can hit this. A
+complete portfolio that is genuinely worth nothing still shows `0.00`.
 
 ### Pending
 
