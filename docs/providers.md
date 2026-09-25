@@ -1,14 +1,17 @@
 # Adding a provider
 
-What a new chain has to implement, what a new price source has to implement, what the
-shared machinery already does for both, and -- kept separate on purpose -- which facts
-about each vendor were confirmed against its published documentation, which were measured
-against the live service, and which are still guesses.
+What a new chain has to implement, what a new price source has to implement, what a new
+exchange has to implement, what the shared machinery already does for all three, and --
+kept separate on purpose -- which facts about each vendor were confirmed against its
+published documentation, which were measured against the live service, and which are still
+guesses.
 
-Two kinds of provider live under `backend/src/portfolio/providers/`. A **chain provider**
+Three kinds of provider live under `backend/src/portfolio/providers/`. A **chain provider**
 reads balances from addresses (`providers/chains/`); a **price source** reads what an asset
-costs (`providers/prices/`). Everything down to "Vendor facts" is about the first kind; the
-"Price sources" section near the end is about the second, and says where the two differ.
+costs (`providers/prices/`); an **exchange provider** reads the spot fills on the owner's
+account at a venue (`providers/exchanges/`). Everything down to "Vendor facts" is about the
+first kind; the "Price sources" section near the end is about the second, and the "Exchange
+providers" section after it is about the third. Each says where it differs.
 
 Read `backend/src/portfolio/providers/base.py` alongside this. The docstrings there are the
 reasoning; this is the checklist.
@@ -892,6 +895,261 @@ The general rule: **a value a money column would silently transform is refused b
 and a value a vendor should never have sent is refused by the parser.** The first protects
 every writer; the second keeps a vendor's mistake on the vendor's error path.
 
+## Exchange providers, which sign their requests and fail in more ways
+
+**Landed in #12 as a seam with nothing on the other side of it yet.** Bitget arrives with #13,
+BingX with #14, and the sync that drives both with #15. What exists is the vocabulary all
+three need before any of them can be written without inventing its own: what a fill is, what
+a venue can do, and why a call failed. Read `providers/exchanges/base.py` and
+`providers/exchanges/errors.py` alongside this; the docstrings there are the reasoning.
+
+An exchange differs from the other two kinds in the ways that shape everything below:
+
+- **Every call is signed with the owner's credentials**, so a failure can mean a revoked key,
+  a key without read permission, a throttle, an outage, or a window older than the venue
+  keeps -- and those need five different reactions.
+- **The answer is a stream of executions, not one number.** It arrives in pages, and the sync
+  must commit a checkpoint between pages, so the seam is a page rather than a generator.
+- **The amounts are the owner's holdings**, like a balance and unlike a price, so no message
+  anywhere in the seam quotes one.
+
+### The shape
+
+`ExchangeProvider` in `portfolio.providers.exchanges.base`, three members:
+
+| Member | Kind | What it must do |
+|---|---|---|
+| `capabilities` | property | Return an `ExchangeCapabilities`. Constant for the life of the instance. |
+| `fetch_fill_page` | async method | Read one page of fills inside a `FillWindow`, from a cursor, for a symbol when the venue requires one. Returns a `FillPage` built with `assemble_fill_page`. |
+| `candidate_symbols` | async method | The symbols worth asking about, for a venue with `requires_symbol`; an empty sequence otherwise. |
+
+**Not `@runtime_checkable`**, for the reason `ChainProvider` is not. A fake proves
+conformance with a module-level `_CONFORMS: ExchangeProvider = FakeExchangeProvider()` that
+`mypy --strict` checks. **A provider raises the seven exchange error classes and nothing
+else**: a `ProviderResponseError` from `decode_json`, an `httpx.TransportError` or a
+`KeyError` from a parser is translated at the provider's boundary, `from` the original.
+
+`candidate_symbols` is in the protocol before either venue needs it so that #14 does not
+change a contract #13 already implements.
+
+### What a venue declares
+
+| `ExchangeCapabilities` field | What the sync does with it |
+|---|---|
+| `exchange_key` | an `ExchangeKey` (`bingx`, `bitget`) -- the value `exchange_accounts.exchange_key` admits |
+| `retention` | `clamp_to_retention` moves the oldest request inside it; `None` means the venue keeps everything |
+| `max_query_window` | the longest `FillWindow` one request may cover; `assemble_fill_page` refuses a longer one |
+| `page_size` | the most fills one page may carry; more is a refusal |
+| `cursor_kind` | `trade_id_before`, `trade_id_after`, `time` or `none` -- how the next page is asked for |
+| `rate_limit` | a `RateLimit(max_requests, per_ms)`; `min_interval_ms` rounds **up**, so 3 per 1000 ms is 334 |
+| `requires_symbol` | whether fills can only be listed per symbol |
+
+`ExchangeCapabilities` refuses a page size below one and a zero or negative query window or
+retention. `RateLimit` refuses a field below one **itself, at construction**, because a rate
+limit of zero requests would divide by zero the first time anything asked for its interval.
+
+### `NormalizedFill`: the one shape every venue's fill is translated into
+
+`external_trade_id`, `external_order_id`, `symbol` (the venue's spelling), `base_asset`,
+`quote_asset`, `side` (a `FillSide`), `quantity`, `price`, `quote_quantity`,
+`quote_quantity_derived`, `fee_amount`, `fee_asset`, `executed_at`, `raw_payload`.
+
+**It refuses what the column would transform**, with `ExchangeSchemaError`: an amount that
+is not a finite `Decimal`, a quantity, price or quote quantity at or below zero, an amount
+with more than 20 digits before the point, and -- the point of the type -- **an amount with
+more than `FILL_SCALE` (18) fractional digits.** `NumericText` would round that silently,
+which is right for a price and wrong for a quote quantity stored "as reported". The test is
+`quantize(value, FILL_SCALE) != value`, so trailing zeros are not a false refusal. It also
+refuses a blank trade id, symbol or asset, a `side` that is not a `FillSide`, a naive
+`executed_at`, and a `fee_asset` of `None` beside a non-zero fee. `fee_amount` is signed:
+positive is paid, negative a rebate.
+
+Four rules a provider inherits rather than decides:
+
+- **`quote_quantity` is as reported.** When a venue omits it, call
+  `derive_quote_quantity(quantity, price)` and set `quote_quantity_derived=True`. Never
+  recompute a reported one: a one-unit disagreement with the venue's rounding haunts every
+  reconciliation after it. The derivation multiplies exactly (`domain.money.multiply`) and
+  rounds once, at 18 places, whatever the calling thread's decimal context says.
+- **`external_trade_id` must be unique per account across every symbol.** It is the key of
+  `uq_exchange_fills_account_trade`. A venue whose ids are unique only within a symbol must
+  namespace them, `BTC-USDT:12345`, or two different fills become one and the second is
+  dropped without a word. #14 must check its venue.
+- **Amounts go through `require_fill_amount(value, field=...)`** -- a JSON string holding a
+  plain decimal number, a `Decimal` from `decode_json`, or an `int`. A `bool`, a `float`,
+  whitespace, underscores, Unicode digits, `NaN` and `Infinity` are refused. It is the
+  exchange counterpart of `require_price`.
+- **`raw_payload` is `encode_raw_payload(fill_object)`**: canonical JSON, keys sorted, no
+  whitespace, every `Decimal` written with its own digits so `0.00012300` stays `0.00012300`
+  and `decode_json(encode_raw_payload(d)) == d`. Pass **the venue's fill object, never the
+  envelope or the request** -- those are where a key or a signature could be. Anything
+  `decode_json` could not have produced is a `TypeError`: a provider bug, not a vendor's.
+
+Timestamps: `datetime_from_epoch_ms(value)` takes an `int` or a digit string and returns an
+aware UTC `datetime` as `EPOCH + timedelta(milliseconds=value)`. The obvious
+`datetime.fromtimestamp(ms / 1000)` is a float division in `providers/` and fails the ban.
+`epoch_ms(moment)` is the inverse for building a request, and refuses a naive `datetime`.
+
+### The page contract, enforced by construction
+
+A provider parses its response into `NormalizedFill`s and hands them to
+`assemble_fill_page(window, fills, capabilities=..., cursor=..., next_cursor=..., symbol=...)`.
+It is the `align_balances` of this seam:
+
+| Case | Outcome |
+|---|---|
+| the window is longer than `max_query_window` | `ValueError` -- the caller's mistake |
+| `symbol` given and not `requires_symbol`, or missing and required | `ValueError` |
+| a fill executed outside `[since, until)` | `ExchangeSchemaError` -- an answer about something not asked |
+| two fills in the page share an `external_trade_id` | `ExchangeSchemaError` |
+| more fills than `page_size` | `ExchangeSchemaError` |
+| `next_cursor` equal to `cursor` (and not `None`) | `ExchangeSchemaError` -- pagination stopped advancing |
+
+`FillWindow(since, until)` is **half-open**: a fill at `since` is in and one at `until` is
+not, so windows laid end to end count no instant twice. The last row is also available on its
+own as `require_cursor_advanced(cursor, next_cursor)`. It catches a venue repeating a cursor;
+it cannot catch one cycling between two, which needs the history only the sync loop has --
+#15 owns that.
+
+`clamp_to_retention(requested_since, now=..., capabilities=...)` returns a `RetentionClamp`
+with both instants and a derived `clamped`: `effective_since = max(requested_since,
+now - retention + RETENTION_MARGIN)`, never later than `now`. **It never raises for a
+request older than retention**; surfacing both dates is #13's criterion, decided here once.
+`RETENTION_MARGIN` is five minutes and **a guess**: without it the oldest window is at the
+edge when computed and past it when the request lands.
+
+### The error taxonomy sits inside the existing hierarchy
+
+Seven classes in `providers/exchanges/errors.py`, each also the `ProviderError` subclass
+whose meaning it shares, so `except ProviderUnavailableError` still means "transient" and
+sees an exchange outage too. `except ExchangeError` catches everything an exchange provider
+may raise.
+
+| Class | Also a | Retry? | Default statuses |
+|---|---|---|---|
+| `ExchangeUnavailableError` | `ProviderUnavailableError` | later | 408, any 5xx, a transport failure |
+| `ExchangeRateLimitedError` | `ProviderRateLimitedError` | later, after `retry_after_ms` | 429 |
+| `ExchangeAuthError` | `ProviderResponseError` | no -- fix the key | 401, 403 |
+| `ExchangeInsufficientScopeError` | `ExchangeAuthError` | no -- grant read permission | none; a venue maps its own code |
+| `ExchangeInvalidRequestError` | `ProviderResponseError` | no | any other 4xx |
+| `ExchangeRetentionWindowError` | `ExchangeInvalidRequestError` | #15 clamps further | none; a venue maps its own code |
+| `ExchangeSchemaError` | `ProviderResponseError` | no | anything unclassified, a 200 with an unmapped code included |
+
+**No constructor except `ExchangeSchemaError`'s takes a message.** Each class builds its
+message from a fixed per-class summary plus `(HTTP <status>, venue code <code>)`, and its
+constructor has no parameter free text could be passed through -- so "an auth error never
+includes the response body" is a property of the type, not a convention at every raise. The
+venue's `msg` field is never carried anywhere: it is exactly the field that echoes request
+parameters. `ExchangeSchemaError(detail)` is the exception, because a parser has to say which
+field was wrong; **a detail names a field and a rule, never a value.**
+
+**A venue code is carried only if it cannot be anything else.** `venue_code_of(raw)` keeps an
+`int` or a string of one to ten ASCII digits, optionally negative, and returns `None` for
+everything else -- a `bool`, a longer number, a string with any other character. Every
+exception constructor passes its code through the same function. Ten digits cannot be a key,
+a signature or an address.
+
+### The error map is data, and the lookup order is fixed
+
+A venue declares what differs from the defaults, once, at import:
+
+```python
+ERROR_MAP: Final = build_error_map(
+    {
+        (None, "11111"): ExchangeAuthError,
+        (400, "22222"): ExchangeRetentionWindowError,
+    }
+)
+```
+
+The codes above are placeholders, not either venue's. `build_error_map` refuses a status
+outside 100-599, a code `venue_code_of` would change, the key `(None, None)` and a value that
+is not a strict `ExchangeError` subclass -- a `ValueError` when the module loads, not a
+misclassification in production -- and returns a read-only mapping.
+
+`classify_error(status, venue_code, error_map)` resolves in this order, first match wins:
+
+1. `(status, code)` -- exact;
+2. `(None, code)` -- the code under any status, for in-band errors that arrive on a 200;
+3. `(status, None)` -- the venue's own reading of a status;
+4. `STATUS_FALLBACKS`: 401 and 403 are auth, 408 unavailable, 429 rate-limited;
+5. any other 4xx is an invalid request, any 5xx unavailable;
+6. anything else -- a 200 with an unmapped code, a 3xx -- is a schema error.
+
+Steps 4 to 6 are the same for every venue, so a venue's map lists only what differs. 403
+defaults to auth rather than scope because a CDN block and an IP allowlist also arrive as 403
+and "fix the key" covers them. Step 6 is deliberate: an in-band code nobody mapped is an
+answer we do not understand, and it fails loudly rather than retrying.
+
+A provider raises the result of
+`exchange_error(status, venue_code, error_map=..., retry_after_ms=...)`, which takes no body,
+no message and no URL, by signature. Parse `Retry-After` with the existing
+`parse_retry_after` and pass it unconditionally; only `ExchangeRateLimitedError` keeps it.
+
+### Signing and credentials
+
+`hmac_sha256_hex(secret, message)` and `hmac_sha256_base64(secret, message)` in
+`providers/exchanges/signing.py` take the secret as a `SecretStr` and unwrap it inside, so no
+provider holds the raw secret in a local. Both UTF-8 encode key and message; hex is lower
+case and Base64 is the standard padded alphabet. They are verified against RFC 4231's
+published vectors, which confirms the primitive and nothing about any venue: **which string a
+venue signs, and which encoding it wants back, are #13's and #14's to confirm.** A signature
+authorises its request for the length of the receive window, and one venue carries it in the
+query string -- which is why the transport logs `request_target` and never a path or a query.
+
+`Credentials(api_key, api_secret, passphrase=None)` in `providers/exchanges/credentials.py`
+holds every field as a `SecretStr`, the API key included, because rule 3 names API keys. It
+refuses a plain `str` (`TypeError`) and a blank value (`ValueError`), naming the field and
+never the value. Its `__repr__` and `__str__` are fixed --
+`Credentials(api_key=<redacted>, api_secret=<redacted>, passphrase=None)` -- and say whether a
+passphrase exists, which is configuration rather than a secret. **Credentials are read from
+the environment, never persisted, never returned by an endpoint and never logged.** No column
+of either exchange table holds secret material, and a test walks both tables and every
+dataclass the seam returns to keep it that way.
+
+### Exchanges in the database
+
+Migration `0006_exchanges` creates two tables.
+
+- **`exchange_accounts`**: `user_id` (cascade from `users`), `exchange_key` (checked against
+  the two venues), `created_at`, and `UNIQUE (user_id, exchange_key)` -- one set of
+  credentials per venue in the environment means one account per venue. Sync state is #15's.
+- **`exchange_fills`**: every `NormalizedFill` field, plus `ingested_at` (our clock, beside
+  the venue's `executed_at`). The four amounts are `NumericText(18)`.
+  `UNIQUE (exchange_account_id, external_trade_id)` as `uq_exchange_fills_account_trade` is
+  what #15's `ON CONFLICT DO NOTHING` will stand on.
+
+Three decisions worth knowing before adding a column:
+
+- **`CHECK (external_trade_id <> '')` is what makes the unique constraint mean anything.** Two
+  empty ids collide, and under `ON CONFLICT DO NOTHING` the second fill vanishes.
+- **No `CHECK` on an amount, deliberately.** `quantity > 0` on a `TEXT` column is a comparison
+  SQLite performs by numeric affinity -- the float coercion rule 2 forbids, inside the
+  database. Signs and scale are enforced by `NormalizedFill`, in Python, where they are exact.
+- **The account foreign key is `ON DELETE RESTRICT`.** Fills are the history a cost basis is
+  computed from; deleting an account must not take that history with it.
+
+`NumericText`'s too-large refusal stopped quoting the amount in the same change: it named the
+value while the type only held prices, and a fill quantity is the owner's holdings.
+
+### Not confirmed, and who confirms it
+
+Nothing vendor-specific is in #12, by design. Each of these is belief, and the issue named
+beside it replaces the belief with the venue's documentation:
+
+| Belief | Owner |
+|---|---|
+| both venues report errors as numeric codes (`venue_code_of` drops anything else, and classification falls back to the status) | #13, #14 |
+| BingX reports some failures, auth included, on a 200 -- an unmapped code there is a schema error, so the account is **not** marked `auth_failed` until #14 maps its auth codes | #14 |
+| timestamps are epoch milliseconds | #13, #14 |
+| each venue pages in one of the four `CursorKind` shapes | #13, #14 |
+| each venue's retention, maximum query window, page size and rate limit | #13, #14 |
+| trade ids are unique per account across symbols | #14 |
+| which string each venue signs, and in which encoding | #13, #14 |
+| `RETENTION_MARGIN` of five minutes is enough | #13 |
+| `FILL_SCALE` of 18 covers every fee a venue reports; a 19th place fails its page loudly | whichever venue meets it |
+| a zero `quote_quantity` for a dust trade never happens; if it does, the page fails loudly | whichever venue meets it |
+
 ## Who calls a provider, and when
 
 **Landed in #10.** The wiring three earlier issues each deferred now exists.
@@ -958,6 +1216,21 @@ it by returning a stale number that looks exactly like a fresh one, which is the
 
 ## Not done yet, and who owns it
 
+- **Every exchange venue.** #12 landed the seam and nothing on the other side of it.
+  #13 (Bitget) and #14 (BingX) each bring their endpoint paths, cursor parameters, error
+  codes and retention, confirmed against the venue's documentation and recorded here with
+  the date; their `PORTFOLIO_BITGET_*` and `PORTFOLIO_BINGX_*` settings; and their endpoint
+  labels in `ENDPOINT_LABELS`, which land with the call site that uses them. **The exchange
+  provider registry arrives with #13**, the first provider that registers: the chain
+  registry's factory takes one argument and an exchange factory also needs `Credentials`,
+  so the first real caller shapes it.
+- **The exchange sync.** #15 owns the loop and everything that needs its history: sync state
+  on `exchange_accounts` (status, `auth_failed`, checkpoints, the requested and effective
+  start), the fills repository with `ON CONFLICT DO NOTHING` and its `seen` against
+  `inserted` counts, splitting a range into windows newest first with a five-minute overlap,
+  and detecting a cursor that cycles between pages -- `require_cursor_advanced` only catches
+  one that repeats. A credential health check is not planned; #15 learns about a bad key
+  from a sync.
 - **Tuning settings.** Every number in the first table above is still a module constant.
   Promoting one to a `PORTFOLIO_PROVIDER_*` setting is a change an operator's measurement
   should drive, not a guess made before anything has ever made a request.
