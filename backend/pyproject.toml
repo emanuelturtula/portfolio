@@ -258,6 +258,12 @@ concurrency = ["thread", "greenlet"]
 # `providers/exchanges/` is fully covered, including every refusal arm review added. The first
 # measurement was 99.48% against this floor, and the tester closed it by writing tests for the
 # eighteen uncovered lines.
+#
+# **99.7 held again at the Bitget provider (#13)**, measured 99.93% over 4962 statements and
+# 952 branches, with the same four units missing. 99.8 would leave 7.8 units of headroom,
+# still below nine, so the floor waits one more issue. `providers/exchanges/bitget.py` is
+# fully covered. The first measurement was 99.68% against this floor, and the tester closed
+# the gap with tests for the pure functions' caller contracts.
 fail_under = 99.7
 show_missing = true
 skip_covered = true
