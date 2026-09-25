@@ -159,9 +159,21 @@ def multiply(left: Decimal, right: Decimal) -> Decimal:
     operands and the answer. The sign follows the usual rule, including for a zero: `-0`
     times a positive amount is `-0`, which `quantize` and `NumericText` normalise.
 
+    **No step converts between `int` and `str`**, and that is what makes this safe on any
+    operand rather than on the ones a caller happened to bound. CPython refuses to convert
+    an integer of more than 4300 digits to or from a string (`sys.get_int_max_str_digits`),
+    with a bare `ValueError`, and the first version of this function did both -- so an
+    amount a venue sent with five thousand digits escaped as an untyped error from the
+    middle of a derivation. `int(Decimal)` and `Decimal(int)` convert the binary
+    representations directly and are not subject to that limit; measured, a product of two
+    5001-digit coefficients round-trips through both.
+
     Raises:
         TypeError: either operand is not a `Decimal` (a `bool` or a `float` included).
         ValueError: either operand is a NaN or an infinity.
+        decimal.InvalidOperation: the product's exponent lies outside the range `Decimal`
+            can represent at all -- the same type `quantize` raises for a result it cannot
+            hold, so a caller that quantizes the product catches one type for both.
     """
     require_amount(left, subject="multiply")
     require_amount(right, subject="multiply")
@@ -169,19 +181,24 @@ def multiply(left: Decimal, right: Decimal) -> Decimal:
     right_sign, right_digits, right_exponent = right.as_tuple()
     product = _coefficient(left_digits) * _coefficient(right_digits)
     # Both exponents are `int` on a finite Decimal; the string forms belong to NaN and
-    # infinity, which `require_amount` has already refused.
+    # infinity, which `require_amount` has already refused. `Decimal(product)` is exact
+    # whatever the context says: construction from an `int` never rounds.
     return Decimal(
         (
             left_sign ^ right_sign,
-            tuple(int(character) for character in str(product)),
+            Decimal(product).as_tuple().digits,
             int(left_exponent) + int(right_exponent),
         )
     )
 
 
 def _coefficient(digits: tuple[int, ...]) -> int:
-    """A Decimal's coefficient digits as the integer they spell. Exact by construction."""
-    return int("".join(str(digit) for digit in digits))
+    """A Decimal's coefficient digits as the integer they spell. Exact by construction.
+
+    Through `int(Decimal)` rather than `int("".join(...))`: the string route is subject to
+    the interpreter's 4300-digit conversion limit, and this one is not.
+    """
+    return int(Decimal((0, digits, 0)))
 
 
 def to_base_units(amount: Decimal, decimals: int) -> int:
