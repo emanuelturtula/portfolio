@@ -418,18 +418,23 @@ class ExchangeSyncWindowRepository:
             .values(cursor=cursor)
         )
 
-    async def set_since(self, window_id: int, since: datetime) -> None:
-        """Move a window's start and restart it from its first page.
+    async def set_since(
+        self, window_id: int, since: datetime, *, keep_cursor: bool = False
+    ) -> None:
+        """Move a window's start, in place, keeping its cursor only when told to.
 
-        The cursor is cleared because it described the old range: whether a venue's cursor
-        still means the same thing once the range under it has moved is an assumption about
-        its semantics, and re-reading a page instead costs nothing but the request -- the
-        unique constraint makes the re-read insert nothing.
+        **By default the cursor is cleared** and the window restarts from its first page:
+        whether a venue's cursor still means the same thing once the range under it moved is an
+        assumption about its semantics, and re-reading a page costs nothing but the request --
+        the unique constraint makes the re-read insert nothing. The sync passes
+        `keep_cursor=True` for the cursor kinds `cursor_survives_a_moved_since` vouches for, a
+        trade-id bound, which is what keeps an interrupted oldest window from restarting.
         """
+        values: dict[str, object] = {"since": since}
+        if not keep_cursor:
+            values["cursor"] = None
         await self._session.execute(
-            update(ExchangeSyncWindow)
-            .where(ExchangeSyncWindow.id == window_id)
-            .values(since=since, cursor=None)
+            update(ExchangeSyncWindow).where(ExchangeSyncWindow.id == window_id).values(values)
         )
 
     async def delete(self, window_id: int) -> None:

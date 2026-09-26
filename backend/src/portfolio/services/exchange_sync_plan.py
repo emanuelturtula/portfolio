@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final
 
-from portfolio.providers.exchanges.base import FillWindow, floor_to_millisecond
+from portfolio.providers.exchanges.base import CursorKind, FillWindow, floor_to_millisecond
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -55,9 +55,11 @@ __all__ = [
     "RATE_LIMIT_RETRIES",
     "RETENTION_STEP",
     "AccountPlan",
+    "MovedSince",
     "NormalisedQueue",
     "PendingWindow",
     "Replacement",
+    "cursor_survives_a_moved_since",
     "normalise_pending",
     "plan_account",
     "seconds_to_wait",
@@ -132,7 +134,8 @@ class PendingWindow:
     """A queued window as this module sees it: its identity, its range, what it carries.
 
     `symbol` and `cursor` are carried, not used: they are what the caller needs to write a
-    change back. A replacement always starts from its first page -- see `normalise_pending`.
+    change back. A replacement always starts from its first page; a window whose `since` only
+    moved keeps its cursor when the venue's cursor kind allows -- see `normalise_pending`.
     """
 
     window_id: int
@@ -150,15 +153,29 @@ class Replacement:
 
 
 @dataclass(frozen=True, slots=True)
+class MovedSince:
+    """A queued window whose `since` moves up to `since` and **nothing else changes**.
+
+    The row is updated in place, so it keeps its id. Whether it keeps its cursor too is the
+    caller's decision, by `cursor_survives_a_moved_since` for the venue's cursor kind.
+    """
+
+    original: PendingWindow
+    since: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class NormalisedQueue:
     """The queue after `normalise_pending`: what stays, what changes, and whether any was lost.
 
-    `truncated` is true when a window was dropped or had its `since` moved up -- history the
-    plan held has aged out of what the venue keeps. A re-split alone loses nothing and is not
-    truncation.
+    `moved` holds the windows whose `since` alone moved up; `replaced` the windows dropped or
+    re-split. `truncated` is true when a window was dropped or had its `since` moved up --
+    history the plan held has aged out of what the venue keeps. A re-split alone loses nothing
+    and is not truncation.
     """
 
     kept: tuple[PendingWindow, ...]
+    moved: tuple[MovedSince, ...]
     replaced: tuple[Replacement, ...]
     truncated: bool
 
@@ -214,12 +231,34 @@ def plan_account(
       `[clamp.effective_since, now)`.
     * **Later syncs**, newest first:
       * the **top**, `[max(planned_until - OVERLAP, clamp.effective_since), now)`, only when
-        `now > planned_until` -- a clock stepped backwards plans nothing;
+        `now > planned_until`;
       * the **bottom**, `[clamp.effective_since, effective_since)`, only when the owner
         **moved the history start earlier** -- `clamp.requested_since` before the recorded
         `requested_since` -- and the clamp still reaches below the recorded floor.
     * `effective_since` becomes the earlier of the floor and the bottom's start,
       `planned_until` the later of the two ceilings.
+    * **A clock behind the plan** (`now < planned_until`) plans nothing, and **pulls
+      `planned_until` back to `now`** -- never below `effective_since`.
+
+    **Why the ceiling is pulled back rather than kept.** A clock that once ran ahead leaves a
+    `planned_until` in the future. Kept, it would plan no top until real time caught up with
+    it, and every fill in between would fall into a range the plan claims to have read: the
+    account reports `ok`, and the trades are silently missing. Pulled back, the next run's top
+    starts at the corrected ceiling minus `OVERLAP` and re-covers everything.
+
+    That is right for a **signed venue**, which refuses every request made while the clock is
+    ahead -- Bitget's timestamp window is thirty seconds -- so the ahead run read nothing past
+    real time, and a pending window it planned into the future is harmless: once the clock is
+    corrected, reading it returns what exists and the next top re-covers the rest. Two
+    residuals, stated rather than hidden:
+
+    * an **unsigned venue** that answers while the clock is ahead reads windows that end in
+      the future; pulling the ceiling back then costs a re-read of what it already read, and
+      nothing else, because the constraint makes the re-read insert nothing;
+    * a **stale clock running behind** real time pulls the ceiling back to a moment the venue
+      has already passed, and the next run re-reads from there. That, too, costs only a
+      re-read -- unless the clock is behind by more than the venue's retention, when the next
+      top starts past the pulled-back ceiling and the hole rule below moves the floor up.
 
     **Why the bottom needs the owner to have asked.** The spec states the bottom "only
     happens when the owner moves the history start earlier", and under a rolling retention
@@ -252,6 +291,14 @@ def plan_account(
             effective_since=edge,
             planned_until=max(edge, ceiling),
         )
+    if ceiling < planned_until:
+        # The clock is behind the plan: see "Why the ceiling is pulled back" above. Never below
+        # the floor, so `[effective_since, planned_until)` stays a range rather than inverting.
+        return AccountPlan(
+            windows=(),
+            effective_since=effective_since,
+            planned_until=max(ceiling, effective_since),
+        )
 
     top: tuple[FillWindow, ...] = ()
     if ceiling > planned_until:
@@ -283,14 +330,17 @@ def normalise_pending(
 
     | Window | Becomes |
     |---|---|
-    | wholly older than `floor` (`until <= floor`) | dropped: its history has aged out |
-    | partly older (`since < floor < until`) | `since` moved up to `floor` |
-    | then, longer than `max_window` | re-split newest first |
-    | anything else | kept as it is, cursor and all |
+    | wholly older than `floor` (`until <= floor`) | `replaced` by nothing: its history aged out |
+    | partly older (`since < floor < until`), within `max_window` | `moved`: `since` up to `floor` |
+    | longer than `max_window`, its `since` moved or not | `replaced` by a newest-first re-split |
+    | anything else | `kept` as it is, cursor and all |
 
-    **A replaced window restarts from its first page.** Its cursor described the old range,
-    and whether a venue's cursor means the same thing once the range under it moved is an
-    assumption about that venue; re-reading a page costs a request and inserts nothing.
+    **A replaced window restarts from its first page**: its replacements are new windows, and
+    a cursor describes a position within one window. **A moved window keeps its row**, and the
+    caller keeps its cursor exactly when `cursor_survives_a_moved_since` says the venue's kind
+    allows. That matters for the oldest window of a backfill: the rolling retention floor
+    passes its `since` by the next run, every run, so restarting it from page one would make
+    an interrupted backfill re-read its oldest window in full.
 
     Raises:
         ValueError: `floor` is naive or off the millisecond grid, or `max_window` is not a
@@ -298,6 +348,7 @@ def normalise_pending(
     """
     _require_positive_millisecond_duration(max_window, field="max_window")
     kept: list[PendingWindow] = []
+    moved: list[MovedSince] = []
     replaced: list[Replacement] = []
     truncated = False
     for pending in windows:
@@ -310,16 +361,40 @@ def normalise_pending(
         if since < floor:
             since = floor
             truncated = True
-        if since == window.since and window.duration <= max_window:
-            kept.append(pending)
-            continue
-        replaced.append(
-            Replacement(
-                original=pending,
-                windows=split_newest_first(since, window.until, max_window=max_window),
+        if window.until - since > max_window:
+            replaced.append(
+                Replacement(
+                    original=pending,
+                    windows=split_newest_first(since, window.until, max_window=max_window),
+                )
             )
-        )
-    return NormalisedQueue(kept=tuple(kept), replaced=tuple(replaced), truncated=truncated)
+        elif since != window.since:
+            moved.append(MovedSince(original=pending, since=since))
+        else:
+            kept.append(pending)
+    return NormalisedQueue(
+        kept=tuple(kept),
+        moved=tuple(moved),
+        replaced=tuple(replaced),
+        truncated=truncated,
+    )
+
+
+def cursor_survives_a_moved_since(cursor_kind: CursorKind) -> bool:
+    """Whether a window's cursor still holds after only its `since` moved forward.
+
+    **Yes for the two trade-id kinds.** A `TRADE_ID_BEFORE` or `TRADE_ID_AFTER` cursor is a
+    bound on trade ids -- "older than id X", "newer than id X" -- and it means the same thing
+    whatever time range it is combined with. Moving `since` forward only narrows the range the
+    venue filters by, so the pages still to come are the same pages, minus the fills that are
+    now outside it.
+
+    **No for `TIME` and `NONE`.** A time cursor is a position in the very range that moved,
+    and whether it still lies inside it, or means the same thing once the range changed, is an
+    assumption about a venue this application does not have; `NONE` has no cursor to keep.
+    Restarting costs a re-read, which the unique constraint makes free.
+    """
+    return cursor_kind in {CursorKind.TRADE_ID_BEFORE, CursorKind.TRADE_ID_AFTER}
 
 
 def split_in_half(window: FillWindow) -> tuple[FillWindow, FillWindow]:

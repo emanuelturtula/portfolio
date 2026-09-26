@@ -31,6 +31,15 @@ when the venue has nothing after the page -- **in one commit**. A crash before i
 page and nothing else; the window is re-read from the last committed cursor, and the unique
 constraint makes the re-read insert nothing. A crash after it has already moved the cursor.
 
+## No network call inside an open write transaction
+
+SQLite has one write lock, held from a transaction's first write to its commit. A venue call
+made after a write and before the commit -- with the rate-limit sleeps around it -- would hold
+that lock for as long as the venue took, and a concurrent login or the balance sync would fail
+with "database is locked". So every commit here closes the writes before the next venue call:
+a page is fetched, then written and committed; a plan is computed and the venue asked for its
+symbols, then every planning write is made and committed at once.
+
 ## Failure isolation is per account, and `Exception` is the boundary
 
 `_sync_account` catches `Exception`, rolls back the page in flight, records the account's
@@ -56,7 +65,7 @@ own `sleep_seconds` by default.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
 from typing import TYPE_CHECKING, Final
 
@@ -101,6 +110,7 @@ from portfolio.services.exchange_sync_plan import (
     RATE_LIMIT_RETRIES,
     RETENTION_STEP,
     PendingWindow,
+    cursor_survives_a_moved_since,
     normalise_pending,
     plan_account,
     seconds_to_wait,
@@ -114,7 +124,12 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from portfolio.domain.exchanges import ExchangeKey
-    from portfolio.providers.exchanges.base import ExchangeProvider, FillPage
+    from portfolio.providers.exchanges.base import (
+        ExchangeCapabilities,
+        ExchangeProvider,
+        FillPage,
+        RetentionClamp,
+    )
     from portfolio.repositories.exchanges import ExchangeAccountState, SyncWindowRow
 
 __all__ = [
@@ -238,6 +253,18 @@ class _Progress:
             error_kind=None if failure is None else failure.error_kind,
             detail=None if failure is None else failure.detail,
         )
+
+
+@dataclass(slots=True)
+class _RetentionRecovery:
+    """This run's retention recovery, per window id: re-clamped already, and steps spent.
+
+    Mutable, and scoped to one account in one run: the limits are "once per window per run"
+    and "`MAX_RETENTION_STEPS` per window per run". Keyed by id, which a move keeps.
+    """
+
+    reclamped: set[int] = field(default_factory=set)
+    steps: dict[int, int] = field(default_factory=dict)
 
 
 class ExchangeSyncService:
@@ -472,6 +499,18 @@ class ExchangeSyncService:
             error_type=type(error).__name__,
         )
 
+    def _clamp_at(self, now: datetime, capabilities: ExchangeCapabilities) -> RetentionClamp:
+        """The requested start moved inside the venue's retention, as of `now`.
+
+        `min(requested, now)`: a clock stepped back behind a configured date must not make the
+        clamp raise. The configured value is still what gets recorded.
+        """
+        return clamp_to_retention(
+            min(self._requested_since, now),
+            now=now,
+            capabilities=capabilities,
+        )
+
     async def _read_account(
         self,
         account: ExchangeAccountState,
@@ -480,18 +519,29 @@ class ExchangeSyncService:
     ) -> None:
         """Plan the account's history, persist the plan, then drain its queue newest first.
 
-        The plan is committed **before any fetch**, so a crash after planning resumes the plan
-        rather than planning over it.
+        **Three phases, and their order is the write-lock rule in the module docstring:**
+
+        1. read the queue, and compute the re-clamp and the plan -- both pure;
+        2. ask the venue for its candidate symbols, only when it requires them and the plan
+           has new windows;
+        3. make every write -- moved and replaced windows, new windows, the account's history
+           -- and commit once.
+
+        So no write is open while the venue answers or the rate limit is waited out, and a
+        failure in phase 2 has written nothing. The plan is committed **before any fetch**, so
+        a crash after planning resumes the plan rather than planning over it.
+
+        A clock behind the plan -- one that once ran ahead, then was corrected -- is logged
+        here, as `exchange_sync_clock_behind_plan`; `plan_account` pulls the ceiling back.
         """
         capabilities = provider.capabilities
         now = floor_to_millisecond(self._clock())
-        # `min(requested, now)`: a clock stepped back behind a configured date must not make
-        # the clamp raise. The configured value is still what gets recorded.
-        clamp = clamp_to_retention(
-            min(self._requested_since, now),
-            now=now,
-            capabilities=capabilities,
-        )
+        clamp = self._clamp_at(now, capabilities)
+        if account.planned_until is not None and now < account.planned_until:
+            _logger.warning(
+                "exchange_sync_clock_behind_plan",
+                exchange_key=account.exchange_key.value,
+            )
 
         rows = await self._windows.list_for_account(account.id)
         queue = normalise_pending(
@@ -499,15 +549,6 @@ class ExchangeSyncService:
             floor=clamp.effective_since,
             max_window=capabilities.max_query_window,
         )
-        for replacement in queue.replaced:
-            await self._windows.delete(replacement.original.window_id)
-            for window in replacement.windows:
-                await self._windows.add(
-                    account.id,
-                    since=window.since,
-                    until=window.until,
-                    symbol=replacement.original.symbol,
-                )
         effective_since = account.effective_since
         if queue.truncated:
             _logger.warning(
@@ -533,6 +574,23 @@ class ExchangeSyncService:
         symbols: tuple[str | None, ...] = (None,)
         if capabilities.requires_symbol:
             symbols = await self._candidate_symbols(account, provider) if plan.windows else ()
+
+        keep_cursor = cursor_survives_a_moved_since(capabilities.cursor_kind)
+        for moved in queue.moved:
+            await self._windows.set_since(
+                moved.original.window_id,
+                moved.since,
+                keep_cursor=keep_cursor,
+            )
+        for replacement in queue.replaced:
+            await self._windows.delete(replacement.original.window_id)
+            for window in replacement.windows:
+                await self._windows.add(
+                    account.id,
+                    since=window.since,
+                    until=window.until,
+                    symbol=replacement.original.symbol,
+                )
         for window in plan.windows:
             for symbol in symbols:
                 await self._windows.add(
@@ -574,13 +632,13 @@ class ExchangeSyncService:
         ordered in SQL. Each pass either deletes a window, splits one into two strictly
         shorter halves, moves one's start forward, or raises, so the loop ends.
         """
-        retention_steps: dict[int, int] = {}
+        retention = _RetentionRecovery()
         while True:
             rows = await self._windows.list_for_account(account.id)
             if not rows:
                 return
             newest = max(rows, key=lambda row: (row.until, row.since, row.id))
-            await self._drain_window(account, provider, newest, progress, retention_steps)
+            await self._drain_window(account, provider, newest, progress, retention)
 
     async def _drain_window(
         self,
@@ -588,11 +646,12 @@ class ExchangeSyncService:
         provider: ExchangeProvider,
         row: SyncWindowRow,
         progress: _Progress,
-        retention_steps: dict[int, int],
+        retention: _RetentionRecovery,
     ) -> None:
         """Page through one window from its committed cursor, one commit per page.
 
-        Returns when the window is finished and deleted, split, or moved by a retention step.
+        Returns when the window is finished and deleted, split, or moved after a retention
+        refusal.
         `sent` holds every cursor sent for this window in this run, so a `next_cursor` seen
         before -- A -> B -> A -- is refused as a schema error before anything is written;
         `require_cursor_advanced` already refuses A -> A.
@@ -608,7 +667,9 @@ class ExchangeSyncService:
             try:
                 page = await self._fetch_page(account, provider, window, cursor, row.symbol)
             except ExchangeRetentionWindowError:
-                if await self._step_past_retention(account, row, window, retention_steps):
+                if await self._recover_from_retention(
+                    account, capabilities, row, window, retention
+                ):
                     return
                 raise
             progress.pages += 1
@@ -708,48 +769,102 @@ class ExchangeSyncService:
         await self._session.commit()
         _logger.info("exchange_sync_window_split", exchange_key=account.exchange_key.value)
 
-    async def _step_past_retention(
+    async def _recover_from_retention(
         self,
         account: ExchangeAccountState,
+        capabilities: ExchangeCapabilities,
         row: SyncWindowRow,
         window: FillWindow,
-        retention_steps: dict[int, int],
+        retention: _RetentionRecovery,
     ) -> bool:
-        """Move a refused window's start forward by `RETENTION_STEP`, or report the steps spent.
+        """Move a refused window's start forward, or report that the moves are spent.
 
-        The venue refused the window as older than it keeps, so its real retention is shorter
-        than declared. The window's `since` moves forward a step (its cursor restarts), every
-        pending window lying wholly below the new `since` is dropped -- this one too, if the
-        step emptied it -- and the account's `effective_since` rises to the new `since`. All
-        of it is committed, so a run that then runs out of steps still leaves the next run
-        starting from the moved point.
+        Two moves, in this order:
+
+        1. **A fresh edge, once per window per run, spending no step.** Newest first means the
+           oldest window is read last, and a backfill that takes longer than
+           `RETENTION_MARGIN` reaches it after the edge it was planned at has aged past what
+           the venue keeps. That refusal is elapsed time, not a short retention, and the right
+           answer is the edge as it stands now: `clamp_to_retention` over a fresh clock read.
+           If that edge is later than the window's `since`, the window moves to it -- rather
+           than a whole `RETENTION_STEP`, which would discard up to a day of history the venue
+           still has.
+        2. **A `RETENTION_STEP`**, when the fresh edge does not move the window, or the request
+           it produced is refused again: the venue keeps less than it declares. At most
+           `MAX_RETENTION_STEPS` per window per run.
 
         Returns:
-            `True` if the window was stepped; `False` if this window has already been stepped
-            `MAX_RETENTION_STEPS` times in this run, and the caller re-raises.
+            `True` if the window moved; `False` when this window's moves are spent in this run,
+            and the caller re-raises, so the account fails `retention_window`. Everything
+            moved before that is committed, so the next run continues from the moved point.
         """
-        steps = retention_steps.get(row.id, 0) + 1
+        if row.id not in retention.reclamped:
+            retention.reclamped.add(row.id)
+            now = floor_to_millisecond(self._clock())
+            edge = self._clamp_at(now, capabilities).effective_since
+            if edge > window.since:
+                _logger.warning(
+                    "exchange_sync_retention_reclamped",
+                    exchange_key=account.exchange_key.value,
+                )
+                await self._move_since(account, capabilities, row, window, edge)
+                return True
+        steps = retention.steps.get(row.id, 0) + 1
         if steps > MAX_RETENTION_STEPS:
             return False
-        retention_steps[row.id] = steps
-        new_since = window.since + RETENTION_STEP
+        retention.steps[row.id] = steps
         _logger.warning(
             "exchange_sync_retention_step",
             exchange_key=account.exchange_key.value,
             step=steps,
         )
+        await self._move_since(account, capabilities, row, window, window.since + RETENTION_STEP)
+        return True
+
+    async def _move_since(
+        self,
+        account: ExchangeAccountState,
+        capabilities: ExchangeCapabilities,
+        row: SyncWindowRow,
+        window: FillWindow,
+        new_since: datetime,
+    ) -> None:
+        """Move a refused window's start to `new_since`, raise the account's floor, and commit.
+
+        Every pending window lying wholly below `new_since` is dropped -- this one too, if the
+        move emptied it. The window keeps its row, and keeps its cursor when
+        `cursor_survives_a_moved_since` vouches for the venue's kind: a trade-id cursor is a
+        bound on ids, and means the same thing over the narrower range.
+
+        The account's `effective_since` rises to **where the held history now really begins**:
+        `new_since` if the window survives the move, or the refused window's own `until` if the
+        move emptied it -- the windows above it were read in this run or an earlier one, and
+        claiming less than that would put the wrong date on the truncation banner. A venue
+        keeping a day, read in six-hour windows, is the case: a day's step empties the oldest
+        window, and `new_since` alone would lie past everything held.
+
+        **Also capped at `planned_until`**, so the planned range can never invert. That is
+        implied for a window planned under a correct clock, whose `until` is never past the
+        ceiling; it is not for one planned while the clock ran ahead, after `plan_account`
+        pulled the ceiling back.
+        """
         for pending in await self._windows.list_for_account(account.id):
             if pending.until <= new_since:
                 await self._windows.delete(pending.id)
         if window.until > new_since:
-            await self._windows.set_since(row.id, new_since)
+            await self._windows.set_since(
+                row.id,
+                new_since,
+                keep_cursor=cursor_survives_a_moved_since(capabilities.cursor_kind),
+            )
         current = await self._accounts.get(account.id)
-        if current is not None and (
-            current.effective_since is None or new_since > current.effective_since
-        ):
-            await self._accounts.set_effective_since(account.id, new_since)
+        if current is not None:
+            floor = min(new_since, window.until)
+            if current.planned_until is not None:
+                floor = min(floor, current.planned_until)
+            if current.effective_since is None or floor > current.effective_since:
+                await self._accounts.set_effective_since(account.id, floor)
         await self._session.commit()
-        return True
 
 
 def _pending_of(row: SyncWindowRow) -> PendingWindow:
