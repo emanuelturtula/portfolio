@@ -1,6 +1,6 @@
-"""The exchange vocabulary: which venues exist, and which way a fill went.
+"""The exchange vocabulary: which venues exist, which way a fill went, how an account stands.
 
-Two enums and nothing else, and they are here rather than in `providers/exchanges/` for the
+Three enums and nothing else, and they are here rather than in `providers/exchanges/` for the
 reason `domain/chains.py` gives about `ChainKey`: a `CHECK` constraint in `db/models.py`
 mirrors each of them, and `db` sits above `domain` and below `providers`. The value a column
 admits, the value a provider produces and the value that crosses the API are one string
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-__all__ = ["ExchangeKey", "FillSide"]
+__all__ = ["AccountSyncStatus", "ExchangeKey", "FillSide"]
 
 
 class ExchangeKey(StrEnum):
@@ -44,3 +44,25 @@ class FillSide(StrEnum):
 
     BUY = "buy"
     SELL = "sell"
+
+
+class AccountSyncStatus(StrEnum):
+    """Where an exchange account stands after the last sync that touched it.
+
+    Mirrored by `ck_exchange_accounts_sync_status`, so adding a member is a migration.
+    Alphabetical, like the `CHECK` text.
+
+    * `NEVER_SYNCED` -- the row exists and no run has finished with it. The column default.
+    * `OK` -- the last run that attempted the account left nothing pending.
+    * `ERROR` -- the last attempt failed for a reason that a later run may not meet again:
+      an outage, a throttle that outlasted the retries, a refused request, an answer that
+      could not be read, a conflicting fill, or a defect in this application.
+    * `AUTH_FAILED` -- the venue refused the key, or the key lacks read permission. **Terminal
+      until the owner acts**: a scheduled run skips the account rather than asking the venue
+      to refuse the same key every interval, and only a manual sync tries it again.
+    """
+
+    AUTH_FAILED = "auth_failed"
+    ERROR = "error"
+    NEVER_SYNCED = "never_synced"
+    OK = "ok"
