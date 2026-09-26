@@ -107,7 +107,8 @@ button {
   cursor: pointer;
 }
 
-button:disabled {
+button:disabled,
+button[aria-disabled='true'] {
   cursor: not-allowed;
   opacity: 0.6;
 }
@@ -282,6 +283,9 @@ td {
 .exchanges-toolbar {
   display: flex;
   flex-direction: column;
+  /* Spec R14: Sync now must not stretch to the toolbar's width - the flex column default
+     (`align-items: stretch`) would otherwise do exactly that to every direct child. */
+  align-items: flex-start;
   gap: 0.35rem;
   margin-bottom: 1rem;
 }

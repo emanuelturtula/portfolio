@@ -758,7 +758,7 @@ nothing.
 The signed-in `/exchanges` page shows all of this without a terminal: the account list, a
 banner for any venue whose retention window truncated its history, and the run log. The
 `curl` commands below still work, and are what a script needs, but a human recovering an
-`auth_failed` key can do the whole thing from the page - see step 4 below.
+`auth_failed` key can do the last step from the page - see step 4 below.
 
 ### The four settings
 

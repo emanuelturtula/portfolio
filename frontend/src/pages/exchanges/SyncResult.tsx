@@ -26,44 +26,71 @@ interface SyncResultProps {
 }
 
 /**
- * The manual sync's result summary (spec criterion 3), shown in a `role="status"` block
- * that stays on screen until the next sync - `ExchangesPage` swaps this out for the pending
- * line the moment a new sync is fired, which is what "stays until the next sync" means in
- * practice.
+ * The manual sync's result summary (spec criterion 3). No `role="status"` of its own - spec
+ * R11 moved that to the one persistent element `ExchangesPage`'s toolbar holds, so this only
+ * ever supplies that element's children, swapped in once the request settles successfully.
+ *
+ * **R8: the headline counts what was actually attempted.** `accounts_skipped` never reached
+ * the venue at all (a scheduled or startup run skipping an `auth_failed` account, joined by
+ * this request), so `attempted = accounts_total - accounts_skipped` is what "from N exchanges"
+ * should count, and "No exchange was read." replaces the whole sentence when that is 0 -
+ * rather than a true "0 exchanges" reading nobody was actually asked. When any account was
+ * skipped, the skip lines and the joined line both lead the headline instead of following it:
+ * the reason the read was incomplete belongs before the summary of what it still achieved.
  */
 export function SyncResult({ result }: SyncResultProps) {
   const duration = formatRunDuration(result.duration_ms);
   const fillsWord = result.fills_inserted === 1 ? 'fill' : 'fills';
-  const exchangeWord = result.accounts_total === 1 ? 'exchange' : 'exchanges';
+  const attempted = result.accounts_total - result.accounts_skipped;
+  const exchangeWord = attempted === 1 ? 'exchange' : 'exchanges';
 
   const failed = result.accounts.filter((account) => account.status === 'failed');
   const skipped = result.accounts.filter((account) => account.status === 'skipped');
 
-  return (
-    <div role="status">
-      <p>
-        The sync {RUN_VERBS[result.status]}: {formatCount(result.fills_inserted)} new {fillsWord} (
-        {formatCount(result.fills_seen)} read) from {formatCount(result.accounts_total)}{' '}
-        {exchangeWord}, in {duration}.
+  const headline = (
+    <p>
+      {attempted === 0
+        ? 'No exchange was read.'
+        : `The sync ${RUN_VERBS[result.status]}: ${formatCount(result.fills_inserted)} new ` +
+          `${fillsWord} (${formatCount(result.fills_seen)} read) from ${formatCount(attempted)} ` +
+          `${exchangeWord}, in ${duration}.`}
+    </p>
+  );
+  const joinedLine = result.joined && <p>It joined a sync that was already running.</p>;
+
+  const failedLines = failed.map((account) => {
+    const venue = EXCHANGES[account.exchange_key].name;
+    return (
+      <p key={account.exchange_key}>
+        {venue}: {accountFailureSentence(account.error_kind, venue)}
       </p>
-      {result.joined && <p>It joined a sync that was already running.</p>}
-      {failed.map((account) => {
-        const venue = EXCHANGES[account.exchange_key].name;
-        return (
-          <p key={account.exchange_key}>
-            {venue}: {accountFailureSentence(account.error_kind, venue)}
-          </p>
-        );
-      })}
-      {skipped.map((account) => {
-        const venue = EXCHANGES[account.exchange_key].name;
-        return (
-          <p key={account.exchange_key}>
-            {venue} was skipped, because its key was refused earlier and only a sync you start
-            retries it. Press Sync now again to retry it.
-          </p>
-        );
-      })}
-    </div>
+    );
+  });
+  const skippedLines = skipped.map((account) => {
+    const venue = EXCHANGES[account.exchange_key].name;
+    return (
+      <p key={account.exchange_key}>
+        {venue} was skipped, because its key was refused earlier and only a sync you start retries
+        it. Press Sync now again to retry it.
+      </p>
+    );
+  });
+
+  return (
+    <>
+      {skipped.length > 0 ? (
+        <>
+          {skippedLines}
+          {joinedLine}
+          {headline}
+        </>
+      ) : (
+        <>
+          {headline}
+          {joinedLine}
+        </>
+      )}
+      {failedLines}
+    </>
   );
 }

@@ -1,6 +1,6 @@
 import type { Exchange } from '@/api/exchanges';
 import { EXCHANGES, formatCount } from '@/lib/exchanges';
-import { formatAbsoluteTime, formatHistoryStart } from '@/lib/time';
+import { formatHistoryStart, formatHistoryStartLocal } from '@/lib/time';
 
 interface TruncationBannerProps {
   /**
@@ -23,6 +23,7 @@ interface TruncationBannerProps {
  */
 export function TruncationBanner({ exchange }: TruncationBannerProps) {
   const {
+    configured,
     effective_since: effectiveSince,
     exchange_key: exchangeKey,
     pending_windows: pendingWindows,
@@ -30,24 +31,31 @@ export function TruncationBanner({ exchange }: TruncationBannerProps) {
 
   const venue = EXCHANGES[exchangeKey].name;
   const headingId = `truncation-heading-${exchangeKey}`;
+  const windowsPhrase = `${formatCount(pendingWindows)} window${pendingWindows === 1 ? '' : 's'} still to read`;
 
   return (
-    <section className="state state-warning" aria-labelledby={headingId}>
+    <section className="state-warning" aria-labelledby={headingId}>
       <h3 id={headingId}>{venue} history is incomplete</h3>
       <p>
         {venue} does not return trades older than its retention window, so the history imported here
         is complete only from{' '}
-        <time dateTime={effectiveSince} title={formatAbsoluteTime(effectiveSince)}>
+        <time dateTime={effectiveSince} title={formatHistoryStartLocal(effectiveSince)}>
           <strong>{formatHistoryStart(effectiveSince)}</strong>
         </time>
         . Any trade made before then may be missing.
       </p>
-      {pendingWindows > 0 && (
-        <p>
-          The import has not finished. That is where the history will be complete from once it does
-          ({formatCount(pendingWindows)} window{pendingWindows === 1 ? '' : 's'} still to read).
-        </p>
-      )}
+      {pendingWindows > 0 &&
+        (configured ? (
+          <p>
+            The import has not finished. That is where the history will be complete from once it
+            does ({windowsPhrase}).
+          </p>
+        ) : (
+          <p>
+            The import stopped before it finished ({windowsPhrase}). Nothing new is read until
+            credentials for {venue} are configured again.
+          </p>
+        ))}
     </section>
   );
 }

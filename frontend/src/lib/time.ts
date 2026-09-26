@@ -165,24 +165,44 @@ function hasSubMillisecondRemainder(iso: string): boolean {
 }
 
 /**
+ * The millisecond instant `formatHistoryStart` and `formatHistoryStartLocal` both name:
+ * `iso`, rounded up to the next whole second. Rounding up - `Math.ceil` over whole seconds,
+ * not `Math.round` - means the named instant is never earlier than the true one: rounding
+ * down a sub-second instant would claim a trade in that truncated fraction as held when it
+ * might not be. A microsecond remainder `parseInstant` truncates away is nudged in first -
+ * see {@link hasSubMillisecondRemainder} - so it still forces the round-up its own
+ * whole-millisecond value would otherwise hide.
+ */
+function roundedUpToSecond(iso: string): number {
+  const ms = parseInstant(iso) + (hasSubMillisecondRemainder(iso) ? 1 : 0);
+  return Math.ceil(ms / SECOND_MS) * SECOND_MS;
+}
+
+/**
  * Renders the instant `iso` names in UTC, at second precision, **rounded up** to the next
  * whole second - the exact earliest date an exchange's history is complete from
  * (`effective_since`), per docs/specs/016-exchanges-page.md.
  *
  * UTC because that is the zone `PORTFOLIO_EXCHANGE_HISTORY_START` is read in, so the owner
  * compares like with like, and because it makes this independent of the machine's zone.
- * Rounding up - `Math.ceil` over whole seconds, not `Math.round` - means the named instant
- * is never earlier than the true one: rounding down a sub-second instant would claim a
- * trade in that truncated fraction as held when it might not be. A microsecond remainder
- * `parseInstant` truncates away is nudged in first - see {@link hasSubMillisecondRemainder} -
- * so it still forces the round-up its own whole-millisecond value would otherwise hide.
  */
 export function formatHistoryStart(iso: string): string {
-  const ms = parseInstant(iso) + (hasSubMillisecondRemainder(iso) ? 1 : 0);
-  const roundedUpMs = Math.ceil(ms / SECOND_MS) * SECOND_MS;
-  return new Date(roundedUpMs).toLocaleString('en', {
+  return new Date(roundedUpToSecond(iso)).toLocaleString('en', {
     dateStyle: 'medium',
     timeStyle: 'long',
     timeZone: 'UTC',
+  });
+}
+
+/**
+ * The same rounded-up instant {@link formatHistoryStart} names, in the browser's own local
+ * time, with seconds - for the truncation banner's `title` (spec R13). A `title` built from
+ * the *raw*, un-rounded `effective_since` could name a moment a whole second earlier than
+ * the rounded-up text it annotates; sharing {@link roundedUpToSecond} is what rules that out.
+ */
+export function formatHistoryStartLocal(iso: string): string {
+  return new Date(roundedUpToSecond(iso)).toLocaleString('en', {
+    dateStyle: 'medium',
+    timeStyle: 'medium',
   });
 }

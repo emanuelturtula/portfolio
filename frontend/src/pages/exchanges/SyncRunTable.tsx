@@ -41,6 +41,19 @@ function exchangesCell(run: ExchangeRun): string {
 }
 
 /**
+ * The Fills column. Spec R7 (reversing `cfd3dad`'s ruling, whose premise was right and
+ * conclusion was not): the backend sums fills from each account's recorded *outcome*, and an
+ * account still in flight on a `running` or `interrupted` run has committed pages but no
+ * outcome yet - so the count is real, but only over the accounts that have actually finished.
+ */
+function fillsCell(run: ExchangeRun): string {
+  const base = `${formatCount(run.fills_inserted)} new of ${formatCount(run.fills_seen)} read`;
+  return run.status === 'running' || run.status === 'interrupted'
+    ? `${base} (finished exchanges only)`
+    : base;
+}
+
+/**
  * The Details column: one line per account, "{Venue}: {outcome label}", a failed one
  * followed by its sentence and the backend-redacted `detail`.
  *
@@ -55,7 +68,7 @@ function DetailsCell({ run }: { readonly run: ExchangeRun }) {
         const venue = EXCHANGES[account.exchange_key].name;
         return (
           <li key={account.exchange_key}>
-            {venue}: {OUTCOME_LABELS[account.status]}
+            {venue}: {OUTCOME_LABELS[account.status]}.
             {account.status === 'failed' && (
               <>
                 {' '}
@@ -107,9 +120,7 @@ export function SyncRunTable({ runs }: SyncRunTableProps) {
             <td>{RUN_STATUS_LABELS[run.status]}</td>
             <td>{formatRunDuration(run.duration_ms)}</td>
             <td>{exchangesCell(run)}</td>
-            <td>
-              {formatCount(run.fills_inserted)} new of {formatCount(run.fills_seen)} read
-            </td>
+            <td>{fillsCell(run)}</td>
             <td>
               <DetailsCell run={run} />
             </td>

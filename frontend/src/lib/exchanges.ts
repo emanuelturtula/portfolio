@@ -59,16 +59,36 @@ export const STATUS_LABELS: Record<AccountSyncStatus, string> = {
 };
 
 /**
- * The label for one account entry. `syncing` overrides the label and nothing else about
- * the entry: an `auth_failed` venue being retried right now still shows its error and its
- * remediation, because until the run ends they are both still true (spec: "Status: one
- * label, never colour alone").
+ * The label for one account entry, in precedence order (spec R4 - review found the plain
+ * `syncing`-overrides-everything rule wrong: a retried `auth_failed` venue must keep saying
+ * so, not "Syncing", since a scheduled run *skips* it and only a manual one is actually
+ * reading it):
+ *
+ * 1. `!configured` - "Not configured".
+ * 2. `status === 'auth_failed'` - "Authentication failed", **even while `syncing`**.
+ * 3. `syncing` - "Syncing".
+ * 4. `status === 'ok'` and `pending_windows > 0` - "Unfinished".
+ * 5. otherwise - `STATUS_LABELS[status]`.
  */
 export function statusLabel(e: {
   readonly status: AccountSyncStatus;
+  readonly configured: boolean;
   readonly syncing: boolean;
+  readonly pending_windows: number;
 }): string {
-  return e.syncing ? 'Syncing' : STATUS_LABELS[e.status];
+  if (!e.configured) {
+    return 'Not configured';
+  }
+  if (e.status === 'auth_failed') {
+    return STATUS_LABELS.auth_failed;
+  }
+  if (e.syncing) {
+    return 'Syncing';
+  }
+  if (e.status === 'ok' && e.pending_windows > 0) {
+    return 'Unfinished';
+  }
+  return STATUS_LABELS[e.status];
 }
 
 /**
@@ -115,19 +135,27 @@ export const OUTCOME_LABELS: Record<AccountOutcomeStatus, string> = {
 };
 
 /**
- * Which ordered remediation an `auth_failed` account needs: `'key'` for an `auth` failure,
- * or for a missing `last_error` (a hand-edited row - see the spec's "What the backend can
- * write"); `'scope'` for `insufficient_scope`. `null` for every other status - `auth_failed`
- * is the only status that needs the owner to act (criterion 2). `auth_failed` never comes
- * from any other `error_kind` (see the spec's status-writing rules), so these two cases are
- * exhaustive for it.
+ * Which ordered remediation an `auth_failed` account needs. `null` for every other status -
+ * `auth_failed` is the only status that needs the owner to act (criterion 2).
+ *
+ * **`'key'` whenever `!configured`, whatever `last_error.error_kind` says (spec R3):**
+ * without credentials the Sync now button itself is hidden, so the credentials have to come
+ * back before anything else does - pointing at the scope steps here would tell the owner to
+ * press a button that is not on screen. Configured, it is `'key'` for an `auth` failure or a
+ * missing `last_error` (a hand-edited row - see "What the backend can write"), and `'scope'`
+ * for `insufficient_scope` - `auth_failed` never comes from any other `error_kind`, so these
+ * are exhaustive for a configured account.
  */
 export function remediationFor(e: {
   readonly status: AccountSyncStatus;
+  readonly configured: boolean;
   readonly last_error: { readonly error_kind: ExchangeSyncErrorKind } | null;
 }): 'key' | 'scope' | null {
   if (e.status !== 'auth_failed') {
     return null;
+  }
+  if (!e.configured) {
+    return 'key';
   }
   return e.last_error?.error_kind === 'insufficient_scope' ? 'scope' : 'key';
 }

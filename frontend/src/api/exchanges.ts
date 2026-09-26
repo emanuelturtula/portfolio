@@ -58,18 +58,26 @@ export function listRefetchInterval(
 }
 
 /**
- * How fast `useExchangeRuns` should poll: fast while the newest run is `running`, or while
- * this page's own sync request is pending, for the same reason {@link listRefetchInterval}
- * is. `runs[0]` is the newest run by the endpoint's own contract (newest first).
+ * How fast `useExchangeRuns` should poll: fast while this page's own sync request is
+ * pending, or while the newest run is `running` **and** the list shows a venue `syncing`
+ * (spec R12, added after review). `runs[0]` is the newest run by the endpoint's own contract
+ * (newest first).
+ *
+ * `anySyncing` is the list's own reading, not this query's - the one place a query here
+ * reads the other's data. A `running` row with no venue `syncing` is an orphan a failed
+ * close-out left behind, swept at the next run rather than polled fast forever: `syncing`
+ * is the coordinator's actual in-flight flag, and a stale `running` row on its own is not
+ * evidence of one.
  */
 export function runsRefetchInterval(
   runs: readonly ExchangeRun[] | undefined,
   syncPending: boolean,
+  anySyncing: boolean,
 ): number {
   if (syncPending) {
     return FAST_POLL_MS;
   }
-  return runs?.[0]?.status === 'running' ? FAST_POLL_MS : SLOW_POLL_MS;
+  return runs?.[0]?.status === 'running' && anySyncing ? FAST_POLL_MS : SLOW_POLL_MS;
 }
 
 /**
@@ -92,8 +100,17 @@ export function useExchanges(syncPending: boolean): UseQueryResult<Exchange[]> {
   });
 }
 
-/** The last {@link EXCHANGE_RUNS_LIMIT} exchange sync runs, newest first. */
-export function useExchangeRuns(syncPending: boolean): UseQueryResult<ExchangeRun[]> {
+/**
+ * The last {@link EXCHANGE_RUNS_LIMIT} exchange sync runs, newest first.
+ *
+ * `anySyncing` - whether any venue in `useExchanges`'s own list is `syncing` - is threaded
+ * in by the caller (`ExchangesPage`) rather than read here, since this hook has no reason to
+ * know about the list query at all otherwise. See {@link runsRefetchInterval}.
+ */
+export function useExchangeRuns(
+  syncPending: boolean,
+  anySyncing: boolean,
+): UseQueryResult<ExchangeRun[]> {
   return useQuery({
     queryKey: exchangeRunsQueryKey,
     queryFn: async ({ signal }) => {
@@ -103,7 +120,7 @@ export function useExchangeRuns(syncPending: boolean): UseQueryResult<ExchangeRu
       );
       return response.runs;
     },
-    refetchInterval: (query) => runsRefetchInterval(query.state.data, syncPending),
+    refetchInterval: (query) => runsRefetchInterval(query.state.data, syncPending, anySyncing),
   });
 }
 

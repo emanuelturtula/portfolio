@@ -1,3 +1,5 @@
+import { useEffect, useRef } from 'react';
+
 import { describeApiError } from '@/api/client';
 import { useExchanges, useExchangeRuns, useSyncExchanges, type Exchange } from '@/api/exchanges';
 import { EmptyState } from '@/components/EmptyState';
@@ -12,7 +14,9 @@ const LIST_FAILURE_FALLBACK =
   'The backend could not be reached. Check that the API is running, then reload the page.';
 const LIST_REFETCH_FALLBACK = 'The server could not be reached.';
 const RUNS_UNAVAILABLE_FALLBACK = 'The run log could not be read.';
-const SYNC_FAILURE_FALLBACK = 'The server could not be reached.';
+/** Spec R9: not "the server could not be reached" - a request the coordinator shields from
+ * the client connection failing client-side says nothing about whether the server heard it. */
+const SYNC_FAILURE_FALLBACK = 'No answer came back from the server.';
 
 const EMPTY_DESCRIPTION =
   'Exchange API keys are read from environment variables on the host, for example ' +
@@ -48,7 +52,56 @@ export function ExchangesPage() {
   const syncMutation = useSyncExchanges();
   const syncPending = syncMutation.isPending;
   const exchanges = useExchanges(syncPending);
-  const runs = useExchangeRuns(syncPending);
+  // The list's own "is any venue syncing" reading, threaded into the runs query too (spec
+  // R12): the runs query is the one place that reads the other query's data, rather than
+  // deciding its poll rate from its own alone.
+  const anySyncing = exchanges.data?.some((exchange) => exchange.syncing) ?? false;
+  const runs = useExchangeRuns(syncPending, anySyncing);
+
+  // What the run log showed at the moment Sync now was last pressed: the newest run's id,
+  // and whether that run was itself `running` then (meaning a click would join it rather
+  // than start a new one). `null` once the failed-POST alert this feeds has been cleared or
+  // there has been no failure to clear (spec R9).
+  const recordedRunRef = useRef<{ readonly runId: number; readonly wasRunning: boolean } | null>(
+    null,
+  );
+
+  useEffect(() => {
+    if (!syncMutation.isError) {
+      return;
+    }
+    const recorded = recordedRunRef.current;
+    if (recorded === null) {
+      return;
+    }
+    const newest = runs.data?.[0];
+    if (newest === undefined || newest.status === 'running') {
+      // Not settled yet - the alert stays exactly as R9 says it should while no new run has
+      // appeared: "the request never started one, and the alert stays."
+      return;
+    }
+    const settled =
+      newest.run_id > recorded.runId || (newest.run_id === recorded.runId && recorded.wasRunning);
+    if (settled) {
+      recordedRunRef.current = null;
+      syncMutation.reset();
+    }
+  }, [runs.data, syncMutation]);
+
+  function handleSyncClick(): void {
+    // Spec R10: a no-op while pending, not a native `disabled` button - `disabled` drops
+    // focus to `<body>` the moment it takes effect, verified in a browser. `aria-disabled`
+    // below keeps the button focusable and keeps this handler in charge of the no-op.
+    if (syncMutation.isPending) {
+      return;
+    }
+    const newest = runs.data?.[0];
+    recordedRunRef.current = {
+      runId: newest?.run_id ?? 0,
+      wasRunning: newest?.status === 'running',
+    };
+    syncMutation.mutate();
+  }
 
   if (exchanges.isPending) {
     return <Skeleton label="Loading exchanges…" />;
@@ -93,24 +146,24 @@ export function ExchangesPage() {
         <div className="exchanges-toolbar">
           <button
             type="button"
-            onClick={() => {
-              syncMutation.mutate();
-            }}
-            disabled={syncMutation.isPending}
+            aria-disabled={syncMutation.isPending ? 'true' : undefined}
+            onClick={handleSyncClick}
           >
             Sync now
           </button>
-          {syncMutation.isPending && (
-            <p role="status">Syncing exchanges… the first import can take several minutes.</p>
-          )}
-          {!syncMutation.isPending && syncMutation.isSuccess && (
-            <SyncResult result={syncMutation.data} />
-          )}
+          {/* Spec R11: one role="status" element, always in the DOM, whose children swap -
+              a region inserted together with its own text is not reliably announced. */}
+          <div role="status">
+            {syncMutation.isPending &&
+              'Syncing exchanges… the first import can take several minutes.'}
+            {!syncMutation.isPending && syncMutation.isSuccess && (
+              <SyncResult result={syncMutation.data} />
+            )}
+          </div>
           {!syncMutation.isPending && syncMutation.isError && (
             <p role="alert">
-              The sync did not complete:{' '}
-              {describeApiError(syncMutation.error, SYNC_FAILURE_FALLBACK)} A sync may still be
-              running on the server; this page updates when it finishes.
+              The sync request failed: {describeApiError(syncMutation.error, SYNC_FAILURE_FALLBACK)}{' '}
+              A sync may still be running on the server; this page updates when it finishes.
             </p>
           )}
         </div>
