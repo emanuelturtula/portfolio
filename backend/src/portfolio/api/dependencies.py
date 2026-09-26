@@ -32,6 +32,7 @@ from portfolio.services.auth import (
     build_auth_service,
 )
 from portfolio.services.balances import BalanceService, build_balance_service
+from portfolio.services.exchanges import ExchangeService, build_exchange_service
 from portfolio.services.password_hasher import PasswordHasher
 from portfolio.services.sync_coordinator import SyncCoordinator
 from portfolio.services.wallets import WalletService, build_wallet_service
@@ -43,6 +44,9 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from portfolio.config import Settings
+    from portfolio.domain.exchanges import ExchangeKey
+    from portfolio.services.balances import SyncRunSummary
+    from portfolio.services.exchanges import ExchangeSyncRunSummary
 
 
 def install_auth_runtime(app: FastAPI, settings: Settings) -> None:
@@ -116,7 +120,7 @@ async def get_balance_service(request: Request) -> AsyncIterator[BalanceService]
         yield build_balance_service(session)
 
 
-def get_sync_coordinator(request: Request) -> SyncCoordinator:
+def get_sync_coordinator(request: Request) -> SyncCoordinator[SyncRunSummary]:
     """The process-wide sync coordinator, which the lifespan installed.
 
     **Not a service built per request, and that is the whole point.** A manual sync joins the
@@ -142,6 +146,54 @@ def get_sync_coordinator(request: Request) -> SyncCoordinator:
         )
         raise RuntimeError(message)
     return coordinator
+
+
+def get_exchange_sync_coordinator(request: Request) -> SyncCoordinator[ExchangeSyncRunSummary]:
+    """The process-wide exchange sync coordinator, which the lifespan installed.
+
+    A separate instance from the balance coordinator, on its own `app.state` attribute, for
+    the reason `get_sync_coordinator` gives about outliving the request. It is installed
+    **always**, whether or not the exchange timer is built, so a manual sync works with the
+    timer switched off.
+
+    Raises:
+        RuntimeError: the lifespan never ran. Not reachable from a served request.
+    """
+    coordinator = getattr(request.app.state, "exchange_sync_coordinator", None)
+    if not isinstance(coordinator, SyncCoordinator):
+        message = (
+            "No exchange sync coordinator is installed: the application's lifespan has not "
+            "run. Exchange sync is wired up in `portfolio.main.lifespan`."
+        )
+        raise RuntimeError(message)
+    return coordinator
+
+
+def configured_exchanges_of(app: FastAPI) -> frozenset[ExchangeKey]:
+    """The venues the lifespan found credentials for, or none if it has not run.
+
+    **The only thing a request learns about credentials**: the keys of the provider mapping,
+    published by the lifespan as `app.state.configured_exchanges`. The mapping itself, and
+    the providers holding the credentials, never reach `app.state`.
+    """
+    configured: frozenset[ExchangeKey] = getattr(app.state, "configured_exchanges", frozenset())
+    return configured
+
+
+async def get_exchange_service(request: Request) -> AsyncIterator[ExchangeService]:
+    """Open a session for this request and hand the router the read side of the exchanges.
+
+    Read-only, like `get_balance_service`. `syncing` is read from the exchange coordinator
+    now, as the request is served.
+    """
+    coordinator = get_exchange_sync_coordinator(request)
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_exchange_service(
+            session,
+            configured=configured_exchanges_of(request.app),
+            syncing=coordinator.in_flight,
+        )
 
 
 def get_principal(request: Request) -> Principal:

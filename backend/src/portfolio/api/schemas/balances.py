@@ -484,7 +484,7 @@ class SyncTriggeredResponse(SyncRunResponse):
     joined: bool
 
     @classmethod
-    def of_outcome(cls, outcome: SyncOutcome) -> SyncTriggeredResponse:
+    def of_outcome(cls, outcome: SyncOutcome[SyncRunSummary]) -> SyncTriggeredResponse:
         """Render the coordinator's answer."""
         summary = outcome.summary
         return cls(

@@ -6,6 +6,7 @@ carries a default that would be unsafe if it survived into production.
 """
 
 import re
+from datetime import UTC, date, datetime
 from functools import lru_cache
 from typing import Final, Literal, Self
 
@@ -391,6 +392,31 @@ class Settings(BaseSettings):
     price_refresh_enabled: bool = True
     price_refresh_interval_minutes: int = 60
 
+    # The exchange fill sync (#15), on its own timer, switch and grace period, for the reason
+    # the price refresh has its own: it answers to different vendors, and they are the ones
+    # that sign in with the owner's key.
+    #
+    # `history_start` is the earliest date the owner wants fills from, at 00:00 UTC. Unset
+    # means "all of it" -- 2009-01-03 -- and in either case the venue's retention clamps it
+    # further, which `GET /api/exchanges` reports as `requested_since` against
+    # `effective_since`. A date after today's (UTC) is refused at startup: it would plan
+    # nothing, and the owner would read that as a sync that works and finds no trades.
+    # Moving it earlier later is supported -- the next run plans the older range, while
+    # retention still allows it.
+    #
+    # `enabled` switches the timer off and nothing else: `POST /api/exchanges/sync` still
+    # works, as `POST /api/balances/sync` does with its switch off. The timer is also not
+    # built when no venue is configured, so an install without exchange credentials writes no
+    # empty run every fifteen minutes.
+    #
+    # `shutdown_grace_seconds` is the balance sync's ten, and the cost of it running out is
+    # the same: every page is committed as it is read, so a cancelled run loses at most the
+    # page in flight, and the sweep marks the run `interrupted`.
+    exchange_history_start: date | None = None
+    exchange_sync_enabled: bool = True
+    exchange_sync_interval_minutes: int = 15
+    exchange_sync_shutdown_grace_seconds: int = 10
+
     @property
     def session_cookie_name(self) -> str:
         """`__Host-psid`, degrading to `psid` on the one configuration that cannot use it."""
@@ -431,9 +457,13 @@ class Settings(BaseSettings):
           says which variable, and never what it holds. Nor can a key or passphrase holding a
           character no HTTP header can carry -- and that one would also write the value into
           a transport error's message. `credential_header_violation` says which.
+        * an exchange sync interval below one is the same loop without a sleep, pointed at a
+          venue that signs in with the owner's key; and an exchange history start after
+          today's UTC date plans nothing, which the owner would read as a working sync that
+          found no trades.
 
-        Refusing to start turns all eight into a container that fails its health check,
-        which is a failure the deployment pipeline already knows how to roll back.
+        Refusing to start turns every one of these into a container that fails its health
+        check, which is a failure the deployment pipeline already knows how to roll back.
 
         **Unconditional, not gated on `prod`.** A URL that cannot be requested is wrong in
         development too, and the case for gating the cost floor -- that the test suite runs
@@ -524,6 +554,11 @@ class Settings(BaseSettings):
                 self.price_refresh_interval_minutes,
                 "PORTFOLIO_PRICE_REFRESH_ENABLED",
             ),
+            (
+                "PORTFOLIO_EXCHANGE_SYNC_INTERVAL_MINUTES",
+                self.exchange_sync_interval_minutes,
+                "PORTFOLIO_EXCHANGE_SYNC_ENABLED",
+            ),
         ):
             if minutes < 1:
                 message = (
@@ -559,6 +594,18 @@ class Settings(BaseSettings):
         )
         if reason is not None:
             raise ValueError(reason)
+        if (
+            self.exchange_history_start is not None
+            and self.exchange_history_start > datetime.now(UTC).date()
+        ):
+            # The value is not quoted, by the rule every refusal here follows: name the
+            # variable and the rule. The owner has the value in the file they just edited.
+            message = (
+                "PORTFOLIO_EXCHANGE_HISTORY_START is after today's date in UTC. A history "
+                "start in the future would plan nothing to import; set a date on or before "
+                "today, or unset it to import everything the venue still keeps."
+            )
+            raise ValueError(message)
         return self
 
 

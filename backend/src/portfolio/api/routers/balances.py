@@ -57,6 +57,7 @@ from portfolio.services.balances import (
     BalanceService,
     HistoryCursor,
     QuoteCurrency,
+    SyncRunSummary,
 )
 from portfolio.services.sync_coordinator import SyncCoordinator, SyncTrigger
 from portfolio.services.wallets import WalletNotFoundError
@@ -66,7 +67,10 @@ from portfolio.services.wallets import WalletNotFoundError
 # dependency graph, so the names inside them are runtime values wearing a type's clothes.
 CurrentPrincipal = Annotated[Principal, Depends(get_principal)]
 CurrentBalanceService = Annotated[BalanceService, Depends(get_balance_service)]
-CurrentSyncCoordinator = Annotated[SyncCoordinator, Depends(get_sync_coordinator)]
+CurrentSyncCoordinator = Annotated[
+    SyncCoordinator[SyncRunSummary],
+    Depends(get_sync_coordinator),
+]
 
 ValuationCurrency = Annotated[
     QuoteCurrency,

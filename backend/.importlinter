@@ -96,3 +96,35 @@ source_modules =
     portfolio.api.routers
 forbidden_modules =
     portfolio.providers.prices
+
+[importlinter:contract:api-never-reaches-an-exchange-provider]
+name = no request path reaches an exchange provider
+# Criterion 7 of #15, as a statement about the import graph: no module under `portfolio.api`
+# may import `portfolio.providers.exchanges`, the package that holds `Credentials` and the
+# providers built from them, **directly or through anything else**.
+#
+# **Deliberately without `allow_indirect_imports`**, for the reason the prices contract above
+# gives. The chain `router -> read-side service -> provider` is exactly the violation worth
+# catching: somebody adds "just check the key while listing the accounts" to
+# `services/exchanges.py`, and a `GET` starts signing requests with the owner's credentials.
+#
+# The one sanctioned path from a request to a venue is the coordinator: `POST
+# /api/exchanges/sync` calls `SyncCoordinator.sync`, whose runner is a closure `main.py` built
+# over the provider mapping. `portfolio.main` is not under `portfolio.api`, so that path does
+# not pass through this contract, and the only thing `app.state` publishes about credentials
+# is `configured_exchanges`, a set of venue keys.
+#
+# **Source is `portfolio.api`, not only the routers**, unlike the prices contract: the schemas
+# and `api/dependencies.py` are request-path code too, and a schema importing a provider's
+# type for an annotation would drag the credential module into every request as surely as a
+# router would. The run vocabulary lives in `repositories/exchange_sync_runs.py`, and the
+# window arithmetic in `services/exchange_sync_plan.py` is imported only by the sync, which
+# is what keeps this contract green.
+#
+# A planted-violation test in `tests/test_import_contracts.py` proves this contract is not
+# vacuous, the treatment the prices contract has.
+type = forbidden
+source_modules =
+    portfolio.api
+forbidden_modules =
+    portfolio.providers.exchanges

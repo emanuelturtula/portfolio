@@ -5,8 +5,9 @@ Run with `uvicorn portfolio.main:app`.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final, Protocol
 
 import structlog
 from anyio import to_thread
@@ -16,7 +17,7 @@ from portfolio import __version__
 from portfolio.api.dependencies import auth_service_for, install_auth_runtime
 from portfolio.api.errors import register_exception_handlers
 from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware
-from portfolio.api.routers import auth, balances, health, wallets
+from portfolio.api.routers import auth, balances, exchanges, health, wallets
 from portfolio.config import get_settings
 from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import (
@@ -31,28 +32,40 @@ from portfolio.logging import configure_logging
 # deliberately does not discover them -- see `providers/registry.py` -- so this is the one
 # line that makes `get_chain_provider` able to answer for any chain at all.
 from portfolio.providers import chains as _registered_chain_providers  # noqa: F401
+from portfolio.providers.exchanges.registry import exchange_providers
 from portfolio.providers.http import build_http_client
 from portfolio.providers.prices.registry import price_sources
 from portfolio.providers.registry import get_chain_provider
+from portfolio.repositories.exchange_sync_runs import ExchangeSyncRunRepository
 from portfolio.repositories.prices import PriceRepository
 from portfolio.repositories.sync_runs import SyncRunRepository
 from portfolio.services.balance_sync import build_balance_sync_service
+from portfolio.services.exchange_sync import build_exchange_sync_service
 from portfolio.services.price_refresh import build_price_refresh_service
 from portfolio.services.scheduler import IntervalScheduler
 from portfolio.services.sync_coordinator import SyncCoordinator, SyncTrigger
 from portfolio.web.spa import mount_spa
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Mapping
     from datetime import datetime
 
     import httpx
 
     from portfolio.config import Settings
+    from portfolio.domain.exchanges import ExchangeKey
+    from portfolio.providers.exchanges.base import ExchangeProvider
+    from portfolio.repositories.exchange_sync_runs import ExchangeSyncRunSummary
     from portfolio.repositories.sync_runs import SyncRunSummary
     from portfolio.services.password_hasher import PasswordHasher
     from portfolio.services.price_refresh import RefreshReport
     from portfolio.services.sync_coordinator import SyncRunner
+
+EXCHANGE_SYNC_TASK_NAME: Final = "exchange-sync"
+"""The exchange run's task name, and the exchange timer's name in every log line."""
+
+EXCHANGE_SYNC_LOG_PREFIX: Final = "exchange_sync"
+"""What every event the exchange coordinator logs begins with."""
 
 _logger = structlog.get_logger(__name__)
 
@@ -87,6 +100,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     killed mid-sync leaves one behind; without the sweep a crashed run and a live run are the
     same row. Doing it at shutdown too is what records a run that outlived the grace period,
     and doing it there rather than inside the cancelled task is what makes it reliable.
+
+    ## The exchange sync (#15)
+
+    A third timer and a second coordinator, with the same shape and nothing shared:
+
+    * **The provider mapping is built once, here**, by `exchange_providers`, the way
+      `price_sources` is. It holds the credentials and it is never published: the runner
+      closes over it, and `app.state` only learns `configured_exchanges`, the set of its keys.
+    * **`exchange_sync_coordinator` is installed always**, so a manual sync works with the
+      timer off. The timer is built only when `PORTFOLIO_EXCHANGE_SYNC_ENABLED` is true *and*
+      at least one venue is configured: an install without credentials writes no empty run
+      every fifteen minutes.
+    * **Both run tables are swept at startup and at shutdown**, and the two coordinators are
+      drained **concurrently**: the deployment's `stop_grace_period` is twenty seconds, and
+      two ten-second grace periods one after the other would spend all of it.
     """
     settings = get_settings()
     ensure_database_directory(settings.database_url)
@@ -97,43 +125,98 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db_sessionmaker = create_session_factory(engine)
     client = build_http_client()
     app.state.http_client = client
-    coordinator: SyncCoordinator | None = None
+    coordinator: SyncCoordinator[SyncRunSummary] | None = None
+    exchange_coordinator: SyncCoordinator[ExchangeSyncRunSummary] | None = None
     schedulers: list[IntervalScheduler] = []
     try:
         await bootstrap_owner(app, settings)
         await warm_password_hasher(app)
         await sweep_interrupted_runs(app)
+        await sweep_interrupted_exchange_runs(app)
         coordinator = SyncCoordinator(balance_sync_runner(app, client))
         app.state.sync_coordinator = coordinator
         app.state.balance_scheduler = balance_scheduler_for(app, settings, coordinator)
         app.state.price_scheduler = price_scheduler_for(app, settings, client)
-        # Two timers, two tasks, sharing nothing but a class. That is what makes "a failed
-        # price refresh does not stop the balance sync" structural rather than a promise.
+
+        providers = exchange_providers(client, settings=settings)
+        configured = frozenset(providers)
+        app.state.configured_exchanges = configured
+        exchange_coordinator = SyncCoordinator(
+            exchange_sync_runner(app, providers, settings),
+            task_name=EXCHANGE_SYNC_TASK_NAME,
+            log_prefix=EXCHANGE_SYNC_LOG_PREFIX,
+        )
+        app.state.exchange_sync_coordinator = exchange_coordinator
+        app.state.exchange_scheduler = exchange_scheduler_for(
+            app, settings, exchange_coordinator, configured
+        )
+        # Three timers, three tasks, sharing nothing but a class. That is what makes "a
+        # failed price refresh does not stop the balance sync" structural rather than a
+        # promise, and the same for a venue refusing a key.
         schedulers = [
             timer
-            for timer in (app.state.balance_scheduler, app.state.price_scheduler)
+            for timer in (
+                app.state.balance_scheduler,
+                app.state.price_scheduler,
+                app.state.exchange_scheduler,
+            )
             if timer is not None
         ]
         for scheduler in schedulers:
             await scheduler.start()
         yield
     finally:
-        # Ordered, and the order is the content. Both timers stop first so that no new tick
-        # can start; the sync already in flight then gets its grace period; the sweep records
-        # whatever did not finish; and only then are the client and the engine taken away,
-        # because a sync still running would need both.
+        # Ordered, and the order is the content. Every timer stops first so that no new tick
+        # can start; the syncs already in flight then get their grace periods, side by side;
+        # the sweeps record whatever did not finish; and only then are the client and the
+        # engine taken away, because a sync still running would need both.
         for scheduler in reversed(schedulers):
             await scheduler.stop()
-        if coordinator is not None:
-            await coordinator.drain(
-                grace_seconds=max(0, settings.balance_sync_shutdown_grace_seconds)
-            )
+        await drain_coordinators(
+            (coordinator, settings.balance_sync_shutdown_grace_seconds),
+            (exchange_coordinator, settings.exchange_sync_shutdown_grace_seconds),
+        )
         await sweep_interrupted_runs(app)
+        await sweep_interrupted_exchange_runs(app)
         await client.aclose()
         await engine.dispose()
 
 
-def balance_sync_runner(app: FastAPI, client: httpx.AsyncClient) -> SyncRunner:
+class Drainable(Protocol):
+    """What shutdown needs of a coordinator: wait for its run, cancel it past a grace period."""
+
+    async def drain(self, *, grace_seconds: int) -> bool:
+        """Wait up to `grace_seconds` for the run in flight; see `SyncCoordinator.drain`."""
+        ...
+
+
+async def drain_coordinators(*coordinators: tuple[Drainable | None, int]) -> None:
+    """Give every coordinator's run in flight its grace period, **concurrently**.
+
+    Concurrently because the deployment's `stop_grace_period` is twenty seconds: two
+    ten-second grace periods in sequence would leave nothing for the sweeps and the engine
+    before the container is killed. A coordinator that was never built is skipped.
+
+    **Never raises**: `drain` already handles its own run's failure and cancellation, and
+    anything else that escapes one drain is logged here, so that the other drain, both sweeps
+    and the disposal still happen -- this runs in the lifespan's `finally`.
+    """
+    drains = [
+        instance.drain(grace_seconds=max(0, grace))
+        for instance, grace in coordinators
+        if instance is not None
+    ]
+    results = await asyncio.gather(*drains, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            _logger.error(
+                "sync_drain_failed",
+                error_type=type(result).__name__,
+                exc_info=result,
+            )
+
+
+def balance_sync_runner(app: FastAPI, client: httpx.AsyncClient) -> SyncRunner[SyncRunSummary]:
     """Build the closure the coordinator runs: a session per run, over the shared client.
 
     **A run must not share the session of whatever asked for it.** A manual sync is joined
@@ -162,7 +245,7 @@ def balance_sync_runner(app: FastAPI, client: httpx.AsyncClient) -> SyncRunner:
 def balance_scheduler_for(
     app: FastAPI,
     settings: Settings,
-    coordinator: SyncCoordinator,
+    coordinator: SyncCoordinator[SyncRunSummary],
 ) -> IntervalScheduler | None:
     """Build the balance timer, or `None` when the operator has switched it off.
 
@@ -193,6 +276,73 @@ def balance_scheduler_for(
         name="balance-sync",
         interval_minutes=settings.balance_sync_interval_minutes,
         last_run_at=lambda: latest_sync_attempt(app),
+        run=run,
+    )
+
+
+def exchange_sync_runner(
+    app: FastAPI,
+    providers: Mapping[ExchangeKey, ExchangeProvider],
+    settings: Settings,
+) -> SyncRunner[ExchangeSyncRunSummary]:
+    """Build the closure the exchange coordinator runs: a session per run, the providers built once.
+
+    A session of its own per run, for the reason `balance_sync_runner` gives. `providers` is
+    the mapping the lifespan built with `exchange_providers` -- **the only reference to the
+    objects holding credentials**, and this closure is the only thing that keeps it. A request
+    reaches it through the coordinator and no other way.
+    """
+
+    async def run(trigger: SyncTrigger) -> ExchangeSyncRunSummary:
+        sessionmaker = app.state.db_sessionmaker
+        async with sessionmaker() as session:
+            service = build_exchange_sync_service(
+                session,
+                providers=providers,
+                history_start=settings.exchange_history_start,
+            )
+            return await service.sync(trigger)
+
+    return run
+
+
+def exchange_scheduler_for(
+    app: FastAPI,
+    settings: Settings,
+    coordinator: SyncCoordinator[ExchangeSyncRunSummary],
+    configured: frozenset[ExchangeKey],
+) -> IntervalScheduler | None:
+    """Build the exchange timer, or `None` when it is off or there is nothing to sync.
+
+    Two conditions, both required:
+
+    * **`PORTFOLIO_EXCHANGE_SYNC_ENABLED`**, an off switch for the loop only --
+      `POST /api/exchanges/sync` keeps working, because the coordinator is installed anyway;
+    * **at least one venue configured.** Without credentials there is nothing to ask, and a
+      timer would write an empty run every interval forever.
+
+    `last_run_at` is the newest exchange run's `started_at`, counting attempts, for the
+    crash-loop reason `latest_sync_attempt` gives. `at_startup` becomes the recorded trigger,
+    and a startup run skips an `auth_failed` account the same as a scheduled one.
+    """
+    if not settings.exchange_sync_enabled:
+        _logger.info("scheduler_disabled", scheduler=EXCHANGE_SYNC_TASK_NAME, reason="disabled")
+        return None
+    if not configured:
+        _logger.info(
+            "scheduler_disabled",
+            scheduler=EXCHANGE_SYNC_TASK_NAME,
+            reason="no_exchange_configured",
+        )
+        return None
+
+    async def run(at_startup: bool) -> None:
+        await coordinator.sync(SyncTrigger.STARTUP if at_startup else SyncTrigger.SCHEDULED)
+
+    return IntervalScheduler(
+        name=EXCHANGE_SYNC_TASK_NAME,
+        interval_minutes=settings.exchange_sync_interval_minutes,
+        last_run_at=lambda: latest_exchange_sync_attempt(app),
         run=run,
     )
 
@@ -319,6 +469,35 @@ async def sweep_interrupted_runs(app: FastAPI) -> None:
         _logger.warning("balance_sync_runs_marked_interrupted", runs=swept)
 
 
+async def latest_exchange_sync_attempt(app: FastAPI) -> datetime | None:
+    """When the newest exchange sync of any status started, over a session of its own.
+
+    The exchange timer's "last run": an attempt, not a success, so a crash-looping container
+    does not ask the venue again on every restart.
+    """
+    sessionmaker = app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        return await ExchangeSyncRunRepository(session).latest_started_at()
+
+
+async def sweep_interrupted_exchange_runs(app: FastAPI) -> None:
+    """Mark every exchange run still at `running` as `interrupted`. **Never raises.**
+
+    Its own function and its own `try`, separate from the balance sweep, so that one table
+    failing to sweep does not leave the other unswept.
+    """
+    try:
+        sessionmaker = app.state.db_sessionmaker
+        async with sessionmaker() as session:
+            swept = await ExchangeSyncRunRepository(session).sweep_interrupted()
+            await session.commit()
+    except Exception:
+        _logger.exception("exchange_sync_orphan_sweep_failed")
+        return
+    if swept:
+        _logger.warning("exchange_sync_runs_marked_interrupted", runs=swept)
+
+
 async def warm_password_hasher(app: FastAPI) -> None:
     """Compute the dummy hash now, so that no request is the first to pay for it.
 
@@ -405,6 +584,7 @@ def create_app() -> FastAPI:
     # paths -- `/wallets/{wallet_id}/balances` among them -- and none of them collides with
     # a wallet route. Only the SPA mount below is order-sensitive.
     app.include_router(balances.router, prefix=API_PREFIX)
+    app.include_router(exchanges.router, prefix=API_PREFIX)
 
     # Mounted last and at the root: it matches every path, so any route registered
     # after it would be unreachable.
