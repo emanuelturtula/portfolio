@@ -330,6 +330,124 @@ section 12, explains how to create a read-only key and where to put it."
   | under an hour | "M minute(s)", then " S second(s)" when S > 0 |
   | an hour or more | "H hour(s)", then " M minute(s)" when M > 0 |
 
+### After review: what changes (R1–R14)
+
+This section overrides the design above wherever the two disagree. It came from the
+reviewer, and from the tech lead's own look at the page in a browser against a stub backend.
+**The root cause was the same one spec 011 recorded.** "What the backend can write" missed
+the most common failure shape. At a venue with no symbols call, which is Bitget, the plan is
+committed before the first fetch (`_read_account`). A window is deleted only after its last
+page commits (`_drain_window`). So **every `auth_failed` account, and every `error` account
+except `internal`, has `requested_since` set and at least one window pending.** A first run
+with a refused key leaves about 13 windows, 0 fills and `history_truncated: true`. The
+fixtures defaulted to 0 windows, so no test ever rendered that state.
+
+**R1. The "history complete from" fact is qualified while windows are pending.** With
+`pending_windows > 0` it reads "History complete from: {instant} once the windows still to read
+are read." It is unchanged otherwise. `models.py` defines `effective_since` as complete only
+"once no window is pending".
+
+**R2. Rule 6 has its own wording for `auth_failed`.** Scheduled runs skip that account, so
+"The next sync continues from them" is false there. For `auth_failed`: "{N} {window|windows} of
+history {is|are} still to read. The first sync you start after fixing the key continues from
+{it|them}." Other statuses keep rule 6, still gated on `configured` and not syncing.
+
+**R3. The scope remediation no longer points at steps that are not on screen.** Its note
+reads: "A new key must first go into `secrets.env` on the host ({variables}), and the
+container be recreated with `docker compose up --force-recreate`." **An unconfigured venue
+always gets the `key` steps**, whatever the kind: its credentials have to come back first, and
+without them the Sync now button is hidden. So `remediationFor` returns `'key'` when
+`!configured`.
+
+**R4. The label rule, in precedence order:**
+
+| Condition | Label |
+|---|---|
+| `!configured` | Not configured |
+| `status === 'auth_failed'` | Authentication failed, **even while `syncing`** |
+| `syncing` | Syncing |
+| `status === 'ok'` and `pending_windows > 0` | Unfinished |
+| otherwise | `STATUS_LABELS[status]` |
+
+**R5. Message 2 no longer claims the venue is being read.** It says "A sync is running." For
+`auth_failed` it adds: "Only a sync you start retries {Venue}; a scheduled one skips it."
+`syncing` is run-wide, a scheduled run skips an `auth_failed` venue, and with #14 BingX
+backfills for minutes while Bitget would otherwise claim to be read.
+
+**R6. No promise of a timer that may be off.**
+- Rule 5 reads "The next sync tries again." It is not shown when `last_error.error_kind` is
+  `conflict`, whose own sentence already says the sync stops there.
+- Rule 7 reads "No sync has finished for {Venue} yet. Press Sync now to start one."
+
+**R7. Fills on a `running` or `interrupted` run.** The account in flight has committed pages
+but no outcome yet, and the backend sums only outcomes. So the cell reads "{n} new of {m} read
+(finished exchanges only)". Settled runs keep "{n} new of {m} read". This reverses the
+`cfd3dad` ruling, whose premise was right and whose conclusion was not.
+
+**R8. The result names what was read, and leads with a skip.**
+- `attempted = accounts_total − accounts_skipped`.
+- The headline reads "The sync {verb}: {n} new {fill|fills} ({m} read) from {attempted}
+  {exchange|exchanges}, in {duration}." When `attempted` is 0, it is "No exchange was read."
+- When any account was skipped, the result **starts** with the skip lines, then "It joined a
+  sync that was already running.", then the headline.
+
+**R9. A failed `POST` does not claim that the server was unreachable, or that nothing ran.**
+- The alert reads: "The sync request failed: {describeApiError(…, 'No answer came back from
+  the server.')} A sync may still be running on the server; this page updates when it
+  finishes."
+- **It is cleared once the run log shows the outcome.** At the click, the page records the
+  newest run's `run_id` and whether it was `running`, or 0 and false if there was none. The
+  mutation is reset, so the alert disappears, when the newest run is settled and either:
+  - its `run_id` is greater than the recorded one; or
+  - its `run_id` equals the recorded one, and that run was `running` at the click, which means
+    the request joined it.
+
+  `run_id` rather than timestamps, so no clock is compared. If no new run ever appears, the
+  request never started one, and the alert stays.
+
+**R10. Focus stays on Sync now.** While its request is pending the button is
+`aria-disabled="true"`, and a click on it does nothing. It is not `disabled`, which drops
+focus to `<body>`, verified in the browser. The button keeps focus through the pending state
+and after it. The Dashboard's Refresh has the same defect, and it is filed separately rather
+than fixed here.
+
+**R11. One persistent live region.** The toolbar holds one `role="status"` element that is
+always in the DOM. The pending line and the result are swapped in as its children, because a
+region inserted together with its text is not reliably announced. The failure stays a
+`role="alert"`.
+
+**R12. An orphaned `running` row does not keep the run log polling fast.** The runs query
+polls fast while this page's `POST` is pending, or while the newest run is `running` **and**
+the list shows a venue `syncing`. The list's `syncing` is the coordinator's in-flight flag.
+A `running` row without it is an orphan left by a failed close-out, and it is swept at the
+next run. The page passes the list's "any syncing" into `useExchangeRuns`. This is the one
+place where a query reads the other's data.
+
+**R13. The banner.**
+- Its `title` is the local time of the same **rounded-up** instant, with seconds, so the
+  tooltip never names an earlier minute than the text.
+- The body text is not muted. Only the heading used the warning colour, against
+  "prominent".
+- When the venue is not configured, the pending sentence is replaced by "The import stopped
+  before it finished ({N} {window|windows} still to read). Nothing new is read until
+  credentials for {Venue} are configured again."
+
+**R14. Small things.**
+- In the run log, a period follows the outcome label: "Bitget: Failed. Bitget refused the API
+  key."
+- Sync now is not stretched to the toolbar's width.
+- The venue's name is an `h4`, under the `h3` "Accounts".
+- `docs/operations.md` says the page covers "the last step" of the recovery, not "the whole
+  thing".
+
+**Accepted, not changed:**
+- `<time dateTime>` carries six fractional digits, which HTML does not allow. `RelativeTime`
+  already does the same everywhere, and browsers parse it.
+- Unmounting during a pending `POST` loses its result on screen. `onSettled` still
+  invalidates, so the run log shows it.
+- Page tests use `OUTCOME_LABELS` from the module under test. The spec leaves those words
+  open, and `lib/exchanges.test.ts` holds them distinct.
+
 ## API contract
 
 No endpoint changes. The page consumes #15's three endpoints as shipped: `GET /api/exchanges`,
