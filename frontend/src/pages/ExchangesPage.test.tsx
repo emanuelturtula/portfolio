@@ -88,7 +88,9 @@ const notConfiguredLine = (venue: string): string =>
 const syncingLine = (venue: string): string => `A sync is reading ${venue} now.`;
 const RETRIES_LINE = 'The next scheduled sync tries again.';
 const windowsPendingLine = (count: number): string =>
-  `${String(count)} windows of history are still to read. The next sync continues from them.`;
+  count === 1
+    ? '1 window of history is still to read. The next sync continues from it.'
+    : `${String(count)} windows of history are still to read. The next sync continues from them.`;
 const neverSyncedLine = (venue: string): string =>
   `No sync has finished for ${venue} yet. ` +
   'The next scheduled sync imports its history, or press Sync now.';
@@ -106,8 +108,8 @@ const bannerLine = (venue: string, when: string): string =>
   `${venue} does not return trades older than its retention window, so the history ` +
   `imported here is complete only from ${when}. Any trade made before then may be missing.`;
 const bannerPendingLine = (count: number): string =>
-  'The import has not finished. That is where the history will be complete from once ' +
-  `the ${String(count)} windows still to read are read.`;
+  'The import has not finished. That is where the history will be complete from once it ' +
+  `does (${String(count)} ${count === 1 ? 'window' : 'windows'} still to read).`;
 
 const EMPTY_TITLE = 'No exchange connected';
 const EMPTY_TEXT =
@@ -499,7 +501,9 @@ describe('ExchangesPage: statuses', () => {
     expect(item).not.toHaveTextContent(/syncing/i);
   });
 
-  it('the not-configured line comes first', async () => {
+  it('the not-configured line comes first, and a refused key keeps its remediation', async () => {
+    // Rules 3 and 4 still apply without credentials: the last error is
+    // history, and the key steps are exactly how the credentials come back.
     openExchanges({
       exchanges: [authFailedExchange('auth', { configured: false })],
       runs: [],
@@ -507,9 +511,71 @@ describe('ExchangesPage: statuses', () => {
 
     const item = await venue('Bitget');
 
+    expect(item).toHaveTextContent(`Detail: ${DETAILS.auth}`);
+    expect(remediationSteps(item)).toHaveLength(4);
     expect(positionOf(item, notConfiguredLine('Bitget'))).toBeLessThan(
       positionOf(item, SENTENCES.bitgetAuth),
     );
+    expect(positionOf(item, SENTENCES.bitgetAuth)).toBeLessThan(
+      positionOf(item, keySteps('Bitget')[0] ?? ''),
+    );
+  });
+
+  it('an unconfigured error venue is promised no next sync', async () => {
+    // An unconfigured venue is in no run. "The next scheduled sync tries
+    // again" beside "nothing new is read" would contradict it on screen.
+    openExchanges({
+      exchanges: [erroredExchange('unavailable', { configured: false })],
+      runs: [],
+    });
+
+    const item = await venue('Bitget');
+
+    expect(item).toHaveTextContent(notConfiguredLine('Bitget'));
+    expect(item).toHaveTextContent('Sync failed');
+    // The last error is still history worth showing.
+    expect(item).toHaveTextContent(SENTENCES.bitgetUnavailable);
+    expect(item).toHaveTextContent(`Detail: ${DETAILS.unavailable}`);
+    expect(item).not.toHaveTextContent(RETRIES_LINE);
+    expect(item).not.toHaveTextContent(/next scheduled sync/i);
+  });
+
+  it('an unconfigured venue with windows pending is promised no next sync', async () => {
+    openExchanges({
+      exchanges: [exchange({ configured: false, pending_windows: 5 })],
+      runs: [],
+    });
+
+    const item = await venue('Bitget');
+
+    expect(item).toHaveTextContent(notConfiguredLine('Bitget'));
+    // The count is a fact about the queue, so it stays.
+    expectFact(item, FACT.windows, '5');
+    expect(item).not.toHaveTextContent(windowsPendingLine(5));
+    expect(item).not.toHaveTextContent(/next sync/i);
+  });
+
+  it('an unconfigured never-synced venue is not told to press Sync now', async () => {
+    // The row was created by a run, then the credentials were removed before
+    // anything was planned.
+    openExchanges({
+      exchanges: [
+        exchange({
+          configured: false,
+          status: 'never_synced',
+          last_synced_at: null,
+          requested_since: null,
+          fills_stored: 0,
+        }),
+      ],
+      runs: [],
+    });
+
+    const item = await venue('Bitget');
+
+    expect(item).toHaveTextContent('Never synced');
+    expect(item).toHaveTextContent(notConfiguredLine('Bitget'));
+    expect(item).not.toHaveTextContent(neverSyncedLine('Bitget'));
   });
 
   it('an ok venue with windows pending says the next sync continues from them', async () => {
@@ -525,6 +591,21 @@ describe('ExchangesPage: statuses', () => {
     expectFact(item, FACT.windows, '3');
     expect(item).toHaveTextContent(windowsPendingLine(3));
     expect(item).not.toHaveTextContent(neverSyncedLine('Bitget'));
+  });
+
+  it('one window pending is singular', async () => {
+    openExchanges({
+      exchanges: [exchange({ pending_windows: 1 })],
+      runs: [interruptedExchangeRun({ accounts_total: 1 })],
+    });
+
+    const item = await venue('Bitget');
+
+    expectFact(item, FACT.windows, '1');
+    expect(item).toHaveTextContent(
+      '1 window of history is still to read. The next sync continues from it.',
+    );
+    expect(item).not.toHaveTextContent(/1 windows/);
   });
 
   it('lists every venue the backend returns, each labelled by its name', async () => {
@@ -766,7 +847,7 @@ describe('ExchangesPage: Sync now', () => {
         run_id: 8,
         trigger: 'manual',
         started_at: NOW,
-        accounts_total: 1,
+        accounts_total: 2,
       }),
       finishedRun(),
     ]);
@@ -783,6 +864,28 @@ describe('ExchangesPage: Sync now', () => {
     expect(text(cell(newest, 'Status'))).toBe('Running');
     expect(text(cell(newest, 'Trigger'))).toBe('Manual');
     expect(text(cell(newest, 'Duration'))).toBe('—');
+    // The counters are written at close; the outcomes as each account ends.
+    expect(text(cell(newest, 'Exchanges'))).toBe('0 of 2 finished');
+    expect(text(cell(newest, 'Fills'))).toBe('0 new of 0 read');
+
+    // BingX finishes first: its outcome is committed, the counters are not.
+    fake.setRuns([
+      runningExchangeRun({
+        run_id: 8,
+        trigger: 'manual',
+        started_at: NOW,
+        accounts_total: 2,
+        accounts: [accountSucceeded('bingx', { fills_seen: 5, fills_inserted: 5 })],
+      }),
+      finishedRun(),
+    ]);
+    await advance(FAST_POLL_MS);
+
+    await waitFor(() => {
+      expect(text(cell(newest, 'Exchanges'))).toBe('1 of 2 finished');
+    });
+    expect(text(cell(newest, 'Fills'))).toBe('5 new of 5 read');
+    expect(cell(newest, 'Details')).toHaveTextContent(`BingX: ${OUTCOME_LABELS.success}`);
 
     release();
   });
@@ -1258,6 +1361,8 @@ describe('ExchangesPage: run log', () => {
     // An interrupted run never finished, so it has no duration.
     expect(text(cell(interrupted, 'Status'))).toBe('Interrupted');
     expect(text(cell(interrupted, 'Duration'))).toBe('—');
+    // It got through one account of two before it died.
+    expect(text(cell(interrupted, 'Exchanges'))).toBe('1 of 2 finished');
     expect(text(cell(interrupted, 'Fills'))).toBe('9 new of 9 read');
     expect(cell(interrupted, 'Details')).toHaveTextContent(`BingX: ${OUTCOME_LABELS.success}`);
 
@@ -1390,6 +1495,27 @@ describe('ExchangesPage: run log', () => {
     expect(bodyRows(table)).toHaveLength(1);
   });
 
+  it('a run with no venue to sync says None, while running and once finished', async () => {
+    // `open_run` counts the configured venues: with none, the total is 0 from
+    // the start, and the run attempts nothing.
+    openExchanges({
+      exchanges: [exchange({ configured: false })],
+      runs: [
+        runningExchangeRun({ run_id: 8, accounts_total: 0 }),
+        finishedRun({ run_id: 7, accounts: [], status: 'success' }),
+      ],
+    });
+
+    const [running, finished] = bodyRows(await runTable());
+    if (running === undefined || finished === undefined) {
+      throw new Error('The run log is missing a row.');
+    }
+
+    expect(text(cell(running, 'Status'))).toBe('Running');
+    expect(text(cell(running, 'Exchanges'))).toBe('None');
+    expect(text(cell(finished, 'Exchanges'))).toBe('None');
+  });
+
   it('an empty run log says no sync has run', async () => {
     openExchanges({ exchanges: [exchange()], runs: [] });
 
@@ -1499,7 +1625,24 @@ describe('ExchangesPage: truncation banner', () => {
     const section = banner('Bitget');
 
     expect(section).toHaveTextContent(bannerLine('Bitget', TRUNCATED_EFFECTIVE_SINCE_TEXT));
+    expect(section).toHaveTextContent(
+      'The import has not finished. That is where the history will be complete from once ' +
+        'it does (4 windows still to read).',
+    );
     expect(section).toHaveTextContent(bannerPendingLine(4));
+  });
+
+  it('the banner is singular for one window still to read', async () => {
+    openExchanges({ exchanges: [truncatedExchange({ pending_windows: 1 })], runs: [] });
+    await venue('Bitget');
+
+    const section = banner('Bitget');
+
+    expect(section).toHaveTextContent(
+      'The import has not finished. That is where the history will be complete from once ' +
+        'it does (1 window still to read).',
+    );
+    expect(section).not.toHaveTextContent(/1 windows/);
   });
 
   it('no banner when history is not truncated', async () => {
