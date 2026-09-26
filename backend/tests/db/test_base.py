@@ -87,6 +87,7 @@ EXPECTED_NAMES = {
         "pk_exchange_accounts",
         "uq_exchange_accounts_user_exchange",
         "ck_exchange_accounts_exchange_key",
+        "ck_exchange_accounts_sync_status",
         "fk_exchange_accounts_user_id_users",
     },
     "exchange_fills": {
@@ -96,6 +97,28 @@ EXPECTED_NAMES = {
         "ck_exchange_fills_side",
         "ck_exchange_fills_quote_quantity_derived",
         "fk_exchange_fills_exchange_account_id_exchange_accounts",
+    },
+    # #15. The pending-window queue is read per account, so its foreign key is indexed; the
+    # run log is read newest first by id and listed by time, as `sync_runs` is. The outcome
+    # table's unique constraint leads with the run, which serves the only query on it.
+    "exchange_sync_windows": {
+        "pk_exchange_sync_windows",
+        "fk_exchange_sync_windows_exchange_account_id_exchange_accounts",
+        "ix_exchange_sync_windows_exchange_account_id",
+    },
+    "exchange_sync_runs": {
+        "pk_exchange_sync_runs",
+        "ck_exchange_sync_runs_trigger",
+        "ck_exchange_sync_runs_status",
+        "ix_exchange_sync_runs_started_at",
+    },
+    "exchange_sync_run_accounts": {
+        "pk_exchange_sync_run_accounts",
+        "uq_exchange_sync_run_accounts_run_account",
+        "ck_exchange_sync_run_accounts_status",
+        "ck_exchange_sync_run_accounts_error_kind",
+        "fk_exchange_sync_run_accounts_exchange_sync_run_id_exchange_sync_runs",
+        "fk_exchange_sync_run_accounts_exchange_account_id_exchange_accounts",
     },
 }
 

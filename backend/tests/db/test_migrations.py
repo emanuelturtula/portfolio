@@ -46,6 +46,7 @@ from portfolio.db.models import (
     _ASSET_KIND_CHECK,
     _BALANCE_SNAPSHOT_CONFIRMED_CHECK,
     _EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK,
+    _EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK,
     _EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK,
     _EXCHANGE_FILL_QUOTE_QUANTITY_DERIVED_CHECK,
     _EXCHANGE_FILL_SIDE_CHECK,
@@ -80,6 +81,11 @@ APPLICATION_TABLES = frozenset(
         # #12. The venue an owner imports from, and the immutable log of its executions.
         "exchange_accounts",
         "exchange_fills",
+        # #15. The pending-window queue that is the sync's checkpoint, and the exchange
+        # run log with one outcome per account per run.
+        "exchange_sync_windows",
+        "exchange_sync_runs",
+        "exchange_sync_run_accounts",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -113,6 +119,12 @@ BALANCE_TABLES = frozenset({"sync_runs", "sync_run_chains", "balance_snapshots"}
 #: #12's revision and its two tables, for the same single-step reversal.
 EXCHANGES_REVISION = "0006_exchanges"
 EXCHANGE_TABLES = frozenset({"exchange_accounts", "exchange_fills"})
+
+#: #15's three tables. Its revision sits on top of #12's, so every single-step reversal
+#: below `0007_exchange_sync` takes these down as well, and each test subtracts them.
+EXCHANGE_SYNC_TABLES = frozenset(
+    {"exchange_sync_windows", "exchange_sync_runs", "exchange_sync_run_accounts"}
+)
 
 EXPECTED_SEED_ROWS = [
     ("BTC", "Bitcoin", 8, "crypto"),
@@ -174,6 +186,8 @@ EXPECTED_CONSTRAINT_NAMES = {
         "pk_exchange_accounts",
         "uq_exchange_accounts_user_exchange",
         "ck_exchange_accounts_exchange_key",
+        # #15: the batch rebuild that added the sync state has to keep every name above.
+        "ck_exchange_accounts_sync_status",
         "fk_exchange_accounts_user_id_users",
     },
     "exchange_fills": {
@@ -183,6 +197,25 @@ EXPECTED_CONSTRAINT_NAMES = {
         "ck_exchange_fills_side",
         "ck_exchange_fills_quote_quantity_derived",
         "fk_exchange_fills_exchange_account_id_exchange_accounts",
+    },
+    # #15. The CHECKs are compared with their constants in
+    # `tests/db/test_exchange_sync_migration.py`; this pins that they exist and are named.
+    "exchange_sync_windows": {
+        "pk_exchange_sync_windows",
+        "fk_exchange_sync_windows_exchange_account_id_exchange_accounts",
+    },
+    "exchange_sync_runs": {
+        "pk_exchange_sync_runs",
+        "ck_exchange_sync_runs_trigger",
+        "ck_exchange_sync_runs_status",
+    },
+    "exchange_sync_run_accounts": {
+        "pk_exchange_sync_run_accounts",
+        "uq_exchange_sync_run_accounts_run_account",
+        "ck_exchange_sync_run_accounts_status",
+        "ck_exchange_sync_run_accounts_error_kind",
+        "fk_exchange_sync_run_accounts_exchange_sync_run_id_exchange_sync_runs",
+        "fk_exchange_sync_run_accounts_exchange_account_id_exchange_accounts",
     },
 }
 
@@ -362,7 +395,7 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
     # is what keeps this test about the prices migration rather than about how many
     # revisions happen to sit on top of it.
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - {"prices"} - BALANCE_TABLES - EXCHANGE_TABLES
+        APPLICATION_TABLES - {"prices"} - BALANCE_TABLES - EXCHANGE_TABLES - EXCHANGE_SYNC_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -392,9 +425,9 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
     command.downgrade(build_alembic_config(database_url), PRICES_REVISION)
 
     # Since #12 the exchange revision sits on top of this one and comes down with it.
-    assert table_names(sync_engine) == (APPLICATION_TABLES - BALANCE_TABLES - EXCHANGE_TABLES) | {
-        STAMP_TABLE
-    }
+    assert table_names(sync_engine) == (
+        APPLICATION_TABLES - BALANCE_TABLES - EXCHANGE_TABLES - EXCHANGE_SYNC_TABLES
+    ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
     upgrade_to_head(database_url)
@@ -458,7 +491,9 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
 
     command.downgrade(build_alembic_config(database_url), BALANCES_REVISION)
 
-    assert table_names(sync_engine) == (APPLICATION_TABLES - EXCHANGE_TABLES) | {STAMP_TABLE}
+    assert table_names(sync_engine) == (
+        APPLICATION_TABLES - EXCHANGE_TABLES - EXCHANGE_SYNC_TABLES
+    ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM users")) == 1
@@ -704,6 +739,7 @@ def test_the_exchange_check_constraints_match_the_models(
     expected = {
         "exchange_accounts": {
             "ck_exchange_accounts_exchange_key": _EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK,
+            "ck_exchange_accounts_sync_status": _EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK,
         },
         "exchange_fills": {
             "ck_exchange_fills_external_trade_id": _EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK,

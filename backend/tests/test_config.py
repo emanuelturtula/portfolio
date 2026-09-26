@@ -14,6 +14,7 @@ zero up to one and carrying on -- is worse than it sounds: an operator who typed
 
 from __future__ import annotations
 
+from datetime import UTC, date, datetime, timedelta
 from typing import Final
 
 import pytest
@@ -50,6 +51,10 @@ def without_an_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "PORTFOLIO_BALANCE_SYNC_SHUTDOWN_GRACE_SECONDS",
         "PORTFOLIO_PRICE_REFRESH_ENABLED",
         "PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES",
+        "PORTFOLIO_EXCHANGE_HISTORY_START",
+        "PORTFOLIO_EXCHANGE_SYNC_ENABLED",
+        "PORTFOLIO_EXCHANGE_SYNC_INTERVAL_MINUTES",
+        "PORTFOLIO_EXCHANGE_SYNC_SHUTDOWN_GRACE_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -179,3 +184,82 @@ def test_the_interval_refusals_do_not_quote_the_bootstrap_password() -> None:
         Settings(balance_sync_interval_minutes=0, bootstrap_password=phrase)
 
     assert phrase not in str(caught.value)
+
+
+# --------------------------------------------------------------------------------------
+# #15: the exchange sync's four settings
+# --------------------------------------------------------------------------------------
+
+
+def test_the_exchange_sync_defaults_are_the_specs() -> None:
+    """No history start (everything the venue keeps), on, fifteen minutes, ten seconds."""
+    settings = Settings()
+
+    assert settings.exchange_history_start is None
+    assert settings.exchange_sync_enabled is True
+    assert settings.exchange_sync_interval_minutes == DEFAULT_BALANCE_INTERVAL_MINUTES
+    assert settings.exchange_sync_shutdown_grace_seconds == DEFAULT_SHUTDOWN_GRACE_SECONDS
+
+
+@pytest.mark.parametrize("interval", [0, -1])
+def test_a_zero_exchange_interval_is_refused_naming_the_switch(interval: int) -> None:
+    """A busy loop against a venue that signs in with the owner's key."""
+    with pytest.raises(ValidationError) as caught:
+        Settings(exchange_sync_interval_minutes=interval)
+
+    message = str(caught.value)
+    assert "PORTFOLIO_EXCHANGE_SYNC_INTERVAL_MINUTES" in message
+    assert "PORTFOLIO_EXCHANGE_SYNC_ENABLED" in message
+
+
+def test_an_exchange_interval_of_one_minute_is_accepted() -> None:
+    assert Settings(exchange_sync_interval_minutes=1).exchange_sync_interval_minutes == 1
+
+
+def test_a_history_start_in_the_future_is_refused_without_quoting_it() -> None:
+    """Two days ahead, so a run crossing midnight UTC cannot turn it into today."""
+    future = datetime.now(UTC).date() + timedelta(days=2)
+
+    with pytest.raises(ValidationError) as caught:
+        Settings(exchange_history_start=future)
+
+    message = f"{caught.value}{caught.value!r}"
+    assert "PORTFOLIO_EXCHANGE_HISTORY_START" in message
+    assert future.isoformat() not in message
+
+
+@pytest.mark.parametrize("days_ago", [0, 1, 365 * 20])
+def test_a_history_start_today_or_earlier_is_accepted(days_ago: int) -> None:
+    """Today exactly is allowed: the boundary is `>`, not `>=`."""
+    start = datetime.now(UTC).date() - timedelta(days=days_ago)
+
+    assert Settings(exchange_history_start=start).exchange_history_start == start
+
+
+def test_the_history_start_is_read_from_the_environment_as_a_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PORTFOLIO_EXCHANGE_HISTORY_START", "2025-01-31")
+
+    assert Settings().exchange_history_start == date(2025, 1, 31)
+
+
+@pytest.mark.parametrize("raw", ["not-a-date", "2025-02-30", "31/01/2025"])
+def test_a_history_start_that_is_not_a_date_is_refused(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("PORTFOLIO_EXCHANGE_HISTORY_START", raw)
+
+    with pytest.raises(ValidationError) as caught:
+        Settings()
+
+    assert "exchange_history_start" in str(caught.value).lower()
+
+
+def test_the_exchange_timer_is_configured_apart_from_the_other_two() -> None:
+    """Its own switch: stopping a venue that is refusing the key stops nothing else."""
+    settings = Settings(exchange_sync_enabled=False)
+
+    assert settings.exchange_sync_enabled is False
+    assert settings.balance_sync_enabled is True
+    assert settings.price_refresh_enabled is True
