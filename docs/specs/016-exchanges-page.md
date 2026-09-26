@@ -350,7 +350,8 @@ are read." It is unchanged otherwise. `models.py` defines `effective_since` as c
 **R2. Rule 6 has its own wording for `auth_failed`.** Scheduled runs skip that account, so
 "The next sync continues from them" is false there. For `auth_failed`: "{N} {window|windows} of
 history {is|are} still to read. The first sync you start after fixing the key continues from
-{it|them}." Other statuses keep rule 6, still gated on `configured` and not syncing.
+{it|them}." It is gated like rule 6, on `configured` and not syncing: an unconfigured venue
+has R13's sentence and rule 1, and a syncing one has R5's. Other statuses keep rule 6.
 
 **R3. The scope remediation no longer points at steps that are not on screen.** Its note
 reads: "A new key must first go into `secrets.env` on the host ({variables}), and the
@@ -389,7 +390,8 @@ but no outcome yet, and the backend sums only outcomes. So the cell reads "{n} n
 - The headline reads "The sync {verb}: {n} new {fill|fills} ({m} read) from {attempted}
   {exchange|exchanges}, in {duration}." When `attempted` is 0, it is "No exchange was read."
 - When any account was skipped, the result **starts** with the skip lines, then "It joined a
-  sync that was already running.", then the headline.
+  sync that was already running.", then the headline. The failed-account lines always come
+  after the headline.
 
 **R9. A failed `POST` does not claim that the server was unreachable, or that nothing ran.**
 - The alert reads: "The sync request failed: {describeApiError(…, 'No answer came back from
