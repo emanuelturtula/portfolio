@@ -106,8 +106,15 @@ export function ExchangesPage() {
     wasRunning: false,
   });
 
+  // Spec R19: the effect below depends on exactly these two, not the whole `syncMutation` -
+  // a fresh object every render. `reset` is stable across renders (`MutationObserver`'s
+  // constructor binds it once - `this.reset = this.reset.bind(this)` in
+  // `@tanstack/query-core`), so naming it here satisfies `exhaustive-deps` with no
+  // suppression needed.
+  const { isError: syncFailed, reset: resetSync } = syncMutation;
+
   useEffect(() => {
-    if (!syncMutation.isError) {
+    if (!syncFailed) {
       return;
     }
     const recorded = recordedRunRef.current;
@@ -134,12 +141,9 @@ export function ExchangesPage() {
       // No need to reset `recordedRunRef` here: `reset()` clears `isError`, so the guard
       // above already short-circuits every later run of this effect until the next click
       // overwrites the ref with a fresh recording anyway.
-      syncMutation.reset();
+      resetSync();
     }
-    // Spec R19: deps name exactly what this effect reads, not the whole `syncMutation` -
-    // a fresh object every render, and the broad dependency R19 exists to replace.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runs.data, syncMutation.isError, syncMutation.reset]);
+  }, [runs.data, syncFailed, resetSync]);
 
   function handleSyncClick(): void {
     // Spec R10: a no-op while pending, not a native `disabled` button - `disabled` drops
