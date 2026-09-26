@@ -384,10 +384,10 @@ floor does not move either: the only backend change is a docstring.
 
 | Agent | Owns |
 |---|---|
-| frontend-dev | `frontend/src/**` **except** test files and `frontend/src/test/**`. Also `frontend/README.md` (the pages list, and its "API types" section, which still says the schema is read over HTTP), `docs/operations.md` (section 13 only: the page exists and **Sync now** is the manual trigger), `backend/src/portfolio/api/routers/exchanges.py` (the one docstring) and `frontend/src/api/generated/schema.ts` (regenerated, never hand-edited) |
+| frontend-dev | `frontend/src/**` **except** test files and `frontend/src/test/**`. Also `frontend/README.md` (the pages list, and its "API types" section, which still says the schema is read over HTTP) and `docs/operations.md` (section 13 only: the page exists and **Sync now** is the manual trigger) |
 | tester | `frontend/src/**/*.test.ts`, `frontend/src/**/*.test.tsx`, `frontend/src/test/**` |
 | reviewer | nothing |
-| tech lead | `docs/specs/016-exchanges-page.md` |
+| tech lead | `docs/specs/016-exchanges-page.md`; the docstring fix in `backend/src/portfolio/api/routers/exchanges.py` and `services/exchange_sync.py`, and `frontend/src/api/generated/schema.ts` regenerated for it (done before the team starts, so no implementer touches `backend/**`) |
 
 ## Risks
 
