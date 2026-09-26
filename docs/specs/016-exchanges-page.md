@@ -1,7 +1,7 @@
 # 016 — Exchanges page: sync status and history
 
 Issue: #16
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -579,6 +579,59 @@ floor does not move either: the only backend change is a docstring.
   mode. That is negligible, and it stops when the tab is hidden.
 - **The banner's instant is only as exact as `effective_since`.** A retention refusal can
   raise it later (#15, F2), and the banner then moves with it. That is the intended behaviour.
+
+## What the plan got wrong
+
+### The writer section read the success path, not the failure path
+
+Spec 011's lesson was to read the code that writes a row, and this spec did. It traced a
+first run, an interrupted run, a success and a removed credential. It did **not** trace a
+failing account at a venue that makes no symbols call. There, the plan commits before the
+first fetch, and a refused fetch leaves its window queued. So the commonest failure at
+Bitget, a refused key, is an `auth_failed` account with about 13 windows pending, 0 fills and
+a truncated history. The fixtures defaulted to 0 windows, and the page claimed a complete
+history and a next sync in exactly that state. Review found it; 711 tests had passed over it.
+
+**For each status, trace the writer path that produces it to its last commit, including the
+failure paths.** A path that ends by raising leaves behind whatever it committed before the
+raise.
+
+### Every promise of a next step needs its actor
+
+"The next sync tries again", "the next sync continues from them" and "once it does" were
+each written against one reader, and each was false for another:
+
+- a scheduled run skips an `auth_failed` account;
+- an unconfigured venue is in no run;
+- a `conflict` stops at the same page every time;
+- the timer can be switched off.
+
+"Syncing" was also claimed for a venue the run skips, and "Authentication failed" was
+claimed for a venue the owner's own run was retrying. **A sentence about the future has to
+name who performs it, and check that they will.**
+
+### Focus was not in the plan, again
+
+Spec 011's closing section said focus was not in the plan. It was not in this one either,
+and a disabled button dropped focus to `<body>`. jsdom tests passed. A browser showed it, and
+the reviewer found it independently. The same defect is on the dashboard's Refresh, and it is
+filed as a follow-up. A live region inserted together with its text was the second half of
+the same miss.
+
+### Coupling two queries coupled their phases
+
+R12 made the run log's poll rate depend on the list's data, to stop an orphaned row from
+polling fast. Two queries at the same rate are not in phase, though, so the run log could
+slow down while its newest run still read `running`. R15 refetches it once on the falling
+edge. **A fix that reads another query's data inherits that query's timing.**
+
+### Smaller
+
+- The result headline counted skipped accounts as read.
+- A failed request was worded as "the server could not be reached", when the likeliest
+  failure is a proxy that gave up on a server still running the sync.
+- Twice, the 100% branch gate caught a guard no writable state reaches, and twice the fix
+  was to narrow a type rather than to test the impossible.
 
 ## Handed on
 
