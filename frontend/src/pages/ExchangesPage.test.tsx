@@ -631,6 +631,35 @@ describe('ExchangesPage: statuses', () => {
     },
   );
 
+  it('in a manual run, a venue that was not refused is syncing, not being retried', async () => {
+    // R17 is about an auth_failed account only. Every other venue in the same
+    // manual run keeps R4's label and R5's line.
+    openExchanges({
+      exchanges: [
+        erroredExchange('unavailable', { exchange_key: 'bingx', syncing: true }),
+        exchange({ syncing: true }),
+      ],
+      runs: [runningExchangeRun({ trigger: 'manual', accounts_total: 2 })],
+    });
+
+    const bitget = await venue('Bitget');
+    const bingx = await venue('BingX');
+    await runTable();
+    await settle();
+
+    for (const [item, name] of [
+      [bitget, 'Bitget'],
+      [bingx, 'BingX'],
+    ] as const) {
+      expect(item).toHaveTextContent('Syncing');
+      expect(item).toHaveTextContent(SYNC_RUNNING_LINE);
+      expect(item).not.toHaveTextContent(RETRYING_LABEL);
+      expect(item).not.toHaveTextContent(retryingLine(name));
+    }
+    // The error venue still shows what failed last time.
+    expect(bingx).toHaveTextContent(`Detail: ${DETAILS.unavailable}`);
+  });
+
   it.each(['scheduled', 'startup'] as const)(
     'a %s run in flight past a refused key keeps "Authentication failed" and the steps',
     async (trigger) => {
@@ -2830,6 +2859,36 @@ describe('ExchangesPage: polling', () => {
     await advance(FAST_POLL_MS);
     await advance(FAST_POLL_MS);
     expect(fake.count('runs')).toBe(readsAfterEdge);
+  });
+
+  it('a run the log sees before the list does is not refetched: that is no falling edge', async () => {
+    // A scheduled run opens between the list's read and the run log's: the
+    // log shows it running while the list does not yet say syncing. Nothing
+    // fell from true to false, so R15 has nothing to refetch; the log polls
+    // on its own clock.
+    fakeIntervals();
+    const { fake } = openExchanges({
+      exchanges: [exchange()],
+      runs: [finishedRun({ run_id: 7 })],
+    });
+    await venue('Bitget');
+    const table = await runTable();
+    await settle();
+    const reads = fake.count('runs');
+
+    fake.setRuns([
+      runningExchangeRun({ run_id: 8, started_at: NOW, accounts_total: 1 }),
+      finishedRun({ run_id: 7 }),
+    ]);
+    await advance(SLOW_POLL_MS);
+    await waitFor(() => {
+      const [row] = bodyRows(table);
+      expect(row === undefined ? '' : text(cell(row, 'Status'))).toBe('Running');
+    });
+    await settle();
+
+    // One read on the log's own clock, and no second one on account of it.
+    expect(fake.count('runs')).toBe(reads + 1);
   });
 
   it('the list staying unsynced does not refetch the run log again', async () => {
