@@ -442,6 +442,49 @@ place where a query reads the other's data.
 - `docs/operations.md` says the page covers "the last step" of the recovery, not "the whole
   thing".
 
+### Second review: R15–R19
+
+The second pass found no rule implemented other than as written. It did find one regression
+that R12 introduced, one gap in R6's reasoning, one consequence of R4, and one hole in R9.
+
+**R15. When no venue is syncing any more, the run log is refetched once.** R12 made the run
+log's fast rate depend on the list's `anySyncing`. The two queries poll on independent 5 s
+phases, so when the list's poll lands first after a run ends, the run log drops to 60 s
+while its newest run still reads `running`. The accounts then say "Up to date" beside a
+"Running" run for up to a minute. On the falling edge of `anySyncing` (true to false), the
+page invalidates `exchangeRunsQueryKey` once.
+
+**R16. `conflict` gets no rule 6 either.** A conflict leaves its window queued, because the
+insert raises before the window advances. So rule 6's "The next sync continues from them"
+would follow "The sync stops at that page until someone looks". R6's exclusion now covers
+rule 6 as well.
+
+**R17. The owner's own retry reads as a retry, not as a failure.** R4 kept "Authentication
+failed" while syncing, because a scheduled or startup run skips the account. A **manual** run
+retries it, though, and a first backfill after a fixed key takes minutes. The fix:
+
+- When the account is `auth_failed` and `syncing`, and the run log's newest run is `running`
+  with `trigger: 'manual'`, the label is **Retrying**.
+- Message 2 then reads "This sync is retrying {Venue}.", and the remediation steps are
+  hidden. `last_error` still shows, because it is still the latest attempted outcome.
+- In every other case R4 and R5 stand.
+- Whether a manual run is in flight comes from the run log, not from this page's pending
+  `POST`. A `POST` that joined a scheduled run is pending as well, and that run skips the
+  account.
+- When the run log is unknown, the label falls back to Authentication failed.
+
+**R18. R9 never clears the alert from an unknown baseline.** When `runs.data` is `undefined`
+at the click (still loading, or its first load failed), the recorded `runId` is `null`, and
+the alert is never cleared automatically. Otherwise a run log that recovers showing the old
+run 41 would clear the alert against a baseline of 0. The id-greater branch also requires
+`trigger: 'manual'`. A later scheduled run is not evidence that this request ran, and a
+joined run the snapshot missed leaves the alert up, which is the safe direction.
+
+**R19. Small things.**
+- The effect's dependencies state what it reads (`runs.data`, `isError`, `reset`), not the
+  whole mutation object, which is new on every render.
+- The banner's `title` includes the time zone (`timeStyle: 'long'`).
+
 **Accepted, not changed:**
 - `<time dateTime>` carries six fractional digits, which HTML does not allow. `RelativeTime`
   already does the same everywhere, and browsers parse it.
@@ -541,3 +584,6 @@ floor does not move either: the only backend change is a docstring.
 
 - **#14:** confirm `PORTFOLIO_BINGX_*` in `src/lib/exchanges.ts`. Check that BingX's auth codes
   map to `auth`, because this page's remediation keys on that.
+  Set `PLANS_BEFORE_FIRST_FETCH.bingx` in `src/test/exchangeFixtures.ts` from BingX's
+  `requires_symbol`. A venue with no symbols call commits its plan before the first fetch,
+  and the fixture guard then holds its failures to that shape.
