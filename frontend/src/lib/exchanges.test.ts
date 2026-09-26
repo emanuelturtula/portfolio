@@ -236,12 +236,13 @@ const LABEL_CASES: readonly (readonly [
 ];
 
 describe('statusLabel', () => {
-  it.each(LABEL_CASES)(
-    'labels %s (manual run in flight: %s) as %j',
-    (_name, build, manual, expected) => {
-      expect(statusLabel(build(), manual)).toBe(expected);
-    },
-  );
+  // Reordered so the title's placeholders name the case, the flag and the
+  // label, and not the builder function.
+  it.each(
+    LABEL_CASES.map(([name, build, manual, expected]) => [name, manual, expected, build] as const),
+  )('labels %s (manual run in flight: %s) as %j', (_name, manual, expected, build) => {
+    expect(statusLabel(build(), manual)).toBe(expected);
+  });
 
   it.each(ALL_ACCOUNT_STATUSES)('keeps the stored label of %s in STATUS_LABELS', (status) => {
     expect(STATUS_LABELS[status]).toBe(STATUS_LABEL_TABLE[status]);
