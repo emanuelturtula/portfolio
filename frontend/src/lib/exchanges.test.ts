@@ -1,15 +1,18 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  accountFailureSentence,
   errorSentence,
   EXCHANGES,
   formatCount,
+  formatRunDuration,
   OUTCOME_LABELS,
   remediationFor,
   RUN_STATUS_LABELS,
   STATUS_LABELS,
   statusLabel,
   TRIGGER_LABELS,
+  UNKNOWN_ACCOUNT_FAILURE_MESSAGE,
 } from '@/lib/exchanges';
 import {
   ALL_ACCOUNT_STATUSES,
@@ -19,6 +22,7 @@ import {
   ALL_RUN_STATUSES,
   ALL_TRIGGERS,
   authFailedExchange,
+  drainedBeforeMarkSynced,
   erroredExchange,
   exchange,
   NON_AUTH_ERROR_KINDS,
@@ -26,6 +30,7 @@ import {
   VENUE_NAMES,
   VENUE_VARIABLES,
   type AccountSyncStatus,
+  type ExchangeResponse,
   type ExchangeSyncErrorKind,
   type SyncRunStatus,
   type SyncTrigger,
@@ -77,32 +82,118 @@ function sentenceFor(kind: ExchangeSyncErrorKind, venue: string): string {
   return SENTENCE_TABLE[kind].replaceAll('{Venue}', venue);
 }
 
-describe('statusLabel', () => {
-  it.each(ALL_ACCOUNT_STATUSES)(
-    'labels a %s account that is not syncing by its status',
-    (status) => {
-      expect(statusLabel({ status, syncing: false })).toBe(STATUS_LABEL_TABLE[status]);
-      expect(STATUS_LABELS[status]).toBe(STATUS_LABEL_TABLE[status]);
-    },
-  );
+const NOT_CONFIGURED_LABEL = 'Not configured';
+const UNFINISHED_LABEL = 'Unfinished';
 
-  it.each(ALL_ACCOUNT_STATUSES)('labels a %s account that is syncing as syncing', (status) => {
-    // `syncing` replaces the label whatever the status: an auth_failed venue
-    // being retried says Syncing, and keeps the rest of its entry.
-    expect(statusLabel({ status, syncing: true })).toBe(SYNCING_LABEL);
+/** An unconfigured account that was created by a run and never planned. */
+const unconfiguredUnplanned = (): ExchangeResponse =>
+  exchange({
+    configured: false,
+    status: 'never_synced',
+    last_synced_at: null,
+    requested_since: null,
+    fills_stored: 0,
   });
 
-  it('gives every status, and syncing, a label of its own', () => {
-    // Never colour alone: two statuses sharing a label would be told apart
-    // only by styling, if at all.
-    const labels = [...ALL_ACCOUNT_STATUSES.map((status) => STATUS_LABELS[status]), SYNCING_LABEL];
+/**
+ * Spec 016 R4, the label rule in precedence order, one row per case the
+ * backend can write. Each row names the rule that must win.
+ */
+const LABEL_CASES: readonly (readonly [string, () => ExchangeResponse, string])[] = [
+  // 1. !configured wins over everything.
+  ['unconfigured ok', () => exchange({ configured: false }), NOT_CONFIGURED_LABEL],
+  [
+    'unconfigured ok with windows pending',
+    () => exchange({ configured: false, pending_windows: 4 }),
+    NOT_CONFIGURED_LABEL,
+  ],
+  [
+    'unconfigured auth_failed',
+    () => authFailedExchange('auth', { configured: false }),
+    NOT_CONFIGURED_LABEL,
+  ],
+  [
+    'unconfigured error',
+    () => erroredExchange('unavailable', { configured: false }),
+    NOT_CONFIGURED_LABEL,
+  ],
+  ['unconfigured never_synced', unconfiguredUnplanned, NOT_CONFIGURED_LABEL],
+  // 2. auth_failed, even while syncing.
+  ['auth_failed', () => authFailedExchange('auth'), 'Authentication failed'],
+  [
+    'auth_failed while a manual retry is syncing',
+    () => authFailedExchange('auth', { syncing: true }),
+    'Authentication failed',
+  ],
+  [
+    'auth_failed with insufficient scope, syncing',
+    () => authFailedExchange('insufficient_scope', { syncing: true }),
+    'Authentication failed',
+  ],
+  [
+    'auth_failed drained before mark_synced',
+    () => drainedBeforeMarkSynced(authFailedExchange('auth')),
+    'Authentication failed',
+  ],
+  // 3. syncing.
+  ['ok, syncing', () => exchange({ syncing: true }), SYNCING_LABEL],
+  [
+    'ok with windows pending, syncing',
+    () => exchange({ syncing: true, pending_windows: 3 }),
+    SYNCING_LABEL,
+  ],
+  ['error, syncing', () => erroredExchange('unavailable', { syncing: true }), SYNCING_LABEL],
+  [
+    'never_synced with no row, syncing',
+    () => unsyncedExchange('bitget', { syncing: true }),
+    SYNCING_LABEL,
+  ],
+  // 4. ok with windows pending.
+  ['ok with windows pending', () => exchange({ pending_windows: 3 }), UNFINISHED_LABEL],
+  ['ok with one window pending', () => exchange({ pending_windows: 1 }), UNFINISHED_LABEL],
+  // 5. otherwise, the status.
+  ['ok', () => exchange(), 'Up to date'],
+  ['never_synced with no row', () => unsyncedExchange('bitget'), 'Never synced'],
+  [
+    'never_synced with windows pending',
+    () =>
+      exchange({
+        status: 'never_synced',
+        last_synced_at: null,
+        fills_stored: 40,
+        pending_windows: 6,
+      }),
+    'Never synced',
+  ],
+  ['error with windows pending', () => erroredExchange('rate_limited'), 'Sync failed'],
+  [
+    'error from our own defect, nothing pending',
+    () => erroredExchange('internal', { pending_windows: 0 }),
+    'Sync failed',
+  ],
+];
+
+describe('statusLabel', () => {
+  it.each(LABEL_CASES)('labels %s as %j', (_name, build, expected) => {
+    expect(statusLabel(build())).toBe(expected);
+  });
+
+  it.each(ALL_ACCOUNT_STATUSES)('keeps the stored label of %s in STATUS_LABELS', (status) => {
+    expect(STATUS_LABELS[status]).toBe(STATUS_LABEL_TABLE[status]);
+  });
+
+  it('gives every label a text of its own', () => {
+    // Never colour alone: two labels sharing a text would be told apart only
+    // by styling, if at all.
+    const labels = [
+      ...ALL_ACCOUNT_STATUSES.map((status) => STATUS_LABELS[status]),
+      SYNCING_LABEL,
+      NOT_CONFIGURED_LABEL,
+      UNFINISHED_LABEL,
+    ];
 
     expect(new Set(labels).size).toBe(labels.length);
-  });
-
-  it('reads a whole list entry', () => {
-    expect(statusLabel(authFailedExchange('auth', { syncing: true }))).toBe(SYNCING_LABEL);
-    expect(statusLabel(authFailedExchange('auth'))).toBe('Authentication failed');
+    expect(new Set(LABEL_CASES.map(([, build]) => statusLabel(build()))).size).toBe(7);
   });
 });
 
@@ -188,8 +279,22 @@ describe('remediationFor', () => {
     );
   });
 
-  it('keeps the remediation after the credentials were removed', () => {
+  it('keeps the remediation when every window was drained before mark_synced', () => {
+    expect(remediationFor(drainedBeforeMarkSynced(authFailedExchange('auth')))).toBe('key');
+    expect(remediationFor(drainedBeforeMarkSynced(authFailedExchange('insufficient_scope')))).toBe(
+      'scope',
+    );
+  });
+
+  it('gives an unconfigured venue the key steps, whatever the kind', () => {
+    // R3: without credentials the Sync now button is hidden, so the scope
+    // steps would point at a button that is not there. The credentials have
+    // to come back first.
     expect(remediationFor(authFailedExchange('auth', { configured: false }))).toBe('key');
+    expect(remediationFor(authFailedExchange('insufficient_scope', { configured: false }))).toBe(
+      'key',
+    );
+    expect(remediationFor(authFailedExchange(null, { configured: false }))).toBe('key');
   });
 
   it('offers none for a status the owner does not have to act on', () => {
@@ -198,6 +303,32 @@ describe('remediationFor', () => {
     for (const kind of NON_AUTH_ERROR_KINDS) {
       expect(remediationFor(erroredExchange(kind))).toBeNull();
     }
+  });
+});
+
+describe('accountFailureSentence', () => {
+  it.each(ALL_EXCHANGE_ERROR_KINDS)('is the kind sentence for %s', (kind) => {
+    expect(accountFailureSentence(kind, 'Bitget')).toBe(sentenceFor(kind, 'Bitget'));
+  });
+
+  it('invents no cause for a failure with no kind', () => {
+    // A hand-edited row. Blaming "a defect in this application", or any
+    // other kind, would be a claim the row does not make.
+    const sentence = accountFailureSentence(null, 'Bitget');
+
+    expect(sentence).toBe(UNKNOWN_ACCOUNT_FAILURE_MESSAGE);
+    for (const kind of ALL_EXCHANGE_ERROR_KINDS) {
+      expect(sentence).not.toBe(sentenceFor(kind, 'Bitget'));
+    }
+    expect(sentence).not.toMatch(/defect|refused|throttled|reached/i);
+  });
+});
+
+describe('formatRunDuration', () => {
+  it('renders a duration through formatDuration, and none as a dash', () => {
+    expect(formatRunDuration(125_000)).toBe('2 minutes 5 seconds');
+    expect(formatRunDuration(0)).toBe('under a second');
+    expect(formatRunDuration(null)).toBe('\u2014');
   });
 });
 

@@ -5,10 +5,12 @@ import {
   formatAbsoluteTime,
   formatDuration,
   formatHistoryStart,
+  formatHistoryStartLocal,
   formatRelativeTime,
   parseInstant,
   useNow,
 } from '@/lib/time';
+import { inTimeZone } from '@/test/timeZone';
 
 const NOW_MS = Date.parse('2026-09-24T12:00:00.000Z');
 
@@ -180,6 +182,10 @@ describe('formatHistoryStart', () => {
     ['2026-06-27T12:05:36.001Z', 'Jun 27, 2026, 12:05:37 PM UTC'],
     ['2026-06-27T12:05:36.500Z', 'Jun 27, 2026, 12:05:37 PM UTC'],
     ['2026-06-27T12:05:36.999999Z', 'Jun 27, 2026, 12:05:37 PM UTC'],
+    // A hundred microseconds past the second: below the millisecond, but not
+    // at its last digit.
+    ['2026-06-27T12:05:36.0001Z', 'Jun 27, 2026, 12:05:37 PM UTC'],
+    ['2026-06-27T12:05:36.000100Z', 'Jun 27, 2026, 12:05:37 PM UTC'],
   ])('rounds the sub-second instant %s up to the next second: %j', (iso, expected) => {
     // Rounding down, or to nearest, would name an instant earlier than the
     // one the history is complete from, and claim a trade in the lost
@@ -205,6 +211,19 @@ describe('formatHistoryStart', () => {
   it('reads an instant with an offset as that instant, and names it in UTC', () => {
     expect(plain(formatHistoryStart('2026-06-27T14:05:36.250+02:00'))).toBe(
       'Jun 27, 2026, 12:05:37 PM UTC',
+    );
+  });
+
+  it('does not read the offset as fractional digits of a whole second', () => {
+    // "+02:00" after ".000" has a nonzero digit, and it is not a fraction.
+    expect(plain(formatHistoryStart('2026-06-27T14:05:36.000+02:00'))).toBe(
+      'Jun 27, 2026, 12:05:36 PM UTC',
+    );
+    expect(plain(formatHistoryStart('2026-06-27T14:05:36.000000+02:00'))).toBe(
+      'Jun 27, 2026, 12:05:36 PM UTC',
+    );
+    expect(plain(formatHistoryStart('2026-06-27T10:05:36.000-02:00'))).toBe(
+      'Jun 27, 2026, 12:05:36 PM UTC',
     );
   });
 
@@ -238,6 +257,32 @@ describe('formatHistoryStart', () => {
 
   it('renders English month names and a 12-hour clock', () => {
     expect(plain(formatHistoryStart('2026-09-24T12:00:00Z'))).toBe('Sep 24, 2026, 12:00:00 PM UTC');
+  });
+});
+
+describe('formatHistoryStartLocal', () => {
+  it('names the same rounded-up instant in local time, with seconds', () => {
+    // R13: the banner's title. Built from the raw instant, it would name
+    // 8:05 while the text says 12:06:00 UTC - an earlier minute.
+    inTimeZone('America/New_York');
+    // Positive control: UTC-4 in June.
+    expect(new Date('2026-06-27T12:05:59.500Z').getHours()).toBe(8);
+
+    expect(plain(formatHistoryStartLocal('2026-06-27T12:05:59.500000Z'))).toBe(
+      'Jun 27, 2026, 8:06:00 AM',
+    );
+    expect(plain(formatHistoryStartLocal('2026-06-27T12:05:36Z'))).toBe('Jun 27, 2026, 8:05:36 AM');
+    expect(plain(formatHistoryStartLocal('2026-06-27T12:05:36.000001Z'))).toBe(
+      'Jun 27, 2026, 8:05:37 AM',
+    );
+  });
+
+  it('follows the machine zone, unlike the UTC text', () => {
+    inTimeZone('Asia/Tokyo');
+
+    expect(plain(formatHistoryStartLocal('2026-06-27T12:05:36.250000Z'))).toBe(
+      'Jun 27, 2026, 9:05:37 PM',
+    );
   });
 });
 
@@ -281,6 +326,9 @@ describe('formatDuration', () => {
     [7_200_000, '2 hours'],
     [7_260_000, '2 hours 1 minute'],
     [7_325_000, '2 hours 2 minutes'],
+    [5_399_999, '1 hour 29 minutes'],
+    [5_400_000, '1 hour 30 minutes'],
+    [9_000_000, '2 hours 30 minutes'],
     [90_000_000, '25 hours'],
   ])('renders %i ms, an hour or more, as hours then minutes when any: %j', (ms, expected) => {
     // Seconds are dropped past an hour: a first backfill measured in hours

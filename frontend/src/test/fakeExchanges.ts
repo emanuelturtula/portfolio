@@ -85,8 +85,10 @@ export interface FakeExchanges {
  * stops declaring JSON fails here rather than on the Pi.
  */
 export function fakeExchanges(options: FakeExchangesOptions = {}): FakeExchanges {
+  // Entries are checked as they are, not copied: a fixture is never mutated, and a
+  // copy would lose the identity an opt-in such as drainedBeforeMarkSynced rides on.
   let exchanges: ExchangeResponse[] = (options.exchanges ?? []).map((entry) =>
-    assertWritableExchange({ ...entry }),
+    assertWritableExchange(entry),
   );
   let runs: ExchangeSyncRunResponse[] = [...(options.runs ?? [])];
   const holds = new Map<ExchangeRoute, Promise<void>>();
@@ -135,9 +137,7 @@ export function fakeExchanges(options: FakeExchangesOptions = {}): FakeExchanges
     exchanges: () => exchanges,
     runs: () => runs,
     setExchanges: (next) => {
-      exchanges = exchangeList(
-        ...next.map((entry) => assertWritableExchange({ ...entry })),
-      ).exchanges;
+      exchanges = exchangeList(...next.map((entry) => assertWritableExchange(entry))).exchanges;
     },
     patchExchange: (key, patch) => {
       exchanges = exchanges.map((entry) =>

@@ -4,22 +4,26 @@ import { http, HttpResponse, type HttpHandler } from 'msw';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { FAST_POLL_MS, SLOW_POLL_MS } from '@/api/exchanges';
-import { OUTCOME_LABELS } from '@/lib/exchanges';
+import { OUTCOME_LABELS, UNKNOWN_ACCOUNT_FAILURE_MESSAGE } from '@/lib/exchanges';
 import {
   accountFailed,
   accountSkipped,
   accountSucceeded,
   authFailedExchange,
   DETAILS,
+  drainedBeforeMarkSynced,
   erroredExchange,
   exchange,
-  EXCHANGE_RUN_STARTED_AT,
   EXCHANGE_OLD_RUN_STARTED_AT,
+  EXCHANGE_RUN_STARTED_AT,
+  EXCHANGE_RUNNING_STARTED_AT,
   finishedRun,
+  FIRST_RUN_WINDOWS,
   handEditedFailure,
   interruptedExchangeRun,
   LAST_SYNCED_AT,
   lastError,
+  NON_AUTH_ERROR_KINDS,
   NOW,
   OLD_REQUESTED_SINCE,
   OLD_SYNCED_AT,
@@ -45,6 +49,7 @@ import {
 } from '@/test/fakeExchanges';
 import { currentPath, renderApp, settle } from '@/test/render';
 import { fakeSession, problem, server, TEST_USERNAME } from '@/test/server';
+import { inTimeZone } from '@/test/timeZone';
 
 /**
  * Every exchanges-page test runs under a fixed clock, faking `Date` only.
@@ -78,38 +83,63 @@ async function advance(ms: number): Promise<void> {
 }
 
 /*
- * The page's sentences, written out from the spec rather than imported from
- * the module under test, so a wording change on either side is a diff here.
+ * The page's sentences, written out from the spec (with its R1-R14 section)
+ * rather than imported from the module under test, so a wording change on
+ * either side is a diff here.
  */
 
 const notConfiguredLine = (venue: string): string =>
   `No credentials for ${venue} are configured on the host. ` +
   'The fills already imported are kept, and nothing new is read.';
-const syncingLine = (venue: string): string => `A sync is reading ${venue} now.`;
-const RETRIES_LINE = 'The next scheduled sync tries again.';
+/** R5: message 2 no longer claims the venue is being read. */
+const SYNC_RUNNING_LINE = 'A sync is running.';
+const authFailedSyncingLine = (venue: string): string =>
+  `Only a sync you start retries ${venue}; a scheduled one skips it.`;
+/** R6: rule 5 names no timer. */
+const RETRIES_LINE = 'The next sync tries again.';
 const windowsPendingLine = (count: number): string =>
   count === 1
     ? '1 window of history is still to read. The next sync continues from it.'
     : `${String(count)} windows of history are still to read. The next sync continues from them.`;
+/** R2: scheduled runs skip an auth_failed account, so only a sync the owner starts continues. */
+const authWindowsPendingLine = (count: number): string =>
+  count === 1
+    ? '1 window of history is still to read. ' +
+      'The first sync you start after fixing the key continues from it.'
+    : `${String(count)} windows of history are still to read. ` +
+      'The first sync you start after fixing the key continues from them.';
+/** R6: rule 7. */
 const neverSyncedLine = (venue: string): string =>
-  `No sync has finished for ${venue} yet. ` +
-  'The next scheduled sync imports its history, or press Sync now.';
+  `No sync has finished for ${venue} yet. Press Sync now to start one.`;
+/** R1: the history fact, qualified while windows are pending. */
+const PENDING_QUALIFIER = 'once the windows still to read are read';
 
 const PENDING_LINE = 'Syncing exchanges… the first import can take several minutes.';
 const JOINED_LINE = 'It joined a sync that was already running.';
 const skippedLine = (venue: string): string =>
   `${venue} was skipped, because its key was refused earlier and only a sync you start ` +
   'retries it. Press Sync now again to retry it.';
-const FAILURE_PREFIX = 'The sync did not complete:';
+/** R8. */
+const NO_EXCHANGE_READ = 'No exchange was read.';
+/** R9. */
+const FAILURE_PREFIX = 'The sync request failed:';
+const NO_ANSWER = 'No answer came back from the server.';
 const MAY_STILL_RUN =
   'A sync may still be running on the server; this page updates when it finishes.';
+/** R7. */
+const FINISHED_ONLY = '(finished exchanges only)';
 
 const bannerLine = (venue: string, when: string): string =>
   `${venue} does not return trades older than its retention window, so the history ` +
   `imported here is complete only from ${when}. Any trade made before then may be missing.`;
+const windowsWord = (count: number): string => (count === 1 ? 'window' : 'windows');
 const bannerPendingLine = (count: number): string =>
   'The import has not finished. That is where the history will be complete from once it ' +
-  `does (${String(count)} ${count === 1 ? 'window' : 'windows'} still to read).`;
+  `does (${String(count)} ${windowsWord(count)} still to read).`;
+/** R13. */
+const bannerStoppedLine = (venue: string, count: number): string =>
+  `The import stopped before it finished (${String(count)} ${windowsWord(count)} still to ` +
+  `read). Nothing new is read until credentials for ${venue} are configured again.`;
 
 const EMPTY_TITLE = 'No exchange connected';
 const EMPTY_TEXT =
@@ -132,7 +162,10 @@ const scopeSteps = (venue: string): readonly string[] => [
     'trade, transfer or withdrawal.',
   `Press Sync now. Scheduled syncs skip ${venue} until a sync you start succeeds.`,
 ];
-const NEW_KEY_NOTE = 'A new key instead needs steps 2 and 3 above first.';
+/** R3: the scope note, inline, with the venue's own variables. */
+const newKeyNote = (variables: readonly string[]): string =>
+  `A new key must first go into secrets.env on the host (${variables.join(', ')}), and the ` +
+  'container be recreated with docker compose up --force-recreate.';
 const FULL_PROCEDURE = 'docs/operations.md, section 13, has the full procedure.';
 
 /** The `ERROR_KIND_SENTENCES` the tests below meet, for Bitget and BingX. */
@@ -141,6 +174,9 @@ const SENTENCES = {
   bitgetRateLimited: 'Bitget throttled the requests for longer than the sync waits.',
   bitgetAuth: 'Bitget refused the API key.',
   bitgetScope: 'The API key does not have read permission at Bitget.',
+  bitgetConflict:
+    'A fill Bitget returned differs from the one stored under the same id. ' +
+    'The sync stops at that page until someone looks.',
   bingxConflict:
     'A fill BingX returned differs from the one stored under the same id. ' +
     'The sync stops at that page until someone looks.',
@@ -211,16 +247,42 @@ function syncButton(): HTMLElement {
   return screen.getByRole('button', { name: 'Sync now' });
 }
 
-/** The polite live region holding the last sync's summary. */
+/** R10: pending means `aria-disabled`, never `disabled`, which drops focus to the body. */
+function expectHeldButton(button: HTMLElement): void {
+  expect(button).toHaveAttribute('aria-disabled', 'true');
+  expect(button).not.toHaveAttribute('disabled');
+}
+
+function expectPressableButton(button: HTMLElement): void {
+  expect(button).not.toHaveAttribute('aria-disabled', 'true');
+  expect(button).not.toHaveAttribute('disabled');
+}
+
+/**
+ * R11: the toolbar's one polite live region, always in the DOM. Every
+ * `role="status"` outside the run log, which must be exactly one.
+ */
+function toolbarStatus(): HTMLElement {
+  const history = screen
+    .queryByRole('heading', { level: 3, name: 'Sync history' })
+    ?.closest('section');
+  const regions = screen.getAllByRole('status').filter((region) => !history?.contains(region));
+  const [only] = regions;
+  if (regions.length !== 1 || only === undefined) {
+    throw new Error(
+      `Expected one status region outside the run log, found ${String(regions.length)}.`,
+    );
+  }
+  return only;
+}
+
+/** The toolbar's region once it holds a result: not empty, and not the pending line. */
 async function resultBlock(): Promise<HTMLElement> {
   return waitFor(() => {
-    const found = screen
-      .getAllByRole('status')
-      .find((element) => element.textContent.includes('The sync '));
-    if (found === undefined) {
-      throw new Error('No sync result is on screen.');
-    }
-    return found;
+    const region = toolbarStatus();
+    expect(text(region)).not.toBe('');
+    expect(region).not.toHaveTextContent(PENDING_LINE);
+    return region;
   });
 }
 
@@ -243,8 +305,8 @@ function timeIn(container: HTMLElement): HTMLElement {
   return only;
 }
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
@@ -265,11 +327,16 @@ const FACT = {
   windows: 'Windows still to read',
 } as const;
 
-/** The index of `text` in `container`'s text, which must contain it. */
-function positionOf(container: HTMLElement, text: string): number {
-  const index = container.textContent.replace(/\s+/g, ' ').indexOf(text);
-  expect(index, `"${text}" is not in the entry`).toBeGreaterThanOrEqual(0);
+/** The index of `needle` in `container`'s text, which must contain it. */
+function positionOf(container: HTMLElement, needle: string): number {
+  const index = container.textContent.replace(/\s+/g, ' ').indexOf(needle);
+  expect(index, `"${needle}" is not in the element`).toBeGreaterThanOrEqual(0);
   return index;
+}
+
+/** Asserts that `first` comes before `second` in `container`'s text. */
+function expectOrder(container: HTMLElement, first: string, second: string): void {
+  expect(positionOf(container, first)).toBeLessThan(positionOf(container, second));
 }
 
 async function runTable(): Promise<HTMLTableElement> {
@@ -338,14 +405,16 @@ describe('ExchangesPage: statuses', () => {
     expect(synced.getAttribute('title')).toBeTruthy();
     // A count, grouped the English way; not money, and not a bare number.
     expectFact(item, FACT.fills, '1,234');
-    // The whole requested history is held, from 1 July.
+    // The whole requested history is held, from 1 July, and nothing is pending:
+    // so the instant stands unqualified (R1).
     expectFact(item, FACT.history, 'Jul 1, 2026, 12:00:00 AM UTC');
+    expect(item).not.toHaveTextContent(PENDING_QUALIFIER);
     // Nothing is wrong, so nothing is said to be.
     expect(item).not.toHaveTextContent(/still to read/i);
     expect(item).not.toHaveTextContent(/detail:/i);
     expect(item).not.toHaveTextContent(RETRIES_LINE);
     expect(item).not.toHaveTextContent(/no credentials/i);
-    expect(item).not.toHaveTextContent(/syncing/i);
+    expect(item).not.toHaveTextContent(/syncing|sync is running/i);
     expect(item.querySelector('ol')).toBeNull();
   });
 
@@ -364,6 +433,8 @@ describe('ExchangesPage: statuses', () => {
     expect(item).not.toHaveTextContent(/still to read/i);
     expect(item).not.toHaveTextContent(/detail:/i);
     expect(item).not.toHaveTextContent(RETRIES_LINE);
+    // R6: no promise of a timer that may be off.
+    expect(item).not.toHaveTextContent(/scheduled/i);
   });
 
   it('a never-synced venue with fills and windows pending shows both', async () => {
@@ -383,19 +454,22 @@ describe('ExchangesPage: statuses', () => {
 
     const item = await venue('Bitget');
 
+    // R4: "Unfinished" is for ok alone.
     expect(item).toHaveTextContent('Never synced');
+    expect(item).not.toHaveTextContent('Unfinished');
     expectFact(item, FACT.lastSync, 'Never');
     expectFact(item, FACT.fills, '2,500');
     expectFact(item, FACT.windows, '6');
+    expectFact(item, FACT.history, `Jul 1, 2026, 12:00:00 AM UTC ${PENDING_QUALIFIER}`);
     expect(item).toHaveTextContent(windowsPendingLine(6));
     expect(item).toHaveTextContent(neverSyncedLine('Bitget'));
     // In the spec's order: the windows before the never-synced line.
-    expect(positionOf(item, windowsPendingLine(6))).toBeLessThan(
-      positionOf(item, neverSyncedLine('Bitget')),
-    );
+    expectOrder(item, windowsPendingLine(6), neverSyncedLine('Bitget'));
   });
 
   it("an error venue shows the kind's sentence, the detail and that the next sync retries", async () => {
+    // The failing run planned two windows before its first fetch, and the
+    // fetch that failed left them queued.
     openExchanges({ exchanges: [erroredExchange('unavailable')], runs: [] });
 
     const item = await venue('Bitget');
@@ -404,15 +478,15 @@ describe('ExchangesPage: statuses', () => {
     expect(item).toHaveTextContent(SENTENCES.bitgetUnavailable);
     expect(item).toHaveTextContent(`Detail: ${DETAILS.unavailable}`);
     expect(item).toHaveTextContent(RETRIES_LINE);
+    expect(item).toHaveTextContent(windowsPendingLine(2));
     // A failure leaves last_synced_at alone: the last success, three days ago, still stands.
     expectFact(item, FACT.lastSync, '3 days ago');
     expect(within(item).getByText('3 days ago')).toHaveAttribute('dateTime', OLD_SYNCED_AT);
     // Only auth_failed gets steps; an outage fixes itself.
     expect(item.querySelector('ol')).toBeNull();
     expect(item).not.toHaveTextContent(/secrets\.env/);
-    expect(positionOf(item, SENTENCES.bitgetUnavailable)).toBeLessThan(
-      positionOf(item, RETRIES_LINE),
-    );
+    expectOrder(item, SENTENCES.bitgetUnavailable, RETRIES_LINE);
+    expectOrder(item, RETRIES_LINE, windowsPendingLine(2));
   });
 
   it('an error venue with no detail shows its sentence alone', async () => {
@@ -428,35 +502,32 @@ describe('ExchangesPage: statuses', () => {
     expect(item).not.toHaveTextContent(/null/);
   });
 
-  it('a syncing venue is labelled syncing and keeps its error', async () => {
-    // A manual retry of a refused key: syncing replaces the label and nothing
-    // else, because until the run ends the refusal is still the latest fact.
-    openExchanges({
-      exchanges: [authFailedExchange('auth', { syncing: true })],
-      runs: [runningExchangeRun({ trigger: 'manual', accounts_total: 1 })],
-    });
+  it('a conflict is not promised a retry: its own sentence says the sync stops there', async () => {
+    // R6. The next sync meets the same fill and stops at the same page.
+    openExchanges({ exchanges: [erroredExchange('conflict')], runs: [] });
 
     const item = await venue('Bitget');
 
-    expect(item).toHaveTextContent('Syncing');
-    expect(item).not.toHaveTextContent('Authentication failed');
-    expect(item).toHaveTextContent(syncingLine('Bitget'));
-    expect(item).toHaveTextContent(SENTENCES.bitgetAuth);
-    expect(item).toHaveTextContent(`Detail: ${DETAILS.auth}`);
-    const steps = remediationSteps(item);
-    expect(steps).toHaveLength(4);
-    // In the spec's order: syncing, then the error, then the remediation.
-    expect(positionOf(item, syncingLine('Bitget'))).toBeLessThan(
-      positionOf(item, SENTENCES.bitgetAuth),
-    );
-    expect(positionOf(item, SENTENCES.bitgetAuth)).toBeLessThan(
-      positionOf(item, keySteps('Bitget')[0] ?? ''),
-    );
+    expect(item).toHaveTextContent('Sync failed');
+    expect(item).toHaveTextContent(SENTENCES.bitgetConflict);
+    expect(item).not.toHaveTextContent(RETRIES_LINE);
   });
 
-  it('a syncing error venue does not promise the next scheduled sync', async () => {
-    // The retry is happening now; "the next scheduled sync tries again" and
-    // "the next sync continues" are for a venue left waiting.
+  it.each(NON_AUTH_ERROR_KINDS.filter((kind) => kind !== 'conflict'))(
+    'an error venue that failed with %s is told the next sync tries again',
+    async (kind) => {
+      openExchanges({ exchanges: [erroredExchange(kind)], runs: [] });
+
+      const item = await venue('Bitget');
+
+      expect(item).toHaveTextContent(RETRIES_LINE);
+    },
+  );
+
+  it('a syncing venue is labelled syncing and keeps its error', async () => {
+    // The retry is happening now, so the rest of the entry stays true until
+    // the run ends - but "the next sync tries again" and "the next sync
+    // continues" are for a venue left waiting.
     openExchanges({
       exchanges: [erroredExchange('unavailable', { syncing: true, pending_windows: 3 })],
       runs: [runningExchangeRun()],
@@ -465,11 +536,41 @@ describe('ExchangesPage: statuses', () => {
     const item = await venue('Bitget');
 
     expect(item).toHaveTextContent('Syncing');
+    expect(item).not.toHaveTextContent('Sync failed');
+    expect(item).toHaveTextContent(SYNC_RUNNING_LINE);
+    // R5: no claim that this venue is the one being read.
+    expect(item).not.toHaveTextContent(/is reading/);
+    expect(item).not.toHaveTextContent(/only a sync you start/i);
     expect(item).toHaveTextContent(SENTENCES.bitgetUnavailable);
+    expect(item).toHaveTextContent(`Detail: ${DETAILS.unavailable}`);
     expect(item).not.toHaveTextContent(RETRIES_LINE);
     expect(item).not.toHaveTextContent(windowsPendingLine(3));
     // The count itself still shows: it is what moves while the sync runs.
     expectFact(item, FACT.windows, '3');
+    expectOrder(item, SYNC_RUNNING_LINE, SENTENCES.bitgetUnavailable);
+  });
+
+  it('a syncing auth_failed venue keeps its label, and says only a sync you start retries it', async () => {
+    // R4 and R5. `syncing` is run-wide, and a scheduled run skips this
+    // account: "Syncing" would claim a read that is not happening.
+    openExchanges({
+      exchanges: [authFailedExchange('auth', { syncing: true })],
+      runs: [runningExchangeRun({ trigger: 'scheduled', accounts_total: 1 })],
+    });
+
+    const item = await venue('Bitget');
+
+    expect(item).toHaveTextContent('Authentication failed');
+    expect(item).not.toHaveTextContent('Syncing');
+    expect(item).toHaveTextContent(`${SYNC_RUNNING_LINE} ${authFailedSyncingLine('Bitget')}`);
+    expect(item).toHaveTextContent(SENTENCES.bitgetAuth);
+    expect(item).toHaveTextContent(`Detail: ${DETAILS.auth}`);
+    expect(remediationSteps(item)).toHaveLength(4);
+    // R2 is gated like rule 6: not while syncing.
+    expect(item).not.toHaveTextContent(authWindowsPendingLine(FIRST_RUN_WINDOWS));
+    // In the spec's order: the running line, then the error, then the remediation.
+    expectOrder(item, SYNC_RUNNING_LINE, SENTENCES.bitgetAuth);
+    expectOrder(item, SENTENCES.bitgetAuth, keySteps('Bitget')[0] ?? '');
   });
 
   it('a syncing venue with no row yet does not say no sync has finished', async () => {
@@ -481,7 +582,7 @@ describe('ExchangesPage: statuses', () => {
     const item = await venue('Bitget');
 
     expect(item).toHaveTextContent('Syncing');
-    expect(item).toHaveTextContent(syncingLine('Bitget'));
+    expect(item).toHaveTextContent(SYNC_RUNNING_LINE);
     expect(item).not.toHaveTextContent(neverSyncedLine('Bitget'));
   });
 
@@ -494,11 +595,13 @@ describe('ExchangesPage: statuses', () => {
     const item = await venue('Bitget');
 
     expect(item).toHaveTextContent(notConfiguredLine('Bitget'));
+    // R4: not configured wins over the stored status.
+    expect(item).toHaveTextContent('Not configured');
+    expect(item).not.toHaveTextContent('Up to date');
     // The row keeps its last state.
-    expect(item).toHaveTextContent('Up to date');
     expectFact(item, FACT.fills, '4,321');
     expectFact(item, FACT.lastSync, '15 minutes ago');
-    expect(item).not.toHaveTextContent(/syncing/i);
+    expect(item).not.toHaveTextContent(/syncing|sync is running/i);
   });
 
   it('the not-configured line comes first, and a refused key keeps its remediation', async () => {
@@ -511,19 +614,19 @@ describe('ExchangesPage: statuses', () => {
 
     const item = await venue('Bitget');
 
+    expect(item).toHaveTextContent('Not configured');
+    expect(item).not.toHaveTextContent('Authentication failed');
     expect(item).toHaveTextContent(`Detail: ${DETAILS.auth}`);
     expect(remediationSteps(item)).toHaveLength(4);
-    expect(positionOf(item, notConfiguredLine('Bitget'))).toBeLessThan(
-      positionOf(item, SENTENCES.bitgetAuth),
-    );
-    expect(positionOf(item, SENTENCES.bitgetAuth)).toBeLessThan(
-      positionOf(item, keySteps('Bitget')[0] ?? ''),
-    );
+    // R2 is gated on configured: R13's banner sentence and rule 1 speak instead.
+    expect(item).not.toHaveTextContent(/continues from/);
+    expectOrder(item, notConfiguredLine('Bitget'), SENTENCES.bitgetAuth);
+    expectOrder(item, SENTENCES.bitgetAuth, keySteps('Bitget')[0] ?? '');
   });
 
   it('an unconfigured error venue is promised no next sync', async () => {
-    // An unconfigured venue is in no run. "The next scheduled sync tries
-    // again" beside "nothing new is read" would contradict it on screen.
+    // An unconfigured venue is in no run. "The next sync tries again" beside
+    // "nothing new is read" would contradict it on screen.
     openExchanges({
       exchanges: [erroredExchange('unavailable', { configured: false })],
       runs: [],
@@ -532,12 +635,12 @@ describe('ExchangesPage: statuses', () => {
     const item = await venue('Bitget');
 
     expect(item).toHaveTextContent(notConfiguredLine('Bitget'));
-    expect(item).toHaveTextContent('Sync failed');
+    expect(item).toHaveTextContent('Not configured');
     // The last error is still history worth showing.
     expect(item).toHaveTextContent(SENTENCES.bitgetUnavailable);
     expect(item).toHaveTextContent(`Detail: ${DETAILS.unavailable}`);
     expect(item).not.toHaveTextContent(RETRIES_LINE);
-    expect(item).not.toHaveTextContent(/next scheduled sync/i);
+    expect(item).not.toHaveTextContent(/next sync/i);
   });
 
   it('an unconfigured venue with windows pending is promised no next sync', async () => {
@@ -549,6 +652,7 @@ describe('ExchangesPage: statuses', () => {
     const item = await venue('Bitget');
 
     expect(item).toHaveTextContent(notConfiguredLine('Bitget'));
+    expect(item).not.toHaveTextContent('Unfinished');
     // The count is a fact about the queue, so it stays.
     expectFact(item, FACT.windows, '5');
     expect(item).not.toHaveTextContent(windowsPendingLine(5));
@@ -573,9 +677,10 @@ describe('ExchangesPage: statuses', () => {
 
     const item = await venue('Bitget');
 
-    expect(item).toHaveTextContent('Never synced');
+    expect(item).toHaveTextContent('Not configured');
     expect(item).toHaveTextContent(notConfiguredLine('Bitget'));
     expect(item).not.toHaveTextContent(neverSyncedLine('Bitget'));
+    expect(item).not.toHaveTextContent(/press sync now/i);
   });
 
   it('an ok venue with windows pending says the next sync continues from them', async () => {
@@ -587,7 +692,9 @@ describe('ExchangesPage: statuses', () => {
 
     const item = await venue('Bitget');
 
-    expect(item).toHaveTextContent('Up to date');
+    // R4: ok with work queued is not "up to date".
+    expect(item).toHaveTextContent('Unfinished');
+    expect(item).not.toHaveTextContent('Up to date');
     expectFact(item, FACT.windows, '3');
     expect(item).toHaveTextContent(windowsPendingLine(3));
     expect(item).not.toHaveTextContent(neverSyncedLine('Bitget'));
@@ -608,6 +715,25 @@ describe('ExchangesPage: statuses', () => {
     expect(item).not.toHaveTextContent(/1 windows/);
   });
 
+  it('the history fact is qualified while windows are pending, and not at zero', async () => {
+    // R1. `effective_since` is where the history is complete from only once
+    // no window is pending.
+    openExchanges({
+      exchanges: [
+        exchange({ exchange_key: 'bingx', pending_windows: 2 }),
+        exchange({ exchange_key: 'bitget', pending_windows: 0 }),
+      ],
+      runs: [],
+    });
+
+    const pending = await venue('BingX');
+    const done = await venue('Bitget');
+
+    expectFact(pending, FACT.history, `Jul 1, 2026, 12:00:00 AM UTC ${PENDING_QUALIFIER}`);
+    expectFact(done, FACT.history, 'Jul 1, 2026, 12:00:00 AM UTC');
+    expect(done).not.toHaveTextContent(PENDING_QUALIFIER);
+  });
+
   it('lists every venue the backend returns, each labelled by its name', async () => {
     openExchanges({
       exchanges: [authFailedExchange('insufficient_scope', { exchange_key: 'bingx' }), exchange()],
@@ -622,6 +748,19 @@ describe('ExchangesPage: statuses', () => {
     expect(within(section).getByRole('listitem', { name: 'Bitget' })).toHaveTextContent(
       'Up to date',
     );
+  });
+
+  it('the venue name is an h4 under the Accounts h3', async () => {
+    // R14.
+    openExchanges({ exchanges: bothVenues(), runs: [] });
+
+    const bitget = await venue('Bitget');
+    const bingx = await venue('BingX');
+
+    expect(within(bitget).getByRole('heading', { level: 4 })).toHaveTextContent(/^Bitget$/);
+    expect(within(bingx).getByRole('heading', { level: 4 })).toHaveTextContent(/^BingX$/);
+    const accounts = await accountsSection();
+    expect(within(accounts).getAllByRole('heading', { level: 4 })).toHaveLength(2);
   });
 
   it('the last complete sync advances without a reload', async () => {
@@ -697,10 +836,51 @@ describe('ExchangesPage: remediation', () => {
     scopeSteps('Bitget').forEach((step, index) => {
       expect(steps[index]).toHaveTextContent(step);
     });
-    expect(item).toHaveTextContent(NEW_KEY_NOTE);
     expect(item).toHaveTextContent(FULL_PROCEDURE);
     // The key exists and works; replacing it is not the fix.
     expect(item).not.toHaveTextContent(/check that the API key still exists/);
+  });
+
+  it('the scope note says what a new key needs, inline, instead of pointing at hidden steps', async () => {
+    // R3. The key steps are not on screen here, so "steps 2 and 3 above"
+    // pointed at nothing.
+    openExchanges({ exchanges: [authFailedExchange('insufficient_scope')], runs: [] });
+
+    const item = await venue('Bitget');
+    const [, lastStep] = remediationSteps(item);
+    if (lastStep === undefined) {
+      throw new Error('There is no second step.');
+    }
+
+    expect(lastStep).toHaveTextContent(newKeyNote(VENUE_VARIABLES.bitget));
+    for (const variable of VENUE_VARIABLES.bitget) {
+      expect(within(lastStep).getByText(variable).tagName).toBe('CODE');
+    }
+    expect(within(lastStep).getByText('docker compose up --force-recreate').tagName).toBe('CODE');
+    expect(item).not.toHaveTextContent(/steps 2 and 3/);
+    expect(item).not.toHaveTextContent(/above/);
+  });
+
+  it('an unconfigured venue with insufficient scope gets the key steps', async () => {
+    // R3. Without credentials the Sync now button is hidden, so the scope
+    // steps' "Press Sync now" would point at nothing. The key has to come
+    // back first.
+    openExchanges({
+      exchanges: [authFailedExchange('insufficient_scope', { configured: false })],
+      runs: [],
+    });
+
+    const item = await venue('Bitget');
+
+    const steps = remediationSteps(item);
+    expect(steps).toHaveLength(4);
+    keySteps('Bitget').forEach((step, index) => {
+      expect(steps[index]).toHaveTextContent(step);
+    });
+    expect(item).not.toHaveTextContent(/edit the API key and grant/);
+    // The error is still the one that was recorded.
+    expect(item).toHaveTextContent(SENTENCES.bitgetScope);
+    expect(screen.queryByRole('button', { name: 'Sync now' })).not.toBeInTheDocument();
   });
 
   it('auth_failed with no last error falls back to the key steps', async () => {
@@ -717,7 +897,34 @@ describe('ExchangesPage: remediation', () => {
     });
   });
 
-  it('auth_failed is not told the next scheduled sync retries it', async () => {
+  it('auth_failed with windows pending is promised the first manual sync, not the next sync', async () => {
+    // R2. The commonest failure there is: a first Bitget run whose key was
+    // refused on the first fetch, with the whole planned history queued.
+    // Scheduled runs skip the account, so "the next sync" would be false.
+    openExchanges({ exchanges: [authFailedExchange('auth')], runs: [] });
+
+    const item = await venue('Bitget');
+
+    expect(item).toHaveTextContent(authWindowsPendingLine(FIRST_RUN_WINDOWS));
+    expect(item).not.toHaveTextContent(windowsPendingLine(FIRST_RUN_WINDOWS));
+    expect(item).not.toHaveTextContent(/the next sync/i);
+    expectFact(item, FACT.windows, String(FIRST_RUN_WINDOWS));
+    expectFact(item, FACT.fills, '0');
+    expectFact(item, FACT.history, `${TRUNCATED_EFFECTIVE_SINCE_TEXT} ${PENDING_QUALIFIER}`);
+    // The banner says so too: the retention clamp already cut the request.
+    expect(banner('Bitget')).toHaveTextContent(bannerPendingLine(FIRST_RUN_WINDOWS));
+  });
+
+  it('auth_failed with one window pending is singular', async () => {
+    openExchanges({ exchanges: [authFailedExchange('auth', { pending_windows: 1 })], runs: [] });
+
+    const item = await venue('Bitget');
+
+    expect(item).toHaveTextContent(authWindowsPendingLine(1));
+    expect(item).not.toHaveTextContent(/1 windows/);
+  });
+
+  it('auth_failed is not told the next sync retries it', async () => {
     // Scheduled runs skip an auth_failed account; only a sync the owner starts
     // retries it, and the last step says exactly that.
     openExchanges({ exchanges: [authFailedExchange('auth')], runs: [] });
@@ -725,6 +932,25 @@ describe('ExchangesPage: remediation', () => {
     const item = await venue('Bitget');
 
     expect(item).not.toHaveTextContent(RETRIES_LINE);
+  });
+
+  it('an auth_failed venue drained before mark_synced keeps its label and steps, and promises nothing', async () => {
+    // The one writable way a refused account holds no window: a manual retry
+    // read the last page, then the process died before mark_synced committed.
+    openExchanges({
+      exchanges: [drainedBeforeMarkSynced(authFailedExchange('auth', { fills_stored: 640 }))],
+      runs: [interruptedExchangeRun({ trigger: 'manual', accounts_total: 1 })],
+    });
+
+    const item = await venue('Bitget');
+
+    expect(item).toHaveTextContent('Authentication failed');
+    expect(remediationSteps(item)).toHaveLength(4);
+    expect(item).not.toHaveTextContent(/continues from/);
+    expect(item).not.toHaveTextContent(/still to read/i);
+    expectFact(item, FACT.history, TRUNCATED_EFFECTIVE_SINCE_TEXT);
+    expect(item).not.toHaveTextContent(PENDING_QUALIFIER);
+    expectFact(item, FACT.fills, '640');
   });
 });
 
@@ -747,14 +973,16 @@ describe('ExchangesPage: Sync now', () => {
     const release = fake.hold('sync');
     const button = syncButton();
     expect(screen.queryByText(PENDING_LINE)).not.toBeInTheDocument();
+    expectPressableButton(button);
 
     await user.click(button);
 
+    // R10: held with aria-disabled, and focus stays on it.
     await waitFor(() => {
-      expect(button).toBeDisabled();
+      expectHeldButton(button);
     });
-    const pending = await screen.findByText(PENDING_LINE);
-    expect(pending.closest('[role="status"]')).not.toBeNull();
+    expect(document.activeElement).toBe(button);
+    expect(toolbarStatus()).toHaveTextContent(PENDING_LINE);
     // A second press while the first is in flight sends nothing.
     await user.click(button);
     expect(fake.requestsTo('sync')).toHaveLength(1);
@@ -764,11 +992,63 @@ describe('ExchangesPage: Sync now', () => {
     release();
 
     await waitFor(() => {
-      expect(button).toBeEnabled();
+      expectPressableButton(button);
     });
+    expect(document.activeElement).toBe(button);
     expect(screen.queryByText(PENDING_LINE)).not.toBeInTheDocument();
     expect(await resultBlock()).toHaveTextContent(/The sync succeeded:/);
     expect(fake.requestsTo('sync')).toHaveLength(1);
+  });
+
+  it('one status region carries the pending line and then the result', async () => {
+    // R11. A live region inserted together with its text is not reliably
+    // announced, so the same element must be there before, during and after.
+    const { user, fake } = openExchanges({ exchanges: [exchange()], runs: [finishedRun()] });
+    await venue('Bitget');
+    await runTable();
+    const region = toolbarStatus();
+    expect(text(region)).toBe('');
+
+    const release = fake.hold('sync');
+    await user.click(syncButton());
+
+    await waitFor(() => {
+      expect(region).toHaveTextContent(PENDING_LINE);
+    });
+    expect(toolbarStatus()).toBe(region);
+
+    release();
+
+    await waitFor(() => {
+      expect(region).toHaveTextContent(/The sync succeeded:/);
+    });
+    expect(toolbarStatus()).toBe(region);
+    expect(region).not.toHaveTextContent(PENDING_LINE);
+
+    // And again for the next sync.
+    const releaseAgain = fake.hold('sync');
+    await user.click(syncButton());
+    await waitFor(() => {
+      expect(region).toHaveTextContent(PENDING_LINE);
+    });
+    expect(toolbarStatus()).toBe(region);
+    releaseAgain();
+    await waitFor(() => {
+      expect(region).not.toHaveTextContent(PENDING_LINE);
+    });
+    expect(toolbarStatus()).toBe(region);
+  });
+
+  it('focus stays on Sync now through a failed sync', async () => {
+    const { user, fake } = openExchanges();
+    await venue('Bitget');
+    fake.fail('sync', () => problem(504, 'Gateway Timeout', 'The upstream did not answer.'));
+
+    await user.click(syncButton());
+    await screen.findByRole('alert');
+
+    expect(document.activeElement).toBe(syncButton());
+    expectPressableButton(syncButton());
   });
 
   it("while the sync runs, the venue's fills stored and windows left update from the poll", async () => {
@@ -866,7 +1146,8 @@ describe('ExchangesPage: Sync now', () => {
     expect(text(cell(newest, 'Duration'))).toBe('—');
     // The counters are written at close; the outcomes as each account ends.
     expect(text(cell(newest, 'Exchanges'))).toBe('0 of 2 finished');
-    expect(text(cell(newest, 'Fills'))).toBe('0 new of 0 read');
+    // R7: the account in flight has pages but no outcome, and only outcomes are summed.
+    expect(text(cell(newest, 'Fills'))).toBe(`0 new of 0 read ${FINISHED_ONLY}`);
 
     // BingX finishes first: its outcome is committed, the counters are not.
     fake.setRuns([
@@ -884,7 +1165,7 @@ describe('ExchangesPage: Sync now', () => {
     await waitFor(() => {
       expect(text(cell(newest, 'Exchanges'))).toBe('1 of 2 finished');
     });
-    expect(text(cell(newest, 'Fills'))).toBe('5 new of 5 read');
+    expect(text(cell(newest, 'Fills'))).toBe(`5 new of 5 read ${FINISHED_ONLY}`);
     expect(cell(newest, 'Details')).toHaveTextContent(`BingX: ${OUTCOME_LABELS.success}`);
 
     release();
@@ -980,10 +1261,11 @@ describe('ExchangesPage: Sync now', () => {
     await user.click(syncButton());
 
     const result = await resultBlock();
-    expect(result).toHaveTextContent(
-      'The sync succeeded: 2 new fills (10 read) from 2 exchanges, in 3 seconds.',
-    );
+    const headline = 'The sync succeeded: 2 new fills (10 read) from 2 exchanges, in 3 seconds.';
+    expect(result).toHaveTextContent(headline);
     expect(result).toHaveTextContent(JOINED_LINE);
+    // R8 moves the joined line ahead of the headline only when an account was
+    // skipped; see the next test.
   });
 
   it('a skipped account says to press Sync now again', async () => {
@@ -1015,12 +1297,46 @@ describe('ExchangesPage: Sync now', () => {
     await user.click(syncButton());
 
     const result = await resultBlock();
+    // R8: the skipped account was not read, so the headline counts one exchange.
+    const headline = 'The sync succeeded: 1 new fill (4 read) from 1 exchange, in 3 seconds.';
+    expect(result).toHaveTextContent(headline);
     expect(result).toHaveTextContent(JOINED_LINE);
     expect(result).toHaveTextContent(skippedLine('Bitget'));
     expect(result).not.toHaveTextContent(skippedLine('BingX'));
+    // R8: a skip leads, then the joined line, then the headline.
+    expectOrder(result, skippedLine('Bitget'), JOINED_LINE);
+    expectOrder(result, JOINED_LINE, headline);
     // A skip is not a failure: no failure sentence for it.
     expect(result).not.toHaveTextContent(SENTENCES.bitgetAuth);
-    expect(syncButton()).toBeEnabled();
+    expectPressableButton(syncButton());
+  });
+
+  it('a run that skipped every account says no exchange was read', async () => {
+    // R8. A joined scheduled run, and the only configured venue is auth_failed.
+    const scheduled = finishedRun({
+      run_id: 11,
+      trigger: 'scheduled',
+      accounts: [accountSkipped('bitget')],
+    });
+    const { user } = openExchanges({
+      exchanges: [authFailedExchange('auth', { syncing: true })],
+      runs: [runningExchangeRun({ run_id: 11, accounts_total: 1 })],
+      onSync: (exchanges) => {
+        exchanges.setExchanges([authFailedExchange('auth')]);
+        exchanges.setRuns([scheduled]);
+        return syncTriggered(scheduled, true);
+      },
+    });
+    await venue('Bitget');
+
+    await user.click(syncButton());
+
+    const result = await resultBlock();
+    expect(result).toHaveTextContent(NO_EXCHANGE_READ);
+    expect(result).not.toHaveTextContent(/The sync succeeded/);
+    expect(result).not.toHaveTextContent(/from 0 exchanges/);
+    expectOrder(result, skippedLine('Bitget'), JOINED_LINE);
+    expectOrder(result, JOINED_LINE, NO_EXCHANGE_READ);
   });
 
   it('a failed account is named with its sentence', async () => {
@@ -1045,10 +1361,12 @@ describe('ExchangesPage: Sync now', () => {
     await user.click(syncButton());
 
     const result = await resultBlock();
-    expect(result).toHaveTextContent(
-      'The sync partially succeeded: 20 new fills (23 read) from 2 exchanges, in 3 seconds.',
-    );
+    const headline =
+      'The sync partially succeeded: 20 new fills (23 read) from 2 exchanges, in 3 seconds.';
+    expect(result).toHaveTextContent(headline);
     expect(result).toHaveTextContent(`BingX: ${SENTENCES.bingxConflict}`);
+    // The failed lines always come after the headline.
+    expectOrder(result, headline, `BingX: ${SENTENCES.bingxConflict}`);
     expect(result).not.toHaveTextContent(/Bitget:/);
     expect(result).not.toHaveTextContent(JOINED_LINE);
   });
@@ -1069,10 +1387,10 @@ describe('ExchangesPage: Sync now', () => {
     await user.click(syncButton());
 
     const result = await resultBlock();
-    expect(result).toHaveTextContent(
-      'The sync failed: 0 new fills (0 read) from 1 exchange, in 3 seconds.',
-    );
+    const headline = 'The sync failed: 0 new fills (0 read) from 1 exchange, in 3 seconds.';
+    expect(result).toHaveTextContent(headline);
     expect(result).toHaveTextContent(`Bitget: ${SENTENCES.bitgetUnavailable}`);
+    expectOrder(result, headline, `Bitget: ${SENTENCES.bitgetUnavailable}`);
   });
 
   it('the result stays through polls, and a second sync replaces it', async () => {
@@ -1120,7 +1438,7 @@ describe('ExchangesPage: Sync now', () => {
     const item = await venue('Bitget');
     expect(item).toHaveTextContent('Syncing');
 
-    expect(syncButton()).toBeEnabled();
+    expectPressableButton(syncButton());
 
     await user.click(syncButton());
 
@@ -1150,11 +1468,13 @@ describe('ExchangesPage: Sync now', () => {
     // The accounts and the run log stay, and the owner can try again.
     expect(await venue('Bitget')).toHaveTextContent('Up to date');
     expect(bodyRows(await runTable())).toHaveLength(1);
-    expect(syncButton()).toBeEnabled();
+    expectPressableButton(syncButton());
     expect(screen.queryByText(PENDING_LINE)).not.toBeInTheDocument();
   });
 
-  it('a sync that never reached the server says so in words', async () => {
+  it('a sync request that got no answer says so, not that the server was unreachable', async () => {
+    // R9. The request may well have reached the server and started a run;
+    // what failed is the answer.
     const { user } = openExchanges(undefined, [
       http.post(EXCHANGE_SYNC_PATH, () => HttpResponse.error()),
     ]);
@@ -1163,9 +1483,9 @@ describe('ExchangesPage: Sync now', () => {
     await user.click(syncButton());
 
     const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(
-      `${FAILURE_PREFIX} The server could not be reached. ${MAY_STILL_RUN}`,
-    );
+    expect(alert).toHaveTextContent(`${FAILURE_PREFIX} ${NO_ANSWER} ${MAY_STILL_RUN}`);
+    expect(alert).not.toHaveTextContent(/could not be reached/i);
+    expect(alert).not.toHaveTextContent(/did not complete/i);
     expect(alert).not.toHaveTextContent(/failed to fetch/i);
   });
 
@@ -1189,9 +1509,7 @@ describe('ExchangesPage: Sync now', () => {
     await user.click(syncButton());
 
     const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(
-      `${FAILURE_PREFIX} The server could not be reached. ${MAY_STILL_RUN}`,
-    );
+    expect(alert).toHaveTextContent(`${FAILURE_PREFIX} ${NO_ANSWER} ${MAY_STILL_RUN}`);
     expect(alert).not.toHaveTextContent(/gateway/i);
   });
 
@@ -1230,6 +1548,8 @@ describe('ExchangesPage: Sync now', () => {
     expect(fake.count('list')).toBeGreaterThan(listBefore);
     expect(fake.count('runs')).toBeGreaterThan(runsBefore);
     expect(item).toHaveTextContent('Syncing');
+    // The run it may have started is still running, so the alert stays.
+    expect(screen.getByRole('alert')).toHaveTextContent(FAILURE_PREFIX);
   });
 
   it('a failed sync keeps polling fast while the run it left behind is still syncing', async () => {
@@ -1269,7 +1589,140 @@ describe('ExchangesPage: Sync now', () => {
     });
     await venue('Bitget');
 
-    expect(syncButton()).toBeEnabled();
+    expectPressableButton(syncButton());
+  });
+});
+
+/*
+ * R9: the failure alert is cleared by the run log, not by a timer.
+ */
+
+describe('ExchangesPage: a failed sync request and the run log', () => {
+  it('the failure alert clears once a newer settled run appears', async () => {
+    fakeIntervals();
+    // At the click the page's run log shows run 7, settled.
+    const { user, fake } = openExchanges({
+      exchanges: [exchange()],
+      runs: [finishedRun({ run_id: 7 })],
+    });
+    await venue('Bitget');
+    await runTable();
+    fake.fail('sync', () => problem(504, 'Gateway Timeout', 'The upstream did not answer.'));
+    // Behind the dropped request, the run it started is going.
+    fake.setExchanges([exchange({ syncing: true })]);
+    fake.setRuns([
+      runningExchangeRun({ run_id: 8, trigger: 'manual', started_at: NOW, accounts_total: 1 }),
+      finishedRun({ run_id: 7 }),
+    ]);
+
+    await user.click(syncButton());
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(FAILURE_PREFIX);
+    await settle();
+    // Run 8 is newer, but not settled: the outcome is not known yet.
+    expect(screen.getByRole('alert')).toHaveTextContent(FAILURE_PREFIX);
+
+    fake.setRuns([
+      finishedRun({ run_id: 8, trigger: 'manual', started_at: NOW }),
+      finishedRun({ run_id: 7 }),
+    ]);
+    fake.patchExchange('bitget', { syncing: false });
+    await advance(FAST_POLL_MS);
+
+    await waitFor(() => {
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+    const [newest] = bodyRows(await runTable());
+    expect(newest === undefined ? '' : text(cell(newest, 'Status'))).toBe('Succeeded');
+  });
+
+  it('the failure alert clears once the joined running run settles', async () => {
+    fakeIntervals();
+    // At the click, run 8 is running: pressing joins it.
+    const { user, fake } = openExchanges({
+      exchanges: [exchange({ syncing: true })],
+      runs: [
+        runningExchangeRun({ run_id: 8, trigger: 'scheduled', accounts_total: 1 }),
+        finishedRun({ run_id: 7 }),
+      ],
+    });
+    await venue('Bitget');
+    await runTable();
+    fake.fail('sync', () => problem(504, 'Gateway Timeout', 'The upstream did not answer.'));
+
+    await user.click(syncButton());
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(FAILURE_PREFIX);
+    await settle();
+    expect(screen.getByRole('alert')).toHaveTextContent(FAILURE_PREFIX);
+
+    // The same run, now settled.
+    fake.setRuns([
+      finishedRun({ run_id: 8, trigger: 'scheduled', started_at: EXCHANGE_RUNNING_STARTED_AT }),
+      finishedRun({ run_id: 7 }),
+    ]);
+    fake.patchExchange('bitget', { syncing: false });
+    await advance(FAST_POLL_MS);
+
+    await waitFor(() => {
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+  });
+
+  it('the failure alert stays when no new run appears', async () => {
+    // The newest run at the click was already settled, and nothing newer ever
+    // appears: the request never started one, and the owner needs to know.
+    fakeIntervals();
+    const { user, fake } = openExchanges({
+      exchanges: [exchange()],
+      runs: [finishedRun({ run_id: 7 })],
+    });
+    await venue('Bitget');
+    await runTable();
+    fake.fail('sync', () => HttpResponse.error());
+
+    await user.click(syncButton());
+    expect(await screen.findByRole('alert')).toHaveTextContent(FAILURE_PREFIX);
+
+    const runReads = fake.count('runs');
+    await advance(SLOW_POLL_MS);
+    await advance(SLOW_POLL_MS);
+
+    // The run log was read again, and still shows run 7 alone.
+    expect(fake.count('runs')).toBeGreaterThan(runReads);
+    expect(screen.getByRole('alert')).toHaveTextContent(`${FAILURE_PREFIX} ${NO_ANSWER}`);
+  });
+
+  it('the failure alert stays when the log is empty and stays empty', async () => {
+    fakeIntervals();
+    const { user, fake } = openExchanges({ exchanges: [exchange()], runs: [] });
+    await venue('Bitget');
+    fake.fail('sync', () => HttpResponse.error());
+
+    await user.click(syncButton());
+    expect(await screen.findByRole('alert')).toHaveTextContent(FAILURE_PREFIX);
+
+    await advance(SLOW_POLL_MS);
+
+    expect(screen.getByRole('alert')).toHaveTextContent(FAILURE_PREFIX);
+  });
+
+  it('a first run ever, settled after a failed request, clears the alert', async () => {
+    // Nothing in the log at the click is recorded as run 0, so run 1 is newer.
+    fakeIntervals();
+    const { user, fake } = openExchanges({ exchanges: [exchange()], runs: [] });
+    await venue('Bitget');
+    fake.fail('sync', () => HttpResponse.error());
+    fake.setRuns([finishedRun({ run_id: 1, trigger: 'manual', started_at: NOW })]);
+
+    await user.click(syncButton());
+
+    await waitFor(() => {
+      expect(fake.count('sync')).toBe(1);
+    });
+    await settle();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(bodyRows(await runTable())).toHaveLength(1);
   });
 });
 
@@ -1341,7 +1794,12 @@ describe('ExchangesPage: run log', () => {
     expect(text(cell(partial, 'Status'))).toBe('Partially succeeded');
     expect(text(cell(partial, 'Duration'))).toBe('2 minutes 5 seconds');
     expect(text(cell(partial, 'Exchanges'))).toBe('1 succeeded, 1 failed');
+    // A settled run: every account has its outcome, so no qualifier (R7).
     expect(text(cell(partial, 'Fills'))).toBe('12 new of 35 read');
+    // R14: a period after the outcome label.
+    expect(cell(partial, 'Details')).toHaveTextContent(
+      `Bitget: ${OUTCOME_LABELS.failed}. ${SENTENCES.bitgetUnavailable}`,
+    );
 
     expect(text(cell(scheduled, 'Started'))).toBe('1 hour ago');
     expect(text(cell(scheduled, 'Trigger'))).toBe('Scheduled');
@@ -1349,8 +1807,8 @@ describe('ExchangesPage: run log', () => {
     expect(text(cell(scheduled, 'Duration'))).toBe('2 hours 2 minutes');
     expect(text(cell(scheduled, 'Exchanges'))).toBe('1 succeeded, 1 skipped');
     expect(text(cell(scheduled, 'Fills'))).toBe('1,200 new of 1,500 read');
-    expect(cell(scheduled, 'Details')).toHaveTextContent(`Bitget: ${OUTCOME_LABELS.skipped}`);
-    expect(cell(scheduled, 'Details')).toHaveTextContent(`BingX: ${OUTCOME_LABELS.success}`);
+    expect(cell(scheduled, 'Details')).toHaveTextContent(`Bitget: ${OUTCOME_LABELS.skipped}.`);
+    expect(cell(scheduled, 'Details')).toHaveTextContent(`BingX: ${OUTCOME_LABELS.success}.`);
 
     // No owner: a success with no accounts at all.
     expect(text(cell(startup, 'Trigger'))).toBe('At startup');
@@ -1363,8 +1821,9 @@ describe('ExchangesPage: run log', () => {
     expect(text(cell(interrupted, 'Duration'))).toBe('—');
     // It got through one account of two before it died.
     expect(text(cell(interrupted, 'Exchanges'))).toBe('1 of 2 finished');
-    expect(text(cell(interrupted, 'Fills'))).toBe('9 new of 9 read');
-    expect(cell(interrupted, 'Details')).toHaveTextContent(`BingX: ${OUTCOME_LABELS.success}`);
+    // R7: the account it died in may have committed pages the sum leaves out.
+    expect(text(cell(interrupted, 'Fills'))).toBe(`9 new of 9 read ${FINISHED_ONLY}`);
+    expect(cell(interrupted, 'Details')).toHaveTextContent(`BingX: ${OUTCOME_LABELS.success}.`);
 
     // The 20 newest, and no more.
     const runReads = fake.requestsTo('runs').map((entry) => new URL(entry.url));
@@ -1394,10 +1853,9 @@ describe('ExchangesPage: run log', () => {
     }
     const details = cell(row, 'Details');
 
-    expect(details).toHaveTextContent(`BingX: ${OUTCOME_LABELS.failed}`);
-    expect(details).toHaveTextContent(SENTENCES.bingxSchema);
+    expect(details).toHaveTextContent(`BingX: ${OUTCOME_LABELS.failed}. ${SENTENCES.bingxSchema}`);
     expect(details).toHaveTextContent(`Detail: ${DETAILS.schema}`);
-    expect(details).toHaveTextContent(`Bitget: ${OUTCOME_LABELS.success}`);
+    expect(details).toHaveTextContent(`Bitget: ${OUTCOME_LABELS.success}.`);
     // The succeeded account has no error to show.
     expect(details.textContent.match(/Detail:/g)).toHaveLength(1);
   });
@@ -1444,7 +1902,8 @@ describe('ExchangesPage: run log', () => {
 
   it('a failed account with no kind, from a hand-edited row, still says it failed', async () => {
     // The CHECK allows a NULL kind, and the backend reads such a row as a hand
-    // edit. The page must still say the account failed, and invent nothing.
+    // edit. The page must still say the account failed, and invent nothing:
+    // no kind's sentence, and above all not "a defect in this application".
     openExchanges({
       exchanges: [exchange()],
       runs: [finishedRun({ trigger: 'scheduled', accounts: [handEditedFailure('bitget')] })],
@@ -1456,7 +1915,10 @@ describe('ExchangesPage: run log', () => {
     }
     const details = cell(row, 'Details');
 
-    expect(details).toHaveTextContent(`Bitget: ${OUTCOME_LABELS.failed}`);
+    expect(details).toHaveTextContent(
+      `Bitget: ${OUTCOME_LABELS.failed}. ${UNKNOWN_ACCOUNT_FAILURE_MESSAGE}`,
+    );
+    expect(details).not.toHaveTextContent(/defect|refused|throttled|reached|shape/i);
     expect(details).not.toHaveTextContent(/detail:/i);
     expect(details).not.toHaveTextContent(/null|undefined/);
     expect(text(cell(row, 'Status'))).toBe('Failed');
@@ -1542,35 +2004,7 @@ describe('ExchangesPage: run log', () => {
     expect(
       screen.queryByRole('heading', { name: 'Could not load exchanges' }),
     ).not.toBeInTheDocument();
-    expect(syncButton()).toBeEnabled();
-  });
-
-  it('the run log polls fast while its newest run is running', async () => {
-    fakeIntervals();
-    const { fake } = openExchanges({
-      exchanges: [exchange()],
-      runs: [runningExchangeRun({ accounts_total: 1 }), finishedRun()],
-    });
-    await runTable();
-    await settle();
-    const reads = fake.count('runs');
-
-    await advance(FAST_POLL_MS - 1);
-    expect(fake.count('runs')).toBe(reads);
-
-    await advance(1);
-    expect(fake.count('runs')).toBe(reads + 1);
-
-    // The run ends; the poll that reads it drops back to one a minute.
-    fake.setRuns([finishedRun({ run_id: 8, started_at: NOW }), finishedRun()]);
-    await advance(FAST_POLL_MS);
-    expect(fake.count('runs')).toBe(reads + 2);
-
-    await advance(FAST_POLL_MS);
-    expect(fake.count('runs')).toBe(reads + 2);
-
-    await advance(SLOW_POLL_MS - FAST_POLL_MS);
-    expect(fake.count('runs')).toBe(reads + 3);
+    expectPressableButton(syncButton());
   });
 });
 
@@ -1586,7 +2020,7 @@ describe('ExchangesPage: truncation banner', () => {
     const section = banner('Bitget');
 
     expect(section).toHaveTextContent(bannerLine('Bitget', TRUNCATED_EFFECTIVE_SINCE_TEXT));
-    expect(section).not.toHaveTextContent(/has not finished/);
+    expect(section).not.toHaveTextContent(/has not finished|stopped before/);
     const instant = timeIn(section);
     expect(instant).toHaveTextContent(TRUNCATED_EFFECTIVE_SINCE_TEXT);
     // The exact instant, unrounded, for anything that reads the markup.
@@ -1618,6 +2052,24 @@ describe('ExchangesPage: truncation banner', () => {
     );
   });
 
+  it("the banner's title names the same rounded-up instant, in local time, with seconds", async () => {
+    // R13. From the raw instant, the title would say 8:05 while the text says
+    // 12:06:00 UTC: an earlier minute than the one the banner names.
+    inTimeZone('America/New_York');
+    openExchanges({
+      exchanges: [truncatedExchange({ effective_since: '2026-06-27T12:05:59.500000Z' })],
+      runs: [],
+    });
+    await venue('Bitget');
+
+    const instant = timeIn(banner('Bitget'));
+
+    expect(instant).toHaveTextContent('Jun 27, 2026, 12:06:00 PM UTC');
+    expect((instant.getAttribute('title') ?? '').replace(/\s+/g, ' ')).toBe(
+      'Jun 27, 2026, 8:06:00 AM',
+    );
+  });
+
   it('the banner says the import has not finished while windows are pending', async () => {
     openExchanges({ exchanges: [truncatedExchange({ pending_windows: 4 })], runs: [] });
     await venue('Bitget');
@@ -1643,6 +2095,23 @@ describe('ExchangesPage: truncation banner', () => {
         'it does (1 window still to read).',
     );
     expect(section).not.toHaveTextContent(/1 windows/);
+  });
+
+  it('the banner of an unconfigured venue says the import stopped', async () => {
+    // R13. Nothing will finish it until the credentials come back.
+    openExchanges({
+      exchanges: [
+        truncatedExchange({ exchange_key: 'bingx', configured: false, pending_windows: 1 }),
+        truncatedExchange({ configured: false, pending_windows: 3 }),
+      ],
+      runs: [],
+    });
+    await venue('Bitget');
+
+    expect(banner('Bitget')).toHaveTextContent(bannerStoppedLine('Bitget', 3));
+    expect(banner('Bitget')).not.toHaveTextContent(/has not finished/);
+    expect(banner('BingX')).toHaveTextContent(bannerStoppedLine('BingX', 1));
+    expect(banner('BingX')).not.toHaveTextContent(/1 windows/);
   });
 
   it('no banner when history is not truncated', async () => {
@@ -1805,7 +2274,7 @@ describe('ExchangesPage: empty, loading and failure', () => {
     expect(
       screen.queryByRole('heading', { name: 'Could not load exchanges' }),
     ).not.toBeInTheDocument();
-    expect(syncButton()).toBeEnabled();
+    expectPressableButton(syncButton());
     expect(await runTable()).toBeInTheDocument();
 
     // The next good poll clears the notice.
@@ -1836,7 +2305,8 @@ describe('ExchangesPage: empty, loading and failure', () => {
 });
 
 /*
- * Polling: each query decides its own rate from its own data.
+ * Polling: each query decides its own rate, and the run log reads the list's
+ * `syncing` (R12).
  */
 
 describe('ExchangesPage: polling', () => {
@@ -1891,6 +2361,74 @@ describe('ExchangesPage: polling', () => {
     // From then on it is polled fast.
     await advance(FAST_POLL_MS);
     expect(fake.count('list')).toBe(reads + 2);
+  });
+
+  it('the run log polls fast while its newest run is running and a venue is syncing', async () => {
+    fakeIntervals();
+    const { fake } = openExchanges({
+      exchanges: [exchange({ syncing: true })],
+      runs: [runningExchangeRun({ accounts_total: 1 }), finishedRun()],
+    });
+    await runTable();
+    await settle();
+    const reads = fake.count('runs');
+
+    await advance(FAST_POLL_MS - 1);
+    expect(fake.count('runs')).toBe(reads);
+
+    await advance(1);
+    expect(fake.count('runs')).toBe(reads + 1);
+
+    // The run ends; the poll that reads it drops back to one a minute.
+    fake.setRuns([finishedRun({ run_id: 8, started_at: NOW }), finishedRun()]);
+    fake.patchExchange('bitget', { syncing: false });
+    await advance(FAST_POLL_MS);
+    expect(fake.count('runs')).toBe(reads + 2);
+
+    await advance(FAST_POLL_MS);
+    expect(fake.count('runs')).toBe(reads + 2);
+
+    await advance(SLOW_POLL_MS - FAST_POLL_MS);
+    expect(fake.count('runs')).toBe(reads + 3);
+  });
+
+  it('an orphaned running row does not keep the run log polling fast', async () => {
+    // R12. A `running` row with no venue syncing was left by a failed
+    // close-out, and the next run sweeps it. Polling it fast would poll fast
+    // until then.
+    fakeIntervals();
+    const { fake } = openExchanges({
+      exchanges: [exchange()],
+      runs: [runningExchangeRun({ accounts_total: 1 }), finishedRun()],
+    });
+    await runTable();
+    await settle();
+    const reads = fake.count('runs');
+
+    await advance(FAST_POLL_MS);
+    expect(fake.count('runs')).toBe(reads);
+
+    await advance(SLOW_POLL_MS - FAST_POLL_MS);
+    expect(fake.count('runs')).toBe(reads + 1);
+  });
+
+  it('the run log speeds up when the list starts syncing under a running row', async () => {
+    // The two readings have to meet: a running newest run, then the list's
+    // own poll noticing the coordinator's flag.
+    fakeIntervals();
+    const { fake } = openExchanges({
+      exchanges: [exchange()],
+      runs: [runningExchangeRun({ accounts_total: 1 }), finishedRun()],
+    });
+    await runTable();
+    await settle();
+
+    fake.patchExchange('bitget', { syncing: true });
+    await advance(SLOW_POLL_MS);
+    const reads = fake.count('runs');
+
+    await advance(FAST_POLL_MS);
+    expect(fake.count('runs')).toBe(reads + 1);
   });
 
   it("both queries poll fast while this page's own sync is pending", async () => {

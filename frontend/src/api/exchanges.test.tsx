@@ -87,31 +87,52 @@ describe('listRefetchInterval', () => {
 
 describe('runsRefetchInterval', () => {
   it('polls slowly before the first read, unless this page is syncing', () => {
-    expect(runsRefetchInterval(undefined, false)).toBe(SLOW_POLL_MS);
-    expect(runsRefetchInterval(undefined, true)).toBe(FAST_POLL_MS);
+    expect(runsRefetchInterval(undefined, false, false)).toBe(SLOW_POLL_MS);
+    expect(runsRefetchInterval(undefined, false, true)).toBe(SLOW_POLL_MS);
+    expect(runsRefetchInterval(undefined, true, false)).toBe(FAST_POLL_MS);
   });
 
   it('polls slowly when the log is empty or its newest run has ended', () => {
-    expect(runsRefetchInterval([], false)).toBe(SLOW_POLL_MS);
-    expect(runsRefetchInterval([finishedRun()], false)).toBe(SLOW_POLL_MS);
-    expect(runsRefetchInterval([interruptedExchangeRun()], false)).toBe(SLOW_POLL_MS);
-    expect(runsRefetchInterval([finishedRun(), interruptedExchangeRun()], false)).toBe(
-      SLOW_POLL_MS,
-    );
+    for (const anySyncing of [false, true]) {
+      expect(runsRefetchInterval([], false, anySyncing)).toBe(SLOW_POLL_MS);
+      expect(runsRefetchInterval([finishedRun()], false, anySyncing)).toBe(SLOW_POLL_MS);
+      expect(runsRefetchInterval([interruptedExchangeRun()], false, anySyncing)).toBe(SLOW_POLL_MS);
+      expect(
+        runsRefetchInterval([finishedRun(), interruptedExchangeRun()], false, anySyncing),
+      ).toBe(SLOW_POLL_MS);
+    }
   });
 
-  it('polls fast while the newest run is running', () => {
+  it('polls fast while the newest run is running and a venue is syncing', () => {
     // A running run is always the newest: opening a run sweeps every older
     // one to interrupted first. So "the newest" is the first entry.
     const running = runningExchangeRun({ accounts_total: 2 });
 
-    expect(runsRefetchInterval([running], false)).toBe(FAST_POLL_MS);
-    expect(runsRefetchInterval([running, finishedRun()], false)).toBe(FAST_POLL_MS);
+    expect(runsRefetchInterval([running], false, true)).toBe(FAST_POLL_MS);
+    expect(runsRefetchInterval([running, finishedRun()], false, true)).toBe(FAST_POLL_MS);
+  });
+
+  it('polls slowly under a running row no venue is syncing: an orphan', () => {
+    // R12. `syncing` is the coordinator's in-flight flag. A `running` row
+    // without it was left by a failed close-out, and the next run sweeps it.
+    const running = runningExchangeRun({ accounts_total: 2 });
+
+    expect(runsRefetchInterval([running], false, false)).toBe(SLOW_POLL_MS);
+    expect(runsRefetchInterval([running, finishedRun()], false, false)).toBe(SLOW_POLL_MS);
+  });
+
+  it('a venue syncing alone does not speed the log up without a running run', () => {
+    expect(runsRefetchInterval([finishedRun()], false, true)).toBe(SLOW_POLL_MS);
   });
 
   it("polls fast while this page's own sync is pending, whatever the log says", () => {
-    expect(runsRefetchInterval([], true)).toBe(FAST_POLL_MS);
-    expect(runsRefetchInterval([finishedRun()], true)).toBe(FAST_POLL_MS);
+    for (const anySyncing of [false, true]) {
+      expect(runsRefetchInterval([], true, anySyncing)).toBe(FAST_POLL_MS);
+      expect(runsRefetchInterval([finishedRun()], true, anySyncing)).toBe(FAST_POLL_MS);
+      expect(
+        runsRefetchInterval([runningExchangeRun({ accounts_total: 1 })], true, anySyncing),
+      ).toBe(FAST_POLL_MS);
+    }
   });
 });
 
@@ -124,7 +145,7 @@ describe('the exchange hooks', () => {
     const hook = renderHook(
       () => ({
         list: useExchanges(false),
-        runs: useExchangeRuns(false),
+        runs: useExchangeRuns(false, false),
         // A query outside ['exchanges'], to prove the sync's invalidation is
         // scoped rather than a refetch of everything.
         unrelated: useQuery({ queryKey: ['balances', 'current'], queryFn: unrelated }),
@@ -237,6 +258,10 @@ describe('the exchange hooks', () => {
 
 describe('the exchange hooks: polling', () => {
   /*
+   * The hooks are rendered without the page, so `anySyncing` is fixed here;
+   * ExchangesPage.test.tsx covers the page reading it from the list.
+   */
+  /*
    * `Date` and `setInterval` are faked; `setTimeout` stays real, because MSW
    * answers through it. TanStack Query schedules `refetchInterval` with
    * `setInterval` and restarts it on every query update, so each assertion
@@ -249,7 +274,10 @@ describe('the exchange hooks: polling', () => {
     const client = createQueryClient();
 
     return renderHook(
-      ({ pending }) => ({ list: useExchanges(pending), runs: useExchangeRuns(pending) }),
+      ({ pending }) => ({
+        list: useExchanges(pending),
+        runs: useExchangeRuns(pending, false),
+      }),
       { wrapper: wrapperFor(client), initialProps: { pending: syncPending } },
     );
   }

@@ -183,6 +183,39 @@ function fail(message: string): never {
   throw new Error(`Impossible exchange fixture: ${message}`);
 }
 
+/**
+ * Whether the venue's sync commits its plan before its first fetch.
+ *
+ * `_read_account` asks for candidate symbols only when the provider
+ * `requires_symbol`; otherwise it commits `requested_since`,
+ * `effective_since` and the planned windows, **then** fetches. Bitget does not
+ * require a symbol (`BITGET_CAPABILITIES`, `requires_symbol=False`). BingX is
+ * unknown until #14 builds its provider, so it is left unconstrained.
+ */
+const PLANS_BEFORE_FIRST_FETCH: Readonly<Record<ExchangeKey, boolean>> = {
+  bitget: true,
+  bingx: false,
+};
+
+/**
+ * Whether the account's status was set by a failure that came out of a fetch.
+ * Every kind but `internal` is raised by a venue call or a page's insert, and
+ * `auth_failed` comes only from `auth` or `insufficient_scope`.
+ */
+function failedInAFetch(view: ExchangeResponse): boolean {
+  if (view.status === 'auth_failed') {
+    return true;
+  }
+  return view.status === 'error' && view.last_error?.error_kind !== 'internal';
+}
+
+/**
+ * States built through {@link drainedBeforeMarkSynced}: the one writable way a
+ * fetch-failed account has no window left. Held by identity, so a patched copy
+ * of one is checked again from scratch.
+ */
+const DRAINED_BEFORE_MARK_SYNCED = new WeakSet<ExchangeResponse>();
+
 function isIntegerAtLeastZero(value: number): boolean {
   return Number.isInteger(value) && value >= 0;
 }
@@ -233,6 +266,23 @@ export function assertWritableExchange(view: ExchangeResponse): ExchangeResponse
 
   if ((view.fills_stored > 0 || view.pending_windows > 0) && view.requested_since === null) {
     fail(`${key}: the plan is committed before any window is queued or any fill stored.`);
+  }
+
+  if (PLANS_BEFORE_FIRST_FETCH[key] && failedInAFetch(view)) {
+    // The plan is committed before any fetch and is never un-set, so a failure
+    // that came out of a fetch always has a plan behind it.
+    if (view.requested_since === null) {
+      fail(`${key}: ${view.status} came out of a fetch, and the plan is committed before any.`);
+    }
+    // A window is deleted only after its last page commits, so the window the
+    // failing fetch was reading is still queued - unless a later run drained
+    // every window and died before `mark_synced` (see drainedBeforeMarkSynced).
+    if (view.pending_windows < 1 && !DRAINED_BEFORE_MARK_SYNCED.has(view)) {
+      fail(
+        `${key}: the window a failed fetch was reading is still queued. For the one way ` +
+          'it is not, build the state with drainedBeforeMarkSynced().',
+      );
+    }
   }
 
   const lastError = view.last_error;
@@ -337,11 +387,21 @@ export function lastError(
 }
 
 /**
+ * How many windows a first Bitget run leaves queued when the venue refuses the
+ * key on the first fetch: the whole planned history, since nothing was read.
+ */
+export const FIRST_RUN_WINDOWS = 13;
+
+/**
  * An account a venue refused. `kind` null is the hand-edited database the
  * spec allows for: `auth_failed` with no `last_error`.
  *
- * The default is the first-run shape: the key was refused while the plan was
- * being made (the symbols call), so nothing was planned and nothing stored.
+ * The default is the commonest failure shape there is (spec 016, "After
+ * review"): a first Bitget run with a refused key. Bitget makes no symbols
+ * call, so the plan - `requested_since`, `effective_since` and every window -
+ * was committed before the first fetch, and the first fetch was refused. So
+ * the whole history is queued, nothing is stored, and the retention clamp has
+ * already cut the request short.
  */
 export function authFailedExchange(
   kind: AuthErrorKind | null,
@@ -350,15 +410,20 @@ export function authFailedExchange(
   return exchange({
     status: 'auth_failed',
     last_synced_at: null,
-    requested_since: null,
-    effective_since: null,
+    requested_since: OLD_REQUESTED_SINCE,
+    effective_since: TRUNCATED_EFFECTIVE_SINCE,
     fills_stored: 0,
+    pending_windows: FIRST_RUN_WINDOWS,
     last_error: kind === null ? null : lastError(kind),
     ...overrides,
   });
 }
 
-/** An account whose latest attempt failed for a reason other than its key. */
+/**
+ * An account whose latest attempt failed for a reason other than its key,
+ * after an earlier success. The run that failed planned the windows since that
+ * success before its first fetch, so they are still queued.
+ */
 export function erroredExchange(
   kind: NonAuthErrorKind,
   overrides: Partial<ExchangeResponse> = {},
@@ -366,9 +431,30 @@ export function erroredExchange(
   return exchange({
     status: 'error',
     last_synced_at: OLD_SYNCED_AT,
+    pending_windows: 2,
     last_error: lastError(kind),
     ...overrides,
   });
+}
+
+/**
+ * `base`, with every window drained: the one writable way a fetch-failed
+ * account holds no window.
+ *
+ * The writer path: a run - for an `auth_failed` account, a manual retry, the
+ * only kind that retries it - reads the last page of the last window, commits
+ * it and deletes the window, then dies before `mark_synced` commits. The
+ * status is never updated, the outcome is never recorded, and the account
+ * keeps its failed status and `last_error` with nothing queued, until the next
+ * run that attempts it.
+ */
+export function drainedBeforeMarkSynced(base: ExchangeResponse): ExchangeResponse {
+  if (!failedInAFetch(base)) {
+    fail(`${base.exchange_key}: only a fetch-failed account needs this opt-in.`);
+  }
+  const view: ExchangeResponse = { ...base, pending_windows: 0 };
+  DRAINED_BEFORE_MARK_SYNCED.add(view);
+  return assertWritableExchange(view);
 }
 
 /** A venue whose retention cut the requested history short. */
