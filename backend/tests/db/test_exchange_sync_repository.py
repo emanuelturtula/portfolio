@@ -524,12 +524,21 @@ async def test_a_window_is_added_advanced_moved_and_deleted(
 
     async with factory() as session:
         repository = ExchangeSyncWindowRepository(session)
+        await repository.set_since(window_id, since + timedelta(hours=6), keep_cursor=True)
+        await session.commit()
+        listed = await repository.list_for_account(account)
+    assert [(window.id, window.since, window.cursor) for window in listed] == [
+        (window_id, since + timedelta(hours=6), "12345")
+    ], "a trade-id cursor is kept when asked: the row moves in place"
+
+    async with factory() as session:
+        repository = ExchangeSyncWindowRepository(session)
         await repository.set_since(window_id, since + timedelta(days=1))
         await session.commit()
         listed = await repository.list_for_account(account)
     assert [(window.since, window.cursor) for window in listed] == [
         (since + timedelta(days=1), None)
-    ], "moving since keeps no cursor: the range it paged through has changed"
+    ], "by default moving since keeps no cursor: the range it paged through has changed"
 
     async with factory() as session:
         repository = ExchangeSyncWindowRepository(session)

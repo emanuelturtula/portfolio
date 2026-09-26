@@ -1248,6 +1248,37 @@ async def test_a_drain_that_raises_does_not_stop_the_other() -> None:
     assert [entry["error_type"] for entry in failed] == ["RuntimeError"]
 
 
+async def test_the_two_coordinators_are_drained_concurrently_not_one_after_the_other() -> None:
+    """Two grace periods in sequence would spend the container's whole stop grace period.
+
+    Each fake drain waits at a two-party barrier, which releases only when both drains are
+    waiting at once -- so the barrier *is* the concurrency check, and nothing sleeps on the
+    passing path. Drained one after the other, the first would wait alone until its bound
+    expired, and the failure would be logged and counted below.
+    """
+    barrier = asyncio.Barrier(2)
+    finished: list[str] = []
+
+    class AtTheBarrier:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def drain(self, *, grace_seconds: int) -> bool:
+            del grace_seconds
+            await asyncio.wait_for(barrier.wait(), timeout=2)
+            finished.append(self.name)
+            return True
+
+    with capture_logs() as captured:
+        await asyncio.wait_for(
+            drain_coordinators((AtTheBarrier("balance"), 10), (AtTheBarrier("exchange"), 10)),
+            timeout=5,
+        )
+
+    assert sorted(finished) == ["balance", "exchange"]
+    assert [entry for entry in captured if entry["event"] == "sync_drain_failed"] == []
+
+
 async def test_an_exchange_sweep_that_fails_does_not_stop_startup_or_the_balance_sweep(
     lifespan_database: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

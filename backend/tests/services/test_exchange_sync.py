@@ -33,6 +33,7 @@ says were read.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
@@ -375,6 +376,269 @@ def pages_the_checkpoint_says_were_read(windows: list[dict[str, Any]], planned: 
         return set(ALL_NINE) if planned else set()
     (window,) = windows
     return {None: set(), "1007": PAGE_ONE, "1004": PAGE_ONE | PAGE_TWO}[window["cursor"]]
+
+
+#: The oldest window of a backfill with no history start, under the simulated venue's
+#: ninety-day retention and seven-day limit: `[T0 - 90 d + 5 min, T0 - 84 d)`.
+OLDEST_UNTIL: Final = T0 - timedelta(days=84)
+
+
+def oldest_nine() -> list[Any]:
+    """The nine fills, placed in the oldest backfill window instead of the newest."""
+    return fills_between(9, newest=T0 - timedelta(days=85))
+
+
+@pytest.mark.parametrize(
+    ("kind", "resumed_cursors"),
+    [
+        (CursorKind.TRADE_ID_BEFORE, ["1004"]),
+        (CursorKind.TRADE_ID_AFTER, ["1004"]),
+        (CursorKind.TIME, [None, "1007", "1004"]),
+    ],
+    ids=["trade id before", "trade id after", "time"],
+)
+async def test_an_interrupted_oldest_window_resumes_at_its_cursor_after_the_floor_moves(
+    factory: async_sessionmaker[AsyncSession],
+    kind: CursorKind,
+    resumed_cursors: list[str | None],
+) -> None:
+    """Criterion 1 for the window the rolling retention floor passes on every run (F3).
+
+    The backfill reads the twelve newer windows, then pages 1 and 2 of the oldest, and page
+    3 fails. Fifteen minutes later the retention floor has moved fifteen minutes, past the
+    oldest window's `since`, so the window's start moves up -- and with a trade-id cursor,
+    which bounds ids rather than instants, it must still resume at page 2's cursor rather
+    than restart. Otherwise an interrupted backfill re-reads its oldest window from the
+    start after every interruption, forever. A time cursor is a position in the range that
+    moved, so that kind restarts -- and the constraint makes the re-read free.
+    """
+    harness = Harness(history_start=None)
+
+    def fail_third_oldest_page(
+        call_number: int, window: FillWindow, cursor: str | None
+    ) -> BaseException | None:
+        del call_number
+        oldest = window.until == OLDEST_UNTIL
+        return ExchangeUnavailableError(status=503) if oldest and cursor == "1004" else None
+
+    await harness.run(
+        factory,
+        SimulatedVenue(oldest_nine(), cursor_kind=kind, fault=fail_third_oldest_page),
+    )
+    assert [row["cursor"] for row in await window_rows(factory)] == ["1004"]
+    harness.clock.advance(timedelta(minutes=15))
+    venue = SimulatedVenue(oldest_nine(), cursor_kind=kind)
+
+    summary = await harness.run(factory, venue)
+
+    oldest_calls = [call for call in venue.calls if call.window.until == OLDEST_UNTIL]
+    assert [call.cursor for call in oldest_calls] == resumed_cursors, (
+        "the oldest window did not resume the way its cursor kind allows"
+    )
+    new_floor = T0 + timedelta(minutes=15) - timedelta(days=90) + timedelta(minutes=5)
+    assert oldest_calls[0].window.since == new_floor
+    assert summary.status is SyncRunStatus.SUCCESS
+    assert_each_once(await trade_ids(factory), ALL_NINE)
+
+
+async def test_a_retention_step_keeps_the_cursor_of_a_trade_id_window(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A step moves only `since`; a trade-id cursor still bounds the same pages.
+
+    The oldest window is interrupted after page 2. In the next run the venue turns out to
+    keep a little less than it declared and refuses the window; the step moves its start a
+    day and the very next request carries page 2's cursor.
+    """
+    harness = Harness(history_start=None)
+
+    def fail_third_oldest_page(
+        call_number: int, window: FillWindow, cursor: str | None
+    ) -> BaseException | None:
+        del call_number
+        oldest = window.until == OLDEST_UNTIL
+        return ExchangeUnavailableError(status=503) if oldest and cursor == "1004" else None
+
+    await harness.run(factory, SimulatedVenue(oldest_nine(), fault=fail_third_oldest_page))
+    venue = SimulatedVenue(
+        oldest_nine(), fault=refuse_older_than(T0 - timedelta(days=89, hours=12))
+    )
+
+    summary = await harness.run(factory, venue)
+
+    oldest_calls = [call for call in venue.calls if call.window.until == OLDEST_UNTIL]
+    assert [call.cursor for call in oldest_calls] == ["1004", "1004"]
+    oldest_since = T0 - timedelta(days=90) + timedelta(minutes=5)
+    assert [call.window.since for call in oldest_calls] == [
+        oldest_since,
+        oldest_since + timedelta(days=1),
+    ]
+    assert summary.status is SyncRunStatus.SUCCESS
+    assert_each_once(await trade_ids(factory), ALL_NINE)
+
+
+async def test_a_clock_that_ran_ahead_leaves_no_range_claimed_and_never_read(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """F1: a ceiling left in the future by a fast clock is pulled back, and re-covered.
+
+    Run 1 happens with the clock a day ahead; the venue, which signs its requests against
+    real time, refuses it. The clock is corrected and run 2 finds its plan ahead of `now`:
+    it logs that and pulls `planned_until` back to `now`. A fill is then executed between
+    run 2 and run 3, and run 3 reads it. Kept at the day-ahead ceiling, no top window would
+    be planned until real time caught up, and the fill would sit forever in a range the
+    account claims to have read.
+    """
+    harness = Harness()
+    harness.clock.moment = T0 + timedelta(days=1)
+    await harness.run(factory, SimulatedVenue(fault=always(ExchangeUnavailableError(status=503))))
+    assert (await account_row(factory))["planned_until"] == sqlite_timestamp(T0 + timedelta(days=1))
+    harness.clock.moment = T0 + timedelta(hours=1)
+
+    with capture_logs() as captured:
+        await harness.run(factory, SimulatedVenue(nine_fills()))
+
+    assert (await account_row(factory))["planned_until"] == sqlite_timestamp(
+        T0 + timedelta(hours=1)
+    )
+    behind = [entry for entry in captured if entry["event"] == "exchange_sync_clock_behind_plan"]
+    assert [entry["log_level"] for entry in behind] == ["warning"]
+    late = make_fill(2000, T0 + timedelta(hours=2))
+    harness.clock.moment = T0 + timedelta(hours=3)
+
+    await harness.run(factory, SimulatedVenue([*nine_fills(), late]))
+
+    assert "2000" in await trade_ids(factory), "the fill after the corrected clock was never read"
+    account = await account_row(factory)
+    assert account["planned_until"] == sqlite_timestamp(T0 + timedelta(hours=3))
+    assert account["sync_status"] == "ok"
+
+
+async def test_an_edge_that_aged_during_the_run_is_re_clamped_without_spending_a_step(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """F2: the oldest window is read last, after the edge it was planned at has aged.
+
+    The venue keeps exactly ninety days as of each request. Ten minutes pass while the newest
+    window is read, so by the time the oldest window is asked for, its `since` is older than
+    the venue keeps. That is elapsed time, not a short retention: the window moves to the
+    edge as it stands now -- ten minutes on, not a whole day -- and no step is spent.
+    """
+    harness = Harness(history_start=None)
+
+    def refuse_past_live_retention(
+        call_number: int, window: FillWindow, cursor: str | None
+    ) -> BaseException | None:
+        del call_number, cursor
+        if window.since < harness.clock.moment - timedelta(days=90):
+            return ExchangeRetentionWindowError(status=400, venue_code="40704")
+        return None
+
+    venue = SimulatedVenue(nine_fills(), fault=refuse_past_live_retention)
+    aged: list[bool] = []
+
+    async def age_the_edge(call: PageCall) -> None:
+        if call.window.until == T0 and not aged:
+            aged.append(True)
+            harness.clock.advance(timedelta(minutes=10))
+
+    venue.on_call = age_the_edge
+
+    with capture_logs() as captured:
+        summary = await harness.run(factory, venue)
+
+    planned = T0 - timedelta(days=90) + timedelta(minutes=5)
+    fresh = T0 + timedelta(minutes=10) - timedelta(days=90) + timedelta(minutes=5)
+    oldest_calls = [call for call in venue.calls if call.window.until == OLDEST_UNTIL]
+    assert [call.window.since for call in oldest_calls] == [planned, fresh]
+    events = [entry["event"] for entry in captured]
+    assert events.count("exchange_sync_retention_reclamped") == 1
+    assert events.count("exchange_sync_retention_step") == 0
+    assert summary.status is SyncRunStatus.SUCCESS
+    assert (await account_row(factory))["effective_since"] == sqlite_timestamp(fresh)
+
+
+async def test_a_step_past_a_short_retention_never_raises_the_floor_past_the_ceiling(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """F2: a step that empties the refused window raises the floor only to that window's end.
+
+    A venue that keeps a day, read in six-hour windows, and in fact keeps only twenty hours:
+    the three newer windows are read, the oldest is refused, and a step of a whole day from
+    its start lands past `now`, emptying it. The history held begins where that window
+    ended, eighteen hours back -- not at the step's target, which would invert the planned
+    range, and not at the ceiling, which would claim eighteen stored hours were never held.
+    """
+    harness = Harness(history_start=None)
+    venue = SimulatedVenue(
+        nine_fills(),
+        retention=timedelta(days=1),
+        max_query_window=timedelta(hours=6),
+        fault=refuse_older_than(T0 - timedelta(hours=20)),
+    )
+
+    summary = await harness.run(factory, venue)
+
+    account = await account_row(factory)
+    assert account["planned_until"] == sqlite_timestamp(T0)
+    assert account["effective_since"] <= account["planned_until"], "the planned range inverted"
+    assert account["effective_since"] == sqlite_timestamp(T0 - timedelta(hours=18)), (
+        "the floor is where the held history begins: the emptied window's end"
+    )
+    assert summary.status is SyncRunStatus.SUCCESS
+    assert await window_rows(factory) == []
+    assert_each_once(await trade_ids(factory), ALL_NINE)
+
+
+async def test_a_window_exactly_as_long_as_the_limit_resumes_at_its_cursor(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every backfill window but the oldest is exactly `max_query_window` long.
+
+    With no history start the first plan is thirteen seven-day windows, the newest holding
+    the nine fills. Page 3 fails; the next run resumes that window at page 2's cursor. A
+    queue normalisation that re-split a window of *exactly* the limit would replace it with
+    an identical one and restart it from its first page.
+    """
+    harness = Harness(history_start=None)
+    newest = FillWindow(since=T0 - timedelta(days=7), until=T0)
+    await harness.run(
+        factory,
+        SimulatedVenue(nine_fills(), fault=faults_on({3: ExchangeUnavailableError(status=503)})),
+    )
+    venue = SimulatedVenue(nine_fills())
+
+    await harness.run(factory, venue)
+
+    assert newest.duration == venue.capabilities.max_query_window
+    assert venue.calls[0] == PageCall(newest, "1004", None)
+    assert PageCall(newest, None, None) not in venue.calls
+    assert_each_once(await trade_ids(factory), ALL_NINE)
+
+
+async def test_a_clock_stepped_back_behind_the_configured_start_plans_no_bottom(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The recorded start is compared through the same `min(..., now)` as the clamp.
+
+    The first run read from the configured 2026-09-20. The clock then steps back to 09-10,
+    behind that date: the clamp asks from `now`, and the recorded 09-20 compared raw would
+    look like the owner asking for ten more days -- a bottom range nobody requested.
+    """
+    harness = Harness(history_start=date(2026, 9, 20))
+    await harness.run(factory, SimulatedVenue(nine_fills()))
+    start = sqlite_timestamp(datetime(2026, 9, 20, tzinfo=UTC))
+    assert (await account_row(factory))["effective_since"] == start
+    harness.clock.moment = datetime(2026, 9, 10, tzinfo=UTC)
+    venue = SimulatedVenue(nine_fills())
+
+    summary = await harness.run(factory, venue)
+
+    assert venue.calls == [], "no range was asked for: nothing was requested"
+    assert summary.status is SyncRunStatus.SUCCESS
+    account = await account_row(factory)
+    assert account["effective_since"] == start
+    assert account["requested_since"] == start
 
 
 async def test_a_crash_at_any_commit_never_separates_the_fills_from_their_checkpoint(
@@ -1006,6 +1270,92 @@ async def test_symbol_discovery_is_only_asked_when_there_are_new_windows(
     assert venue.symbol_calls == 0, "the clock did not move, so nothing new was planned"
 
 
+def a_writer_can_begin(database: Path, seen: list[str | None]) -> Callable[[], None]:
+    """Try to take SQLite's write lock from a second connection, without waiting for it.
+
+    Records `None` when `BEGIN IMMEDIATE` succeeds, or the refusal's message when another
+    connection -- the sync's own session -- is holding a write transaction open.
+    """
+
+    def attempt() -> None:
+        connection = sqlite3.connect(database, timeout=0)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.rollback()
+            seen.append(None)
+        except sqlite3.OperationalError as error:
+            seen.append(str(error))
+        finally:
+            connection.close()
+
+    return attempt
+
+
+async def test_no_write_transaction_is_held_open_while_symbols_are_discovered(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    """Discovery is a network call, and SQLite has one writer: nothing may wait behind it.
+
+    The second run reshapes the pending windows the retention floor has passed -- writes --
+    before it asks the venue for its symbols. If those writes were still uncommitted, every
+    other writer (a login, a manual sync of balances) would wait on the venue's latency, and
+    past the five-second busy timeout it would fail. A second connection taking the write
+    lock from inside `candidate_symbols` is the proof.
+    """
+    database = tmp_path / "test.db"
+    harness = Harness(history_start=None)
+    first_seen: list[str | None] = []
+    first = SimulatedVenue(
+        requires_symbol=True,
+        symbols=("BTCUSDT",),
+        fault=always(ExchangeUnavailableError(status=503)),
+    )
+    first.on_symbols = a_writer_can_begin(database, first_seen)
+    await harness.run(factory, first)
+    harness.clock.advance(timedelta(days=3))
+    seen: list[str | None] = []
+    venue = SimulatedVenue(nine_fills(), requires_symbol=True, symbols=("BTCUSDT",))
+    venue.on_symbols = a_writer_can_begin(database, seen)
+
+    summary = await harness.run(factory, venue)
+
+    assert first_seen == [None]
+    assert seen == [None], "a write transaction was open while the venue was being asked"
+    assert summary.status is SyncRunStatus.SUCCESS
+
+
+async def test_no_write_transaction_is_open_while_a_rate_limited_discovery_waits(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    """F4 with the retry: both attempts at discovery, and the wait between them, hold no lock."""
+    database = tmp_path / "test.db"
+    harness = Harness(history_start=None)
+    await harness.run(
+        factory,
+        SimulatedVenue(
+            requires_symbol=True,
+            symbols=("BTCUSDT",),
+            fault=always(ExchangeUnavailableError(status=503)),
+        ),
+    )
+    harness.clock.advance(timedelta(days=3))
+    seen: list[str | None] = []
+    venue = SimulatedVenue(
+        nine_fills(),
+        requires_symbol=True,
+        symbols=("BTCUSDT",),
+        symbols_fault=throttled(1000),
+        symbols_fault_times=1,
+    )
+    venue.on_symbols = a_writer_can_begin(database, seen)
+
+    summary = await harness.run(factory, venue)
+
+    assert seen == [None, None]
+    assert harness.sleeper.slept == [1]
+    assert summary.status is SyncRunStatus.SUCCESS
+
+
 async def test_symbol_discovery_is_retried_after_a_rate_limit_like_a_page(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -1218,6 +1568,160 @@ async def test_every_attempted_account_failing_is_a_failed_run(
     )
 
     assert summary.status is SyncRunStatus.FAILED
+
+
+async def test_a_skipped_account_does_not_turn_a_failed_run_partial(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The run status is computed over the accounts **attempted**; a skipped one is not.
+
+    BingX is `auth_failed` and skipped by the scheduled run; Bitget, the one attempted,
+    fails. Every attempted account failed, so the run failed -- counting the skipped one
+    would call it `partial`, as though something had worked.
+    """
+    harness = Harness()
+    await harness.run(
+        factory,
+        {
+            ExchangeKey.BITGET: SimulatedVenue(nine_fills()),
+            ExchangeKey.BINGX: SimulatedVenue(
+                exchange_key=ExchangeKey.BINGX, fault=always(ExchangeAuthError(status=401))
+            ),
+        },
+    )
+    harness.clock.advance(timedelta(minutes=15))
+
+    summary = await harness.run(
+        factory,
+        {
+            ExchangeKey.BITGET: SimulatedVenue(fault=always(ExchangeUnavailableError(status=503))),
+            ExchangeKey.BINGX: SimulatedVenue(exchange_key=ExchangeKey.BINGX),
+        },
+    )
+
+    assert [outcome.status for outcome in summary.accounts] == [
+        AccountOutcomeStatus.SKIPPED,
+        AccountOutcomeStatus.FAILED,
+    ]
+    assert summary.status is SyncRunStatus.FAILED
+    assert (summary.accounts_failed, summary.accounts_skipped) == (1, 1)
+
+
+async def test_a_failure_before_any_account_leaves_the_run_row_as_evidence(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run row is committed the moment it is opened, not with a later write.
+
+    A failure between opening the run and the first account -- the owner lookup, here --
+    propagates out of `sync`. What must survive it is the `running` row that says a run
+    started, for the sweep to close; a row only flushed would be rolled back with the rest.
+    """
+
+    async def refuse(self: object) -> list[object]:
+        del self
+        message = "database is locked"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr("portfolio.repositories.users.UserRepository.list_all", refuse)
+    harness = Harness()
+    venue = SimulatedVenue(nine_fills())
+
+    with pytest.raises(RuntimeError, match="database is locked"):
+        await harness.run(factory, venue)
+
+    assert [run["status"] for run in await rows(factory, RUNS_SQL)] == ["running"]
+    assert venue.calls == []
+
+
+async def test_a_retention_step_that_empties_a_window_deletes_it_and_moves_on(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """ "A window left empty is deleted and the sync moves on."
+
+    Day-long windows from 2026-09-23: `[09-24 12:00, 09-25 12:00)`, `[09-23 12:00, 09-24
+    12:00)` and `[09-23 00:00, 09-23 12:00)`. The venue keeps nothing before 09-24, so the
+    middle window is refused; one step moves its start to exactly its end, which empties it,
+    and the oldest window lies wholly below the step. Both go, and the run succeeds having
+    asked about the emptied window once -- not four times, and not failing on it.
+    """
+    harness = Harness(history_start=date(2026, 9, 23))
+    edge = datetime(2026, 9, 24, tzinfo=UTC)
+    venue = SimulatedVenue(
+        nine_fills(), max_query_window=timedelta(days=1), fault=refuse_older_than(edge)
+    )
+    middle = FillWindow(
+        since=datetime(2026, 9, 23, 12, tzinfo=UTC), until=datetime(2026, 9, 24, 12, tzinfo=UTC)
+    )
+
+    summary = await harness.run(factory, venue)
+
+    assert [call.window for call in venue.calls].count(middle) == 1
+    assert all(call.window.since >= middle.since for call in venue.calls), (
+        "the oldest window, wholly below the step, is never asked about"
+    )
+    assert summary.status is SyncRunStatus.SUCCESS
+    assert await window_rows(factory) == []
+    assert (await account_row(factory))["effective_since"] == sqlite_timestamp(middle.until)
+    assert_each_once(await trade_ids(factory), ALL_NINE)
+
+
+async def test_windows_that_aged_out_while_stalled_raise_the_floor(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Pending windows the rolling retention passed are dropped or shrunk, and it is recorded.
+
+    The first run plans ninety days and reads nothing. Ten days later the retention edge has
+    moved ten days: the oldest pending window is wholly below it and is dropped, the next
+    one straddles it and is shrunk. The history held now starts at the new edge, and
+    `effective_since` says so -- leaving it at the old floor would claim ten days nobody
+    can read any more.
+    """
+    harness = Harness(history_start=None)
+    await harness.run(factory, SimulatedVenue(fault=always(ExchangeUnavailableError(status=503))))
+    assert (await account_row(factory))["effective_since"] == sqlite_timestamp(
+        T0 - timedelta(days=90) + timedelta(minutes=5)
+    )
+    harness.clock.advance(timedelta(days=10))
+    venue = SimulatedVenue(nine_fills())
+
+    with capture_logs() as captured:
+        summary = await harness.run(factory, venue)
+
+    new_edge = T0 + timedelta(days=10) - timedelta(days=90) + timedelta(minutes=5)
+    assert summary.status is SyncRunStatus.SUCCESS
+    assert (await account_row(factory))["effective_since"] == sqlite_timestamp(new_edge)
+    assert min(call.window.since for call in venue.calls) == new_edge
+    truncated = [entry for entry in captured if entry["event"] == "exchange_sync_history_truncated"]
+    assert [entry["windows_dropped"] for entry in truncated] == [1]
+
+
+async def test_a_window_reshaped_by_the_retention_floor_keeps_its_symbol(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A replacement row is written with the original's symbol, or the venue cannot be asked.
+
+    A venue that requires a symbol plans one row per symbol. When the floor shrinks such a
+    row, the rows replacing it must still name the symbol: one without it is a request the
+    provider refuses as the caller's mistake.
+    """
+    harness = Harness(history_start=None)
+    await harness.run(
+        factory,
+        SimulatedVenue(
+            requires_symbol=True,
+            symbols=("BTCUSDT",),
+            fault=always(ExchangeUnavailableError(status=503)),
+        ),
+    )
+    harness.clock.advance(timedelta(days=3))
+    venue = SimulatedVenue(nine_fills(), requires_symbol=True, symbols=("BTCUSDT",))
+
+    summary = await harness.run(factory, venue)
+
+    assert summary.status is SyncRunStatus.SUCCESS
+    assert {call.symbol for call in venue.calls} == {"BTCUSDT"}
+    floor = T0 + timedelta(days=3) - timedelta(days=90) + timedelta(minutes=5)
+    assert min(call.window.since for call in venue.calls) == floor
 
 
 async def test_an_account_whose_venue_is_no_longer_configured_is_not_synced(

@@ -27,6 +27,7 @@ from hypothesis import strategies as st
 
 from portfolio.providers.exchanges.base import (
     EPOCH,
+    CursorKind,
     FillWindow,
     RetentionClamp,
     floor_to_millisecond,
@@ -38,8 +39,10 @@ from portfolio.services.exchange_sync_plan import (
     OVERLAP,
     RATE_LIMIT_RETRIES,
     RETENTION_STEP,
+    MovedSince,
     PendingWindow,
     Replacement,
+    cursor_survives_a_moved_since,
     normalise_pending,
     plan_account,
     seconds_to_wait,
@@ -419,11 +422,14 @@ def test_an_edge_exactly_at_the_ceiling_is_not_a_hole() -> None:
     [timedelta(0), timedelta(milliseconds=1), timedelta(hours=2)],
     ids=["equal", "a millisecond back", "two hours back"],
 )
-def test_a_clock_stepped_back_plans_nothing_new_at_the_top(stepped_back: timedelta) -> None:
-    """`now <= planned_until` is a clock that went backwards, not a range to read.
+def test_a_clock_behind_the_plan_plans_nothing_and_pulls_the_ceiling_back(
+    stepped_back: timedelta,
+) -> None:
+    """F1: `now < planned_until` means the clock once ran ahead, or has been stepped back.
 
-    Nothing is planned and `planned_until` is not moved back with it: the history up to it
-    is planned already, and pulling the ceiling down would re-plan it on the next run.
+    Nothing is planned, and the ceiling comes back to `now`: a ceiling left in the future
+    would plan no top until real time caught up with it, and every fill in between would
+    sit in a range the plan claims to have read. Equal is not behind: nothing moves.
     """
     planned_until = NOW
     effective = NOW - timedelta(days=30)
@@ -438,7 +444,25 @@ def test_a_clock_stepped_back_plans_nothing_new_at_the_top(stepped_back: timedel
     )
 
     assert plan.windows == ()
-    assert plan.planned_until == planned_until
+    assert plan.planned_until == NOW - stepped_back
+    assert plan.effective_since == effective
+
+
+def test_a_clock_behind_the_floor_pulls_the_ceiling_back_no_further_than_the_floor() -> None:
+    """`[effective_since, planned_until)` stays a range: the ceiling stops at the floor."""
+    effective = NOW - timedelta(days=1)
+
+    plan = plan_account(
+        requested_since=HISTORY_GENESIS,
+        effective_since=effective,
+        planned_until=NOW,
+        clamp=clamp(HISTORY_GENESIS, NOW - timedelta(days=5)),
+        now=NOW - timedelta(days=3),
+        max_window=MAX_WINDOW,
+    )
+
+    assert plan.windows == ()
+    assert plan.planned_until == effective
     assert plan.effective_since == effective
 
 
@@ -580,9 +604,10 @@ def test_every_planned_range_touches_the_planned_history(
 
     Whenever the retention edge is no later than the planned ceiling, the planned history
     and everything newly planned form one interval: the top overlaps it, the bottom abuts
-    it. The floor falls only when the owner asked for more, never rises here, the ceiling
-    never falls, every window is within the limit, and none asks for history the clamp says
-    is gone.
+    it. The floor falls only when the owner asked for more and never rises here; the
+    ceiling moves to `now`, forward or -- for a clock behind the plan, F1 -- back, never
+    below the floor; every window is within the limit, and none asks for history the clamp
+    says is gone.
     """
     effective = NOW - timedelta(milliseconds=floor_offset)
     planned_until = effective + timedelta(milliseconds=planned_length)
@@ -599,8 +624,14 @@ def test_every_planned_range_touches_the_planned_history(
         max_window=MAX_WINDOW,
     )
 
+    if now < planned_until:
+        # F1: a clock behind the plan plans nothing and pulls the ceiling back to it.
+        assert plan.windows == ()
+        assert plan.effective_since == effective
+        assert plan.planned_until == max(now, effective)
+        return
     assert plan.effective_since == (min(effective, edge) if asked_for_more else effective)
-    assert plan.planned_until == max(planned_until, now)
+    assert plan.planned_until == now
     assert_newest_first(plan.windows)
     assert_within_limit(plan.windows)
     union = covered([FillWindow(since=effective, until=planned_until), *plan.windows])
@@ -626,6 +657,7 @@ def test_windows_inside_the_floor_and_the_limit_are_kept_as_they_are() -> None:
     queue = normalise_pending(windows, floor=FLOOR, max_window=MAX_WINDOW)
 
     assert queue.kept == tuple(windows)
+    assert queue.moved == ()
     assert queue.replaced == ()
     assert queue.truncated is False
 
@@ -633,14 +665,15 @@ def test_windows_inside_the_floor_and_the_limit_are_kept_as_they_are() -> None:
 def test_a_window_ending_exactly_at_the_floor_is_dropped() -> None:
     """`until <= floor` is wholly below: the window holds no instant the venue still has.
 
-    The boundary that a `<` would keep -- and then have to shrink to an empty window, which
-    `FillWindow` refuses.
+    The boundary a `<` would get wrong: the window would be "moved" to start at its own end,
+    an empty range that `FillWindow` refuses when the row is next read.
     """
     at_floor = pending(3, FLOOR - timedelta(days=1), FLOOR, cursor="c-3")
 
     queue = normalise_pending([at_floor], floor=FLOOR, max_window=MAX_WINDOW)
 
     assert queue.kept == ()
+    assert queue.moved == ()
     assert queue.replaced == (Replacement(original=at_floor, windows=()),)
     assert queue.truncated is True
 
@@ -650,22 +683,20 @@ def test_a_window_wholly_below_the_floor_is_dropped() -> None:
 
     queue = normalise_pending([below], floor=FLOOR, max_window=MAX_WINDOW)
 
+    assert queue.moved == ()
     assert queue.replaced == (Replacement(original=below, windows=()),)
     assert queue.truncated is True
 
 
-def test_a_window_straddling_the_floor_has_its_since_moved_up() -> None:
+def test_a_window_straddling_the_floor_is_moved_in_place_not_replaced() -> None:
+    """Only `since` moves: the row, and for a trade-id venue its cursor, survive (F3)."""
     straddling = pending(5, FLOOR - timedelta(days=2), FLOOR + timedelta(days=3), cursor="c-5")
 
     queue = normalise_pending([straddling], floor=FLOOR, max_window=MAX_WINDOW)
 
     assert queue.kept == ()
-    assert queue.replaced == (
-        Replacement(
-            original=straddling,
-            windows=(FillWindow(since=FLOOR, until=FLOOR + timedelta(days=3)),),
-        ),
-    )
+    assert queue.moved == (MovedSince(original=straddling, since=FLOOR),)
+    assert queue.replaced == ()
     assert queue.truncated is True
 
 
@@ -675,7 +706,28 @@ def test_a_window_starting_exactly_at_the_floor_is_kept() -> None:
     queue = normalise_pending([at_floor], floor=FLOOR, max_window=MAX_WINDOW)
 
     assert queue.kept == (at_floor,)
+    assert queue.moved == ()
     assert queue.truncated is False
+
+
+def test_a_window_exactly_as_long_as_the_limit_is_kept() -> None:
+    """Every backfill window but the oldest is exactly the limit: not "longer than" it."""
+    exact = pending(11, NOW - MAX_WINDOW, NOW, cursor="c-11")
+
+    queue = normalise_pending([exact], floor=FLOOR, max_window=MAX_WINDOW)
+
+    assert queue.kept == (exact,)
+    assert (queue.moved, queue.replaced, queue.truncated) == ((), (), False)
+
+
+def test_a_moved_window_exactly_as_long_as_the_limit_is_moved_not_re_split() -> None:
+    """After the move the window is exactly the limit, so it stays one row."""
+    moved = pending(12, FLOOR - timedelta(days=1), FLOOR + MAX_WINDOW, cursor="c-12")
+
+    queue = normalise_pending([moved], floor=FLOOR, max_window=MAX_WINDOW)
+
+    assert queue.moved == (MovedSince(original=moved, since=FLOOR),)
+    assert queue.replaced == ()
 
 
 def test_a_window_longer_than_the_limit_is_re_split_without_truncation() -> None:
@@ -685,6 +737,7 @@ def test_a_window_longer_than_the_limit_is_re_split_without_truncation() -> None
     queue = normalise_pending([long], floor=FLOOR, max_window=MAX_WINDOW)
 
     assert queue.kept == ()
+    assert queue.moved == ()
     assert queue.replaced == (
         Replacement(
             original=long,
@@ -698,10 +751,12 @@ def test_a_window_longer_than_the_limit_is_re_split_without_truncation() -> None
 
 
 def test_a_window_both_straddling_and_too_long_is_moved_then_split() -> None:
+    """A re-split is a replacement even when its `since` also moved: new rows, first pages."""
     both = pending(10, FLOOR - timedelta(days=5), FLOOR + timedelta(days=40))
 
     queue = normalise_pending([both], floor=FLOOR, max_window=MAX_WINDOW)
 
+    assert queue.moved == ()
     assert queue.replaced == (
         Replacement(
             original=both,
@@ -714,14 +769,16 @@ def test_a_window_both_straddling_and_too_long_is_moved_then_split() -> None:
     assert queue.truncated is True
 
 
-def test_a_mixed_queue_keeps_what_it_can_and_reports_truncation_once() -> None:
+def test_a_mixed_queue_sorts_every_window_into_exactly_one_outcome() -> None:
     fine = pending(1, NOW - timedelta(days=3), NOW)
     gone = pending(2, FLOOR - timedelta(days=9), FLOOR - timedelta(days=8))
     long = pending(3, NOW - timedelta(days=70), NOW - timedelta(days=3))
+    straddling = pending(4, FLOOR - timedelta(days=1), FLOOR + timedelta(days=1), cursor="c-4")
 
-    queue = normalise_pending([fine, gone, long], floor=FLOOR, max_window=MAX_WINDOW)
+    queue = normalise_pending([fine, gone, long, straddling], floor=FLOOR, max_window=MAX_WINDOW)
 
     assert queue.kept == (fine,)
+    assert queue.moved == (MovedSince(original=straddling, since=FLOOR),)
     assert {replacement.original for replacement in queue.replaced} == {gone, long}
     assert queue.truncated is True
 
@@ -729,7 +786,21 @@ def test_a_mixed_queue_keeps_what_it_can_and_reports_truncation_once() -> None:
 def test_an_empty_queue_is_nothing_to_do() -> None:
     queue = normalise_pending([], floor=FLOOR, max_window=MAX_WINDOW)
 
-    assert (queue.kept, queue.replaced, queue.truncated) == ((), (), False)
+    assert (queue.kept, queue.moved, queue.replaced, queue.truncated) == ((), (), (), False)
+
+
+@pytest.mark.parametrize(
+    ("kind", "survives"),
+    [
+        (CursorKind.TRADE_ID_BEFORE, True),
+        (CursorKind.TRADE_ID_AFTER, True),
+        (CursorKind.TIME, False),
+        (CursorKind.NONE, False),
+    ],
+)
+def test_only_a_trade_id_cursor_survives_a_moved_since(kind: CursorKind, survives: bool) -> None:
+    """A bound on ids means the same over a narrower range; a position in time does not."""
+    assert cursor_survives_a_moved_since(kind) is survives
 
 
 # --------------------------------------------------------------------------------------

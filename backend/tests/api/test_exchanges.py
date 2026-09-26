@@ -32,6 +32,7 @@ from portfolio.domain.exchanges import ExchangeKey
 from portfolio.main import create_app
 from portfolio.providers.exchanges.errors import ExchangeAuthError, ExchangeUnavailableError
 from portfolio.repositories.exchange_sync_runs import SyncTrigger
+from portfolio.services.exchanges import build_exchange_service
 from tests.auth.conftest import BASE_URL, JSON_HEADERS, sign_in
 from tests.exchange_sync_harness import (
     SimulatedVenue,
@@ -582,3 +583,31 @@ async def test_fills_stored_counts_each_accounts_own_fills(
         entries = await listed(client)
 
     assert (entries["bitget"]["fills_stored"], entries["bingx"]["fills_stored"]) == (9, 4)
+
+
+async def test_the_read_service_clamps_a_runs_limit_the_schema_did_not_check(
+    api_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`list_runs` holds `1..100` itself, for a caller that does not come through the router."""
+    del api_environment
+    async with (
+        application(monkeypatch, {}) as (app, _client),
+        app.state.db_sessionmaker() as session,
+    ):
+        for _ in range(101):
+            await session.execute(
+                text(
+                    "INSERT INTO exchange_sync_runs (trigger, status, started_at, "
+                    "accounts_total) VALUES ('scheduled', 'success', :at, 0)"
+                ),
+                {"at": sqlite_timestamp(datetime(2026, 9, 25, tzinfo=UTC))},
+            )
+        await session.commit()
+        service = build_exchange_service(session, configured=frozenset(), syncing=False)
+        too_many = await service.list_runs(limit=1000)
+        too_few = await service.list_runs(limit=0)
+        negative = await service.list_runs(limit=-5)
+
+    assert len(too_many) == 100
+    assert len(too_few) == 1
+    assert len(negative) == 1

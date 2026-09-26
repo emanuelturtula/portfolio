@@ -225,6 +225,9 @@ class SimulatedVenue:
         #: An awaitable run before each answer, after the call is recorded -- for a test
         #: that needs to look at the database from inside a provider call.
         self.on_call: Callable[[PageCall], Any] | None = None
+        #: A plain callable run at the start of every `candidate_symbols` call -- for a test
+        #: that needs to see what the database allows while discovery is in progress.
+        self.on_symbols: Callable[[], None] | None = None
 
     @property
     def capabilities(self) -> ExchangeCapabilities:
@@ -281,6 +284,8 @@ class SimulatedVenue:
 
     async def candidate_symbols(self) -> Sequence[str]:
         self.symbol_calls += 1
+        if self.on_symbols is not None:
+            self.on_symbols()
         failing = self.symbols_fault_times is None or self.symbol_calls <= self.symbols_fault_times
         if self.symbols_fault is not None and failing:
             raise self.symbols_fault
