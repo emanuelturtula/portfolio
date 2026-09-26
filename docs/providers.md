@@ -1482,14 +1482,32 @@ earlier -- judged against the recorded `requested_since`, because a floor that a
 step lifted above the declared edge must not be re-planned every run. Ranges are split into
 windows no longer than `max_query_window`, newest first, and **persisted before any fetch**.
 
+**A clock behind the plan pulls the plan back.** If `now < planned_until` -- a clock that once
+ran ahead, then was corrected -- nothing is planned, `planned_until` is pulled back to `now`
+(never below the floor), and `exchange_sync_clock_behind_plan` is logged. Keeping the future
+ceiling would plan no top until real time caught up, and every fill in between would fall in a
+range the plan claims to have read. A signed venue refuses every request made while the clock
+is ahead, so the pull-back loses nothing; an unsigned one that answered pays a re-read.
+
+**No network call inside an open write transaction.** SQLite has one write lock, held from a
+transaction's first write to its commit. Planning therefore computes the re-clamp and the plan
+first (both pure), then asks a `requires_symbol` venue for its symbols, and only then makes
+every planning write and commits once; a page is fetched before it is written. A write held
+open across a venue call and its rate-limit sleeps made a concurrent login or balance sync fail
+with "database is locked".
+
 **The pending queue is the checkpoint.** `exchange_sync_windows` holds only unfinished work:
 a window, an optional symbol, and the cursor of its next page. Each page is one transaction --
 insert the fills, then advance the cursor or delete the window -- so a crash loses at most the
 page in flight, and the re-read is deduplicated by the constraint. Windows are read newest
 first across the whole queue, sorted in Python. Before reading, the queue is re-clamped to the
-current retention floor: a window wholly below it is dropped, one partly below is shortened,
-and one longer than the venue's limit is re-split; a replaced window restarts from its first
-page rather than trusting a cursor across a changed range.
+current retention floor: a window wholly below it is dropped, one partly below has its
+`since` moved up in place, and one longer than the venue's limit is re-split. A re-split
+window restarts from its first page. **A window whose `since` only moved keeps its cursor
+when the cursor is a trade id** (`trade_id_before`, `trade_id_after`): a bound on ids means
+the same thing over a narrower range, and the rolling floor passes the oldest backfill window's
+`since` on every run, so restarting it would make an interrupted backfill re-read that window
+in full. A `time` cursor, or none, restarts.
 
 | Cursor kind | What the sync does |
 |---|---|
@@ -1513,7 +1531,7 @@ refuse any `UPDATE` or `DELETE` of a fill.
 | `ExchangeInsufficientScopeError` | `auth_failed` | `insufficient_scope` | stop, no retry |
 | `ExchangeAuthError` | `auth_failed` | `auth` | stop, no retry |
 | `ExchangeRateLimitedError` | `error` if exhausted | `rate_limited` | retry the same request up to `RATE_LIMIT_RETRIES` (3) times, waiting `Retry-After` or 2, 4, 8 s, rounded up to whole seconds; a wait over `MAX_RATE_LIMIT_WAIT_SECONDS` (60) is not waited |
-| `ExchangeRetentionWindowError` | `error` if the steps run out | `retention_window` | move the window's `since` a `RETENTION_STEP` (a day) later, drop pending windows wholly below it, raise `effective_since`; at most `MAX_RETENTION_STEPS` (3) per window per run, and the moved start is kept |
+| `ExchangeRetentionWindowError` | `error` if the steps run out | `retention_window` | first, once per window per run and spending no step, move the window's `since` to the retention edge computed from a fresh clock read, if that is later; otherwise, or when refused again, move it a `RETENTION_STEP` (a day) later, at most `MAX_RETENTION_STEPS` (3) per window per run. Either move drops pending windows wholly below the new `since`, keeps a trade-id cursor, and raises `effective_since` to where the held history now begins -- the new `since`, or the refused window's `until` when the move emptied it -- never past `planned_until`; the moved start is kept |
 | `ExchangeUnavailableError` | `error` | `unavailable` | stop; the transport already retried |
 | `ExchangeInvalidRequestError` | `error` | `invalid_request` | stop |
 | `ExchangeSchemaError`, a cursor cycle included | `error` | `schema` | stop |
@@ -1530,6 +1548,11 @@ the run becomes `ok`, with `last_synced_at`.
 exception's type name. Never a trade id, a cursor, a symbol or an amount. A stored `detail` is
 an exchange error's `str()` -- a fixed class summary, the status and a digits-only venue code
 -- a conflict's count, or a type name.
+
+**Why a fresh edge comes before a step.** Newest first means a long first backfill reaches its
+oldest window last, after the edge it was planned at has aged past what the venue keeps --
+five minutes of `RETENTION_MARGIN` is less than a large backfill takes. That refusal is elapsed
+time, not a short retention, and a whole day's step would discard history the venue still has.
 
 **Guesses, recorded as guesses.** `RETENTION_STEP` of a day and `MAX_RETENTION_STEPS` of
 three: the venue's real retention differing from its declared one is expected to be a matter

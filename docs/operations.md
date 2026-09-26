@@ -777,6 +777,24 @@ at most the page in flight and the next run resumes where the last one stopped. 
 read from where the previous plan ended, reaching five minutes back to catch a fill the
 venue recorded late.
 
+### The host clock must be synchronised
+
+The sync plans by the host's clock, and a signed venue checks it: Bitget refuses any request
+whose timestamp is more than 30 seconds from its own (venue code `40008`, reported as
+`unavailable`). Keep NTP on -- `timedatectl` should say `System clock synchronized: yes`.
+
+If the clock is wrong anyway:
+
+- **Ahead**: every request is refused while it is, so nothing is read. The run plans up to
+  the wrong time; once the clock is corrected, the next run notices the plan is ahead of the
+  clock (log event `exchange_sync_clock_behind_plan`), pulls it back, and the run after that
+  reads everything from there. No fill is lost, but nothing is imported until the clock is
+  right.
+- **Behind**: the venue refuses requests as well, beyond its 30-second window. Once corrected,
+  the sync re-reads from where the slow clock left the plan. That costs requests and inserts
+  nothing twice. Only a clock behind by more than the venue's retention (90 days at Bitget)
+  loses history, and `history_truncated` then says so.
+
 ### Reading the account list
 
 ```bash
@@ -792,8 +810,8 @@ the process has one, never what it is.
 | `status` | where the account stands; see below |
 | `syncing` | a sync is running now and covers this venue |
 | `requested_since` | what you asked for: `PORTFOLIO_EXCHANGE_HISTORY_START`, or 2009-01-03 when it is unset |
-| `effective_since` | where the history actually held begins |
-| `history_truncated` | `effective_since` is later than `requested_since`: the venue did not keep what you asked for, and fills before `effective_since` were not imported |
+| `effective_since` | the instant from which the history held is complete |
+| `history_truncated` | `effective_since` is later than `requested_since`: the venue did not keep everything you asked for, and **the history is complete from `effective_since`**. Some older fills may still be stored -- from before a long outage, or before the venue refused a window as too old -- but there is no promise about anything before it |
 | `last_synced_at` | when a run last finished the account with nothing left to read |
 | `fills_stored` | how many fills are stored for it |
 | `pending_windows` | how many windows of history are planned and not yet read. Non-zero after a failure or an interruption; the next run continues from them |
@@ -833,6 +851,12 @@ every fifteen minutes is how an address gets banned. **To recover:**
    The response carries the run and one entry per account. `status: "success"` on the
    account means it is `ok` again, and the timer picks it up from there.
 
+   **If the response says `"joined": true`**, your request attached to a scheduled or
+   startup run that was already in flight -- the one right after the container came up,
+   most likely -- and that run skipped the `auth_failed` account: its entry says `skipped`.
+   Wait for it to finish (`GET /api/exchanges` shows `syncing: false`), then send the POST
+   again. A run you start yourself is the one that retries the account.
+
 ### `error_kind`
 
 | Kind | Whose problem | What happens next |
@@ -840,7 +864,7 @@ every fifteen minutes is how an address gets banned. **To recover:**
 | `auth`, `insufficient_scope` | the key | the account becomes `auth_failed`; recover as above. `insufficient_scope` means the key was accepted but lacks read permission |
 | `rate_limited` | the venue throttled us | each request is retried three times, waiting what the venue asks or 2, 4, then 8 seconds. A wait over 60 seconds is not waited: the account fails for this run, and the next one asks again |
 | `unavailable` | the venue | the shared HTTP client already retried; the next run asks again |
-| `retention_window` | the venue keeps less than it declares | the sync moves the refused window a day later and asks again, up to three times per window per run. When those run out the account fails, **keeping the moved start**, so the next run continues from there; `effective_since` rises with it |
+| `retention_window` | the venue keeps less than it declares | first, once per window, the sync moves the refused window up to the retention edge as it stands now -- a long first backfill reaches its oldest window after that edge has moved on. If that does not help, it moves the window a day later and asks again, up to three times per window per run. When those run out the account fails, **keeping the moved start**, so the next run continues from there; `effective_since` rises with it |
 | `invalid_request`, `schema` | the venue changed what it accepts or answers, or our request is wrong | read `detail`; it names a field and a rule. A cursor that returned to one already visited is a `schema` error too |
 | `conflict` | see below | the account stops at that page until someone looks |
 | `internal` | ours | a bug. The container log has the traceback; `detail` is only the exception's type name |
@@ -877,8 +901,11 @@ none inserted.
 A run row is written before the first request to any venue, and a surviving `running` row is
 swept to `interrupted` at startup, at shutdown and at the start of every exchange run. An
 interrupted run loses nothing already committed: every page is its own transaction, and the
-next run resumes each window from its last committed cursor. **Do not run an exchange sync
-from a second process while the server is up**, for the reason section 11 gives.
+next run resumes each window from its last committed cursor -- at Bitget, whose cursor is a
+trade id, even when the retention edge has moved past the window's start in the meantime.
+(A venue whose cursor is a time or who has none re-reads such a window from its first page,
+which costs requests and inserts nothing twice.) **Do not run an exchange sync from a second
+process while the server is up**, for the reason section 11 gives.
 
 ## Troubleshooting
 
@@ -895,7 +922,8 @@ from a second process while the server is up**, for the reason section 11 gives.
 | Edited `secrets.env`, nothing changed | `env_file` is read at container creation — recreate, do not restart |
 | Container never becomes healthy after setting the Esplora URLs | One of them has no scheme, no host, or a scheme other than `http`/`https` — the startup log names which — section 8 |
 | Container refuses to start, log names `PORTFOLIO_EXCHANGE_HISTORY_START` | The date is after today's date in UTC — section 13 |
-| An exchange account stays `auth_failed` after fixing the key | Scheduled runs skip it: recreate the container, then trigger a sync by hand — section 13 |
+| An exchange account stays `auth_failed` after fixing the key | Scheduled runs skip it: recreate the container, then trigger a sync by hand, and again if the first POST says `"joined": true` — section 13 |
+| Exchange syncs fail `unavailable` with venue code `40008` | The host clock is off by more than 30 seconds — section 13, "The host clock must be synchronised" |
 | An exchange account fails with `conflict` on every run | A stored fill changed under the same id; it needs a person — section 13 |
 | A Bitcoin wallet reports "the address is on a different network" | `PORTFOLIO_BITCOIN_NETWORK` does not match the address — section 8 |
 | Bitcoin balances stop updating and the log shows 429 | The public index is throttling us. Lengthen nothing by hand; run your own Esplora — section 8 |
