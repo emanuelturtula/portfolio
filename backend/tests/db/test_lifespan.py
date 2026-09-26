@@ -248,18 +248,24 @@ def is_running(scheduler: IntervalScheduler) -> bool:
 
 
 async def until(condition: Callable[[], bool]) -> None:
-    """Yield to the loop until `condition` holds. Bounded by the caller's `wait_for`.
+    """Wait until `condition` holds, polling every 10 ms. Bounded by the caller's `wait_for`.
 
-    `asyncio.sleep(0)` is a bare checkpoint, not a pause: it hands control to the scheduler
-    task and takes it straight back, so this spins the loop rather than waiting on it. The
-    condition is set deep inside a lifespan's own task and has no event to hang an
+    **A real sleep, not `asyncio.sleep(0)`.** A bare checkpoint hands control to the scheduler
+    and takes it straight back, so the loop spins, and it spins against the one thread that
+    can make the condition true: what these tests wait for is written through `aiosqlite`,
+    whose work runs in a worker thread competing for the GIL. On a two-core CI runner under
+    coverage that starved the worker past the five-second bound twice, in two different tests
+    (#71, and `test_shutdown_drains_both_coordinators` on PR #78, where the exchange run the
+    spin was waiting on took 3.3 s). `tests/test_no_network.py` learned the same lesson first.
+
+    The condition is set deep inside a lifespan's own task and has no event to hang an
     `asyncio.Event` off without reaching into the application to plant one -- which would be
     a seam in production code that exists only for a test. `noqa: ASYNC110` for that reason;
     every caller wraps this in `asyncio.wait_for`, so a condition that never holds fails
     with a timeout rather than hanging the suite.
     """
     while not condition():  # noqa: ASYNC110
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
 
 
 async def test_the_http_client_is_closed_on_shutdown(

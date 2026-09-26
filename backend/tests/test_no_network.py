@@ -241,9 +241,10 @@ async def test_entering_the_lifespan_opens_no_socket(
 async def until(condition: Callable[[], bool]) -> None:
     """Yield to the loop until `condition` holds. Bounded by the caller's `wait_for`.
 
-    A real sleep rather than a bare checkpoint, unlike its namesake in `test_lifespan.py`:
-    what is being waited for here happens in the resolver's worker thread, and a loop that
-    only ever checkpoints would spin without giving that thread's result a chance to land.
+    A real sleep rather than a bare checkpoint, as its namesake in `test_lifespan.py` now
+    uses too: what is being waited for here happens in the resolver's worker thread, and a
+    loop that only ever checkpoints would spin without giving that thread's result a chance
+    to land.
     """
     while not condition():  # noqa: ASYNC110
         await asyncio.sleep(0.01)

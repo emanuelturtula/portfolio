@@ -101,9 +101,13 @@ def recent_fills(count: int = 9) -> list[Any]:
 
 
 async def until(condition: Callable[[], bool]) -> None:
-    """Yield to the loop until `condition` holds. Every caller bounds it with `wait_for`."""
+    """Wait until `condition` holds, polling every 10 ms. Every caller bounds it with `wait_for`.
+
+    A real sleep rather than a bare checkpoint, for the reason `tests/db/test_lifespan.py`'s
+    `until` gives: a spinning loop starves the `aiosqlite` worker thread it is waiting on.
+    """
     while not condition():  # noqa: ASYNC110
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
 
 
 def instant(value: str) -> datetime:
