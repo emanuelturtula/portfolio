@@ -16,6 +16,7 @@ from portfolio.config import (
     get_settings,
 )
 from portfolio.db.models import Session, User
+from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_TIME_COST
 from portfolio.main import create_app
 from portfolio.services.password_hasher import PasswordHasher
 from tests.auth.conftest import (
@@ -45,6 +46,9 @@ if TYPE_CHECKING:
 TIMING_RATIO_LOWER_BOUND: Final = 0.2
 TIMING_RATIO_UPPER_BOUND: Final = 5.0
 TIMING_SAMPLES: Final = 7
+
+# Fictional, and never a real host (rule 3). Plain HTTP because that is what is under test.
+PLAIN_HTTP_BASE_URL: Final = "http://testserver"
 
 
 def parse_set_cookie(header: str) -> SimpleCookie:
@@ -88,8 +92,8 @@ async def test_cookie_name_drops_the_host_prefix_when_insecure(
 
     The `__Host-` prefix is only valid on a `Secure` cookie. Sending `__Host-psid` without
     `Secure` produces a browser that drops the cookie without a word, so the name has to
-    degrade with the flag. `prod` refuses this configuration outright; it exists for a
-    developer on plain HTTP who is not on `localhost`.
+    degrade with the flag. `prod` accepts this configuration only on a plain `http://`
+    origin; anywhere else it exists for a developer on plain HTTP who is not on `localhost`.
     """
     apply_auth_environment(monkeypatch, tmp_path, secure_cookie=False)
     app = create_app()
@@ -107,6 +111,66 @@ async def test_cookie_name_drops_the_host_prefix_when_insecure(
     assert INSECURE_SESSION_COOKIE_NAME in cookie
     assert SECURE_SESSION_COOKIE_NAME not in cookie
     assert cookie[INSECURE_SESSION_COOKIE_NAME]["secure"] == ""
+
+
+async def test_a_plain_http_production_deployment_can_sign_in_and_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole cycle in `prod` on an `http://` origin: the cookie set is the cookie read.
+
+    The startup tests prove the configuration is *accepted*; this proves it *works*, which
+    is the point of allowing it. Three places name the cookie -- login sets it, the
+    middleware reads it, logout deletes it -- and each takes the name and the flag from
+    settings. A regression in any one is invisible to a test that only looks at the login
+    response, and shows up in production as "204, then straight back to the sign-in form".
+
+    `prod` is entered for real rather than imitated with `dev` settings, because it is the
+    environment that decides whether this configuration starts at all. It also enforces the
+    Argon2 floor, so the deliberately cheap parameters the suite normally runs at are
+    raised to it -- the cheapest values `prod` accepts, not the shipped ones.
+    """
+    apply_auth_environment(monkeypatch, tmp_path, secure_cookie=False)
+    monkeypatch.setenv("PORTFOLIO_ENVIRONMENT", "prod")
+    monkeypatch.setenv("PORTFOLIO_ALLOWED_ORIGIN", PLAIN_HTTP_BASE_URL)
+    monkeypatch.setenv("PORTFOLIO_ARGON2_TIME_COST", str(OWASP_MINIMUM_TIME_COST))
+    monkeypatch.setenv("PORTFOLIO_ARGON2_MEMORY_COST", str(OWASP_MINIMUM_MEMORY_COST))
+    get_settings.cache_clear()
+    headers = {"Origin": PLAIN_HTTP_BASE_URL, "Content-Type": "application/json"}
+
+    try:
+        app = create_app()
+        async with app.router.lifespan_context(app):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url=PLAIN_HTTP_BASE_URL) as client:
+                login = await client.post(
+                    LOGIN_PATH,
+                    json={"username": OWNER_USERNAME, "password": OWNER_PHRASE},
+                    headers=headers,
+                )
+                # The jar is a real one: it would refuse to send back a `Secure` cookie over
+                # `http://`, so this only passes because the cookie is not `Secure`.
+                signed_in = await client.get(SESSION_PATH)
+
+                logout = await client.post(LOGOUT_PATH, headers=headers)
+                signed_out = await client.get(SESSION_PATH)
+    finally:
+        get_settings.cache_clear()
+
+    assert login.status_code == 204
+    issued = parse_set_cookie(login.headers["set-cookie"])
+    assert INSECURE_SESSION_COOKIE_NAME in issued
+    assert issued[INSECURE_SESSION_COOKIE_NAME]["secure"] == ""
+
+    assert signed_in.status_code == 200
+    assert signed_in.json() == {"username": OWNER_USERNAME}
+
+    assert logout.status_code == 204
+    cleared = parse_set_cookie(logout.headers["set-cookie"])
+    assert INSECURE_SESSION_COOKIE_NAME in cleared
+    assert SECURE_SESSION_COOKIE_NAME not in cleared
+    assert cleared[INSECURE_SESSION_COOKIE_NAME]["secure"] == ""
+    assert signed_out.status_code == 401
 
 
 async def test_unknown_user_and_wrong_password_are_indistinguishable(

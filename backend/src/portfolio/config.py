@@ -432,8 +432,13 @@ class Settings(BaseSettings):
 
         * a bootstrap password that is blank or one of the well-known defaults creates a
           real account with a password an attacker already has;
-        * `prod` without a `Secure` cookie means the session cookie loses the `__Host-`
-          prefix, and with it the guarantee that no other host on the domain set it;
+        * `prod` on an `https://` origin without a `Secure` cookie means the session cookie
+          loses the `__Host-` prefix, and with it the guarantee that no other host on the
+          domain set it. A `http://` origin is exempt, and is the only one: a browser drops
+          a `Secure` cookie that arrives over plain HTTP from any host but `localhost`, so
+          there the flag does not protect the session, it makes sign-in impossible. Running
+          that way is a deliberate choice -- the password and the session travel in the
+          clear -- and takes two explicit variables, the origin and the flag, never one;
         * `prod` still carrying the development origin rejects every write with a 403
           while the health check stays green -- "login works, nothing else does", a
           symptom that does not name its cause;
@@ -518,10 +523,15 @@ class Settings(BaseSettings):
             if reason is not None:
                 message = f"PORTFOLIO_BOOTSTRAP_PASSWORD is not acceptable: {reason}"
                 raise ValueError(message)
-        if self.environment == "prod" and not self.session_cookie_secure:
+        if (
+            self.environment == "prod"
+            and not self.session_cookie_secure
+            and not self.allowed_origin.startswith("http://")
+        ):
             message = (
-                "PORTFOLIO_SESSION_COOKIE_SECURE cannot be false in production: the "
-                "session cookie would lose its __Host- prefix and travel over plain HTTP."
+                "PORTFOLIO_SESSION_COOKIE_SECURE cannot be false in production unless "
+                "PORTFOLIO_ALLOWED_ORIGIN is a plain http:// origin: the session cookie "
+                "would lose its __Host- prefix on a deployment that serves HTTPS."
             )
             raise ValueError(message)
         if self.environment == "prod" and self.allowed_origin == DEV_ALLOWED_ORIGIN:

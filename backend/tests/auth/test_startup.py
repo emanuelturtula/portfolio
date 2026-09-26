@@ -14,7 +14,12 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from portfolio.config import DEV_ALLOWED_ORIGIN, Settings, get_settings
+from portfolio.config import (
+    DEV_ALLOWED_ORIGIN,
+    INSECURE_SESSION_COOKIE_NAME,
+    Settings,
+    get_settings,
+)
 from portfolio.db.models import User
 from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_TIME_COST
 from portfolio.main import create_app
@@ -25,6 +30,7 @@ if TYPE_CHECKING:
 
 # Fictional, and never a real hostname: rule 3 keeps infrastructure out of the repository.
 PRODUCTION_ORIGIN = "https://portfolio.example"
+PLAIN_HTTP_ORIGIN = "http://portfolio.example:8083"
 
 
 def build_settings(monkeypatch: pytest.MonkeyPatch, value: str) -> Settings:
@@ -85,10 +91,11 @@ def test_no_bootstrap_password_is_a_valid_configuration(monkeypatch: pytest.Monk
 
 
 def test_prod_refuses_an_insecure_session_cookie() -> None:
-    """Criterion 5's interpretation: the one configuration that loses `__Host-` is refused.
+    """Criterion 5's interpretation: an HTTPS deployment cannot drop `Secure`.
 
-    Without `Secure` the prefix is invalid and the browser drops the cookie in silence, so
-    production would sign a user in and then fail every request with nothing in any log.
+    On an `https://` origin the flag costs nothing and the `__Host-` prefix guarantees no
+    other host on the domain set the cookie, so turning it off there is a mistake and is
+    refused. The one origin that is exempt is `http://`, below.
     """
     with pytest.raises(ValidationError, match="PORTFOLIO_SESSION_COOKIE_SECURE"):
         Settings(
@@ -96,6 +103,46 @@ def test_prod_refuses_an_insecure_session_cookie() -> None:
             session_cookie_secure=False,
             allowed_origin=PRODUCTION_ORIGIN,
         )
+
+
+def test_prod_accepts_an_insecure_session_cookie_on_a_plain_http_origin() -> None:
+    """A deployment reached over plain HTTP on the LAN has no working `Secure` cookie.
+
+    A browser drops a `Secure` cookie that arrives over `http://` from any host but
+    `localhost`, so the flag would make sign-in impossible rather than safe. The operator
+    who serves that way says so twice, in the origin and in the flag, and the cookie name
+    degrades with it because `__Host-` is invalid without `Secure`.
+    """
+    settings = Settings(
+        environment="prod",
+        session_cookie_secure=False,
+        allowed_origin=PLAIN_HTTP_ORIGIN,
+    )
+
+    assert settings.session_cookie_secure is False
+    assert settings.session_cookie_name == INSECURE_SESSION_COOKIE_NAME
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "ftp://portfolio.example",
+        "portfolio.example",
+        "",
+        # Forms a URL parser would read as `http` but that a browser never sends as an
+        # `Origin`, so they cannot be a working plain-HTTP deployment.
+        "HTTP://portfolio.example",
+        "http:portfolio.example",
+    ],
+)
+def test_prod_refuses_an_insecure_cookie_on_an_origin_that_is_not_http(origin: str) -> None:
+    """Only an origin that starts with the literal `http://` earns the exemption.
+
+    A scheme-less or mistyped origin can never equal what a browser sends, so it must not
+    be able to switch the cookie's protection off on the way to being wrong.
+    """
+    with pytest.raises(ValidationError, match="PORTFOLIO_SESSION_COOKIE_SECURE"):
+        Settings(environment="prod", session_cookie_secure=False, allowed_origin=origin)
 
 
 def test_prod_refuses_the_development_allowed_origin() -> None:

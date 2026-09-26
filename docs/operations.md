@@ -52,6 +52,36 @@ docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml up --force-rec
 A plain restart silently keeps the old values. That is already the last row of the
 troubleshooting table in `docs/deployment.md`, and it catches people here too.
 
+### Serving over plain HTTP on the local network
+
+The application is built to sit behind HTTPS, and its defaults assume it. If you would rather
+open it at the address the Raspberry Pi has on your own network, with no TLS in front, `prod`
+accepts that when you say so twice — in the origin and in the cookie flag:
+
+```
+PORTFOLIO_ALLOWED_ORIGIN=http://<host-address>:<port>
+PORTFOLIO_SESSION_COOKIE_SECURE=false
+```
+
+Both lines are required. A browser drops a `Secure` cookie that arrives over plain HTTP from
+any host but `localhost`, so with only the origin set, login returns `204` and the page stays
+on the sign-in form. The flag on its own is refused unless the origin starts with `http://`:
+on an `https://` origin `Secure` stays mandatory.
+
+**What this costs.** The password and the session cookie cross the network unencrypted, so
+anyone who can capture traffic on that network can sign in as you. That is a reasonable trade
+on a home network you control and not on a shared one, and the port must never be forwarded
+to the internet.
+
+A second cost is easy to miss. Without `Secure` the cookie is named `psid` rather than
+`__Host-psid`, and browsers do not isolate cookies by port (RFC 6265 §8.5): every other
+plain-HTTP service on the same address receives `psid` with each request and could log or
+overwrite it, with no network capture needed. On a host that also runs other web applications,
+that means trusting each of them with a live session token. Signing out deletes the session
+server-side, which limits what a leaked token is worth afterwards.
+
+Recreate the container after editing the file, exactly as above.
+
 ## 2. Creating the account without a bootstrap password
 
 If you would rather not put the password in a file at all, leave
@@ -172,7 +202,7 @@ rather than guessing which one you mean.
 
 | | |
 |---|---|
-| Cookie | `__Host-psid` — `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain` |
+| Cookie | `__Host-psid` — `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain`. Named `psid` and not `Secure` on a plain-HTTP deployment — section 1 |
 | Idle expiry | 7 days since the last request (`PORTFOLIO_SESSION_IDLE_DAYS`) |
 | Absolute expiry | 30 days since login, never extended (`PORTFOLIO_SESSION_ABSOLUTE_DAYS`) |
 | Stored as | a SHA-256 hash of the token, so a leaked database file yields no usable session |
@@ -913,7 +943,8 @@ process while the server is up**, for the reason section 11 gives.
 |---|---|
 | Container never becomes healthy after the auth deployment, deployment rolls back | `PORTFOLIO_ALLOWED_ORIGIN` not set in `secrets.env` — section 1 |
 | Container refuses to start, log names the bootstrap password | It is blank, under 12 characters, or a deny-listed default |
-| Login returns 204 but the app still shows the login page | The cookie was dropped. `__Host-` requires `Secure`, which requires HTTPS — check the origin is not plain HTTP on a non-`localhost` host |
+| Container refuses to start, log names `PORTFOLIO_SESSION_COOKIE_SECURE` | The flag is `false` but `PORTFOLIO_ALLOWED_ORIGIN` does not start with `http://` — section 1 |
+| Login returns 204 but the app still shows the login page | The cookie was dropped. `__Host-` requires `Secure`, which requires HTTPS. On a plain `http://` origin, also set `PORTFOLIO_SESSION_COOKIE_SECURE=false` — section 1 |
 | Reads work, every write returns 403 | `PORTFOLIO_ALLOWED_ORIGIN` does not match the address bar exactly |
 | `/api/docs` returns 401 in the browser | Working as intended — sign in first, section 6 |
 | Login returns 429 | Throttled — section 7 |
