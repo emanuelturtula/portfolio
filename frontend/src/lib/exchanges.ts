@@ -59,28 +59,39 @@ export const STATUS_LABELS: Record<AccountSyncStatus, string> = {
 };
 
 /**
- * The label for one account entry, in precedence order (spec R4 - review found the plain
+ * The label for one account entry, in precedence order. Spec R4 found the plain
  * `syncing`-overrides-everything rule wrong: a retried `auth_failed` venue must keep saying
  * so, not "Syncing", since a scheduled run *skips* it and only a manual one is actually
- * reading it):
+ * reading it. Spec R17 then refined *that*: when the retry is a manual one actually in
+ * flight, saying "Authentication failed" reads as if the fix did not work, when it is
+ * simply still being checked.
  *
  * 1. `!configured` - "Not configured".
- * 2. `status === 'auth_failed'` - "Authentication failed", **even while `syncing`**.
- * 3. `syncing` - "Syncing".
- * 4. `status === 'ok'` and `pending_windows > 0` - "Unfinished".
- * 5. otherwise - `STATUS_LABELS[status]`.
+ * 2. `status === 'auth_failed'`, `syncing`, and `manualRunInFlight` - "Retrying".
+ * 3. `status === 'auth_failed'` - "Authentication failed", **even while `syncing`**.
+ * 4. `syncing` - "Syncing".
+ * 5. `status === 'ok'` and `pending_windows > 0` - "Unfinished".
+ * 6. otherwise - `STATUS_LABELS[status]`.
+ *
+ * `manualRunInFlight` - whether the run log's newest run is `running` with `trigger:
+ * 'manual'` - comes from the run log, not from this page's own pending `POST`: a `POST`
+ * that *joined* a scheduled run is pending too, and that run skips the account rather than
+ * retrying it. Pass `false` while the run log is unknown, which falls back to rule 3.
  */
-export function statusLabel(e: {
-  readonly status: AccountSyncStatus;
-  readonly configured: boolean;
-  readonly syncing: boolean;
-  readonly pending_windows: number;
-}): string {
+export function statusLabel(
+  e: {
+    readonly status: AccountSyncStatus;
+    readonly configured: boolean;
+    readonly syncing: boolean;
+    readonly pending_windows: number;
+  },
+  manualRunInFlight: boolean,
+): string {
   if (!e.configured) {
     return 'Not configured';
   }
   if (e.status === 'auth_failed') {
-    return STATUS_LABELS.auth_failed;
+    return e.syncing && manualRunInFlight ? 'Retrying' : STATUS_LABELS.auth_failed;
   }
   if (e.syncing) {
     return 'Syncing';

@@ -196,13 +196,15 @@ export function formatHistoryStart(iso: string): string {
 
 /**
  * The same rounded-up instant {@link formatHistoryStart} names, in the browser's own local
- * time, with seconds - for the truncation banner's `title` (spec R13). A `title` built from
- * the *raw*, un-rounded `effective_since` could name a moment a whole second earlier than
- * the rounded-up text it annotates; sharing {@link roundedUpToSecond} is what rules that out.
+ * time, with seconds and its zone name - for the truncation banner's `title` (spec R13,
+ * `timeStyle: 'long'` added by R19). A `title` built from the *raw*, un-rounded
+ * `effective_since` could name a moment a whole second earlier than the rounded-up text it
+ * annotates; sharing {@link roundedUpToSecond} is what rules that out. Naming the zone is
+ * what tells the owner the tooltip is *not* the UTC instant the visible text already gives.
  */
 export function formatHistoryStartLocal(iso: string): string {
   return new Date(roundedUpToSecond(iso)).toLocaleString('en', {
     dateStyle: 'medium',
-    timeStyle: 'medium',
+    timeStyle: 'long',
   });
 }

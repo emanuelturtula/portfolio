@@ -1,7 +1,14 @@
 import { useEffect, useRef } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 
 import { describeApiError } from '@/api/client';
-import { useExchanges, useExchangeRuns, useSyncExchanges, type Exchange } from '@/api/exchanges';
+import {
+  exchangeRunsQueryKey,
+  useExchanges,
+  useExchangeRuns,
+  useSyncExchanges,
+  type Exchange,
+} from '@/api/exchanges';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
 import { Skeleton } from '@/components/Skeleton';
@@ -49,6 +56,7 @@ function isTruncated(exchange: Exchange): exchange is Exchange & { effective_sin
  * not become a lock", the mutation being pending never disables anything but its own button.
  */
 export function ExchangesPage() {
+  const queryClient = useQueryClient();
   const syncMutation = useSyncExchanges();
   const syncPending = syncMutation.isPending;
   const exchanges = useExchanges(syncPending);
@@ -57,14 +65,43 @@ export function ExchangesPage() {
   // deciding its poll rate from its own alone.
   const anySyncing = exchanges.data?.some((exchange) => exchange.syncing) ?? false;
   const runs = useExchangeRuns(syncPending, anySyncing);
+  const newestRun = runs.data?.[0];
+  /**
+   * Whether a manual sync is actually retrying `auth_failed` accounts right now (spec R17),
+   * from the run log rather than from `syncPending`: a `POST` that *joined* a scheduled run
+   * is pending too, and that run still skips them. `false` while the run log is unknown.
+   */
+  const manualRunInFlight = newestRun?.status === 'running' && newestRun.trigger === 'manual';
 
-  // What the run log showed at the moment Sync now was last pressed: the newest run's id,
-  // and whether that run was itself `running` then (meaning a click would join it rather
-  // than start a new one). Never actually read except while `syncMutation.isError` (below),
-  // and `handleSyncClick` always writes a fresh value before every `mutate()` - so there is
-  // no "not recorded yet" state worth a `null` for a fixture to (never) exercise. Its default
-  // is what a click before any run has ever loaded records: `runId: 0, wasRunning: false`.
-  const recordedRunRef = useRef<{ readonly runId: number; readonly wasRunning: boolean }>({
+  /**
+   * Spec R15: the list and the run log poll on independent 5 s phases, so when the list's
+   * poll lands first after a run ends, the run log can keep reading `running` for up to a
+   * minute at the slow rate before its own next poll - the accounts would say "Up to date"
+   * beside a "Running" run log entry. On the falling edge of `anySyncing` (true to false),
+   * the run log is invalidated once instead of waited out.
+   *
+   * Guarded on the run log's *own* newest run still reading `running`: when the two queries
+   * happen to be in phase and the run log already caught up in the same tick that flipped
+   * `anySyncing`, invalidating again would only fetch a second time for data already fresh.
+   */
+  const previousAnySyncingRef = useRef(anySyncing);
+  useEffect(() => {
+    if (previousAnySyncingRef.current && !anySyncing && newestRun?.status === 'running') {
+      void queryClient.invalidateQueries({ queryKey: exchangeRunsQueryKey });
+    }
+    previousAnySyncingRef.current = anySyncing;
+  }, [anySyncing, newestRun, queryClient]);
+
+  /**
+   * What the run log showed at the moment Sync now was last pressed: the newest run's id,
+   * and whether that run was itself `running` then (meaning a click would join it rather
+   * than start a new one). `runId` is `null` when the run log's own state was unknown at
+   * that moment - still loading, or its first load had already failed (spec R18) - which is
+   * also the one baseline the effect below never auto-clears from: otherwise a run log that
+   * later recovers showing some unrelated old run could be mistaken for evidence this
+   * request settled. Only a later click, once the run log is known, replaces it.
+   */
+  const recordedRunRef = useRef<{ readonly runId: number | null; readonly wasRunning: boolean }>({
     runId: 0,
     wasRunning: false,
   });
@@ -74,21 +111,35 @@ export function ExchangesPage() {
       return;
     }
     const recorded = recordedRunRef.current;
+    if (recorded.runId === null) {
+      return;
+    }
+    // Recomputed from `runs.data` (already a dependency) rather than closing over the
+    // render-scoped `newestRun` above, so this effect's own dependency list - spec R19 -
+    // can state exactly what it reads instead of a broader, always-fresh mutation object.
     const newest = runs.data?.[0];
     if (newest === undefined || newest.status === 'running') {
       // Not settled yet - the alert stays exactly as R9 says it should while no new run has
       // appeared: "the request never started one, and the alert stays."
       return;
     }
+    // Spec R18: a later *scheduled* run reaching a higher id is not evidence this request
+    // ever ran, so the id-greater branch also requires `trigger: 'manual'`. The equal-id
+    // branch needs no such check - it means this request joined the very run recorded as
+    // `running` at the click, whatever that run's own trigger was.
     const settled =
-      newest.run_id > recorded.runId || (newest.run_id === recorded.runId && recorded.wasRunning);
+      (newest.run_id > recorded.runId && newest.trigger === 'manual') ||
+      (newest.run_id === recorded.runId && recorded.wasRunning);
     if (settled) {
       // No need to reset `recordedRunRef` here: `reset()` clears `isError`, so the guard
       // above already short-circuits every later run of this effect until the next click
       // overwrites the ref with a fresh recording anyway.
       syncMutation.reset();
     }
-  }, [runs.data, syncMutation]);
+    // Spec R19: deps name exactly what this effect reads, not the whole `syncMutation` -
+    // a fresh object every render, and the broad dependency R19 exists to replace.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runs.data, syncMutation.isError, syncMutation.reset]);
 
   function handleSyncClick(): void {
     // Spec R10: a no-op while pending, not a native `disabled` button - `disabled` drops
@@ -97,10 +148,9 @@ export function ExchangesPage() {
     if (syncMutation.isPending) {
       return;
     }
-    const newest = runs.data?.[0];
     recordedRunRef.current = {
-      runId: newest?.run_id ?? 0,
-      wasRunning: newest?.status === 'running',
+      runId: runs.data === undefined ? null : (newestRun?.run_id ?? 0),
+      wasRunning: newestRun?.status === 'running',
     };
     syncMutation.mutate();
   }
@@ -175,7 +225,7 @@ export function ExchangesPage() {
         <TruncationBanner key={exchange.exchange_key} exchange={exchange} />
       ))}
 
-      <ExchangeList exchanges={data} />
+      <ExchangeList exchanges={data} manualRunInFlight={manualRunInFlight} />
 
       <section aria-labelledby="sync-history-heading">
         <h3 id="sync-history-heading">Sync history</h3>

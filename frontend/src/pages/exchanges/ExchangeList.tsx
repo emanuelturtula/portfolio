@@ -11,14 +11,27 @@ import { formatHistoryStart } from '@/lib/time';
 
 interface ExchangeRowProps {
   readonly exchange: Exchange;
+  /**
+   * Whether the run log's newest run is `running` with `trigger: 'manual'` - i.e. an owner
+   * really is retrying `auth_failed` accounts right now, as opposed to a scheduled or
+   * startup run merely skipping them (spec R17). Computed once by `ExchangesPage` from the
+   * run log, not from this page's own pending `POST`: a request that *joined* a scheduled
+   * run is pending too, and that run still skips the account.
+   */
+  readonly manualRunInFlight: boolean;
+}
+
+interface RemediationProps {
+  readonly exchange: Exchange;
 }
 
 /**
  * The ordered remediation steps for an `auth_failed` account (spec criterion 2), chosen by
  * `remediationFor`. Returns nothing for any other status - `remediationFor` already encodes
- * that this is the only status that needs the owner to act.
+ * that this is the only status that needs the owner to act. The caller hides this component
+ * entirely during a manual retry in flight (spec R17) - see `ExchangeRow`.
  */
-function Remediation({ exchange }: ExchangeRowProps) {
+function Remediation({ exchange }: RemediationProps) {
   const kind = remediationFor(exchange);
   if (kind === null) {
     return null;
@@ -106,23 +119,28 @@ function windowsPendingSentence(pendingWindows: number, authFailed: boolean): st
 /**
  * One venue's entry: its status, what it holds, and whichever of the spec's seven messages
  * apply, in order. Several can apply at once - a `syncing` `auth_failed` venue still shows
- * its error and its remediation, because until the run ends they are still true.
+ * its error, because it is still the last attempted outcome.
  *
  * `lastErrorKind` is computed once, rather than read through `exchange.last_error?.error_kind`
- * at each use: rule 5 (spec R6) needs the same narrowed value message 3 already establishes,
- * and reusing it is what keeps rule 5's `!== 'conflict'` check from being a second,
- * independently-null-checked read of a field the fixtures only ever leave null for the
- * statuses that never reach rule 5 in the first place.
+ * at each use: rules 5 and 6 (spec R6, R16) need the same narrowed value message 3 already
+ * establishes, and reusing it is what keeps their `!== 'conflict'` checks from being a
+ * second, independently-null-checked read of a field the fixtures only ever leave null for
+ * the statuses that never reach those rules in the first place.
+ *
+ * `isManualRetry` (spec R17) is the one case where `auth_failed` and `syncing` together mean
+ * something better than "Authentication failed" and its remediation: a manual run is
+ * actually retrying this venue right now, not merely leaving a scheduled run to skip it.
  */
-function ExchangeRow({ exchange }: ExchangeRowProps) {
+function ExchangeRow({ exchange, manualRunInFlight }: ExchangeRowProps) {
   const venue = EXCHANGES[exchange.exchange_key].name;
   const headingId = `exchange-heading-${exchange.exchange_key}`;
   const lastErrorKind = exchange.last_error === null ? null : exchange.last_error.error_kind;
+  const isManualRetry = exchange.status === 'auth_failed' && exchange.syncing && manualRunInFlight;
 
   return (
     <li aria-labelledby={headingId}>
       <h4 id={headingId}>{venue}</h4>
-      <p>{statusLabel(exchange)}</p>
+      <p>{statusLabel(exchange, manualRunInFlight)}</p>
 
       <ul>
         <li>
@@ -162,9 +180,15 @@ function ExchangeRow({ exchange }: ExchangeRowProps) {
 
       {exchange.syncing && (
         <p>
-          A sync is running.
-          {exchange.status === 'auth_failed' && (
-            <> Only a sync you start retries {venue}; a scheduled one skips it.</>
+          {isManualRetry ? (
+            <>This sync is retrying {venue}.</>
+          ) : (
+            <>
+              A sync is running.
+              {exchange.status === 'auth_failed' && (
+                <> Only a sync you start retries {venue}; a scheduled one skips it.</>
+              )}
+            </>
           )}
         </p>
       )}
@@ -176,16 +200,21 @@ function ExchangeRow({ exchange }: ExchangeRowProps) {
         </p>
       )}
 
-      <Remediation exchange={exchange} />
+      {!isManualRetry && <Remediation exchange={exchange} />}
 
       {exchange.status === 'error' &&
         exchange.configured &&
         !exchange.syncing &&
         lastErrorKind !== 'conflict' && <p>The next sync tries again.</p>}
 
-      {exchange.pending_windows > 0 && exchange.configured && !exchange.syncing && (
-        <p>{windowsPendingSentence(exchange.pending_windows, exchange.status === 'auth_failed')}</p>
-      )}
+      {exchange.pending_windows > 0 &&
+        exchange.configured &&
+        !exchange.syncing &&
+        lastErrorKind !== 'conflict' && (
+          <p>
+            {windowsPendingSentence(exchange.pending_windows, exchange.status === 'auth_failed')}
+          </p>
+        )}
 
       {exchange.status === 'never_synced' && exchange.configured && !exchange.syncing && (
         <p>No sync has finished for {venue} yet. Press Sync now to start one.</p>
@@ -196,16 +225,22 @@ function ExchangeRow({ exchange }: ExchangeRowProps) {
 
 interface ExchangeListProps {
   readonly exchanges: readonly Exchange[];
+  /** See `ExchangeRowProps.manualRunInFlight`; the same value for every row. */
+  readonly manualRunInFlight: boolean;
 }
 
 /** The Accounts section: one list item per venue, each labelled by its venue name. */
-export function ExchangeList({ exchanges }: ExchangeListProps) {
+export function ExchangeList({ exchanges, manualRunInFlight }: ExchangeListProps) {
   return (
     <section aria-labelledby="exchanges-accounts-heading">
       <h3 id="exchanges-accounts-heading">Accounts</h3>
       <ul className="exchange-list">
         {exchanges.map((exchange) => (
-          <ExchangeRow key={exchange.exchange_key} exchange={exchange} />
+          <ExchangeRow
+            key={exchange.exchange_key}
+            exchange={exchange}
+            manualRunInFlight={manualRunInFlight}
+          />
         ))}
       </ul>
     </section>
