@@ -73,10 +73,68 @@ table -- and this revision's downgrade drops both triggers first anyway.
 
 _TRIGGER_NAMES: Final = ("exchange_fills_no_delete", "exchange_fills_no_update")
 
+_SYNC_STATUS_CHECK: Final = "sync_status IN ('auth_failed', 'error', 'never_synced', 'ok')"
+
+
+def _exchange_accounts_before() -> sa.Table:
+    """`exchange_accounts` exactly as `0006_exchanges` created it: the batch's `copy_from`.
+
+    **Batch mode on SQLite rebuilds the table, and to rebuild it has to know it.** Without
+    `copy_from` it reflects the live table, which offline `--sql` mode cannot do -- there is no
+    connection -- and the generated script would not exist. Written out rather than reflected,
+    the rebuild also stops depending on what the reflection of a `CHECK` happens to recover:
+    every constraint the copy carries is named here, with its text.
+    """
+    return sa.Table(
+        "exchange_accounts",
+        sa.MetaData(),
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("user_id", sa.Integer(), nullable=False),
+        sa.Column("exchange_key", sa.Text(), nullable=False),
+        sa.Column("created_at", UtcDateTime(), nullable=False),
+        sa.CheckConstraint(
+            "exchange_key IN ('bingx', 'bitget')",
+            name="ck_exchange_accounts_exchange_key",
+        ),
+        sa.ForeignKeyConstraint(
+            ["user_id"],
+            ["users.id"],
+            name="fk_exchange_accounts_user_id_users",
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("id", name="pk_exchange_accounts"),
+        sa.UniqueConstraint(
+            "user_id",
+            "exchange_key",
+            name="uq_exchange_accounts_user_exchange",
+        ),
+    )
+
+
+def _exchange_accounts_after() -> sa.Table:
+    """`exchange_accounts` as this revision leaves it: the downgrade's `copy_from`."""
+    table = _exchange_accounts_before()
+    table.append_column(
+        sa.Column(
+            "sync_status",
+            sa.Text(),
+            server_default=sa.text("'never_synced'"),
+            nullable=False,
+        )
+    )
+    for name in ("requested_since", "effective_since", "planned_until", "last_synced_at"):
+        table.append_column(sa.Column(name, UtcDateTime(), nullable=True))
+    table.append_constraint(
+        sa.CheckConstraint(_SYNC_STATUS_CHECK, name="ck_exchange_accounts_sync_status")
+    )
+    return table
+
 
 def upgrade() -> None:
     """Add the sync state, the queue, the run log, and the append-only triggers."""
-    with op.batch_alter_table("exchange_accounts") as batch_op:
+    with op.batch_alter_table(
+        "exchange_accounts", copy_from=_exchange_accounts_before()
+    ) as batch_op:
         batch_op.add_column(
             sa.Column(
                 "sync_status",
@@ -94,7 +152,7 @@ def upgrade() -> None:
         batch_op.add_column(sa.Column("last_synced_at", UtcDateTime(), nullable=True))
         batch_op.create_check_constraint(
             op.f("ck_exchange_accounts_sync_status"),
-            "sync_status IN ('auth_failed', 'error', 'never_synced', 'ok')",
+            _SYNC_STATUS_CHECK,
         )
 
     op.create_table(
@@ -217,7 +275,9 @@ def downgrade() -> None:
         table_name="exchange_sync_windows",
     )
     op.drop_table("exchange_sync_windows")
-    with op.batch_alter_table("exchange_accounts") as batch_op:
+    with op.batch_alter_table(
+        "exchange_accounts", copy_from=_exchange_accounts_after()
+    ) as batch_op:
         batch_op.drop_constraint(op.f("ck_exchange_accounts_sync_status"), type_="check")
         batch_op.drop_column("last_synced_at")
         batch_op.drop_column("planned_until")
