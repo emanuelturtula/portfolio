@@ -1,7 +1,7 @@
 # 015 — Resumable windowed exchange sync with checkpoints and idempotent writes
 
 Issue: #15
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -555,3 +555,124 @@ Mutations the tester must see killed:
   second (the host limiter's default) is seconds for a personal account, but a bot trader's
   history is not. A manual click joins rather than piling up, and each page is durable, so a
   shutdown mid-backfill loses at most one page of work.
+
+## Departures agreed during implementation
+
+- **`plan_account` takes `max_window` and the recorded `requested_since`.** The plan is
+  persisted before any fetch, so it has to be split already. A bottom range is planned only
+  when the owner moved the history start earlier. The rule as written here, "the clamp
+  reaches below the floor", re-planned history the venue had just refused every run after a
+  retention step, because the step lifts the floor above the declared edge. tester-15 found
+  it.
+- **The hole rule.** When the clamp's edge is past `planned_until`, the account stalled for
+  longer than the venue keeps. The floor then moves to the edge. Otherwise
+  `[effective_since, planned_until)` would claim a complete history across a gap no request
+  can fill.
+- **Each account's outcome row is written in the same commit as its `sync_status`**, not all
+  at the end. That way `status` and `last_error` can never disagree, and an interrupted run
+  keeps the outcomes of the accounts that finished.
+- **A replaced window restarts from its first page**, with one exception added after review:
+  a window whose `since` alone moved forward keeps a trade-id cursor (see below).
+- **`candidate_symbols()` is called only when the plan has new windows.**
+- **The two coordinators are drained concurrently.** `deploy/compose.yml` gives the container
+  a 20-second `stop_grace_period`, and two 10-second drains back to back would spend all of it.
+- **`SyncCoordinator(runner, *, task_name, log_prefix)`.** The defaults keep the balance
+  instance's task name and log events unchanged.
+- **Repositories return frozen snapshots**, because a rollback expires ORM rows.
+  `insert_page` takes a `FillRecord` protocol, because repositories may not import providers.
+  Inserts are chunked below SQLite's bound-parameter cap.
+- **`accounts_total`** is rewritten when the run finishes: it is 0 when there is no owner or
+  more than one.
+- **`seconds_to_wait` counts attempts from 1**, so the default waits are 2, 4 and 8 s.
+- **`exchange_sync_plan.py` imports `providers.exchanges.base`** for `FillWindow` and the
+  clamp. Those are value types, and it calls no provider. It is on the write side of the
+  import contract.
+- **No index on `exchange_sync_run_accounts.exchange_account_id`.** The one read by account
+  walks the primary key backwards.
+- **The migration passes `copy_from` to `batch_alter_table`.** Without it, `alembic upgrade
+  --sql` cannot run offline.
+- **Recovering from `auth_failed` needs the container recreated, not restarted.** `env_file`
+  is read when the container is created.
+
+### After review
+
+The reviewer found no blocker, and four should-fix defects. All four are fixed and tested
+(`77cc991`):
+
+- **A clock that ran ahead once left a range claimed but never read.** The top window was
+  planned into the future and `planned_until` stored there. After the clock was corrected, no
+  top was planned until real time caught up, and then only from the stored value.
+  `plan_account` now pulls `planned_until` back to `max(now, effective_since)` whenever
+  `now` is behind it. A signed venue refuses every request made while the clock is ahead, so
+  nothing is read then. After the correction the next top covers everything from the
+  pulled-back ceiling. `docs/operations.md` now requires an NTP-synchronised host.
+- **A refusal caused only by elapsed time cost a whole day of history.** Newest first reads
+  the oldest window last. A default-configuration backfill longer than `RETENTION_MARGIN`
+  had that window refused, and the sync stepped a day. It now re-clamps first, once per
+  window per run and without spending a step, to an edge computed from a fresh clock read. A
+  whole-day step happens only if that does not help. The raised floor is
+  `min(new_since, refused window's until)`, still capped at `planned_until`. tester-15
+  found the under-claim this avoids.
+- **The oldest backfill window lost its cursor on every run.** The rolling floor always
+  passes its `since` by the next run, so criterion 1 did not hold for it. For a
+  `TRADE_ID_BEFORE` or `TRADE_ID_AFTER` venue, a window whose only change is `since` moving
+  forward now keeps its cursor. That applies both in `normalise_pending` and in the retention
+  step. A trade-id cursor bounds ids, not time. `TIME`, `NONE` and re-splits still restart.
+- **The SQLite write lock was held across `candidate_symbols()`** and its rate-limit sleeps. A
+  concurrent login or balance sync would then fail with "database is locked". Planning is
+  now read, normalise and plan (all pure), then the network call, then every write in one
+  commit. **No network call runs inside an open write transaction.**
+
+Accepted and not changed:
+
+- **A history start after today's date is refused at startup.** The refusal guards against a
+  typo that would import nothing forever. The cost is that a Pi booting with a stale clock
+  and a start of *today* refuses until NTP syncs.
+- **A declared retention that later grows is not backfilled** unless the owner moves the
+  history start. `history_truncated` still shows it.
+- **A persistent 429 can cost about twelve requests per page**: the transport's three
+  attempts times the sync's four. The multiplication predates this issue.
+
+## What the plan got wrong
+
+**Every defect was about time passing between two readings of the clock.** The spec reasoned
+about each rule at one instant, and there it was right:
+
+- The bottom-range rule was right under a rolling retention, and wrong one run after a
+  retention step had lifted the floor.
+- The pending-window normalisation was right at planning time, and a run later it discarded
+  the oldest window's cursor because the floor had moved.
+- The clamp was right when computed, and wrong by the end of a backfill longer than its
+  margin.
+- `planned_until` was right while the clock was right, and poisoned after the clock was
+  corrected.
+- The planning transaction was right as a unit of work, and it held a lock across however
+  long a network call took.
+
+**For every value the plan derives from the clock, ask what it means one run later, one
+backfill later, and after the clock is corrected.** For every transaction, ask what it waits
+on while it is open.
+
+A smaller one: the recovery procedure said "restart the container", and `env_file` is read
+at creation. backend-dev caught it by reading `deploy/compose.yml` rather than the spec.
+
+## Handed on
+
+- **#14 (BingX):**
+  - Whether it `requires_symbol`. If it does, windows are planned for the candidates known at
+    plan time, so a symbol first traded later is not re-read in windows already planned.
+    Decide whether that is enough.
+  - Whether its cursor survives a restart and a moved `since`. F3 keeps trade-id cursors only.
+  - Map its retention refusal to `ExchangeRetentionWindowError`, and its "timestamp expired"
+    code to anything but auth.
+- **#16 (the page):**
+  - `status`, `syncing`, and `history_truncated` with `effective_since` for the banner.
+  - `last_error.error_kind`: `auth` means fix the key, `insufficient_scope` means grant read
+    permission.
+  - A manual sync that answers `joined: true` may have skipped an `auth_failed` account, so
+    offer to sync again when the run ends.
+- **M4:** an adjustment model for a fill a venue corrects under the same id. Until then, a
+  `conflict` stops that account's sync at that page, loudly.
+- **The owner's first real sync** is the first measurement of `RETENTION_MARGIN` and
+  `RETENTION_STEP` against Bitget. `exchange_sync_retention_reclamped` and
+  `exchange_sync_retention_step` in the log are the evidence.
