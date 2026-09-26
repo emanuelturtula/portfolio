@@ -558,6 +558,73 @@ async def test_an_edge_that_aged_during_the_run_is_re_clamped_without_spending_a
     assert (await account_row(factory))["effective_since"] == sqlite_timestamp(fresh)
 
 
+async def test_a_fresh_edge_is_tried_once_per_window_then_the_step_takes_over(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """F2's re-clamp is once per window per run, even while the clock keeps moving.
+
+    The venue keeps a day and a half less than it declares, and a minute passes with every
+    request. The first refusal re-clamps to the fresh edge; that request is refused too, and
+    from then on the window is stepped a day at a time. Re-clamping on every refusal would
+    chase an edge that moves a minute per request and never reach the venue's real one.
+    """
+    harness = Harness(history_start=None)
+
+    def refuse_short_live_retention(
+        call_number: int, window: FillWindow, cursor: str | None
+    ) -> BaseException | None:
+        del call_number, cursor
+        if window.since < harness.clock.moment - timedelta(days=88, hours=12):
+            return ExchangeRetentionWindowError(status=400, venue_code="40704")
+        return None
+
+    async def a_minute_per_request(call: PageCall) -> None:
+        del call
+        harness.clock.advance(timedelta(minutes=1))
+
+    venue = SimulatedVenue(nine_fills(), fault=refuse_short_live_retention)
+    venue.on_call = a_minute_per_request
+
+    with capture_logs() as captured:
+        summary = await harness.run(factory, venue)
+
+    oldest_calls = [call for call in venue.calls if call.window.until == OLDEST_UNTIL]
+    events = [entry["event"] for entry in captured]
+    assert events.count("exchange_sync_retention_reclamped") == 1
+    assert events.count("exchange_sync_retention_step") == 2
+    assert len(oldest_calls) == 4, "planned edge, fresh edge, then two day steps"
+    assert summary.status is SyncRunStatus.SUCCESS
+
+
+async def test_a_window_planned_while_the_clock_ran_ahead_cannot_push_the_floor_past_the_ceiling(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The `planned_until` cap in F2: the one window whose end lies past the ceiling.
+
+    Run 1 happens with the clock a day ahead and plans `[09-25 00:00, 09-26 12:00)`; the
+    venue refuses it. With the clock corrected, run 2 pulls the ceiling back to 12:00 today
+    (F1) and reads that window -- and the venue refuses it as older than it keeps, so it is
+    stepped a day, to 09-26 00:00. The floor rises to where the held history begins, but
+    never past the ceiling: `[effective_since, planned_until)` must stay a range.
+    """
+    harness = Harness()
+    harness.clock.moment = T0 + timedelta(days=1)
+    await harness.run(factory, SimulatedVenue(fault=always(ExchangeUnavailableError(status=503))))
+    harness.clock.moment = T0
+    venue = SimulatedVenue(fault=refuse_older_than(T0 - timedelta(hours=1)))
+
+    summary = await harness.run(factory, venue)
+
+    assert [call.window.since for call in venue.calls] == [
+        MIDNIGHT,
+        MIDNIGHT + timedelta(days=1),
+    ]
+    account = await account_row(factory)
+    assert account["planned_until"] == sqlite_timestamp(T0)
+    assert account["effective_since"] == sqlite_timestamp(T0), "capped at the ceiling"
+    assert summary.status is SyncRunStatus.SUCCESS
+
+
 async def test_a_step_past_a_short_retention_never_raises_the_floor_past_the_ceiling(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -1693,6 +1760,42 @@ async def test_windows_that_aged_out_while_stalled_raise_the_floor(
     assert min(call.window.since for call in venue.calls) == new_edge
     truncated = [entry for entry in captured if entry["event"] == "exchange_sync_history_truncated"]
     assert [entry["windows_dropped"] for entry in truncated] == [1]
+
+
+async def test_a_window_re_split_for_a_smaller_limit_keeps_its_symbol(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A re-split replaces a row with new ones, and each must still name the symbol.
+
+    The first run plans seven-day windows for one symbol and reads none of them. The venue's
+    limit then shrinks to three days -- a provider change between deployments -- so every
+    pending window is re-split. A replacement without the symbol is a request the provider
+    refuses as the caller's mistake.
+    """
+    harness = Harness(history_start=date(2026, 9, 11))
+    await harness.run(
+        factory,
+        SimulatedVenue(
+            requires_symbol=True,
+            symbols=("BTCUSDT",),
+            fault=always(ExchangeUnavailableError(status=503)),
+        ),
+    )
+    assert {row["symbol"] for row in await window_rows(factory)} == {"BTCUSDT"}
+    venue = SimulatedVenue(
+        nine_fills(),
+        requires_symbol=True,
+        symbols=("BTCUSDT",),
+        max_query_window=timedelta(days=3),
+    )
+
+    summary = await harness.run(factory, venue)
+
+    assert summary.status is SyncRunStatus.SUCCESS
+    assert venue.calls, "the re-split windows were read"
+    assert {call.symbol for call in venue.calls} == {"BTCUSDT"}
+    assert all(call.window.duration <= timedelta(days=3) for call in venue.calls)
+    assert_each_once(await trade_ids(factory), ALL_NINE)
 
 
 async def test_a_window_reshaped_by_the_retention_floor_keeps_its_symbol(
