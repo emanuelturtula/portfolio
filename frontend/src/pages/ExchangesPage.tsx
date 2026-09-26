@@ -60,20 +60,20 @@ export function ExchangesPage() {
 
   // What the run log showed at the moment Sync now was last pressed: the newest run's id,
   // and whether that run was itself `running` then (meaning a click would join it rather
-  // than start a new one). `null` once the failed-POST alert this feeds has been cleared or
-  // there has been no failure to clear (spec R9).
-  const recordedRunRef = useRef<{ readonly runId: number; readonly wasRunning: boolean } | null>(
-    null,
-  );
+  // than start a new one). Never actually read except while `syncMutation.isError` (below),
+  // and `handleSyncClick` always writes a fresh value before every `mutate()` - so there is
+  // no "not recorded yet" state worth a `null` for a fixture to (never) exercise. Its default
+  // is what a click before any run has ever loaded records: `runId: 0, wasRunning: false`.
+  const recordedRunRef = useRef<{ readonly runId: number; readonly wasRunning: boolean }>({
+    runId: 0,
+    wasRunning: false,
+  });
 
   useEffect(() => {
     if (!syncMutation.isError) {
       return;
     }
     const recorded = recordedRunRef.current;
-    if (recorded === null) {
-      return;
-    }
     const newest = runs.data?.[0];
     if (newest === undefined || newest.status === 'running') {
       // Not settled yet - the alert stays exactly as R9 says it should while no new run has
@@ -83,7 +83,9 @@ export function ExchangesPage() {
     const settled =
       newest.run_id > recorded.runId || (newest.run_id === recorded.runId && recorded.wasRunning);
     if (settled) {
-      recordedRunRef.current = null;
+      // No need to reset `recordedRunRef` here: `reset()` clears `isError`, so the guard
+      // above already short-circuits every later run of this effect until the next click
+      // overwrites the ref with a fresh recording anyway.
       syncMutation.reset();
     }
   }, [runs.data, syncMutation]);
