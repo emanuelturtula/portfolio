@@ -95,65 +95,125 @@ const unconfiguredUnplanned = (): ExchangeResponse =>
     fills_stored: 0,
   });
 
+/** R17: the owner's own retry, in flight. */
+const RETRYING_LABEL = 'Retrying';
+
+/** Whether the run log's newest run is `running` with `trigger: 'manual'`. */
+type ManualRunInFlight = boolean;
+
 /**
- * Spec 016 R4, the label rule in precedence order, one row per case the
- * backend can write. Each row names the rule that must win.
+ * Spec 016 R4 and R17, the label rule in precedence order, one row per case
+ * the backend can write. Each row names the rule that must win, and whether
+ * the run log shows a manual run in flight. The two readings come from two
+ * polls, so a row may pair a list and a log that disagree for a moment.
  */
-const LABEL_CASES: readonly (readonly [string, () => ExchangeResponse, string])[] = [
+const LABEL_CASES: readonly (readonly [
+  string,
+  () => ExchangeResponse,
+  ManualRunInFlight,
+  string,
+])[] = [
   // 1. !configured wins over everything.
-  ['unconfigured ok', () => exchange({ configured: false }), NOT_CONFIGURED_LABEL],
+  ['unconfigured ok', () => exchange({ configured: false }), false, NOT_CONFIGURED_LABEL],
   [
     'unconfigured ok with windows pending',
     () => exchange({ configured: false, pending_windows: 4 }),
+    false,
     NOT_CONFIGURED_LABEL,
   ],
   [
     'unconfigured auth_failed',
     () => authFailedExchange('auth', { configured: false }),
+    false,
+    NOT_CONFIGURED_LABEL,
+  ],
+  [
+    'unconfigured auth_failed while a manual run retries the others',
+    () => authFailedExchange('auth', { configured: false }),
+    true,
     NOT_CONFIGURED_LABEL,
   ],
   [
     'unconfigured error',
     () => erroredExchange('unavailable', { configured: false }),
+    false,
     NOT_CONFIGURED_LABEL,
   ],
-  ['unconfigured never_synced', unconfiguredUnplanned, NOT_CONFIGURED_LABEL],
-  // 2. auth_failed, even while syncing.
-  ['auth_failed', () => authFailedExchange('auth'), 'Authentication failed'],
+  ['unconfigured never_synced', unconfiguredUnplanned, false, NOT_CONFIGURED_LABEL],
+  // 2. auth_failed, syncing, and a manual run in flight: the owner's retry.
   [
     'auth_failed while a manual retry is syncing',
     () => authFailedExchange('auth', { syncing: true }),
+    true,
+    RETRYING_LABEL,
+  ],
+  [
+    'auth_failed with insufficient scope while a manual retry is syncing',
+    () => authFailedExchange('insufficient_scope', { syncing: true }),
+    true,
+    RETRYING_LABEL,
+  ],
+  [
+    'auth_failed with no last error while a manual retry is syncing',
+    () => authFailedExchange(null, { syncing: true }),
+    true,
+    RETRYING_LABEL,
+  ],
+  // 3. auth_failed otherwise, even while syncing.
+  ['auth_failed', () => authFailedExchange('auth'), false, 'Authentication failed'],
+  [
+    'auth_failed while a scheduled or startup run is syncing',
+    () => authFailedExchange('auth', { syncing: true }),
+    false,
     'Authentication failed',
   ],
   [
-    'auth_failed with insufficient scope, syncing',
+    'auth_failed with insufficient scope while a scheduled run is syncing',
     () => authFailedExchange('insufficient_scope', { syncing: true }),
+    false,
+    'Authentication failed',
+  ],
+  [
+    'auth_failed, a manual run in the log, the list not yet syncing',
+    () => authFailedExchange('auth'),
+    true,
     'Authentication failed',
   ],
   [
     'auth_failed drained before mark_synced',
     () => drainedBeforeMarkSynced(authFailedExchange('auth')),
+    false,
     'Authentication failed',
   ],
-  // 3. syncing.
-  ['ok, syncing', () => exchange({ syncing: true }), SYNCING_LABEL],
+  // 4. syncing, whoever started the run.
+  ['ok, syncing', () => exchange({ syncing: true }), false, SYNCING_LABEL],
+  ['ok, syncing in a manual run', () => exchange({ syncing: true }), true, SYNCING_LABEL],
   [
     'ok with windows pending, syncing',
     () => exchange({ syncing: true, pending_windows: 3 }),
+    false,
     SYNCING_LABEL,
   ],
-  ['error, syncing', () => erroredExchange('unavailable', { syncing: true }), SYNCING_LABEL],
+  ['error, syncing', () => erroredExchange('unavailable', { syncing: true }), false, SYNCING_LABEL],
+  [
+    'error, syncing in a manual run',
+    () => erroredExchange('unavailable', { syncing: true }),
+    true,
+    SYNCING_LABEL,
+  ],
   [
     'never_synced with no row, syncing',
     () => unsyncedExchange('bitget', { syncing: true }),
+    false,
     SYNCING_LABEL,
   ],
-  // 4. ok with windows pending.
-  ['ok with windows pending', () => exchange({ pending_windows: 3 }), UNFINISHED_LABEL],
-  ['ok with one window pending', () => exchange({ pending_windows: 1 }), UNFINISHED_LABEL],
-  // 5. otherwise, the status.
-  ['ok', () => exchange(), 'Up to date'],
-  ['never_synced with no row', () => unsyncedExchange('bitget'), 'Never synced'],
+  // 5. ok with windows pending.
+  ['ok with windows pending', () => exchange({ pending_windows: 3 }), false, UNFINISHED_LABEL],
+  ['ok with one window pending', () => exchange({ pending_windows: 1 }), false, UNFINISHED_LABEL],
+  // 6. otherwise, the status.
+  ['ok', () => exchange(), false, 'Up to date'],
+  ['ok, a manual run in the log, the list not yet syncing', () => exchange(), true, 'Up to date'],
+  ['never_synced with no row', () => unsyncedExchange('bitget'), false, 'Never synced'],
   [
     'never_synced with windows pending',
     () =>
@@ -163,20 +223,25 @@ const LABEL_CASES: readonly (readonly [string, () => ExchangeResponse, string])[
         fills_stored: 40,
         pending_windows: 6,
       }),
+    false,
     'Never synced',
   ],
-  ['error with windows pending', () => erroredExchange('rate_limited'), 'Sync failed'],
+  ['error with windows pending', () => erroredExchange('rate_limited'), false, 'Sync failed'],
   [
     'error from our own defect, nothing pending',
     () => erroredExchange('internal', { pending_windows: 0 }),
+    false,
     'Sync failed',
   ],
 ];
 
 describe('statusLabel', () => {
-  it.each(LABEL_CASES)('labels %s as %j', (_name, build, expected) => {
-    expect(statusLabel(build())).toBe(expected);
-  });
+  it.each(LABEL_CASES)(
+    'labels %s (manual run in flight: %s) as %j',
+    (_name, build, manual, expected) => {
+      expect(statusLabel(build(), manual)).toBe(expected);
+    },
+  );
 
   it.each(ALL_ACCOUNT_STATUSES)('keeps the stored label of %s in STATUS_LABELS', (status) => {
     expect(STATUS_LABELS[status]).toBe(STATUS_LABEL_TABLE[status]);
@@ -190,10 +255,13 @@ describe('statusLabel', () => {
       SYNCING_LABEL,
       NOT_CONFIGURED_LABEL,
       UNFINISHED_LABEL,
+      RETRYING_LABEL,
     ];
 
     expect(new Set(labels).size).toBe(labels.length);
-    expect(new Set(LABEL_CASES.map(([, build]) => statusLabel(build()))).size).toBe(7);
+    expect(new Set(LABEL_CASES.map(([, build, manual]) => statusLabel(build(), manual))).size).toBe(
+      8,
+    );
   });
 });
 

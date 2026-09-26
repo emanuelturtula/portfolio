@@ -3,7 +3,7 @@ import userEvent, { type UserEvent } from '@testing-library/user-event';
 import { http, HttpResponse, type HttpHandler } from 'msw';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { FAST_POLL_MS, SLOW_POLL_MS } from '@/api/exchanges';
+import { EXCHANGE_RUNS_LIMIT, FAST_POLL_MS, SLOW_POLL_MS } from '@/api/exchanges';
 import { OUTCOME_LABELS, UNKNOWN_ACCOUNT_FAILURE_MESSAGE } from '@/lib/exchanges';
 import {
   accountFailed,
@@ -41,6 +41,7 @@ import {
   type ExchangeSyncRunResponse,
 } from '@/test/exchangeFixtures';
 import {
+  EXCHANGE_RUNS_PATH,
   EXCHANGE_SYNC_PATH,
   EXCHANGES_PATH,
   fakeExchanges,
@@ -95,6 +96,9 @@ const notConfiguredLine = (venue: string): string =>
 const SYNC_RUNNING_LINE = 'A sync is running.';
 const authFailedSyncingLine = (venue: string): string =>
   `Only a sync you start retries ${venue}; a scheduled one skips it.`;
+/** R17: the owner's own retry, read from the run log. */
+const RETRYING_LABEL = 'Retrying';
+const retryingLine = (venue: string): string => `This sync is retrying ${venue}.`;
 /** R6: rule 5 names no timer. */
 const RETRIES_LINE = 'The next sync tries again.';
 const windowsPendingLine = (count: number): string =>
@@ -502,8 +506,11 @@ describe('ExchangesPage: statuses', () => {
     expect(item).not.toHaveTextContent(/null/);
   });
 
-  it('a conflict is not promised a retry: its own sentence says the sync stops there', async () => {
-    // R6. The next sync meets the same fill and stops at the same page.
+  it('a conflict is promised neither a retry nor a continuation: its own sentence says it stops', async () => {
+    // R6 and R16. The insert raises before the window advances, so the window
+    // stays queued, and the next sync meets the same fill at the same page.
+    // "The next sync continues from them" after "The sync stops at that page
+    // until someone looks" would contradict it.
     openExchanges({ exchanges: [erroredExchange('conflict')], runs: [] });
 
     const item = await venue('Bitget');
@@ -511,16 +518,34 @@ describe('ExchangesPage: statuses', () => {
     expect(item).toHaveTextContent('Sync failed');
     expect(item).toHaveTextContent(SENTENCES.bitgetConflict);
     expect(item).not.toHaveTextContent(RETRIES_LINE);
+    expect(item).not.toHaveTextContent(windowsPendingLine(2));
+    expect(item).not.toHaveTextContent(/continues from/);
+    // The queue is still a fact, and the history is still not complete.
+    expectFact(item, FACT.windows, '2');
+    expect(item).toHaveTextContent(PENDING_QUALIFIER);
+  });
+
+  it('a conflict with one window pending gets no continuation either', async () => {
+    openExchanges({
+      exchanges: [erroredExchange('conflict', { pending_windows: 1 })],
+      runs: [],
+    });
+
+    const item = await venue('Bitget');
+
+    expect(item).not.toHaveTextContent(windowsPendingLine(1));
+    expect(item).not.toHaveTextContent(/continues from/);
   });
 
   it.each(NON_AUTH_ERROR_KINDS.filter((kind) => kind !== 'conflict'))(
-    'an error venue that failed with %s is told the next sync tries again',
+    'an error venue that failed with %s is told the next sync tries again and continues',
     async (kind) => {
       openExchanges({ exchanges: [erroredExchange(kind)], runs: [] });
 
       const item = await venue('Bitget');
 
       expect(item).toHaveTextContent(RETRIES_LINE);
+      expect(item).toHaveTextContent(windowsPendingLine(2));
     },
   );
 
@@ -571,6 +596,158 @@ describe('ExchangesPage: statuses', () => {
     // In the spec's order: the running line, then the error, then the remediation.
     expectOrder(item, SYNC_RUNNING_LINE, SENTENCES.bitgetAuth);
     expectOrder(item, SENTENCES.bitgetAuth, keySteps('Bitget')[0] ?? '');
+  });
+
+  it.each(['auth', 'insufficient_scope'] as const)(
+    "the owner's own retry of a %s failure reads as a retry",
+    async (kind) => {
+      // R17. A manual run retries an auth_failed account, and a first
+      // backfill after a fixed key takes minutes: "Authentication failed"
+      // and the steps would say the fix did not work while it is working.
+      openExchanges({
+        exchanges: [authFailedExchange(kind, { syncing: true })],
+        runs: [runningExchangeRun({ trigger: 'manual', accounts_total: 1 })],
+      });
+
+      const item = await venue('Bitget');
+      await runTable();
+
+      await waitFor(() => {
+        expect(item).toHaveTextContent(RETRYING_LABEL);
+      });
+      expect(item).not.toHaveTextContent('Authentication failed');
+      expect(item).toHaveTextContent(retryingLine('Bitget'));
+      expect(item).not.toHaveTextContent(SYNC_RUNNING_LINE);
+      expect(item).not.toHaveTextContent(/only a sync you start/i);
+      // The steps are hidden while the fix is being tried.
+      expect(item.querySelector('ol')).toBeNull();
+      expect(item).not.toHaveTextContent(/secrets\.env/);
+      // The last error is still the latest attempted outcome.
+      expect(item).toHaveTextContent(
+        kind === 'auth' ? SENTENCES.bitgetAuth : SENTENCES.bitgetScope,
+      );
+      expect(item).toHaveTextContent(`Detail: ${DETAILS[kind]}`);
+      expectOrder(item, retryingLine('Bitget'), `Detail: ${DETAILS[kind]}`);
+    },
+  );
+
+  it.each(['scheduled', 'startup'] as const)(
+    'a %s run in flight past a refused key keeps "Authentication failed" and the steps',
+    async (trigger) => {
+      // R17. Those runs skip the account; nothing is retrying it.
+      openExchanges({
+        exchanges: [authFailedExchange('auth', { syncing: true })],
+        runs: [runningExchangeRun({ trigger, accounts_total: 1 })],
+      });
+
+      const item = await venue('Bitget');
+      await runTable();
+      await settle();
+
+      expect(item).toHaveTextContent('Authentication failed');
+      expect(item).not.toHaveTextContent(RETRYING_LABEL);
+      expect(item).not.toHaveTextContent(retryingLine('Bitget'));
+      expect(item).toHaveTextContent(`${SYNC_RUNNING_LINE} ${authFailedSyncingLine('Bitget')}`);
+      expect(remediationSteps(item)).toHaveLength(4);
+    },
+  );
+
+  it('a settled manual run is not a retry in flight', async () => {
+    // Between the two polls a scheduled run can start after the log was read:
+    // the list says syncing, and the newest run the page knows is settled.
+    openExchanges({
+      exchanges: [authFailedExchange('auth', { syncing: true })],
+      runs: [
+        finishedRun({ run_id: 7, trigger: 'manual', accounts: [accountFailed('bitget', 'auth')] }),
+      ],
+    });
+
+    const item = await venue('Bitget');
+    await runTable();
+    await settle();
+
+    expect(item).toHaveTextContent('Authentication failed');
+    expect(item).not.toHaveTextContent(retryingLine('Bitget'));
+    expect(remediationSteps(item)).toHaveLength(4);
+  });
+
+  it('a manual run in flight is not a retry of a venue that is not syncing', async () => {
+    // An unconfigured venue is in no run, whatever the log says.
+    openExchanges({
+      exchanges: [
+        exchange({ exchange_key: 'bingx', syncing: true }),
+        authFailedExchange('auth', { configured: false }),
+      ],
+      runs: [runningExchangeRun({ trigger: 'manual', accounts_total: 1 })],
+    });
+
+    const item = await venue('Bitget');
+    await runTable();
+    await settle();
+
+    expect(item).toHaveTextContent('Not configured');
+    expect(item).not.toHaveTextContent(retryingLine('Bitget'));
+    expect(remediationSteps(item)).toHaveLength(4);
+  });
+
+  it('with the run log still loading, a syncing refused key reads "Authentication failed"', async () => {
+    // R17: unknown falls back to the refusal, which is the safe reading.
+    const { fake } = openExchanges({
+      exchanges: [authFailedExchange('auth', { syncing: true })],
+      runs: [runningExchangeRun({ trigger: 'manual', accounts_total: 1 })],
+    });
+    const release = fake.hold('runs');
+
+    const item = await venue('Bitget');
+    await settle();
+
+    expect(item).toHaveTextContent('Authentication failed');
+    expect(item).not.toHaveTextContent(RETRYING_LABEL);
+    expect(remediationSteps(item)).toHaveLength(4);
+
+    // Once the log arrives and shows a manual run in flight, it is a retry.
+    release();
+    await waitFor(() => {
+      expect(item).toHaveTextContent(RETRYING_LABEL);
+    });
+  });
+
+  it('with the run log failed, a syncing refused key reads "Authentication failed"', async () => {
+    const { fake } = openExchanges({
+      exchanges: [authFailedExchange('auth', { syncing: true })],
+      runs: [runningExchangeRun({ trigger: 'manual', accounts_total: 1 })],
+    });
+    fake.fail('runs', () => problem(503, 'Service Unavailable', 'The database is restarting.'));
+
+    const item = await venue('Bitget');
+    await within(await historySection()).findByRole('alert');
+
+    expect(item).toHaveTextContent('Authentication failed');
+    expect(item).not.toHaveTextContent(RETRYING_LABEL);
+    expect(remediationSteps(item)).toHaveLength(4);
+  });
+
+  it("this page's own pending request that joined a scheduled run is not a retry", async () => {
+    // R17: the retry is read from the run log, not from this page's POST. A
+    // POST that joined a scheduled run is pending too, and that run skips the
+    // account.
+    const { user, fake } = openExchanges({
+      exchanges: [authFailedExchange('auth', { syncing: true })],
+      runs: [runningExchangeRun({ trigger: 'scheduled', accounts_total: 1 })],
+    });
+    const item = await venue('Bitget');
+    await runTable();
+    const release = fake.hold('sync');
+
+    await user.click(syncButton());
+    await screen.findByText(PENDING_LINE);
+    await settle();
+
+    expect(item).toHaveTextContent('Authentication failed');
+    expect(item).not.toHaveTextContent(RETRYING_LABEL);
+    expect(remediationSteps(item)).toHaveLength(4);
+
+    release();
   });
 
   it('a syncing venue with no row yet does not say no sync has finished', async () => {
@@ -1598,7 +1775,7 @@ describe('ExchangesPage: Sync now', () => {
  */
 
 describe('ExchangesPage: a failed sync request and the run log', () => {
-  it('the failure alert clears once a newer settled run appears', async () => {
+  it('the failure alert clears once a newer settled manual run appears', async () => {
     fakeIntervals();
     // At the click the page's run log shows run 7, settled.
     const { user, fake } = openExchanges({
@@ -1708,10 +1885,11 @@ describe('ExchangesPage: a failed sync request and the run log', () => {
   });
 
   it('a first run ever, settled after a failed request, clears the alert', async () => {
-    // Nothing in the log at the click is recorded as run 0, so run 1 is newer.
+    // A log known to be empty at the click is recorded as run 0, so run 1 is newer.
     fakeIntervals();
     const { user, fake } = openExchanges({ exchanges: [exchange()], runs: [] });
     await venue('Bitget');
+    await within(await historySection()).findByText(NO_RUNS_LINE);
     fake.fail('sync', () => HttpResponse.error());
     fake.setRuns([finishedRun({ run_id: 1, trigger: 'manual', started_at: NOW })]);
 
@@ -1723,6 +1901,129 @@ describe('ExchangesPage: a failed sync request and the run log', () => {
     await settle();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(bodyRows(await runTable())).toHaveLength(1);
+  });
+});
+
+describe('ExchangesPage: a failed sync request and an unknown or unrelated run', () => {
+  /** The sync request's own alert, told apart from the run log's notice. */
+  function syncAlert(): HTMLElement | undefined {
+    return screen
+      .queryAllByRole('alert')
+      .find((alert) => alert.textContent.includes(FAILURE_PREFIX));
+  }
+
+  it('an alert raised while the run log had failed stays when the log recovers on an old run', async () => {
+    // R18. With the log unknown at the click, run 41 could be the run this
+    // request started or one from last week. A baseline of 0 would read it as
+    // new and clear the alert; the alert must stay.
+    fakeIntervals();
+    const { user, fake } = openExchanges({
+      exchanges: [exchange()],
+      runs: [finishedRun({ run_id: 41, trigger: 'manual' })],
+    });
+    fake.fail('runs', () => problem(503, 'Service Unavailable', 'The database is restarting.'));
+    await venue('Bitget');
+    await within(await historySection()).findByRole('alert');
+    fake.fail('sync', () => HttpResponse.error());
+    // The log is back, but the page has not read it again before the click.
+    fake.fail('runs', null);
+
+    await user.click(syncButton());
+
+    await waitFor(() => {
+      expect(syncAlert()).toBeDefined();
+    });
+    // The settle's re-read recovers the log, showing run 41.
+    expect(bodyRows(await runTable())).toHaveLength(1);
+    await advance(SLOW_POLL_MS);
+
+    expect(syncAlert()).toHaveTextContent(`${FAILURE_PREFIX} ${NO_ANSWER}`);
+  });
+
+  it('an alert raised while the run log was still loading stays when it arrives on an old run', async () => {
+    fakeIntervals();
+    const { user, fake } = openExchanges({
+      exchanges: [exchange()],
+      runs: [finishedRun({ run_id: 41, trigger: 'manual' })],
+    });
+    const releaseRuns = fake.hold('runs');
+    await venue('Bitget');
+    fake.fail('sync', () => HttpResponse.error());
+
+    // The run log has not answered at the click: its data is unknown.
+    await user.click(syncButton());
+    await waitFor(() => {
+      expect(fake.count('sync')).toBe(1);
+    });
+    // `onSettled` returns the invalidation, which TanStack awaits: the failed
+    // request stays pending until the re-read it triggered lands. So the log
+    // answers - showing old run 41 - before the alert can show.
+    releaseRuns();
+
+    await waitFor(() => {
+      expect(syncAlert()).toBeDefined();
+    });
+    expect(bodyRows(await runTable())).toHaveLength(1);
+    await advance(SLOW_POLL_MS);
+
+    expect(syncAlert()).toHaveTextContent(FAILURE_PREFIX);
+  });
+
+  it.each(['scheduled', 'startup'] as const)(
+    'a later %s run with a greater id does not clear the alert',
+    async (trigger) => {
+      // R18. The scheduler running is not evidence that this request ran.
+      fakeIntervals();
+      const { user, fake } = openExchanges({
+        exchanges: [exchange()],
+        runs: [finishedRun({ run_id: 7 })],
+      });
+      await venue('Bitget');
+      await runTable();
+      fake.fail('sync', () => HttpResponse.error());
+      fake.setRuns([
+        finishedRun({ run_id: 8, trigger, started_at: NOW }),
+        finishedRun({ run_id: 7 }),
+      ]);
+
+      await user.click(syncButton());
+
+      await waitFor(() => {
+        expect(syncAlert()).toBeDefined();
+      });
+      const table = await runTable();
+      await waitFor(() => {
+        expect(bodyRows(table)).toHaveLength(2);
+      });
+      await advance(SLOW_POLL_MS);
+
+      expect(syncAlert()).toHaveTextContent(FAILURE_PREFIX);
+    },
+  );
+
+  it('a later manual run with a greater id does clear the alert', async () => {
+    fakeIntervals();
+    const { user, fake } = openExchanges({
+      exchanges: [exchange()],
+      runs: [finishedRun({ run_id: 7 })],
+    });
+    await venue('Bitget');
+    await runTable();
+    fake.fail('sync', () => HttpResponse.error());
+    fake.setRuns([
+      finishedRun({ run_id: 8, trigger: 'manual', started_at: NOW }),
+      finishedRun({ run_id: 7 }),
+    ]);
+
+    await user.click(syncButton());
+
+    await waitFor(() => {
+      expect(fake.count('sync')).toBe(1);
+    });
+    await waitFor(() => {
+      expect(syncAlert()).toBeUndefined();
+    });
+    expect(bodyRows(await runTable())).toHaveLength(2);
   });
 });
 
@@ -2065,9 +2366,21 @@ describe('ExchangesPage: truncation banner', () => {
     const instant = timeIn(banner('Bitget'));
 
     expect(instant).toHaveTextContent('Jun 27, 2026, 12:06:00 PM UTC');
+    // R19: with the zone, so a local time is never mistaken for UTC.
     expect((instant.getAttribute('title') ?? '').replace(/\s+/g, ' ')).toBe(
-      'Jun 27, 2026, 8:06:00 AM',
+      'Jun 27, 2026, 8:06:00 AM EDT',
     );
+  });
+
+  it("the banner's title names whichever zone the machine is in", async () => {
+    inTimeZone('Asia/Tokyo');
+    openExchanges({ exchanges: [truncatedExchange()], runs: [] });
+    await venue('Bitget');
+
+    const title = (timeIn(banner('Bitget')).getAttribute('title') ?? '').replace(/\s+/g, ' ');
+
+    expect(title).toBe('Jun 27, 2026, 9:05:37 PM GMT+9');
+    expect(title).toMatch(/ (GMT[+-]\d+|[A-Z]{2,5})$/);
   });
 
   it('the banner says the import has not finished while windows are pending', async () => {
@@ -2429,6 +2742,111 @@ describe('ExchangesPage: polling', () => {
 
     await advance(FAST_POLL_MS);
     expect(fake.count('runs')).toBe(reads + 1);
+  });
+
+  it('the run log is refetched at once when the list sees the run end first', async () => {
+    // R15. The two queries poll on their own phases. Here the run log is read
+    // while the run is still going and its answer is held back; the run then
+    // closes, and the list, read after that, lands first saying nothing is
+    // syncing. Without a refetch on that falling edge, the stale "running"
+    // answer lands, the log drops to one poll a minute, and it shows
+    // "Running" beside "Up to date" for up to a minute.
+    fakeIntervals();
+    const { fake } = openExchanges({
+      exchanges: [exchange({ syncing: true })],
+      runs: [runningExchangeRun({ run_id: 8, accounts_total: 1 }), finishedRun({ run_id: 7 })],
+    });
+    const item = await venue('Bitget');
+    const table = await runTable();
+    await settle();
+    const newest = (): string => {
+      const [row] = bodyRows(table);
+      return row === undefined ? '' : text(cell(row, 'Status'));
+    };
+    expect(newest()).toBe('Running');
+
+    // The next run-log read snapshots the log as it is at arrival, and waits.
+    let releaseRunsRead: () => void = () => undefined;
+    const runsGate = new Promise<void>((resolve) => {
+      releaseRunsRead = resolve;
+    });
+    // The next list read waits too, and answers with the state at release.
+    let releaseListRead: () => void = () => undefined;
+    const listGate = new Promise<void>((resolve) => {
+      releaseListRead = resolve;
+    });
+    let heldReads = 0;
+    server.use(
+      http.get(
+        EXCHANGE_RUNS_PATH,
+        async () => {
+          heldReads += 1;
+          const snapshot = { runs: fake.runs().slice(0, EXCHANGE_RUNS_LIMIT) };
+          await runsGate;
+          return HttpResponse.json(snapshot);
+        },
+        { once: true },
+      ),
+      http.get(
+        EXCHANGES_PATH,
+        async () => {
+          heldReads += 1;
+          await listGate;
+          return HttpResponse.json({ exchanges: fake.exchanges() });
+        },
+        { once: true },
+      ),
+    );
+
+    // Both polls fire at once: the run log is read while the run is going.
+    await advance(FAST_POLL_MS);
+    expect(heldReads).toBe(2);
+
+    // The run closes.
+    fake.setRuns([
+      finishedRun({ run_id: 8, started_at: EXCHANGE_RUNNING_STARTED_AT }),
+      finishedRun({ run_id: 7 }),
+    ]);
+    fake.patchExchange('bitget', { syncing: false });
+    const readsBeforeEdge = fake.count('runs');
+
+    // The list's answer lands first, saying nothing is syncing.
+    releaseListRead();
+    await waitFor(() => {
+      expect(item).toHaveTextContent('Up to date');
+    });
+    await settle();
+    // Then the stale run-log answer lands, still saying "running".
+    releaseRunsRead();
+    await settle();
+
+    // Within one fast interval - not a minute - the log says the run ended.
+    await advance(FAST_POLL_MS);
+    expect(newest()).toBe('Succeeded');
+
+    // It was refetched once, on the edge, and then polls at the slow rate.
+    const readsAfterEdge = fake.count('runs');
+    expect(readsAfterEdge - readsBeforeEdge).toBe(1);
+    await advance(FAST_POLL_MS);
+    await advance(FAST_POLL_MS);
+    expect(fake.count('runs')).toBe(readsAfterEdge);
+  });
+
+  it('the list staying unsynced does not refetch the run log again', async () => {
+    // R15 is an edge, not a level: false to false triggers nothing.
+    fakeIntervals();
+    const { fake } = openExchanges({ exchanges: [exchange()], runs: [finishedRun()] });
+    await venue('Bitget');
+    await runTable();
+    await settle();
+    const runs = fake.count('runs');
+
+    // Two list polls, both unsynced.
+    await advance(SLOW_POLL_MS);
+    await advance(SLOW_POLL_MS);
+
+    // The run log polled twice on its own clock, and not once more per list answer.
+    expect(fake.count('runs')).toBe(runs + 2);
   });
 
   it("both queries poll fast while this page's own sync is pending", async () => {

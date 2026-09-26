@@ -261,7 +261,7 @@ describe('formatHistoryStart', () => {
 });
 
 describe('formatHistoryStartLocal', () => {
-  it('names the same rounded-up instant in local time, with seconds', () => {
+  it('names the same rounded-up instant in local time, with seconds and the zone', () => {
     // R13: the banner's title. Built from the raw instant, it would name
     // 8:05 while the text says 12:06:00 UTC - an earlier minute.
     inTimeZone('America/New_York');
@@ -269,11 +269,13 @@ describe('formatHistoryStartLocal', () => {
     expect(new Date('2026-06-27T12:05:59.500Z').getHours()).toBe(8);
 
     expect(plain(formatHistoryStartLocal('2026-06-27T12:05:59.500000Z'))).toBe(
-      'Jun 27, 2026, 8:06:00 AM',
+      'Jun 27, 2026, 8:06:00 AM EDT',
     );
-    expect(plain(formatHistoryStartLocal('2026-06-27T12:05:36Z'))).toBe('Jun 27, 2026, 8:05:36 AM');
+    expect(plain(formatHistoryStartLocal('2026-06-27T12:05:36Z'))).toBe(
+      'Jun 27, 2026, 8:05:36 AM EDT',
+    );
     expect(plain(formatHistoryStartLocal('2026-06-27T12:05:36.000001Z'))).toBe(
-      'Jun 27, 2026, 8:05:37 AM',
+      'Jun 27, 2026, 8:05:37 AM EDT',
     );
   });
 
@@ -281,7 +283,7 @@ describe('formatHistoryStartLocal', () => {
     inTimeZone('Asia/Tokyo');
 
     expect(plain(formatHistoryStartLocal('2026-06-27T12:05:36.250000Z'))).toBe(
-      'Jun 27, 2026, 9:05:37 PM',
+      'Jun 27, 2026, 9:05:37 PM GMT+9',
     );
   });
 });
