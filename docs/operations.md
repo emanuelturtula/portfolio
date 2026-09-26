@@ -3,7 +3,8 @@
 Day-two tasks on the running instance: creating the account, tuning the password hash to the
 hardware, changing the password, understanding when a session ends, pointing the application
 at the chain index it reads balances from, refreshing the prices that turn a balance into
-a value, and connecting the Bitget account whose trades say what each asset cost.
+a value, connecting the Bitget account whose trades say what each asset cost, and keeping
+the import of those trades running.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -621,8 +622,10 @@ already read.
 
 The application reads your Bitget **spot fills** -- every buy and sell execution -- with a
 read-only API key, to know what you paid for each asset. The provider that reads them landed
-with #13; the sync that runs it and stores the fills lands with #15. Until then, setting the
-variables below has one visible effect: the container checks them at startup.
+with #13, and the sync that runs it and stores the fills with #15: once the three variables
+below are set and the container recreated, the exchange timer imports fills every fifteen
+minutes. Section 13 covers the sync -- its settings, what an account's status means, and how
+to recover when Bitget refuses the key.
 
 ### Keep the account Classic: do not accept the Unified Trading Account upgrade
 
@@ -744,6 +747,139 @@ Classic. The same goes for a schema error saying `data must be an array of fills
 the documentation does not say what a UTA account's key gets back, for syncs that suddenly
 find no trades at all after an upgrade.
 
+## 13. Syncing exchange fills
+
+Every configured venue's spot fills are imported into `exchange_fills` on a timer of their
+own. Each attempt is one row in `exchange_sync_runs` plus one row per account in
+`exchange_sync_run_accounts`. The fills table is **append-only**: the database itself refuses
+an update or a delete of a fill, and re-reading history the sync already holds inserts
+nothing.
+
+### The four settings
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PORTFOLIO_EXCHANGE_HISTORY_START` | unset | The earliest date to import fills from, `YYYY-MM-DD`, at 00:00 UTC. Unset means everything the venue still keeps. A date after today's (UTC) date is refused at startup. Moving it **earlier** later is supported: the next run imports the older range, as far as the venue's retention allows. |
+| `PORTFOLIO_EXCHANGE_SYNC_ENABLED` | `true` | Whether the timer runs. **Does not disable `POST /api/exchanges/sync`**, as with the balance switch. |
+| `PORTFOLIO_EXCHANGE_SYNC_INTERVAL_MINUTES` | `15` | Minutes between runs. Must be at least 1; the container refuses to start otherwise. |
+| `PORTFOLIO_EXCHANGE_SYNC_SHUTDOWN_GRACE_SECONDS` | `10` | How long shutdown waits for a run in flight before cancelling it and recording it `interrupted`. The balance sync's grace runs at the same time, not after it. |
+
+**The timer only exists when a venue is configured.** With no exchange credentials in
+`secrets.env` nothing is scheduled and no empty run is written every fifteen minutes; the
+manual trigger still works and records a run with nothing in it. The same at-most-once-per-
+interval rule as the balance timer applies (section 11): the startup run happens only if the
+newest exchange run, of any status, started more than one interval ago.
+
+**The first sync is a backfill.** It reads everything from the history start -- clamped to
+what the venue keeps, 90 days at Bitget -- newest first, in windows the venue accepts, one
+page at a time. Each page is committed with its checkpoint, so a restart in the middle loses
+at most the page in flight and the next run resumes where the last one stopped. Later runs
+read from where the previous plan ended, reaching five minutes back to catch a fill the
+venue recorded late.
+
+### Reading the account list
+
+```bash
+curl -s -b "$COOKIE" https://<host>/api/exchanges | jq .
+```
+
+One entry per configured venue, plus any venue that has an account row but no credentials
+any more (`configured: false`). **Nothing here is a credential**: `configured` says whether
+the process has one, never what it is.
+
+| Field | Means |
+|---|---|
+| `status` | where the account stands; see below |
+| `syncing` | a sync is running now and covers this venue |
+| `requested_since` | what you asked for: `PORTFOLIO_EXCHANGE_HISTORY_START`, or 2009-01-03 when it is unset |
+| `effective_since` | where the history actually held begins |
+| `history_truncated` | `effective_since` is later than `requested_since`: the venue did not keep what you asked for, and fills before `effective_since` were not imported |
+| `last_synced_at` | when a run last finished the account with nothing left to read |
+| `fills_stored` | how many fills are stored for it |
+| `pending_windows` | how many windows of history are planned and not yet read. Non-zero after a failure or an interruption; the next run continues from them |
+| `last_error` | the kind and detail of the latest attempt, when that attempt failed. A run that skipped the account does not replace it |
+
+`history_truncated: true` with the history start unset is the normal state at Bitget: you
+asked for everything, and Bitget keeps 90 days.
+
+### What an account's status means
+
+| `status` | Means | What to do |
+|---|---|---|
+| `never_synced` | no run has finished with this account yet | nothing, or trigger one |
+| `ok` | the last run read everything planned | nothing |
+| `error` | the last attempt failed; `last_error` says why. **The next scheduled run tries again** | see `error_kind` below |
+| `auth_failed` | the venue refused the key, or the key lacks read permission. **Scheduled runs skip the account** (their outcome says `skipped`) until you act | recover as below |
+
+`auth_failed` is not retried on the timer on purpose: asking a venue to refuse the same key
+every fifteen minutes is how an address gets banned. **To recover:**
+
+1. Fix the key at the venue, or create a new read-only one (section 12).
+2. Put the corrected values in the host-local `secrets.env`, and nowhere else.
+3. Recreate the container -- `env_file` is read at creation, so a restart is not enough:
+
+   ```bash
+   docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml up --force-recreate app
+   ```
+
+4. Trigger a sync by hand. **A manual sync is the one that retries an `auth_failed`
+   account**:
+
+   ```bash
+   curl -X POST -H 'Content-Type: application/json' -H "Origin: https://<host>" \
+        -b "$COOKIE" https://<host>/api/exchanges/sync
+   ```
+
+   The response carries the run and one entry per account. `status: "success"` on the
+   account means it is `ok` again, and the timer picks it up from there.
+
+### `error_kind`
+
+| Kind | Whose problem | What happens next |
+|---|---|---|
+| `auth`, `insufficient_scope` | the key | the account becomes `auth_failed`; recover as above. `insufficient_scope` means the key was accepted but lacks read permission |
+| `rate_limited` | the venue throttled us | each request is retried three times, waiting what the venue asks or 2, 4, then 8 seconds. A wait over 60 seconds is not waited: the account fails for this run, and the next one asks again |
+| `unavailable` | the venue | the shared HTTP client already retried; the next run asks again |
+| `retention_window` | the venue keeps less than it declares | the sync moves the refused window a day later and asks again, up to three times per window per run. When those run out the account fails, **keeping the moved start**, so the next run continues from there; `effective_since` rises with it |
+| `invalid_request`, `schema` | the venue changed what it accepts or answers, or our request is wrong | read `detail`; it names a field and a rule. A cursor that returned to one already visited is a `schema` error too |
+| `conflict` | see below | the account stops at that page until someone looks |
+| `internal` | ours | a bug. The container log has the traceback; `detail` is only the exception's type name |
+
+`detail` never holds a trade id, a symbol, an amount or anything the venue wrote in its
+message -- only a fixed summary, the HTTP status and the venue's numeric code.
+
+### `conflict`: a fill that changed under the same id
+
+Re-reading a fill that is already stored is normal and inserts nothing. A re-read fill whose
+trade id is stored but whose **contents differ** -- side, symbol, assets, quantity, price,
+quote amount, fee, fee asset, order id or execution time -- is a conflict, and it is refused
+rather than silently keeping either version. The page is rolled back, the checkpoint does not
+move, and the account fails with `conflict` on every run until someone looks.
+
+It means one of two things: the venue revised a settled fill, or its trade ids are not unique
+per account the way this application assumes. Neither is fixed from here, and neither
+recovers on its own; open an issue with the run's `detail` (a count, never an id). Recording a
+correction as an adjustment is the cost-basis milestone's decision. A venue adding a new
+field to its response is **not** a conflict: the stored payload is not compared.
+
+### Reading the run log, and interrupted runs
+
+```bash
+curl -s -b "$COOKIE" "https://<host>/api/exchanges/runs?limit=20" | jq .
+```
+
+Newest first; `limit` is 1 to 100. Each run has the same five statuses as a balance run
+(section 11), computed over the accounts it **attempted**: a run that only skipped an
+`auth_failed` account is a `success` that did nothing. `fills_seen` counts every fill read,
+overlap included; `fills_inserted` only the new ones, so a quiet interval shows a few seen and
+none inserted.
+
+A run row is written before the first request to any venue, and a surviving `running` row is
+swept to `interrupted` at startup, at shutdown and at the start of every exchange run. An
+interrupted run loses nothing already committed: every page is its own transaction, and the
+next run resumes each window from its last committed cursor. **Do not run an exchange sync
+from a second process while the server is up**, for the reason section 11 gives.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -758,6 +894,9 @@ find no trades at all after an upgrade.
 | Logged out roughly monthly despite daily use | Working as intended: the 30-day absolute ceiling, which activity does not extend |
 | Edited `secrets.env`, nothing changed | `env_file` is read at container creation — recreate, do not restart |
 | Container never becomes healthy after setting the Esplora URLs | One of them has no scheme, no host, or a scheme other than `http`/`https` — the startup log names which — section 8 |
+| Container refuses to start, log names `PORTFOLIO_EXCHANGE_HISTORY_START` | The date is after today's date in UTC — section 13 |
+| An exchange account stays `auth_failed` after fixing the key | Scheduled runs skip it: recreate the container, then trigger a sync by hand — section 13 |
+| An exchange account fails with `conflict` on every run | A stored fill changed under the same id; it needs a person — section 13 |
 | A Bitcoin wallet reports "the address is on a different network" | `PORTFOLIO_BITCOIN_NETWORK` does not match the address — section 8 |
 | Bitcoin balances stop updating and the log shows 429 | The public index is throttling us. Lengthen nothing by hand; run your own Esplora — section 8 |
 | Reading many Bitcoin addresses takes a minute | Working as intended: one request per second per host — section 8 |

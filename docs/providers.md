@@ -900,8 +900,8 @@ every writer; the second keeps a vendor's mistake on the vendor's error path.
 ## Exchange providers, which sign their requests and fail in more ways
 
 **The seam landed in #12, and Bitget is the first venue behind it (#13).** BingX arrives with
-#14, and the sync that drives both with #15. The seam is the vocabulary every venue needs
-before it can be written without inventing its own: what a fill is, what a venue can do, and
+#14, and #15's sync drives every configured venue -- see "The exchange sync" below. The seam
+is the vocabulary every venue needs before it can be written without inventing its own: what a fill is, what a venue can do, and
 why a call failed. Read `providers/exchanges/base.py` and `providers/exchanges/errors.py`
 alongside this; the docstrings there are the reasoning. The Bitget section below records
 what its documentation confirmed and what it left open.
@@ -1044,8 +1044,9 @@ It is the `align_balances` of this seam:
 `FillWindow(since, until)` is **half-open**: a fill at `since` is in and one at `until` is
 not, so windows laid end to end count no instant twice. The last row is also available on its
 own as `require_cursor_advanced(cursor, next_cursor)`. It catches a venue repeating a cursor;
-it cannot catch one cycling between two, which needs the history only the sync loop has --
-#15 owns that.
+it cannot catch one cycling between two, which needs the history only the sync loop has:
+#15's sync keeps the cursors it has sent within one window in one run and refuses a
+`next_cursor` it has already sent, as a schema error.
 
 `clamp_to_retention(requested_since, now=..., capabilities=...)` returns a `RetentionClamp`
 with both instants and a derived `clamped`: `effective_since = max(requested_since,
@@ -1165,11 +1166,14 @@ Migration `0006_exchanges` creates two tables.
 
 - **`exchange_accounts`**: `user_id` (cascade from `users`), `exchange_key` (checked against
   the two venues), `created_at`, and `UNIQUE (user_id, exchange_key)` -- one set of
-  credentials per venue in the environment means one account per venue. Sync state is #15's.
+  credentials per venue in the environment means one account per venue. #15's
+  `0007_exchange_sync` adds the sync state: `sync_status`, `requested_since`,
+  `effective_since`, `planned_until` and `last_synced_at`.
 - **`exchange_fills`**: every `NormalizedFill` field, plus `ingested_at` (our clock, beside
   the venue's `executed_at`). The four amounts are `NumericText(18)`.
   `UNIQUE (exchange_account_id, external_trade_id)` as `uq_exchange_fills_account_trade` is
-  what #15's `ON CONFLICT DO NOTHING` will stand on.
+  what #15's `ON CONFLICT DO NOTHING` stands on. Since `0007_exchange_sync` two triggers make
+  the table append-only: an `UPDATE` or a `DELETE` of a fill is aborted by the database.
 
 Three decisions worth knowing before adding a column:
 
@@ -1237,7 +1241,7 @@ every one of them either cannot matter or fails loudly, never so that a guess de
 |---|---|
 | whether `startTime` and `endTime` are **inclusive** | widens the request by a millisecond and drops the two edge milliseconds after parsing: right under all four readings |
 | the order of fills **within a page** | the next cursor is the smallest `tradeId` on the page, which is right under any order |
-| that `tradeId` is numeric, or unique across symbols | requires canonical digits of at most 64 bits; anything else fails the page. A collision within a page is refused; across windows it is #15's |
+| that `tradeId` is numeric, or unique across symbols | requires canonical digits of at most 64 bits; anything else fails the page. A collision within a page is refused; across windows, #15 refuses a same-id fill that differs as a `conflict` |
 | what `size` and `amount` are measured in | base and quote, as the example's arithmetic shows (`13000 x 0.0007 = 9.1`) |
 | **the fee's sign** | the REST example is negative for a fee paid; the WebSocket fill channel reports it positive. Negated, and a positive `totalFee` refused |
 | what `totalFee` and `totalDeductionFee` mean when the fee is paid in **BGB** | a `deduction` other than `"no"` is refused |
@@ -1293,7 +1297,7 @@ change the number #15 plans around. `page_size` 100, `cursor_kind` `trade_id_bef
 host is stricter), `requires_symbol` false and `candidate_symbols()` empty -- `symbol` is
 optional, so one query covers every symbol. If "90 days" turns out to be three calendar
 months, the oldest window is refused with `40704`, which is `ExchangeRetentionWindowError`,
-and #15 clamps further.
+and #15 steps that window a day later, up to three times per window per run.
 
 **The request.** Query keys in ascending order -- `endTime`, `idLessThan` (only with a
 cursor), `limit=100`, `startTime` -- every value ASCII digits, and the URL sent with exactly
@@ -1439,7 +1443,7 @@ itself -- and `parse_rate_limit` runs on **every** response:
 Nothing vendor-specific is in #12, by design. Each of these was belief, and the issue named
 beside it replaces the belief with the venue's documentation. #13 has done so for Bitget,
 **from documentation alone**: no request has been made to the signed endpoint, because that
-needs a key this repository must not contain. The owner's first sync after #15 is the first
+needs a key this repository must not contain. The owner's first sync with #15 is the first
 measurement.
 
 | Belief | Bitget, after #13 | Still open for |
@@ -1449,13 +1453,91 @@ measurement.
 | timestamps are epoch milliseconds | **confirmed** for `ACCESS-TIMESTAMP`, `startTime` and `endTime`; `cTime` is documented both ways and read as milliseconds (a seconds value fails the page) | #14 |
 | each venue pages in one of the four `CursorKind` shapes | **confirmed**: `trade_id_before`, over `idLessThan` | #14 |
 | each venue's retention, maximum query window, page size and rate limit | **confirmed**: 90 days, 90 days (30 declared, on purpose), 100, 10/s per UID | #14 |
-| trade ids are unique per account across symbols | **not documented**. One cursor pages every symbol, which only works if they are; a collision within a page is refused, across windows it is #15's to detect | #14, #15 |
+| trade ids are unique per account across symbols | **not documented**. One cursor pages every symbol, which only works if they are; a collision within a page is refused, and across windows #15 refuses a same-id fill whose accounting fields differ, as a `conflict` that stops the account | #14 |
 | which string each venue signs, and in which encoding | **confirmed**: `timestamp + "GET" + path + "?" + query`, HMAC-SHA256, Base64. No published vector; the tests compute theirs outside the code | #14 |
-| `RETENTION_MARGIN` of five minutes is enough | **not measurable without a key.** "The last three months" in `40704` may be 89 days; if so the oldest window is refused as `ExchangeRetentionWindowError` and #15 clamps further | #15's first sync |
+| `RETENTION_MARGIN` of five minutes is enough | **not measurable without a key.** "The last three months" in `40704` may be 89 days; if so the oldest window is refused as `ExchangeRetentionWindowError` and #15 steps it a day later (`RETENTION_STEP`, itself a guess) | the owner's first sync |
 | whether `startTime` and `endTime` are inclusive, and the order within a page | **not documented**, and made not to matter: the window is widened and filtered, the cursor is the smallest id | -- |
 | the sign of a fee, and the fields of a fee paid in BGB | **not documented**. A positive fee and a BGB deduction are refused loudly | the first real fill that shows either |
 | `FILL_SCALE` of 18 covers every fee a venue reports; a 19th place fails its page loudly | unmeasured | whichever venue meets it |
 | a zero `quote_quantity` for a dust trade never happens; if it does, the page fails loudly | unmeasured | whichever venue meets it |
+
+### The exchange sync (#15)
+
+`services/exchange_sync.py` drives every configured venue; `services/exchange_sync_plan.py`
+holds its arithmetic as pure functions; `repositories/exchanges.py` and
+`repositories/exchange_sync_runs.py` hold its queries. Nothing in this section is
+vendor-specific, and nothing in it was measured against a venue: it is written against #12's
+protocol and tested with a fake provider. The owner's first sync is the first measurement.
+
+**A run.** Sweep interrupted runs, open the run (committed), find the single owner, ensure an
+`exchange_accounts` row per configured venue (committed), then sync each account in turn,
+sorted by `exchange_key`, over one session. No owner is a `success` with no accounts; more
+than one is a `failed` run that calls no venue.
+
+**Planning.** The requested start is `PORTFOLIO_EXCHANGE_HISTORY_START` at 00:00 UTC, or
+2009-01-03; `clamp_to_retention` moves it inside the venue's retention. The first sync plans
+`[effective_since, now)`. A later one plans a **top** range reaching `OVERLAP` (five minutes)
+back into planned history, and a **bottom** range only when the owner moved the history start
+earlier -- judged against the recorded `requested_since`, because a floor that a retention
+step lifted above the declared edge must not be re-planned every run. Ranges are split into
+windows no longer than `max_query_window`, newest first, and **persisted before any fetch**.
+
+**The pending queue is the checkpoint.** `exchange_sync_windows` holds only unfinished work:
+a window, an optional symbol, and the cursor of its next page. Each page is one transaction --
+insert the fills, then advance the cursor or delete the window -- so a crash loses at most the
+page in flight, and the re-read is deduplicated by the constraint. Windows are read newest
+first across the whole queue, sorted in Python. Before reading, the queue is re-clamped to the
+current retention floor: a window wholly below it is dropped, one partly below is shortened,
+and one longer than the venue's limit is re-split; a replaced window restarts from its first
+page rather than trusting a cursor across a changed range.
+
+| Cursor kind | What the sync does |
+|---|---|
+| `trade_id_before`, `trade_id_after`, `time` | pass the cursor back and follow `next_cursor` to `None`. A `next_cursor` already sent for this window in this run is a cursor cycle, refused as a schema error |
+| `none` | a page holding `page_size` fills is not inserted: the window is replaced by its two halves, the newer read first. A full page for a window under 2 ms is a schema error |
+
+**Idempotent, append-only writes.** `INSERT ... ON CONFLICT (exchange_account_id,
+external_trade_id) DO NOTHING RETURNING external_trade_id` reports `seen` and `inserted`. Every
+id the constraint skipped is compared with the stored row on the accounting fields -- order
+id, symbol, both assets, side, quantity, price, quote quantity and its derived flag, fee and
+fee asset, execution time -- as `Decimal`s and aware datetimes. A difference raises
+`FillConflictError`, the page rolls back, and the account fails with `conflict`. **`raw_payload`
+is not compared**, narrowing spec 014's hand-on: a venue adding a field to its response would
+otherwise make every overlap re-read a false conflict. The triggers from `0007_exchange_sync`
+refuse any `UPDATE` or `DELETE` of a fill.
+
+**Failures, per account.** Subclasses are matched before their parents:
+
+| Raised | Account status | `error_kind` | Behaviour |
+|---|---|---|---|
+| `ExchangeInsufficientScopeError` | `auth_failed` | `insufficient_scope` | stop, no retry |
+| `ExchangeAuthError` | `auth_failed` | `auth` | stop, no retry |
+| `ExchangeRateLimitedError` | `error` if exhausted | `rate_limited` | retry the same request up to `RATE_LIMIT_RETRIES` (3) times, waiting `Retry-After` or 2, 4, 8 s, rounded up to whole seconds; a wait over `MAX_RATE_LIMIT_WAIT_SECONDS` (60) is not waited |
+| `ExchangeRetentionWindowError` | `error` if the steps run out | `retention_window` | move the window's `since` a `RETENTION_STEP` (a day) later, drop pending windows wholly below it, raise `effective_since`; at most `MAX_RETENTION_STEPS` (3) per window per run, and the moved start is kept |
+| `ExchangeUnavailableError` | `error` | `unavailable` | stop; the transport already retried |
+| `ExchangeInvalidRequestError` | `error` | `invalid_request` | stop |
+| `ExchangeSchemaError`, a cursor cycle included | `error` | `schema` | stop |
+| `FillConflictError` | `error` | `conflict` | stop, page rolled back |
+| anything else | `error` | `internal` | stop; traceback logged, `detail` is the type name only |
+
+Only `Exception` is caught: a cancellation or the process being stopped leaves the run row
+`running` for the sweep and writes no outcome. **A scheduled or startup run skips an
+`auth_failed` account** without calling the venue, and records `skipped`; a manual sync
+retries it (`docs/operations.md` section 13). An account whose queue is empty at the end of
+the run becomes `ok`, with `last_synced_at`.
+
+**What reaches a log, a column or a response**: counts, `exchange_key`, `error_kind` and the
+exception's type name. Never a trade id, a cursor, a symbol or an amount. A stored `detail` is
+an exchange error's `str()` -- a fixed class summary, the status and a digits-only venue code
+-- a conflict's count, or a type name.
+
+**Guesses, recorded as guesses.** `RETENTION_STEP` of a day and `MAX_RETENTION_STEPS` of
+three: the venue's real retention differing from its declared one is expected to be a matter
+of a day or so ("the last three months" against 90 days). `OVERLAP` of five minutes: long
+enough for a fill recorded a moment late, and free, because the constraint makes the re-read
+insert nothing. The rate-limit numbers: three retries and a one-minute cap keep one account's
+throttle from holding the coordinator, and a manual sync joined to it, for as long as a venue
+likes.
 
 ## Who calls a provider, and when
 
@@ -1502,6 +1584,19 @@ most of an hour. There is no coordinator and
 no join, because there is no endpoint that can ask for one: nothing in a request path may
 reach a price vendor, which is the contract.
 
+**Landed in #15: what reaches an exchange provider.** The lifespan builds the provider
+mapping once, with `exchange_providers(client, settings=settings)`, and hands it to a closure
+the exchange `SyncCoordinator` runs; `app.state` learns only `configured_exchanges`, the set
+of its keys. Two things reach an exchange provider, both through that coordinator: the
+exchange timer, which exists only when `PORTFOLIO_EXCHANGE_SYNC_ENABLED` is true **and** a
+venue is configured, and `POST /api/exchanges/sync`. The
+`api-never-reaches-an-exchange-provider` import contract forbids any module under
+`portfolio.api` from importing `portfolio.providers.exchanges` at all, directly or not, so the
+coordinator is the only path from a request to a credential.
+
+**Three timers, three tasks, three switches, and no shared state.** The paragraph below
+predates the exchange timer and holds for it too.
+
 **Two timers, two tasks, two switches, and no shared state.** `services/scheduler.py` is
 generic over what it ticks -- it takes "when did this last happen" and "do it" -- so the two
 are instances rather than loops, and neither can stop the other. They are separate because
@@ -1537,15 +1632,18 @@ it by returning a stale number that looks exactly like a fresh one, which is the
 - **The Bitget provider has never met its venue.** Like CoinGecko's parser, it is written
   from documentation, because measuring a signed endpoint needs a key this repository must
   not contain. Every guess in the Bitget section is written to fail loudly, as a typed error
-  naming a field, rather than to guess; the owner's first sync after #15 is the first
+  naming a field, rather than to guess; the owner's first sync with #15 is the first
   measurement, and a refusal there is the evidence to act on.
-- **The exchange sync.** #15 owns the loop and everything that needs its history: sync state
-  on `exchange_accounts` (status, `auth_failed`, checkpoints, the requested and effective
-  start), the fills repository with `ON CONFLICT DO NOTHING` and its `seen` against
-  `inserted` counts, splitting a range into windows newest first with a five-minute overlap,
-  and detecting a cursor that cycles between pages -- `require_cursor_advanced` only catches
-  one that repeats. A credential health check is not planned; #15 learns about a bad key
-  from a sync.
+- **What #15 guessed, and the owner's first sync measures.** `RETENTION_STEP` (a day),
+  `MAX_RETENTION_STEPS` (three), `OVERLAP` (five minutes) and the rate-limit numbers are
+  choices, not documentation; "The exchange sync" above says what each does. A retention
+  refusal on the first sync is the evidence for moving `RETENTION_MARGIN` or the step.
+- **A venue that `requires_symbol` is planned with the symbols known at plan time.** No wired
+  venue requires one. A symbol first traded later is read only from windows planned after it
+  appears; #14 decides whether BingX needs a symbol and whether that is enough.
+- **A corrected fill is refused, not recorded.** The sync stops the account with `conflict`
+  rather than overwriting or silently keeping the first version. Recording a correction as an
+  adjustment is M4's, with the cost-basis model.
 - **A signed request replayed by the transport can arrive expired.** `RetryingTransport`
   retries a `GET` that got a 429, a 5xx or no answer by sending **the same request
   again** -- same timestamp, same signature -- for up to `RetryPolicy.max_attempts` (3)
