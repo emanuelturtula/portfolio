@@ -105,6 +105,12 @@ def test_the_walk_actually_finds_the_routes(auth_app: FastAPI) -> None:
     assert ("GET", "/api/balances/current") in routes
     assert ("GET", "/api/balances/runs") in routes
     assert ("GET", "/api/wallets/{wallet_id}/balances") in routes
+    # #15's three. Nothing was added to `PUBLIC_API_PATHS`, so registering them protected
+    # them; named so the sweep visibly covers the endpoint that signs requests with the
+    # owner's exchange key.
+    assert ("GET", "/api/exchanges") in routes
+    assert ("POST", "/api/exchanges/sync") in routes
+    assert ("GET", "/api/exchanges/runs") in routes
     # FastAPI's own documentation endpoints are routes like any other, and are covered.
     assert ("GET", "/api/openapi.json") in routes
     assert ("GET", "/api/docs") in routes

@@ -99,7 +99,7 @@ async def wait_for[T](awaitable: Awaitable[T]) -> T:
     return await asyncio.wait_for(awaitable, timeout=DEADLOCK_TIMEOUT)
 
 
-def in_flight(coordinator: SyncCoordinator) -> bool:
+def in_flight(coordinator: SyncCoordinator[SyncRunSummary]) -> bool:
     """Read the flag afresh, through a call `mypy` cannot narrow.
 
     Written inline, `assert coordinator.in_flight is False` narrows the property to
@@ -448,14 +448,14 @@ def tracebacks(captured: Sequence[Mapping[str, Any]]) -> list[str]:
     return [str(entry["event"]) for entry in captured if entry.get("exc_info")]
 
 
-async def settle(coordinator: SyncCoordinator) -> None:
+async def settle(coordinator: SyncCoordinator[SyncRunSummary]) -> None:
     """Let the run end and its done-callback fire, which happens a loop turn after the await."""
     await wait_for(until_not_in_flight(coordinator))
     for _ in range(3):
         await asyncio.sleep(0)
 
 
-async def until_not_in_flight(coordinator: SyncCoordinator) -> None:
+async def until_not_in_flight(coordinator: SyncCoordinator[SyncRunSummary]) -> None:
     while in_flight(coordinator):  # noqa: ASYNC110 - bounded by the caller's wait_for
         await asyncio.sleep(0)
 
@@ -558,3 +558,137 @@ async def test_a_failed_scheduled_run_is_one_traceback_end_to_end() -> None:
 async def never_ran() -> None:
     """`last_run_at` for a timer that has never run, so its first tick is at startup."""
     return
+
+
+# --------------------------------------------------------------------------------------
+# #15: the coordinator is generic, and the exchange instance speaks its own names
+# --------------------------------------------------------------------------------------
+
+
+def exchange_coordinator(runner: Runner) -> SyncCoordinator[SyncRunSummary]:
+    """The instance `main.py` builds for the exchange sync, over a counting stub."""
+    return SyncCoordinator(runner, task_name="exchange-sync", log_prefix="exchange_sync")
+
+
+class NamingRunner(Runner):
+    """Records the name of the task it runs in, which is what a debugger shows."""
+
+    def __init__(self, **keywords: Any) -> None:
+        super().__init__(**keywords)
+        self.task_names: list[str] = []
+
+    async def __call__(self, trigger: SyncTrigger) -> SyncRunSummary:
+        current = asyncio.current_task()
+        assert current is not None
+        self.task_names.append(current.get_name())
+        return await super().__call__(trigger)
+
+
+async def test_the_balance_coordinator_keeps_its_names_when_built_without_them() -> None:
+    """`SyncCoordinator(runner)` is the balance coordinator, unchanged by the generic class."""
+    runner = NamingRunner()
+    coordinator = SyncCoordinator(runner)
+
+    await wait_for(coordinator.sync(SyncTrigger.MANUAL))
+
+    assert (coordinator.task_name, coordinator.log_prefix) == ("balance-sync", "balance_sync")
+    assert runner.task_names == ["balance-sync"]
+
+
+async def test_the_exchange_coordinator_runs_under_its_own_task_name() -> None:
+    runner = NamingRunner()
+
+    await wait_for(exchange_coordinator(runner).sync(SyncTrigger.MANUAL))
+
+    assert runner.task_names == ["exchange-sync"]
+
+
+async def test_the_exchange_coordinator_joins_rather_than_starting_a_second_run() -> None:
+    """Criterion 6 of #10, for the second instance: one run, two callers, both answered."""
+    runner = Runner(gated=True)
+    coordinator = exchange_coordinator(runner)
+
+    first = asyncio.create_task(coordinator.sync(SyncTrigger.SCHEDULED))
+    await wait_for(runner.started.wait())
+    second = asyncio.create_task(coordinator.sync(SyncTrigger.MANUAL))
+    await asyncio.sleep(0)
+    assert in_flight(coordinator) is True
+    runner.gate.set()
+    started, joined = await wait_for(asyncio.gather(first, second))
+
+    assert runner.triggers == [SyncTrigger.SCHEDULED]
+    assert (started.joined, joined.joined) == (False, True)
+    assert joined.summary.trigger == SyncTrigger.SCHEDULED
+
+
+async def test_two_coordinators_do_not_join_each_others_runs() -> None:
+    """The balance and exchange syncs are separate instances: neither blocks the other."""
+    balances = Runner(gated=True)
+    exchanges = Runner()
+    balance_coordinator = SyncCoordinator(balances)
+
+    held = asyncio.create_task(balance_coordinator.sync(SyncTrigger.SCHEDULED))
+    await wait_for(balances.started.wait())
+    outcome = await wait_for(exchange_coordinator(exchanges).sync(SyncTrigger.MANUAL))
+    balances.gate.set()
+    await wait_for(held)
+
+    assert outcome.joined is False
+    assert exchanges.triggers == [SyncTrigger.MANUAL]
+
+
+async def test_an_unobserved_exchange_failure_is_logged_under_the_exchange_name() -> None:
+    """`exchange_sync_failed`, and never the balance sync's event for an exchange run."""
+    runner = Runner(gated=True, raises=RuntimeError("the database went away"))
+    coordinator = exchange_coordinator(runner)
+
+    with capture_logs() as captured:
+        waiter = asyncio.create_task(coordinator.sync(SyncTrigger.MANUAL))
+        await wait_for(runner.started.wait())
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        runner.gate.set()
+        await settle(coordinator)
+
+    assert tracebacks(captured) == ["exchange_sync_failed"]
+    assert not any(str(entry["event"]).startswith("balance_sync") for entry in captured)
+
+
+async def test_an_exchange_run_cancelled_at_shutdown_is_logged_under_the_exchange_name() -> None:
+    runner = Runner(gated=True)
+    coordinator = exchange_coordinator(runner)
+    running = asyncio.create_task(coordinator.sync(SyncTrigger.SCHEDULED))
+    await wait_for(runner.started.wait())
+
+    with capture_logs() as captured:
+        drained = await wait_for(coordinator.drain(grace_seconds=0))
+
+    assert drained is False
+    events = [entry["event"] for entry in captured]
+    assert "exchange_sync_cancelled_at_shutdown" in events
+    assert "balance_sync_cancelled_at_shutdown" not in events
+    runner.gate.set()
+    with suppress(asyncio.CancelledError, TimeoutError, RuntimeError):
+        await wait_for(running)
+
+
+async def test_an_exchange_run_that_fails_inside_the_grace_counts_as_drained() -> None:
+    """The failure line itself is at debug, below what the suite's logger passes through."""
+    runner = Runner(gated=True, raises=RuntimeError("the database went away"))
+    coordinator = exchange_coordinator(runner)
+    running = asyncio.create_task(coordinator.sync(SyncTrigger.SCHEDULED))
+    await wait_for(runner.started.wait())
+
+    async def release() -> None:
+        await asyncio.sleep(0)
+        runner.gate.set()
+
+    releasing = asyncio.create_task(release())
+    drained = await wait_for(coordinator.drain(grace_seconds=DEADLOCK_TIMEOUT))
+    await releasing
+
+    assert drained is True
+    assert in_flight(coordinator) is False
+    with pytest.raises(RuntimeError):
+        await wait_for(running)

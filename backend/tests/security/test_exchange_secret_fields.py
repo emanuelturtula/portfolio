@@ -22,7 +22,14 @@ from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import Column, MetaData, Table, Text
 
-from portfolio.db.models import ExchangeAccount, ExchangeFill, metadata
+from portfolio.db.models import (
+    ExchangeAccount,
+    ExchangeFill,
+    ExchangeSyncRun,
+    ExchangeSyncRunAccount,
+    ExchangeSyncWindow,
+    metadata,
+)
 from portfolio.logging import is_sensitive_key
 from portfolio.providers.exchanges.base import (
     ExchangeCapabilities,
@@ -33,12 +40,40 @@ from portfolio.providers.exchanges.base import (
     RetentionClamp,
 )
 from portfolio.providers.exchanges.credentials import Credentials
+from portfolio.repositories.exchange_sync_runs import AccountOutcome, ExchangeSyncRunSummary
+from portfolio.repositories.exchanges import (
+    ExchangeAccountState,
+    FillInsertResult,
+    SyncWindowRow,
+)
+from portfolio.services.exchange_sync_plan import (
+    AccountPlan,
+    NormalisedQueue,
+    PendingWindow,
+    Replacement,
+)
+from portfolio.services.exchanges import ExchangeView, LastError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
-EXCHANGE_TABLES: Final = ("exchange_accounts", "exchange_fills")
-MAPPED_CLASSES: Final = (ExchangeAccount, ExchangeFill)
+#: #15 added three tables and eleven dataclasses: the sync state, the queue, the run log,
+#: and the views the read side serves. Scanned as #12's were, because a column or a field
+#: that could hold a credential is how rule 3 gets broken in a diff nobody reads twice.
+EXCHANGE_TABLES: Final = (
+    "exchange_accounts",
+    "exchange_fills",
+    "exchange_sync_windows",
+    "exchange_sync_runs",
+    "exchange_sync_run_accounts",
+)
+MAPPED_CLASSES: Final = (
+    ExchangeAccount,
+    ExchangeFill,
+    ExchangeSyncWindow,
+    ExchangeSyncRun,
+    ExchangeSyncRunAccount,
+)
 PROVIDER_DATACLASSES: Final = (
     NormalizedFill,
     FillPage,
@@ -46,6 +81,17 @@ PROVIDER_DATACLASSES: Final = (
     RateLimit,
     FillWindow,
     RetentionClamp,
+    ExchangeAccountState,
+    SyncWindowRow,
+    FillInsertResult,
+    AccountOutcome,
+    ExchangeSyncRunSummary,
+    AccountPlan,
+    PendingWindow,
+    Replacement,
+    NormalisedQueue,
+    ExchangeView,
+    LastError,
 )
 
 #: The spellings of a secret-bearing type in an annotation. Annotations are strings under
@@ -65,6 +111,12 @@ MUST_BE_SCANNED: Final = frozenset(
         "FillWindow.since",
         "RetentionClamp.effective_since",
         "FillPage.next_cursor",
+        "exchange_accounts.sync_status",
+        "exchange_sync_windows.cursor",
+        "exchange_sync_run_accounts.detail",
+        "ExchangeView.configured",
+        "LastError.detail",
+        "AccountOutcome.detail",
     }
 )
 

@@ -394,6 +394,11 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         "/api/balances/current",
         "/api/balances/runs",
         "/api/wallets/{wallet_id}/balances",
+        # Exchange sync (#15): the accounts, a manual sync, and the run log. No money crosses
+        # any of them -- counts and instants only.
+        "/api/exchanges",
+        "/api/exchanges/sync",
+        "/api/exchanges/runs",
     }
 
 

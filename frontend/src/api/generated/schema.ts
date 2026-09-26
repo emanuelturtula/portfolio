@@ -161,6 +161,73 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/exchanges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Every configured exchange and every exchange with an account, with its sync state
+         * @description Return each venue's sync state. **Never a credential**: `configured` is a boolean.
+         *
+         *     Reads the database; calls no venue.
+         */
+        get: operations["listExchanges"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/exchanges/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The most recent exchange sync runs, newest first
+         * @description Return the exchange run log: what ran, when, and what each account did.
+         */
+        get: operations["listExchangeSyncRuns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/exchanges/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import fills from every configured exchange now and return the run summary
+         * @description Run a manual sync, or join the one in flight, and return what it did.
+         *
+         *     `200` whatever the run's own status, for the reason `POST /api/balances/sync` gives: a run
+         *     in which one venue failed is a `partial` run this endpoint performed and reported. **A
+         *     manual sync is the one that retries an `auth_failed` account** -- after the owner has
+         *     fixed the key and restarted the container.
+         */
+        post: operations["syncExchanges"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/health": {
         parameters: {
             query?: never;
@@ -289,6 +356,33 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * AccountOutcomeStatus
+         * @description What one account did in one run. Mirrored by `ck_exchange_sync_run_accounts_status`.
+         *
+         *     `SKIPPED` is an `auth_failed` account a scheduled or startup run did not attempt. It is
+         *     not a failure and not a success, and the run's own status is computed without it.
+         * @enum {string}
+         */
+        AccountOutcomeStatus: "failed" | "skipped" | "success";
+        /**
+         * AccountSyncStatus
+         * @description Where an exchange account stands after the last sync that touched it.
+         *
+         *     Mirrored by `ck_exchange_accounts_sync_status`, so adding a member is a migration.
+         *     Alphabetical, like the `CHECK` text.
+         *
+         *     * `NEVER_SYNCED` -- the row exists and no run has finished with it. The column default.
+         *     * `OK` -- the last run that attempted the account left nothing pending.
+         *     * `ERROR` -- the last attempt failed for a reason that a later run may not meet again:
+         *       an outage, a throttle that outlasted the retries, a refused request, an answer that
+         *       could not be read, a conflicting fill, or a defect in this application.
+         *     * `AUTH_FAILED` -- the venue refused the key, or the key lacks read permission. **Terminal
+         *       until the owner acts**: a scheduled run skips the account rather than asking the venue
+         *       to refuse the same key every interval, and only a manual sync tries it again.
+         * @enum {string}
+         */
+        AccountSyncStatus: "auth_failed" | "error" | "never_synced" | "ok";
+        /**
          * ChainKey
          * @description Every chain balances can be read from.
          *
@@ -344,6 +438,176 @@ export interface components {
             unread: components["schemas"]["UnreadWalletResponse"][];
             /** Wallets */
             wallets: components["schemas"]["WalletBalanceResponse"][];
+        };
+        /**
+         * ExchangeAccountOutcomeResponse
+         * @description What one account did during one run.
+         */
+        ExchangeAccountOutcomeResponse: {
+            /** Detail */
+            detail: string | null;
+            error_kind: components["schemas"]["ExchangeSyncErrorKind"] | null;
+            exchange_key: components["schemas"]["ExchangeKey"];
+            /** Fills Inserted */
+            fills_inserted: number;
+            /** Fills Seen */
+            fills_seen: number;
+            /** Pages */
+            pages: number;
+            status: components["schemas"]["AccountOutcomeStatus"];
+            /** Windows Completed */
+            windows_completed: number;
+        };
+        /**
+         * ExchangeKey
+         * @description Every venue spot fills can be imported from.
+         *
+         *     A `StrEnum`, so `exchange_accounts.exchange_key == ExchangeKey.BITGET` compares the
+         *     string the column holds. The order is alphabetical because the `CHECK` constraint lists
+         *     the values that way and a reader comparing the two should not have to sort either.
+         * @enum {string}
+         */
+        ExchangeKey: "bingx" | "bitget";
+        /**
+         * ExchangeLastErrorResponse
+         * @description Why the account's latest attempted sync failed. Skipped runs are not attempts.
+         */
+        ExchangeLastErrorResponse: {
+            /** Detail */
+            detail: string | null;
+            error_kind: components["schemas"]["ExchangeSyncErrorKind"];
+        };
+        /**
+         * ExchangeListResponse
+         * @description Every configured venue and every venue with an account, sorted by `exchange_key`.
+         */
+        ExchangeListResponse: {
+            /** Exchanges */
+            exchanges: components["schemas"]["ExchangeResponse"][];
+        };
+        /**
+         * ExchangeResponse
+         * @description One venue: whether it is configured, where its sync stands, what history it holds.
+         *
+         *     `history_truncated` is `effective_since > requested_since`: the venue's retention cut the
+         *     requested history short, and `effective_since` is where what is held begins. `syncing` is
+         *     true while an exchange sync is in flight and this venue is configured.
+         */
+        ExchangeResponse: {
+            /** Configured */
+            configured: boolean;
+            /** Effective Since */
+            effective_since: string | null;
+            exchange_key: components["schemas"]["ExchangeKey"];
+            /** Fills Stored */
+            fills_stored: number;
+            /** History Truncated */
+            history_truncated: boolean;
+            last_error: components["schemas"]["ExchangeLastErrorResponse"] | null;
+            /** Last Synced At */
+            last_synced_at: string | null;
+            /** Pending Windows */
+            pending_windows: number;
+            /** Requested Since */
+            requested_since: string | null;
+            status: components["schemas"]["AccountSyncStatus"];
+            /** Syncing */
+            syncing: boolean;
+        };
+        /**
+         * ExchangeSyncErrorKind
+         * @description Why an account's sync failed, as a value the owner can act on.
+         *
+         *     Seven are the exchange error classes, subclass and parent kept apart where the remedy
+         *     differs: `INSUFFICIENT_SCOPE` and `AUTH` both mean "edit the key", and #16 says which edit;
+         *     `RETENTION_WINDOW` is the venue refusing a window as too old after the sync ran out of
+         *     steps. `CONFLICT` is a re-read fill that differs from the stored one. `INTERNAL` is a
+         *     defect of ours, kept apart so that a parser bug is never read as an outage at the venue.
+         *     Mirrored by `ck_exchange_sync_run_accounts_error_kind`, alphabetical like it.
+         * @enum {string}
+         */
+        ExchangeSyncErrorKind: "auth" | "conflict" | "insufficient_scope" | "internal" | "invalid_request" | "rate_limited" | "retention_window" | "schema" | "unavailable";
+        /**
+         * ExchangeSyncRunListResponse
+         * @description The exchange run log, newest first, wrapped in an object so it can grow.
+         */
+        ExchangeSyncRunListResponse: {
+            /** Runs */
+            runs: components["schemas"]["ExchangeSyncRunResponse"][];
+        };
+        /**
+         * ExchangeSyncRunResponse
+         * @description One exchange sync run: when, how long, how many accounts, and what each did.
+         *
+         *     `fills_seen` and `fills_inserted` are the sums of the accounts' counts. `finished_at` and
+         *     `duration_ms` are `null` for a run in flight and for an interrupted one.
+         */
+        ExchangeSyncRunResponse: {
+            /** Accounts */
+            accounts: components["schemas"]["ExchangeAccountOutcomeResponse"][];
+            /** Accounts Failed */
+            accounts_failed: number;
+            /** Accounts Skipped */
+            accounts_skipped: number;
+            /** Accounts Succeeded */
+            accounts_succeeded: number;
+            /** Accounts Total */
+            accounts_total: number;
+            /** Duration Ms */
+            duration_ms: number | null;
+            /** Fills Inserted */
+            fills_inserted: number;
+            /** Fills Seen */
+            fills_seen: number;
+            /** Finished At */
+            finished_at: string | null;
+            /** Run Id */
+            run_id: number;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            status: components["schemas"]["SyncRunStatus"];
+            trigger: components["schemas"]["SyncTrigger"];
+        };
+        /**
+         * ExchangeSyncTriggeredResponse
+         * @description A run summary plus whether this request started it or joined one in flight.
+         *
+         *     `joined` is a fact about this call, not the run, for the reason `SyncTriggeredResponse`
+         *     gives. When it is true, `trigger` is the running run's.
+         */
+        ExchangeSyncTriggeredResponse: {
+            /** Accounts */
+            accounts: components["schemas"]["ExchangeAccountOutcomeResponse"][];
+            /** Accounts Failed */
+            accounts_failed: number;
+            /** Accounts Skipped */
+            accounts_skipped: number;
+            /** Accounts Succeeded */
+            accounts_succeeded: number;
+            /** Accounts Total */
+            accounts_total: number;
+            /** Duration Ms */
+            duration_ms: number | null;
+            /** Fills Inserted */
+            fills_inserted: number;
+            /** Fills Seen */
+            fills_seen: number;
+            /** Finished At */
+            finished_at: string | null;
+            /** Joined */
+            joined: boolean;
+            /** Run Id */
+            run_id: number;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            status: components["schemas"]["SyncRunStatus"];
+            trigger: components["schemas"]["SyncTrigger"];
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -971,6 +1235,78 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SyncTriggeredResponse"];
+                };
+            };
+        };
+    };
+    listExchanges: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExchangeListResponse"];
+                };
+            };
+        };
+    };
+    listExchangeSyncRuns: {
+        parameters: {
+            query?: {
+                /** @description How many runs to return, newest first. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExchangeSyncRunListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    syncExchanges: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExchangeSyncTriggeredResponse"];
                 };
             };
         };

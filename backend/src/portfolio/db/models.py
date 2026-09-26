@@ -133,6 +133,27 @@ _EXCHANGE_FILL_SIDE_CHECK: Final = "side IN ('buy', 'sell')"
 # accept `2` from any writer that is not the ORM. Named, like every other constraint here.
 _EXCHANGE_FILL_QUOTE_QUANTITY_DERIVED_CHECK: Final = "quote_quantity_derived IN (0, 1)"
 
+# The `domain.exchanges.AccountSyncStatus` members, alphabetical, with the same duplication
+# hazard as every constant above -- repeated verbatim in `0007_exchange_sync` -- and the same
+# reflection test.
+_EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK: Final = (
+    "sync_status IN ('auth_failed', 'error', 'never_synced', 'ok')"
+)
+
+# One account's outcome within one exchange sync run. `skipped` is the third value the chain
+# outcome does not have: an `auth_failed` account is not attempted by a scheduled run, and the
+# row saying so is what makes "why did nothing happen" answerable from the run log.
+_EXCHANGE_SYNC_RUN_ACCOUNT_STATUS_CHECK: Final = "status IN ('failed', 'skipped', 'success')"
+
+# Why an account's sync failed: the seven exchange error classes, a fill that conflicts with
+# one already stored, and `internal` for a defect of ours. Alphabetical. Nullable, because a
+# success and a skip have no error to name.
+_EXCHANGE_SYNC_RUN_ACCOUNT_ERROR_KIND_CHECK: Final = (
+    "error_kind IS NULL OR "
+    "error_kind IN ('auth', 'conflict', 'insufficient_scope', 'internal', 'invalid_request', "
+    "'rate_limited', 'retention_window', 'schema', 'unavailable')"
+)
+
 PRICE_SCALE: Final = 12
 """Decimal places `prices.amount` rounds to and stores. Public, because a test pins it.
 
@@ -527,8 +548,24 @@ class ExchangeAccount(Base):
     Relaxing it -- two sub-accounts at one venue -- needs a credential story first, and a
     migration then.
 
-    Sync state -- status, `auth_failed`, checkpoints, the requested and effective start of
-    the history -- is #15's and arrives with the loop that writes it.
+    ## Sync state (#15)
+
+    `sync_status` is the `AccountSyncStatus` the last run left. The three instants describe
+    the history the sync has **planned**, which is not the same as the history it holds:
+
+    * `requested_since` -- what the owner asked for (`PORTFOLIO_EXCHANGE_HISTORY_START`, or
+      2009-01-03 when unset), as of the last plan. The configured value, never clamped.
+    * `effective_since` -- the floor of the planned history. Once no window is pending in
+      `exchange_sync_windows`, every fill from here to `planned_until` is held. Later than
+      `requested_since` when the venue's retention cut the request short, which is what
+      `history_truncated` reports.
+    * `planned_until` -- the ceiling of the planned history; the next run plans from here,
+      reaching back `OVERLAP` to catch a fill that landed late.
+
+    `last_synced_at` is when a run last left the account with nothing pending. Our clock.
+
+    None of these is compared in SQL: they are `TEXT` in SQLite, and the sync reads them into
+    Python and compares there.
     """
 
     __tablename__ = "exchange_accounts"
@@ -536,6 +573,7 @@ class ExchangeAccount(Base):
         UniqueConstraint("user_id", "exchange_key", name="uq_exchange_accounts_user_exchange"),
         # Named, because a batch rebuild cannot re-create an anonymous CHECK.
         CheckConstraint(_EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK, name="exchange_key"),
+        CheckConstraint(_EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK, name="sync_status"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -548,6 +586,15 @@ class ExchangeAccount(Base):
     )
     exchange_key: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    sync_status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=text("'never_synced'"),
+    )
+    requested_since: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    effective_since: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    planned_until: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    last_synced_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
 
 class ExchangeFill(Base):
@@ -586,9 +633,20 @@ class ExchangeFill(Base):
     Two clocks, and they are not redundant: `executed_at` is the venue's, when the trade
     happened; `ingested_at` is ours, when this row was written.
 
-    No index beyond the unique constraint, which leads with `exchange_account_id`. The
-    reader that needs one arrives with #15 or later and adds it then, as
-    `balance_snapshots` did.
+    No index beyond the unique constraint, which leads with `exchange_account_id`: #15's
+    reads -- a count per account, and the stored rows behind a page's skipped ids -- are both
+    served by it.
+
+    **Append-only is a database property, not a convention** (#15). Migration
+    `0007_exchange_sync` creates `exchange_fills_no_update` and `exchange_fills_no_delete`,
+    two `BEFORE` triggers that abort any `UPDATE` or `DELETE` of a row. A corrected fill is
+    refused as a conflict by the sync rather than overwriting the first version; recording
+    it as an adjustment is M4's.
+
+    **Alembic batch mode does not recreate triggers.** A future migration that rebuilds this
+    table -- any `batch_alter_table("exchange_fills")` that is not a plain `ADD COLUMN` --
+    drops both of them silently and must create them again. The reflection test that compares
+    `sqlite_master.sql` against the migration's constants is what fails if it does not.
     """
 
     __tablename__ = "exchange_fills"
@@ -631,6 +689,141 @@ class ExchangeFill(Base):
     executed_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
     raw_payload: Mapped[str] = mapped_column(Text, nullable=False)
     ingested_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
+class ExchangeSyncWindow(Base):
+    """One window of an account's history the sync has planned and not yet finished reading.
+
+    **The pending queue is the checkpoint.** A row exists only while its window is unread; the
+    page that reads its last fill deletes it, in the same transaction as those fills. So a
+    process that dies anywhere leaves exactly the work it had not committed, and the union of
+    the finished and the pending windows is always the one interval
+    `[effective_since, planned_until)` on the account.
+
+    `cursor` is the venue's cursor for the next page to request, `NULL` for the window's first
+    page. It is advanced in the same transaction as the fills of the page that produced it --
+    which is what makes resuming after a crash re-read at most one page. **It is a trade id at
+    Bitget and never reaches a log**, a message or a response.
+
+    `symbol` is set only for a venue that `requires_symbol`: one row per window per symbol.
+
+    **No `CHECK (since < until)`**, deliberately: that compares two `TEXT` datetimes in SQL,
+    which is a string comparison that happens to agree with time only while every value is
+    written by one code path. `FillWindow` refuses an inverted window when the row is read.
+    """
+
+    __tablename__ = "exchange_sync_windows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Indexed: every read of the queue is one account's. `ix_exchange_sync_windows_exchange_
+    # account_id` by the naming convention.
+    exchange_account_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("exchange_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    since: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    until: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    symbol: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ExchangeSyncRun(Base):
+    """One attempt to sync every configured exchange account, whatever became of it.
+
+    The shape of `sync_runs`, and for the same reasons: written at `running` and committed
+    before any venue is called, swept to `interrupted` by the lifespan and by the next run,
+    `finished_at` and `duration_ms` left `NULL` for a run that did not live to finish, and
+    the duration taken from a monotonic clock. `trigger` and `status` use the same `CHECK`
+    constants as `sync_runs` -- one vocabulary, not two that could drift.
+
+    Counts are of **accounts**. `accounts_skipped` is an `auth_failed` account a scheduled
+    run did not attempt; the run's own `status` is computed over the accounts it attempted.
+    Fill counts are not stored here: they are the sums of the account rows, computed in
+    Python when a run is read.
+    """
+
+    __tablename__ = "exchange_sync_runs"
+    __table_args__ = (
+        # Named, because a batch rebuild cannot re-create an anonymous CHECK. The same
+        # constants as `sync_runs`, deliberately.
+        CheckConstraint(_SYNC_RUN_TRIGGER_CHECK, name="trigger"),
+        CheckConstraint(_SYNC_RUN_STATUS_CHECK, name="status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    trigger: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    # `ix_exchange_sync_runs_started_at` by the naming convention.
+    started_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    accounts_total: Mapped[int] = mapped_column(Integer, nullable=False)
+    accounts_succeeded: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
+    accounts_failed: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
+    accounts_skipped: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
+
+
+class ExchangeSyncRunAccount(Base):
+    """What one account did during one exchange sync run.
+
+    **Written as each account finishes, in the same commit as the account's `sync_status`**,
+    not all at once when the run closes. So the status an account shows and the outcome
+    `GET /api/exchanges` reads its `last_error` from can never disagree, and a run interrupted
+    after its first account keeps that account's outcome.
+
+    `detail` is `str()` of an exchange error -- a fixed class summary, a status and a
+    digits-only venue code, by construction -- or the fixed count-only message of a fill
+    conflict, or, for a defect of ours, the exception's type name and nothing else. It is
+    rendered by an endpoint, so no other text may reach it.
+    """
+
+    __tablename__ = "exchange_sync_run_accounts"
+    __table_args__ = (
+        UniqueConstraint(
+            "exchange_sync_run_id",
+            "exchange_account_id",
+            name="uq_exchange_sync_run_accounts_run_account",
+        ),
+        CheckConstraint(_EXCHANGE_SYNC_RUN_ACCOUNT_STATUS_CHECK, name="status"),
+        CheckConstraint(_EXCHANGE_SYNC_RUN_ACCOUNT_ERROR_KIND_CHECK, name="error_kind"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No index of its own: the unique constraint leads with it.
+    exchange_sync_run_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("exchange_sync_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # No index either, deliberately: the one read by account is "its newest attempted
+    # outcome", which walks the primary key backwards and stops at the first match, over at
+    # most two accounts' rows interleaved.
+    exchange_account_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("exchange_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    windows_completed: Mapped[int] = mapped_column(Integer, nullable=False)
+    pages: Mapped[int] = mapped_column(Integer, nullable=False)
+    fills_seen: Mapped[int] = mapped_column(Integer, nullable=False)
+    fills_inserted: Mapped[int] = mapped_column(Integer, nullable=False)
+    error_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 # Re-exported so that anything needing the schema -- Alembic's `env.py`, the drift check --

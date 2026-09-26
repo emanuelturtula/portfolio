@@ -264,6 +264,13 @@ concurrency = ["thread", "greenlet"]
 # still below nine, so the floor waits one more issue. `providers/exchanges/bitget.py` is
 # fully covered. The first measurement was 99.68% against this floor, and the tester closed
 # the gap with tests for the pure functions' caller contracts.
+#
+# **99.7 held again at the exchange sync (#15)**, measured 99.89% over 5940 statements and
+# 1102 branches, with eight units missing: the four above, and four partial branches in
+# `services/exchange_sync.py`. Those four are the defensive "account row vanished" and "no
+# ceiling yet" paths, and the two cases where a floor that is already high enough stays put.
+# None of them can claim history as covered. 99.8 would leave 6.1 units of headroom, below
+# nine, so the floor waits.
 fail_under = 99.7
 show_missing = true
 skip_covered = true

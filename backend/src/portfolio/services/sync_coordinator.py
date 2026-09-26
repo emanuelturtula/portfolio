@@ -1,4 +1,11 @@
-"""One balance sync at a time in this process, by **joining** rather than refusing.
+"""One sync at a time per kind in this process, by **joining** rather than refusing.
+
+Two instances exist: the balance sync (#10) and the exchange sync (#15). The class is generic
+over the summary its runner returns (PEP 695), and the task name and the log-event prefix are
+constructor arguments. **Their defaults are the balance sync's**, `balance-sync` and
+`balance_sync`, so the task name and every log event that instance has always written are
+unchanged; the exchange instance passes `exchange-sync` and `exchange_sync`. Two instances
+share nothing but the class, so a run of one never joins, blocks or drains the other.
 
 A second caller -- the scheduler's tick arriving while a manual sync is still running, or a
 second click on a refresh button -- does not start a second run and does not get a 409. It
@@ -37,7 +44,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import structlog
 
@@ -51,13 +58,24 @@ from portfolio.repositories.sync_runs import SyncTrigger
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
-    from portfolio.repositories.sync_runs import SyncRunSummary
-
-__all__ = ["SyncCoordinator", "SyncOutcome", "SyncRunner", "SyncTrigger"]
+__all__ = [
+    "BALANCE_SYNC_LOG_PREFIX",
+    "BALANCE_SYNC_TASK_NAME",
+    "SyncCoordinator",
+    "SyncOutcome",
+    "SyncRunner",
+    "SyncTrigger",
+]
 
 _logger = structlog.get_logger(__name__)
 
-type SyncRunner = Callable[[SyncTrigger], Coroutine[Any, Any, SyncRunSummary]]
+BALANCE_SYNC_TASK_NAME: Final = "balance-sync"
+"""The balance run's task name, and the coordinator's default, unchanged since #10."""
+
+BALANCE_SYNC_LOG_PREFIX: Final = "balance_sync"
+"""The prefix of the balance coordinator's log events, and the default, unchanged since #10."""
+
+type SyncRunner[SummaryT] = Callable[[SyncTrigger], Coroutine[Any, Any, SummaryT]]
 """What actually performs a run, given a trigger. An `async def`, which is what
 `Coroutine` rather than the looser `Awaitable` says: `asyncio.create_task` takes a
 coroutine, and a named task is what makes this run legible in a debugger.
@@ -70,21 +88,21 @@ lifespan passes a closure that opens its own session per run.
 
 
 @dataclass(frozen=True, slots=True)
-class SyncOutcome:
+class SyncOutcome[SummaryT]:
     """A run's summary, and whether this caller started it or attached to it.
 
     `joined` is a fact about *this call*, not about the run, which is why it is here rather
-    than on `SyncRunSummary`: the same run is `joined=False` for the caller that started it
-    and `joined=True` for everyone who arrived afterwards, and a field on the summary could
-    only record one of those.
+    than on the summary: the same run is `joined=False` for the caller that started it and
+    `joined=True` for everyone who arrived afterwards, and a field on the summary could only
+    record one of those.
     """
 
-    summary: SyncRunSummary
+    summary: SummaryT
     joined: bool
 
 
 @dataclass(slots=True)
-class _RunInFlight:
+class _RunInFlight[SummaryT]:
     """One run's task and how many callers are still waiting to be handed its outcome.
 
     **Per run, not per coordinator**, and that is the point of the class. A task is `done()`
@@ -98,30 +116,53 @@ class _RunInFlight:
     on the event loop's thread.
     """
 
-    task: asyncio.Task[SyncRunSummary]
+    task: asyncio.Task[SummaryT]
     waiting: int = field(default=0)
 
 
-class SyncCoordinator:
+class SyncCoordinator[SummaryT]:
     """Holds the run in flight, if there is one, and hands it to whoever asks next.
 
-    One instance per application, installed on `app.state` by the lifespan. Not safe across
-    processes and it does not need to be: there is one instance of this application, and the
-    thing being protected is a burst of requests at a public index rather than a database
-    invariant.
+    One instance per kind of sync per application, installed on `app.state` by the lifespan.
+    Not safe across processes and it does not need to be: there is one instance of this
+    application, and the thing being protected is a burst of requests at a public index or a
+    venue rather than a database invariant.
+
+    `task_name` names the run's task, and `log_prefix` begins every event this instance logs
+    (`<prefix>_failed`, `<prefix>_cancelled_at_shutdown`, `<prefix>_failed_before_shutdown`).
+    Both default to the balance sync's, so an instance built as `SyncCoordinator(runner)` is
+    the balance coordinator exactly as it was before the class became generic.
     """
 
-    def __init__(self, runner: SyncRunner) -> None:
+    def __init__(
+        self,
+        runner: SyncRunner[SummaryT],
+        *,
+        task_name: str = BALANCE_SYNC_TASK_NAME,
+        log_prefix: str = BALANCE_SYNC_LOG_PREFIX,
+    ) -> None:
         self._runner = runner
+        self._task_name = task_name
+        self._log_prefix = log_prefix
         self._lock = asyncio.Lock()
-        self._current: _RunInFlight | None = None
+        self._current: _RunInFlight[SummaryT] | None = None
+
+    @property
+    def task_name(self) -> str:
+        """The name the run's task is created with."""
+        return self._task_name
+
+    @property
+    def log_prefix(self) -> str:
+        """What every event this instance logs begins with."""
+        return self._log_prefix
 
     @property
     def in_flight(self) -> bool:
         """Whether a run is happening right now. For the lifespan's shutdown, and for a test."""
         return self._current is not None and not self._current.task.done()
 
-    async def sync(self, trigger: SyncTrigger) -> SyncOutcome:
+    async def sync(self, trigger: SyncTrigger) -> SyncOutcome[SummaryT]:
         """Start a run, or attach to the one already going, and return its summary.
 
         `trigger` is recorded only when this call actually starts the run. A caller that
@@ -144,9 +185,11 @@ class SyncCoordinator:
             if current is not None and not current.task.done():
                 joined = True
             else:
-                task = asyncio.create_task(self._runner(trigger), name="balance-sync")
+                task = asyncio.create_task(self._runner(trigger), name=self._task_name)
                 current = _RunInFlight(task=task)
-                task.add_done_callback(partial(_report_unobserved_failure, current))
+                task.add_done_callback(
+                    partial(_report_unobserved_failure, current, log_prefix=self._log_prefix)
+                )
                 self._current = current
                 joined = False
             current.waiting += 1
@@ -184,7 +227,9 @@ class SyncCoordinator:
             # below, deliberately and after the grace period has actually elapsed.
             await asyncio.wait_for(asyncio.shield(task), grace_seconds)
         except TimeoutError:
-            _logger.warning("balance_sync_cancelled_at_shutdown", grace_seconds=grace_seconds)
+            _logger.warning(
+                f"{self._log_prefix}_cancelled_at_shutdown", grace_seconds=grace_seconds
+            )
             task.cancel()
             # `asyncio.wait` rather than `await task`: it returns when the task is done and
             # never re-raises, so neither the `CancelledError` nor a failure needs
@@ -198,14 +243,16 @@ class SyncCoordinator:
             # else was waiting, `_report_unobserved_failure` has logged it with the
             # traceback. Nothing to add here and nothing to sweep: the run's own row was
             # either closed out by the run or will be swept by the lifespan.
-            _logger.debug("balance_sync_failed_before_shutdown")
+            _logger.debug(f"{self._log_prefix}_failed_before_shutdown")
             return True
         return True
 
 
-def _report_unobserved_failure(
-    run: _RunInFlight,
-    task: asyncio.Task[SyncRunSummary],
+def _report_unobserved_failure[SummaryT](
+    run: _RunInFlight[SummaryT],
+    task: asyncio.Task[SummaryT],
+    *,
+    log_prefix: str,
 ) -> None:
     """Log a failed run **only if no caller is still waiting to receive the failure**.
 
@@ -234,4 +281,4 @@ def _report_unobserved_failure(
         return
     error = task.exception()
     if error is not None:
-        _logger.error("balance_sync_failed", error_type=type(error).__name__, exc_info=error)
+        _logger.error(f"{log_prefix}_failed", error_type=type(error).__name__, exc_info=error)

@@ -47,6 +47,8 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+import pytest
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -387,7 +389,7 @@ def test_the_relaxed_configuration_still_catches_a_direct_import(tmp_path: Path)
     assert "BROKEN" in output, output
 
 
-def test_the_file_holds_exactly_these_four_contracts() -> None:
+def test_the_file_holds_exactly_these_five_contracts() -> None:
     """The contract set, pinned against a literal, so a deletion is a red test.
 
     Exact rather than `>=`, for the reason `APPLICATION_TABLES` in `tests/db/` gives: a
@@ -410,6 +412,193 @@ def test_the_file_holds_exactly_these_four_contracts() -> None:
         "thin-routers",
         "framework-free-services",
         "prices-are-never-fetched-in-a-request",
+        "api-never-reaches-an-exchange-provider",
     }
     assert PRICES_CONTRACT_ID in contracts
+    assert EXCHANGES_CONTRACT_ID in contracts
     assert parser.get("importlinter", "root_package") == "portfolio"
+
+
+# --------------------------------------------------------------------------------------
+# #15 criterion 7: no request path reaches an exchange provider, proven able to fail
+# --------------------------------------------------------------------------------------
+#
+# The same two halves as criterion 2 of #9 above, for a contract with a wider source: the
+# whole of `portfolio.api` -- routers, schemas and `dependencies.py` -- may not import
+# `portfolio.providers.exchanges`, the package holding `Credentials`, directly or through a
+# service. The one sanctioned path from a request to a venue is the coordinator's runner,
+# which `portfolio.main` builds, and `main` is outside `portfolio.api`.
+
+#: The section header of #15's contract, and the identifier `--contract` takes.
+EXCHANGES_CONTRACT_ID: Final = "api-never-reaches-an-exchange-provider"
+EXCHANGES_CONTRACT_SECTION: Final = f"importlinter:contract:{EXCHANGES_CONTRACT_ID}"
+
+API_MODULE: Final = "portfolio.api"
+EXCHANGE_PROVIDERS_MODULE: Final = "portfolio.providers.exchanges"
+
+#: The shadow tree's packages. `credentials` is the module the contract exists to wall off.
+SHADOW_EXCHANGE_PACKAGES: Final[tuple[str, ...]] = (
+    "portfolio",
+    "portfolio/api",
+    "portfolio/api/routers",
+    "portfolio/api/schemas",
+    "portfolio/services",
+    "portfolio/providers",
+    "portfolio/providers/exchanges",
+)
+SHADOW_CREDENTIALS: Final = "portfolio/providers/exchanges/credentials.py"
+SHADOW_READ_SERVICE: Final = "portfolio/services/exchanges.py"
+
+
+def import_line(module: str) -> str:
+    """`from a.b import c` for `a.b.c`, with an `__all__` so nothing is flagged as unused."""
+    package, _, name = module.rpartition(".")
+    return f"from {package} import {name}\n\n__all__ = ['{name}']\n"
+
+
+def plant_exchange_shadow(
+    root: Path,
+    *,
+    importer: str,
+    reaches: str | None,
+    service_reaches_provider: bool,
+) -> None:
+    """A throwaway `portfolio` whose `importer` module imports `reaches`, if anything.
+
+    `importer` is a path under the shadow root, `reaches` a dotted module name. The read
+    service imports the credentials module when `service_reaches_provider` is set, which is
+    what makes `router -> service -> provider` a chain rather than two unrelated imports.
+    """
+    for package in SHADOW_EXCHANGE_PACKAGES:
+        directory = root / package
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "__init__.py").write_text("", encoding="utf-8")
+    (root / SHADOW_CREDENTIALS).write_text('FIELD = "api_key"\n', encoding="utf-8")
+    service_body = (
+        import_line("portfolio.providers.exchanges.credentials")
+        if service_reaches_provider
+        else "__all__: list[str] = []\n"
+    )
+    (root / SHADOW_READ_SERVICE).write_text(service_body, encoding="utf-8")
+    importer_path = root / importer
+    importer_path.parent.mkdir(parents=True, exist_ok=True)
+    body = "__all__: list[str] = []\n" if reaches is None else import_line(reaches)
+    importer_path.write_text(body, encoding="utf-8")
+
+
+def relaxed_exchange_configuration(destination: Path) -> Path:
+    """The shipped config with `allow_indirect_imports = True` added to #15's contract only."""
+    lines = IMPORT_LINTER_CONFIG.read_text(encoding="utf-8").splitlines()
+    header = f"[{EXCHANGES_CONTRACT_SECTION}]"
+    assert header in lines, f"{header} is not in {IMPORT_LINTER_CONFIG}"
+    index = lines.index(header)
+    relaxed = [*lines[: index + 1], "allow_indirect_imports = True", *lines[index + 1 :]]
+    destination.write_text("\n".join(relaxed) + "\n", encoding="utf-8")
+    return destination
+
+
+def run_exchange_contract(package_root: Path, config: Path) -> tuple[int, str]:
+    result = run_lint_imports(
+        package_root=package_root, config=config, contracts=(EXCHANGES_CONTRACT_ID,)
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+def test_the_exchange_contract_walls_off_the_whole_api_package() -> None:
+    """Forbidden, `portfolio.api` entire as the source, the exchange providers as the target.
+
+    Field by field, and `allow_indirect_imports` absent, for the reasons the prices contract's
+    tests give: the dangerous failure is a contract that still exists and forbids nothing.
+    """
+    parser = configuration()
+
+    assert parser.has_section(EXCHANGES_CONTRACT_SECTION)
+    assert parser.get(EXCHANGES_CONTRACT_SECTION, "type") == "forbidden"
+    assert module_list(parser, EXCHANGES_CONTRACT_SECTION, "source_modules") == [API_MODULE]
+    assert module_list(parser, EXCHANGES_CONTRACT_SECTION, "forbidden_modules") == [
+        EXCHANGE_PROVIDERS_MODULE
+    ]
+    assert not parser.has_option(EXCHANGES_CONTRACT_SECTION, "allow_indirect_imports")
+    assert parser.get(EXCHANGES_CONTRACT_SECTION, "name").strip() != ""
+
+
+def test_the_shipped_exchange_contract_reports_a_router_reaching_a_provider_through_a_service(
+    tmp_path: Path,
+) -> None:
+    """The planted violation: a router, the read service, the credentials module."""
+    plant_exchange_shadow(
+        tmp_path,
+        importer="portfolio/api/routers/exchanges.py",
+        reaches="portfolio.services.exchanges",
+        service_reaches_provider=True,
+    )
+
+    code, output = run_exchange_contract(tmp_path, IMPORT_LINTER_CONFIG)
+
+    assert code != 0, f"the contract accepted router -> service -> exchange provider:\n{output}"
+    assert "BROKEN" in output, output
+    assert "portfolio.api.routers.exchanges" in output, output
+    assert "portfolio.services.exchanges" in output, output
+    assert "portfolio.providers.exchanges.credentials" in output, output
+
+
+@pytest.mark.parametrize(
+    "importer",
+    ["portfolio/api/dependencies.py", "portfolio/api/schemas/exchanges.py"],
+    ids=["dependencies", "a schema"],
+)
+def test_the_exchange_contract_covers_api_code_that_is_not_a_router(
+    tmp_path: Path, importer: str
+) -> None:
+    """A schema importing a provider's type for an annotation is a request path too."""
+    plant_exchange_shadow(
+        tmp_path,
+        importer=importer,
+        reaches="portfolio.providers.exchanges.credentials",
+        service_reaches_provider=False,
+    )
+
+    code, output = run_exchange_contract(tmp_path, IMPORT_LINTER_CONFIG)
+
+    assert code != 0, f"{importer} reached an exchange provider unreported:\n{output}"
+    assert "BROKEN" in output, output
+
+
+def test_the_composition_root_may_reach_an_exchange_provider(tmp_path: Path) -> None:
+    """The control: the same tree with the chain cut, and `main` building the providers.
+
+    `portfolio.main` is where the coordinator's runner is built over the provider mapping,
+    and it is outside `portfolio.api`. A contract that refused it would refuse the one
+    sanctioned path; a harness broken enough to pass this tree for the wrong reason would
+    also pass the violation above, which is why both run the same way.
+    """
+    plant_exchange_shadow(
+        tmp_path,
+        importer="portfolio/api/routers/exchanges.py",
+        reaches="portfolio.services.exchanges",
+        service_reaches_provider=False,
+    )
+    (tmp_path / "portfolio" / "main.py").write_text(
+        import_line("portfolio.providers.exchanges.credentials"), encoding="utf-8"
+    )
+
+    code, output = run_exchange_contract(tmp_path, IMPORT_LINTER_CONFIG)
+
+    assert code == 0, f"the composition root or a clean router was reported:\n{output}"
+    assert "KEPT" in output, output
+
+
+def test_allowing_indirect_imports_would_hide_the_exchange_chain(tmp_path: Path) -> None:
+    """The discriminator: the planted chain passes a config with the flag added."""
+    plant_exchange_shadow(
+        tmp_path,
+        importer="portfolio/api/routers/exchanges.py",
+        reaches="portfolio.services.exchanges",
+        service_reaches_provider=True,
+    )
+    relaxed = relaxed_exchange_configuration(tmp_path / "relaxed.importlinter")
+
+    code, output = run_exchange_contract(tmp_path, relaxed)
+
+    assert code == 0, output
+    assert "KEPT" in output, output

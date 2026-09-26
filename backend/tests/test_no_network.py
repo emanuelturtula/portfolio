@@ -55,9 +55,14 @@ if TYPE_CHECKING:
 
     from fastapi import FastAPI
 
-#: The settings that decide whether a lifespan reaches a vendor. Both default to `true`,
+#: The settings that decide whether a lifespan reaches a vendor. All three default to `true`,
 #: which is right in production and is exactly why a test environment has to say otherwise.
-SCHEDULE_SWITCHES: Final = ("balance_sync_enabled", "price_refresh_enabled")
+#: The exchange timer also needs a configured venue, and a developer's `.env` can supply one.
+SCHEDULE_SWITCHES: Final = (
+    "balance_sync_enabled",
+    "price_refresh_enabled",
+    "exchange_sync_enabled",
+)
 
 
 class ReachedTheNetworkError(AssertionError):
@@ -226,6 +231,7 @@ async def test_entering_the_lifespan_opens_no_socket(
             assert app.state.http_client.is_closed is False
             assert app.state.balance_scheduler is None, "the balance timer ignored its switch"
             assert app.state.price_scheduler is None, "the price timer ignored its switch"
+            assert app.state.exchange_scheduler is None, "the exchange timer ignored its switch"
     finally:
         get_settings.cache_clear()
 
@@ -235,9 +241,10 @@ async def test_entering_the_lifespan_opens_no_socket(
 async def until(condition: Callable[[], bool]) -> None:
     """Yield to the loop until `condition` holds. Bounded by the caller's `wait_for`.
 
-    A real sleep rather than a bare checkpoint, unlike its namesake in `test_lifespan.py`:
-    what is being waited for here happens in the resolver's worker thread, and a loop that
-    only ever checkpoints would spin without giving that thread's result a chance to land.
+    A real sleep rather than a bare checkpoint, as its namesake in `test_lifespan.py` now
+    uses too: what is being waited for here happens in the resolver's worker thread, and a
+    loop that only ever checkpoints would spin without giving that thread's result a chance
+    to land.
     """
     while not condition():  # noqa: ASYNC110
         await asyncio.sleep(0.01)

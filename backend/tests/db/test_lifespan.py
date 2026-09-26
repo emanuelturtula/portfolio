@@ -12,9 +12,11 @@ a temporary database URL cached for every test that runs afterwards in the sessi
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -27,7 +29,8 @@ from portfolio.config import get_settings
 from portfolio.db.engine import create_database_engine, create_session_factory
 from portfolio.db.models import Asset
 from portfolio.domain.chains import ChainKey
-from portfolio.main import create_app
+from portfolio.domain.exchanges import ExchangeKey
+from portfolio.main import create_app, drain_coordinators
 from portfolio.providers.errors import ProviderUnavailableError
 from portfolio.providers.prices.base import SUPPORTED_PAIRS, PriceQuote, PriceSource
 from portfolio.services.scheduler import IntervalScheduler
@@ -43,6 +46,7 @@ from tests.balance_harness import (
     sqlite_timestamp,
     stub_chain_providers,
 )
+from tests.exchange_sync_harness import SimulatedVenue
 from tests.offline_http import (
     ReachedAVendorError,
     take_offline_attempts,
@@ -78,6 +82,8 @@ def lifespan_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
     )
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_EXCHANGE_SYNC_ENABLED", "false")
+    monkeypatch.delenv("PORTFOLIO_EXCHANGE_HISTORY_START", raising=False)
     # Offline unless a test says otherwise: see `tests/offline_http.py`. The two tests here
     # whose subject is the client itself take the real one back and prove they got it.
     use_an_offline_http_client(monkeypatch)
@@ -242,18 +248,24 @@ def is_running(scheduler: IntervalScheduler) -> bool:
 
 
 async def until(condition: Callable[[], bool]) -> None:
-    """Yield to the loop until `condition` holds. Bounded by the caller's `wait_for`.
+    """Wait until `condition` holds, polling every 10 ms. Bounded by the caller's `wait_for`.
 
-    `asyncio.sleep(0)` is a bare checkpoint, not a pause: it hands control to the scheduler
-    task and takes it straight back, so this spins the loop rather than waiting on it. The
-    condition is set deep inside a lifespan's own task and has no event to hang an
+    **A real sleep, not `asyncio.sleep(0)`.** A bare checkpoint hands control to the scheduler
+    and takes it straight back, so the loop spins, and it spins against the one thread that
+    can make the condition true: what these tests wait for is written through `aiosqlite`,
+    whose work runs in a worker thread competing for the GIL. On a two-core CI runner under
+    coverage that starved the worker past the five-second bound twice, in two different tests
+    (#71, and `test_shutdown_drains_both_coordinators` on PR #78, where the exchange run the
+    spin was waiting on took 3.3 s). `tests/test_no_network.py` learned the same lesson first.
+
+    The condition is set deep inside a lifespan's own task and has no event to hang an
     `asyncio.Event` off without reaching into the application to plant one -- which would be
     a seam in production code that exists only for a test. `noqa: ASYNC110` for that reason;
     every caller wraps this in `asyncio.wait_for`, so a condition that never holds fails
     with a timeout rather than hanging the suite.
     """
     while not condition():  # noqa: ASYNC110
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
 
 
 async def test_the_http_client_is_closed_on_shutdown(
@@ -957,3 +969,395 @@ async def test_recent_attempts_suppress_the_startup_sync_even_when_none_finished
         await sleep.reached()
 
     assert bool(provider.calls) is synced_at_startup
+
+
+# --------------------------------------------------------------------------------------
+# #15: the exchange timer, its coordinator, and both run tables
+# --------------------------------------------------------------------------------------
+
+EXCHANGE_RUNS_SQL: Final = (
+    "SELECT id, trigger, status, finished_at FROM exchange_sync_runs ORDER BY id"
+)
+
+
+class ProviderMappingCalls:
+    """Stands in for `exchange_providers` at the composition root, and counts its calls."""
+
+    def __init__(self, providers: dict[ExchangeKey, SimulatedVenue]) -> None:
+        self.providers = providers
+        self.calls = 0
+
+    def __call__(self, client: object, **keywords: object) -> MappingProxyType[ExchangeKey, Any]:
+        del client, keywords
+        self.calls += 1
+        return MappingProxyType(dict(self.providers))
+
+
+def configure_venues(
+    monkeypatch: pytest.MonkeyPatch, providers: dict[ExchangeKey, SimulatedVenue]
+) -> ProviderMappingCalls:
+    """Hand the lifespan these venues as the configured ones, where `main` looks them up."""
+    stub = ProviderMappingCalls(providers)
+    monkeypatch.setattr("portfolio.main.exchange_providers", stub)
+    return stub
+
+
+async def exchange_runs_in(database: Path) -> list[dict[str, object]]:
+    async with own_session(database) as session:
+        return await rows_of(session, EXCHANGE_RUNS_SQL)
+
+
+async def with_an_owner(database: Path) -> None:
+    await bring_the_schema_up(database)
+    async with own_session(database) as session:
+        await insert_user(session)
+
+
+@pytest.fixture
+def exchange_timer_on(lifespan_database: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """The exchange schedule **on**, a grace that lets a startup run finish."""
+    monkeypatch.setenv("PORTFOLIO_EXCHANGE_SYNC_ENABLED", "true")
+    monkeypatch.setenv("PORTFOLIO_EXCHANGE_SYNC_SHUTDOWN_GRACE_SECONDS", "5")
+    get_settings.cache_clear()
+    try:
+        yield lifespan_database
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_the_exchange_coordinator_is_published_even_with_nothing_configured(
+    lifespan_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual sync must work with the timer off, so the coordinator always exists."""
+    del lifespan_database
+    stub = configure_venues(monkeypatch, {})
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        coordinator = app.state.exchange_sync_coordinator
+        assert isinstance(coordinator, SyncCoordinator)
+        assert coordinator.task_name == "exchange-sync"
+        assert coordinator.log_prefix == "exchange_sync"
+        assert coordinator is not app.state.sync_coordinator
+        assert app.state.configured_exchanges == frozenset()
+        assert app.state.exchange_scheduler is None
+
+    assert stub.calls == 1
+
+
+async def test_the_configured_set_is_the_provider_mappings_keys_and_nothing_else(
+    lifespan_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The only thing the read side learns about credentials: which venues have them."""
+    del lifespan_database
+    venue = SimulatedVenue()
+    configure_venues(monkeypatch, {ExchangeKey.BITGET: venue})
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        assert app.state.configured_exchanges == frozenset({ExchangeKey.BITGET})
+        assert isinstance(app.state.configured_exchanges, frozenset)
+        state: dict[str, object] = app.state._state
+        leaked = [
+            name
+            for name, value in state.items()
+            if value is venue or (isinstance(value, Mapping) and venue in value.values())
+        ]
+        assert leaked == [], "a provider, or the mapping holding it, was published"
+
+
+async def test_the_exchange_timer_is_not_built_when_nothing_is_configured(
+    exchange_timer_on: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An install without credentials writes no empty run every fifteen minutes."""
+    configure_venues(monkeypatch, {})
+    app = create_app()
+
+    with capture_logs() as captured:
+        async with app.router.lifespan_context(app):
+            assert app.state.exchange_scheduler is None
+
+    assert await exchange_runs_in(exchange_timer_on) == []
+    disabled = [
+        entry
+        for entry in captured
+        if entry["event"] == "scheduler_disabled" and entry.get("scheduler") == "exchange-sync"
+    ]
+    assert [entry["reason"] for entry in disabled] == ["no_exchange_configured"]
+
+
+async def test_the_exchange_timer_is_not_built_when_disabled(
+    lifespan_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await with_an_owner(lifespan_database)
+    venue = SimulatedVenue()
+    configure_venues(monkeypatch, {ExchangeKey.BITGET: venue})
+    app = create_app()
+
+    with capture_logs() as captured:
+        async with app.router.lifespan_context(app):
+            assert app.state.exchange_scheduler is None
+
+    assert venue.calls == []
+    assert await exchange_runs_in(lifespan_database) == []
+    disabled = [
+        entry
+        for entry in captured
+        if entry["event"] == "scheduler_disabled" and entry.get("scheduler") == "exchange-sync"
+    ]
+    assert [entry["reason"] for entry in disabled] == ["disabled"]
+
+
+async def test_the_exchange_timer_is_built_when_enabled_and_configured_and_syncs_at_startup(
+    exchange_timer_on: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The startup tick is a `startup` run, through the coordinator, against the venue."""
+    await with_an_owner(exchange_timer_on)
+    venue = SimulatedVenue()
+    stub = configure_venues(monkeypatch, {ExchangeKey.BITGET: venue})
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        scheduler = app.state.exchange_scheduler
+        assert scheduler is not None
+        assert scheduler.name == "exchange-sync"
+        assert scheduler.interval_seconds == 15 * 60
+        assert is_running(scheduler) is True
+        await asyncio.wait_for(until(lambda: bool(venue.calls)), timeout=5)
+
+    assert is_running(scheduler) is False
+    assert stub.calls == 1, "the provider mapping is built once, not per run"
+    runs = await exchange_runs_in(exchange_timer_on)
+    assert [(row["trigger"], row["status"]) for row in runs] == [("startup", "success")]
+    assert await runs_in(exchange_timer_on) == [], "the balance timer stayed off"
+
+
+async def test_both_run_tables_are_swept_at_startup(lifespan_database: Path) -> None:
+    await bring_the_schema_up(lifespan_database)
+    async with own_session(lifespan_database) as session:
+        await session.execute(
+            text(
+                "INSERT INTO sync_runs (trigger, status, started_at, wallets_total, "
+                "wallets_succeeded, wallets_failed) "
+                "VALUES ('scheduled', 'running', '2026-09-24 00:00:00.000000', 1, 0, 0)"
+            )
+        )
+        await session.execute(
+            text(
+                "INSERT INTO exchange_sync_runs (trigger, status, started_at, accounts_total) "
+                "VALUES ('scheduled', 'running', '2026-09-24 00:00:00.000000', 1)"
+            )
+        )
+        await session.commit()
+    app = create_app()
+
+    with capture_logs() as captured:
+        async with app.router.lifespan_context(app):
+            during_balances = await runs_in(lifespan_database)
+            during_exchanges = await exchange_runs_in(lifespan_database)
+
+    assert [row["status"] for row in during_balances] == ["interrupted"]
+    assert [row["status"] for row in during_exchanges] == ["interrupted"]
+    assert during_exchanges[0]["finished_at"] is None
+    swept = [
+        entry for entry in captured if entry["event"] == "exchange_sync_runs_marked_interrupted"
+    ]
+    assert [entry["runs"] for entry in swept] == [1]
+
+
+async def test_an_exchange_run_that_outlasts_the_grace_is_recorded_as_interrupted(
+    exchange_timer_on: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The venue never answers, the grace is zero: the shutdown sweep closes the row."""
+    monkeypatch.setenv("PORTFOLIO_EXCHANGE_SYNC_SHUTDOWN_GRACE_SECONDS", "0")
+    get_settings.cache_clear()
+    await with_an_owner(exchange_timer_on)
+    forever = asyncio.Event()
+    venue = SimulatedVenue()
+
+    async def never_answer(call: object) -> None:
+        del call
+        await forever.wait()
+
+    venue.on_call = never_answer
+    configure_venues(monkeypatch, {ExchangeKey.BITGET: venue})
+    app = create_app()
+
+    try:
+        with capture_logs() as captured:
+            async with app.router.lifespan_context(app):
+                await asyncio.wait_for(until(lambda: bool(venue.calls)), timeout=5)
+    finally:
+        forever.set()
+        await asyncio.sleep(0)
+
+    runs = await exchange_runs_in(exchange_timer_on)
+    assert [row["status"] for row in runs] == ["interrupted"]
+    assert runs[0]["finished_at"] is None
+    assert "exchange_sync_cancelled_at_shutdown" in [entry["event"] for entry in captured]
+
+
+async def test_shutdown_drains_both_coordinators(
+    exchange_timer_on: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A balance run and an exchange run both in flight at shutdown, both allowed to finish."""
+    monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "true")
+    monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_SHUTDOWN_GRACE_SECONDS", "5")
+    get_settings.cache_clear()
+    await register_a_wallet(exchange_timer_on)
+
+    async def dawdle(ignored: object) -> None:
+        del ignored
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    chain = StubChainProvider(
+        ChainKey.BITCOIN, {DEFAULT_BITCOIN_ADDRESS: 123_456_789}, on_fetch=dawdle
+    )
+    stub_chain_providers(monkeypatch, {ChainKey.BITCOIN: chain})
+    venue = SimulatedVenue()
+    venue.on_call = dawdle
+    configure_venues(monkeypatch, {ExchangeKey.BITGET: venue})
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        await asyncio.wait_for(until(lambda: bool(chain.calls) and bool(venue.calls)), timeout=5)
+
+    assert [row["status"] for row in await runs_in(exchange_timer_on)] == ["success"]
+    assert [row["status"] for row in await exchange_runs_in(exchange_timer_on)] == ["success"]
+
+
+async def test_a_drain_that_raises_does_not_stop_the_other() -> None:
+    """`drain_coordinators` runs in the lifespan's `finally`: it logs, it never raises."""
+
+    class Broken:
+        async def drain(self, *, grace_seconds: int) -> bool:
+            del grace_seconds
+            message = "the drain itself failed"
+            raise RuntimeError(message)
+
+    class Healthy:
+        def __init__(self) -> None:
+            self.graces: list[int] = []
+
+        async def drain(self, *, grace_seconds: int) -> bool:
+            self.graces.append(grace_seconds)
+            return True
+
+    healthy = Healthy()
+
+    with capture_logs() as captured:
+        await drain_coordinators((Broken(), 5), (None, 5), (healthy, -3))
+
+    assert healthy.graces == [0], "a negative grace is clamped to zero"
+    failed = [entry for entry in captured if entry["event"] == "sync_drain_failed"]
+    assert [entry["error_type"] for entry in failed] == ["RuntimeError"]
+
+
+async def test_the_two_coordinators_are_drained_concurrently_not_one_after_the_other() -> None:
+    """Two grace periods in sequence would spend the container's whole stop grace period.
+
+    Each fake drain waits at a two-party barrier, which releases only when both drains are
+    waiting at once -- so the barrier *is* the concurrency check, and nothing sleeps on the
+    passing path. Drained one after the other, the first would wait alone until its bound
+    expired, and the failure would be logged and counted below.
+    """
+    barrier = asyncio.Barrier(2)
+    finished: list[str] = []
+
+    class AtTheBarrier:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def drain(self, *, grace_seconds: int) -> bool:
+            del grace_seconds
+            await asyncio.wait_for(barrier.wait(), timeout=2)
+            finished.append(self.name)
+            return True
+
+    with capture_logs() as captured:
+        await asyncio.wait_for(
+            drain_coordinators((AtTheBarrier("balance"), 10), (AtTheBarrier("exchange"), 10)),
+            timeout=5,
+        )
+
+    assert sorted(finished) == ["balance", "exchange"]
+    assert [entry for entry in captured if entry["event"] == "sync_drain_failed"] == []
+
+
+async def test_an_exchange_sweep_that_fails_does_not_stop_startup_or_the_balance_sweep(
+    lifespan_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each sweep in its own `try`: bookkeeping never stops a healthy application."""
+    await bring_the_schema_up(lifespan_database)
+    async with own_session(lifespan_database) as session:
+        await session.execute(
+            text(
+                "INSERT INTO sync_runs (trigger, status, started_at, wallets_total, "
+                "wallets_succeeded, wallets_failed) "
+                "VALUES ('scheduled', 'running', '2026-09-24 00:00:00.000000', 1, 0, 0)"
+            )
+        )
+        await session.commit()
+
+    async def refuse(self: object) -> int:
+        del self
+        message = "database is locked"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(
+        "portfolio.repositories.exchange_sync_runs.ExchangeSyncRunRepository.sweep_interrupted",
+        refuse,
+    )
+    app = create_app()
+
+    with capture_logs() as captured:
+        async with app.router.lifespan_context(app):
+            during = await runs_in(lifespan_database)
+
+    assert [row["status"] for row in during] == ["interrupted"]
+    events = [entry["event"] for entry in captured]
+    assert events.count("exchange_sync_orphan_sweep_failed") == 2, "at startup and at shutdown"
+
+
+async def seed_exchange_run(database: Path, *, status: str, age: timedelta) -> None:
+    started = sqlite_timestamp(datetime.now(UTC) - age)
+    async with own_session(database) as session:
+        await session.execute(
+            text(
+                "INSERT INTO exchange_sync_runs (trigger, status, started_at, accounts_total) "
+                "VALUES ('startup', :status, :started, 1)"
+            ),
+            {"status": status, "started": started},
+        )
+        await session.commit()
+
+
+@pytest.mark.parametrize(
+    ("status", "age", "synced_at_startup"),
+    [
+        ("interrupted", timedelta(minutes=1), False),
+        ("success", timedelta(hours=2), True),
+    ],
+    ids=["an interrupted attempt a minute ago", "a success two hours ago"],
+)
+async def test_a_recent_exchange_attempt_suppresses_the_startup_sync(
+    exchange_timer_on: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    age: timedelta,
+    synced_at_startup: bool,
+) -> None:
+    """A crash-looping container must not ask a venue again on every restart."""
+    await with_an_owner(exchange_timer_on)
+    await seed_exchange_run(exchange_timer_on, status=status, age=age)
+    venue = SimulatedVenue()
+    configure_venues(monkeypatch, {ExchangeKey.BITGET: venue})
+    sleep = PacedSleep()
+    with_a_paced_sleep(monkeypatch, sleep)
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        await sleep.reached()
+
+    assert bool(venue.calls) is synced_at_startup
