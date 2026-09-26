@@ -147,9 +147,15 @@ And, in this order, whichever of these messages apply:
 3. **`last_error`**, whenever present: `ERROR_KIND_SENTENCES[kind]`, then "Detail:" and the
    `detail` as plain text.
 4. **`auth_failed`**: the remediation below.
-5. **`error`**, when not syncing: "The next scheduled sync tries again."
-6. **Windows pending**, when not syncing: "{N} windows of history are still to read. The next
-   sync continues from them."
+5. **`error`**, configured, not syncing: "The next scheduled sync tries again."
+6. **Windows pending**, configured, not syncing: "{N} windows of history are still to read.
+   The next sync continues from them." For one window, "1 window of history is still to read.
+   The next sync continues from it."
+
+Rules 5 and 6 require `configured`, as rule 7 does. An unconfigured venue is in no run, so
+promising a next sync beside rule 1's "nothing new is read" would contradict it on screen.
+Rules 3 and 4 still apply: the last error is history, and the key remediation is exactly how
+the credentials come back.
 7. **`never_synced`, configured, not syncing**: "No sync has finished for {Venue} yet. The next
    scheduled sync imports its history, or press Sync now."
 
@@ -214,7 +220,7 @@ live region: it is page state, and a 5-second poll would re-announce it.
 > may be missing.
 
 When `pending_windows > 0` it adds: "The import has not finished. That is where the history
-will be complete from once the {N} windows still to read are read."
+will be complete from once it does ({N} {window|windows} still to read)."
 
 **Why `effective_since`:** `docs/operations.md` defines it as "the instant from which the
 history held is complete" once nothing is pending. That is the "exact earliest date actually
@@ -272,11 +278,18 @@ The Sync history section holds a table of the 20 newest runs:
 | Trigger | Scheduled, Manual, At startup |
 | Status | Running, Succeeded, Partially succeeded, Failed, Interrupted |
 | Duration | `formatDuration(duration_ms)`, or "—" when `null` (a running or interrupted run) |
-| Exchanges | "{n} succeeded, {n} failed, {n} skipped", zero counts left out; "None" when `accounts_total` is 0 |
+| Exchanges | settled run: "{n} succeeded, {n} failed, {n} skipped", zero counts left out. `running` or `interrupted`: "{accounts.length} of {accounts_total} finished". "None" when `accounts_total` is 0 |
 | Fills | "{fills_inserted} new of {fills_seen} read" |
 | Details | per account: "{Venue}: {outcome label}". A failed one adds its sentence and "Detail: {detail}" |
 
 An empty log renders "No exchange sync has run yet."
+
+**The three account counters are written only when a run closes** (`finish_run`), while each
+account's outcome is committed as that account finishes (`record_outcome`). A `running` or
+`interrupted` run therefore has `accounts_total` from its opening, all three counters at 0,
+and the outcomes of the accounts it got through. So its Exchanges cell counts `accounts`
+rather than the counters, and it doubles as progress while the run is in flight. Its Fills
+cell is right as it stands: the backend sums fills from the recorded outcomes.
 
 **"Redacted errors" is the backend's guarantee, and the frontend's job is not to undo it.**
 `detail` is built from a fixed summary, an HTTP status and a digits-only venue code (spec 012).
