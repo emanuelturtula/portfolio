@@ -1494,11 +1494,14 @@ async def test_the_symbol_is_split_on_its_hyphen(symbol: str, base: str, quote: 
         pytest.param('"KASUSDT"', id="no hyphen"),
         pytest.param('"A-B-C"', id="two hyphens"),
         pytest.param('"kas-usdt"', id="lower case"),
+        pytest.param('"kas-USDT"', id="a lower-case base"),
+        pytest.param('"KAS-usdt"', id="a lower-case quote"),
         pytest.param('"\\ud800"', id="a lone surrogate"),
         pytest.param('""', id="empty"),
         pytest.param('"-USDT"', id="no base"),
         pytest.param('"KAS-"', id="no quote"),
         pytest.param('"' + "A" * 21 + '-USDT"', id="a 21-character base"),
+        pytest.param('"KAS-' + "U" * 21 + '"', id="a 21-character quote"),
         pytest.param('"KAS_USDT"', id="an underscore"),
         pytest.param('"KAS/USDT"', id="a slash"),
         pytest.param('"KAS-USDT "', id="a trailing space"),
@@ -1512,6 +1515,22 @@ async def test_a_symbol_that_is_not_base_hyphen_quote_is_refused(fragment: str |
 
     assert type(error) is ExchangeSchemaError
     assert names_field(error, "symbol")
+
+
+async def test_an_unencodable_commission_asset_is_refused_naming_the_venues_field() -> None:
+    """The provider checks UTF-8 itself, where it still knows the venue's name for the field.
+
+    Left to `NormalizedFill`, the refusal would name `fee_asset` rather than
+    `commissionAsset`, and carry the `UnicodeEncodeError` as its context -- whose `args` hold
+    the whole string.
+    """
+    error = await refused(one_fill_fake(commissionAsset='"\\ud800"'))
+
+    assert type(error) is ExchangeSchemaError
+    assert names_field(error, "commissionAsset")
+    assert "fee_asset" not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 async def test_a_sell_is_a_sell() -> None:
