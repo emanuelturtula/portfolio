@@ -149,7 +149,8 @@ const EMPTY_TITLE = 'No exchange connected';
 const EMPTY_TEXT =
   'Exchange API keys are read from environment variables on the host, for example ' +
   'PORTFOLIO_BITGET_API_KEY, and are never entered in this app. docs/operations.md, ' +
-  'section 12, explains how to create a read-only key and where to put it.';
+  'sections 12 (Bitget) and 14 (BingX) explain how to create a read-only key and where to ' +
+  'put it.';
 const NO_RUNS_LINE = 'No exchange sync has run yet.';
 
 const keySteps = (venue: string): readonly string[] => [
@@ -2530,6 +2531,9 @@ describe('ExchangesPage: empty, loading and failure', () => {
     const main = screen.getByRole('main');
 
     expect(main).toHaveTextContent(EMPTY_TEXT);
+    // Both venues' runbooks are named: operations.md section 12 is Bitget's, 14 is BingX's.
+    expect(main).toHaveTextContent('sections 12 (Bitget)');
+    expect(main).toHaveTextContent('14 (BingX)');
     expect(heading).toBeInTheDocument();
     // No Sync now: there is nothing to sync. No run log either.
     expect(screen.queryByRole('button', { name: 'Sync now' })).not.toBeInTheDocument();
