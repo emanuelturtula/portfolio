@@ -8,7 +8,7 @@
 # ---------------------------------------------------------------------------------------
 # Stage 1 - build the single-page application
 # ---------------------------------------------------------------------------------------
-FROM node:25-alpine AS frontend
+FROM node:26-alpine AS frontend
 
 WORKDIR /build
 
