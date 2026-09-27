@@ -1,0 +1,352 @@
+import { QueryClientProvider, useQuery, type QueryClient } from '@tanstack/react-query';
+import { act, renderHook, waitFor } from '@testing-library/react';
+import type { ReactNode } from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  EXCHANGE_RUNS_LIMIT,
+  exchangeRunsQueryKey,
+  exchangesQueryKey,
+  FAST_POLL_MS,
+  listRefetchInterval,
+  runsRefetchInterval,
+  SLOW_POLL_MS,
+  useExchangeRuns,
+  useExchanges,
+  useSyncExchanges,
+} from '@/api/exchanges';
+import { createQueryClient } from '@/lib/queryClient';
+import {
+  accountFailed,
+  authFailedExchange,
+  exchange,
+  finishedRun,
+  interruptedExchangeRun,
+  NOW,
+  runningExchangeRun,
+  unsyncedExchange,
+} from '@/test/exchangeFixtures';
+import { fakeExchanges, type FakeExchanges } from '@/test/fakeExchanges';
+import { settle } from '@/test/render';
+import { problem, server } from '@/test/server';
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+function wrapperFor(client: QueryClient) {
+  return function Wrapper({ children }: { readonly children: ReactNode }) {
+    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+  };
+}
+
+describe('the polling constants', () => {
+  it('polls every 5 seconds fast, every minute slow, and reads 20 runs', () => {
+    expect(FAST_POLL_MS).toBe(5_000);
+    expect(SLOW_POLL_MS).toBe(60_000);
+    expect(EXCHANGE_RUNS_LIMIT).toBe(20);
+  });
+
+  it('keys both queries under exchanges, so one invalidation reaches both', () => {
+    expect(exchangesQueryKey).toEqual(['exchanges', 'list']);
+    expect(exchangeRunsQueryKey).toEqual(['exchanges', 'runs']);
+  });
+});
+
+describe('listRefetchInterval', () => {
+  it('polls slowly before the first read, unless this page is syncing', () => {
+    expect(listRefetchInterval(undefined, false)).toBe(SLOW_POLL_MS);
+    expect(listRefetchInterval(undefined, true)).toBe(FAST_POLL_MS);
+  });
+
+  it('polls slowly when no venue is syncing', () => {
+    expect(listRefetchInterval([], false)).toBe(SLOW_POLL_MS);
+    expect(listRefetchInterval([exchange()], false)).toBe(SLOW_POLL_MS);
+    expect(
+      listRefetchInterval([unsyncedExchange('bingx'), authFailedExchange('auth')], false),
+    ).toBe(SLOW_POLL_MS);
+  });
+
+  it('polls fast while any venue is syncing', () => {
+    // A venue without credentials is never syncing, so "any" and "every"
+    // differ exactly when one venue has been unconfigured.
+    const syncing = exchange({ syncing: true });
+    const unconfigured = exchange({ exchange_key: 'bingx', configured: false });
+
+    expect(listRefetchInterval([syncing], false)).toBe(FAST_POLL_MS);
+    expect(listRefetchInterval([unconfigured, syncing], false)).toBe(FAST_POLL_MS);
+    expect(listRefetchInterval([syncing, unconfigured], false)).toBe(FAST_POLL_MS);
+  });
+
+  it("polls fast while this page's own sync is pending, whatever the list says", () => {
+    expect(listRefetchInterval([], true)).toBe(FAST_POLL_MS);
+    expect(listRefetchInterval([exchange()], true)).toBe(FAST_POLL_MS);
+    expect(listRefetchInterval([exchange({ syncing: true })], true)).toBe(FAST_POLL_MS);
+  });
+});
+
+describe('runsRefetchInterval', () => {
+  it('polls slowly before the first read, unless this page is syncing', () => {
+    expect(runsRefetchInterval(undefined, false, false)).toBe(SLOW_POLL_MS);
+    expect(runsRefetchInterval(undefined, false, true)).toBe(SLOW_POLL_MS);
+    expect(runsRefetchInterval(undefined, true, false)).toBe(FAST_POLL_MS);
+  });
+
+  it('polls slowly when the log is empty or its newest run has ended', () => {
+    for (const anySyncing of [false, true]) {
+      expect(runsRefetchInterval([], false, anySyncing)).toBe(SLOW_POLL_MS);
+      expect(runsRefetchInterval([finishedRun()], false, anySyncing)).toBe(SLOW_POLL_MS);
+      expect(runsRefetchInterval([interruptedExchangeRun()], false, anySyncing)).toBe(SLOW_POLL_MS);
+      expect(
+        runsRefetchInterval([finishedRun(), interruptedExchangeRun()], false, anySyncing),
+      ).toBe(SLOW_POLL_MS);
+    }
+  });
+
+  it('polls fast while the newest run is running and a venue is syncing', () => {
+    // A running run is always the newest: opening a run sweeps every older
+    // one to interrupted first. So "the newest" is the first entry.
+    const running = runningExchangeRun({ accounts_total: 2 });
+
+    expect(runsRefetchInterval([running], false, true)).toBe(FAST_POLL_MS);
+    expect(runsRefetchInterval([running, finishedRun()], false, true)).toBe(FAST_POLL_MS);
+  });
+
+  it('polls slowly under a running row no venue is syncing: an orphan', () => {
+    // R12. `syncing` is the coordinator's in-flight flag. A `running` row
+    // without it was left by a failed close-out, and the next run sweeps it.
+    const running = runningExchangeRun({ accounts_total: 2 });
+
+    expect(runsRefetchInterval([running], false, false)).toBe(SLOW_POLL_MS);
+    expect(runsRefetchInterval([running, finishedRun()], false, false)).toBe(SLOW_POLL_MS);
+  });
+
+  it('a venue syncing alone does not speed the log up without a running run', () => {
+    expect(runsRefetchInterval([finishedRun()], false, true)).toBe(SLOW_POLL_MS);
+  });
+
+  it("polls fast while this page's own sync is pending, whatever the log says", () => {
+    for (const anySyncing of [false, true]) {
+      expect(runsRefetchInterval([], true, anySyncing)).toBe(FAST_POLL_MS);
+      expect(runsRefetchInterval([finishedRun()], true, anySyncing)).toBe(FAST_POLL_MS);
+      expect(
+        runsRefetchInterval([runningExchangeRun({ accounts_total: 1 })], true, anySyncing),
+      ).toBe(FAST_POLL_MS);
+    }
+  });
+});
+
+describe('the exchange hooks', () => {
+  function setUp(fake: FakeExchanges = fakeExchanges({ exchanges: [exchange()] })) {
+    server.use(...fake.handlers);
+    const client = createQueryClient();
+    const unrelated = vi.fn(() => Promise.resolve('unrelated'));
+
+    const hook = renderHook(
+      () => ({
+        list: useExchanges(false),
+        runs: useExchangeRuns(false, false),
+        // A query outside ['exchanges'], to prove the sync's invalidation is
+        // scoped rather than a refetch of everything.
+        unrelated: useQuery({ queryKey: ['balances', 'current'], queryFn: unrelated }),
+        sync: useSyncExchanges(),
+      }),
+      { wrapper: wrapperFor(client) },
+    );
+
+    return { fake, client, unrelated, hook };
+  }
+
+  async function loaded(hook: ReturnType<typeof setUp>['hook']): Promise<void> {
+    await waitFor(() => {
+      expect(hook.result.current.list.isSuccess).toBe(true);
+      expect(hook.result.current.runs.isSuccess).toBe(true);
+      expect(hook.result.current.unrelated.isSuccess).toBe(true);
+    });
+  }
+
+  it('reads the list and the 20 newest runs, under their keys', async () => {
+    const { fake, client, hook } = setUp(
+      fakeExchanges({ exchanges: [exchange()], runs: [finishedRun()] }),
+    );
+    await loaded(hook);
+
+    expect(fake.requestsTo('list').map((entry) => new URL(entry.url).pathname)).toEqual([
+      '/api/exchanges',
+    ]);
+    const runs = fake.requestsTo('runs').map((entry) => new URL(entry.url));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.pathname).toBe('/api/exchanges/runs');
+    expect(runs[0]?.searchParams.get('limit')).toBe('20');
+    expect(client.getQueryData(exchangesQueryKey)).toBeDefined();
+    expect(client.getQueryData(exchangeRunsQueryKey)).toBeDefined();
+  });
+
+  it('posts the sync as JSON, and re-reads the list and the run log when it succeeds', async () => {
+    const { fake, unrelated, hook } = setUp();
+    await loaded(hook);
+    const listBefore = fake.count('list');
+    const runsBefore = fake.count('runs');
+    const unrelatedBefore = unrelated.mock.calls.length;
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+
+    await waitFor(() => {
+      expect(hook.result.current.sync.isSuccess).toBe(true);
+    });
+    await waitFor(() => {
+      expect(fake.count('list')).toBe(listBefore + 1);
+      expect(fake.count('runs')).toBe(runsBefore + 1);
+    });
+    const posts = fake.requestsTo('sync');
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.method).toBe('POST');
+    // Bodyless, and still declared JSON, or the backend's write guard refuses it.
+    expect(posts[0]?.contentType).toBe('application/json');
+    await settle();
+    expect(unrelated.mock.calls.length).toBe(unrelatedBefore);
+  });
+
+  it('re-reads the list and the run log when the sync fails, too', async () => {
+    // A proxy that cuts the held request off has not stopped the run: the
+    // coordinator shields it. So a failed POST is the moment the page most
+    // needs to look again.
+    const { fake, unrelated, hook } = setUp();
+    await loaded(hook);
+    fake.fail('sync', () => problem(504, 'Gateway Timeout', 'The upstream did not answer.'));
+    const listBefore = fake.count('list');
+    const runsBefore = fake.count('runs');
+    const unrelatedBefore = unrelated.mock.calls.length;
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+
+    await waitFor(() => {
+      expect(hook.result.current.sync.isError).toBe(true);
+    });
+    await waitFor(() => {
+      expect(fake.count('list')).toBe(listBefore + 1);
+      expect(fake.count('runs')).toBe(runsBefore + 1);
+    });
+    await settle();
+    expect(unrelated.mock.calls.length).toBe(unrelatedBefore);
+  });
+
+  it('hands back the run summary the POST answered with', async () => {
+    const run = finishedRun({
+      run_id: 12,
+      trigger: 'manual',
+      accounts: [accountFailed('bitget', 'unavailable')],
+    });
+    const { hook } = setUp(
+      fakeExchanges({ exchanges: [exchange()], onSync: () => ({ ...run, joined: false }) }),
+    );
+    await loaded(hook);
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+
+    await waitFor(() => {
+      expect(hook.result.current.sync.data).toEqual({ ...run, joined: false });
+    });
+  });
+});
+
+describe('the exchange hooks: polling', () => {
+  /*
+   * The hooks are rendered without the page, so `anySyncing` is fixed here;
+   * ExchangesPage.test.tsx covers the page reading it from the list.
+   */
+  /*
+   * `Date` and `setInterval` are faked; `setTimeout` stays real, because MSW
+   * answers through it. TanStack Query schedules `refetchInterval` with
+   * `setInterval` and restarts it on every query update, so each assertion
+   * below counts from the instant the last answer landed.
+   */
+  function pollingHook(fake: FakeExchanges, syncPending: boolean) {
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    vi.setSystemTime(new Date(NOW));
+    server.use(...fake.handlers);
+    const client = createQueryClient();
+
+    return renderHook(
+      ({ pending }) => ({
+        list: useExchanges(pending),
+        runs: useExchangeRuns(pending, false),
+      }),
+      { wrapper: wrapperFor(client), initialProps: { pending: syncPending } },
+    );
+  }
+
+  async function advance(ms: number): Promise<void> {
+    act(() => {
+      vi.advanceTimersByTime(ms);
+    });
+    await settle();
+  }
+
+  /**
+   * `waitFor` cannot be used here: it re-checks on a `setInterval` of its own,
+   * which is faked, and on DOM mutations, which a hook's result never makes.
+   * So this re-checks on the real `setTimeout` that `settle()` waits on.
+   */
+  async function eventually(assertion: () => void): Promise<void> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        assertion();
+        return;
+      } catch (error) {
+        if (attempt >= 40) {
+          throw error;
+        }
+        await settle();
+      }
+    }
+  }
+
+  it("polls both queries every 5 seconds while this page's sync is pending", async () => {
+    const fake = fakeExchanges({ exchanges: [exchange()], runs: [finishedRun()] });
+    const hook = pollingHook(fake, true);
+    await eventually(() => {
+      expect(hook.result.current.list.isSuccess).toBe(true);
+      expect(hook.result.current.runs.isSuccess).toBe(true);
+    });
+    await settle();
+    const list = fake.count('list');
+    const runs = fake.count('runs');
+
+    await advance(FAST_POLL_MS - 1);
+    expect(fake.count('list')).toBe(list);
+    expect(fake.count('runs')).toBe(runs);
+
+    await advance(1);
+    expect(fake.count('list')).toBe(list + 1);
+    expect(fake.count('runs')).toBe(runs + 1);
+  });
+
+  it('drops back to one poll a minute when the sync is no longer pending', async () => {
+    const fake = fakeExchanges({ exchanges: [exchange()], runs: [finishedRun()] });
+    const hook = pollingHook(fake, true);
+    await eventually(() => {
+      expect(hook.result.current.list.isSuccess).toBe(true);
+      expect(hook.result.current.runs.isSuccess).toBe(true);
+    });
+
+    hook.rerender({ pending: false });
+    await settle();
+    const list = fake.count('list');
+    const runs = fake.count('runs');
+
+    await advance(FAST_POLL_MS);
+    expect(fake.count('list')).toBe(list);
+    expect(fake.count('runs')).toBe(runs);
+
+    await advance(SLOW_POLL_MS - FAST_POLL_MS);
+    expect(fake.count('list')).toBe(list + 1);
+    expect(fake.count('runs')).toBe(runs + 1);
+  });
+});

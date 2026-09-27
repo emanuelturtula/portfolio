@@ -157,9 +157,12 @@ prefix is only valid on a `Secure` cookie, and a browser silently drops a `__Hos
 that arrives without it — the failure mode is a login that returns 204 and then does not
 work, with nothing in any log. So the name is derived from `session_cookie_secure`:
 `__Host-psid` when it is true, `psid` when it is false. `session_cookie_secure` defaults to
-true, and `environment=prod` with it set to false refuses to start. Every configuration
-this product actually ships therefore uses `__Host-psid`; the bare name exists only for a
-developer on plain HTTP who is not on `localhost`.
+true, and `environment=prod` with it set to false refuses to start **unless the configured
+origin is plain `http://`**. On such an origin `Secure` cannot work at all — a browser drops
+the cookie — so insisting on it would only make sign-in impossible. Every HTTPS
+configuration this product ships therefore uses `__Host-psid`; the bare name exists for a
+developer on plain HTTP who is not on `localhost`, and for an owner who has deliberately
+chosen to serve the application over plain HTTP on a trusted network.
 
 `SameSite=Lax` rather than `Strict`: `Strict` withholds the cookie on a top-level navigation
 from any other site, so following a bookmark from another tab would land on a logged-out
@@ -335,7 +338,7 @@ Verbatim from the issue, numbered.
 4. Two expiries: sliding idle (7 days) and hard absolute (30 days).
 5. Cookie is `__Host-psid`, `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain`.
    *Interpretation:* the name degrades to `psid` when `session_cookie_secure` is false,
-   which `prod` refuses. See Design.
+   which `prod` refuses unless the origin is plain `http://`. See Design.
 6. Non-GET requests require a matching `Origin` **and** `Content-Type: application/json`;
    a cross-origin POST and a form-encoded POST are both rejected, each with a test.
 7. Login throttling: 6th failure within 15 minutes is rejected.
@@ -369,7 +372,10 @@ Verbatim from the issue, numbered.
 | 4 | `last_seen_at` write is throttled | `tests/auth/test_sessions.py::test_last_seen_is_not_written_on_every_request` |
 | 5 | Every cookie attribute | `tests/auth/test_login.py::test_cookie_carries_every_required_attribute` |
 | 5 | Name degrades when insecure | `tests/auth/test_login.py::test_cookie_name_drops_the_host_prefix_when_insecure` |
-| 5 | `prod` refuses insecure | `tests/auth/test_startup.py::test_prod_refuses_an_insecure_session_cookie` |
+| 5 | `prod` refuses insecure on an `https://` origin | `tests/auth/test_startup.py::test_prod_refuses_an_insecure_session_cookie` |
+| 5 | `prod` accepts insecure on a plain `http://` origin | `tests/auth/test_startup.py::test_prod_accepts_an_insecure_session_cookie_on_a_plain_http_origin` |
+| 5 | Only an origin starting with `http://` is exempt | `tests/auth/test_startup.py::test_prod_refuses_an_insecure_cookie_on_an_origin_that_is_not_http` |
+| 5 | A plain-HTTP `prod` deployment signs in and out | `tests/auth/test_login.py::test_a_plain_http_production_deployment_can_sign_in_and_out` |
 | 6 | `prod` refuses the dev origin | `tests/auth/test_startup.py::test_prod_refuses_the_development_allowed_origin` |
 | 6 | Cross-origin POST | `tests/auth/test_request_guards.py::test_cross_origin_post_is_rejected` |
 | 6 | Missing Origin | `tests/auth/test_request_guards.py::test_post_without_an_origin_is_rejected` |

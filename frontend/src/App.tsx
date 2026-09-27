@@ -5,6 +5,7 @@ import { describeApiError } from '@/api/client';
 import { logout, sessionQueryKey, useSession } from '@/api/session';
 import { RequireSession } from '@/components/RequireSession';
 import { DashboardPage } from '@/pages/DashboardPage';
+import { ExchangesPage } from '@/pages/ExchangesPage';
 import { HealthPage } from '@/pages/HealthPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { NotFoundPage } from '@/pages/NotFoundPage';
@@ -16,7 +17,8 @@ import { WalletsPage } from '@/pages/WalletsPage';
  *
  * `/login` is the only public route. Everything else - including the
  * catch-all - is wrapped in `RequireSession`, per the route table in
- * docs/specs/004-login-page-and-app-shell.md, extended by #11 for `/wallets`.
+ * docs/specs/004-login-page-and-app-shell.md, extended by #11 for `/wallets` and by #16 for
+ * `/exchanges`.
  */
 export function App() {
   return (
@@ -42,6 +44,14 @@ export function App() {
             element={
               <RequireSession>
                 <WalletsPage />
+              </RequireSession>
+            }
+          />
+          <Route
+            path="/exchanges"
+            element={
+              <RequireSession>
+                <ExchangesPage />
               </RequireSession>
             }
           />
@@ -85,6 +95,7 @@ function MainNav() {
         Dashboard
       </NavLink>
       <NavLink to="/wallets">Wallets</NavLink>
+      <NavLink to="/exchanges">Exchanges</NavLink>
     </nav>
   );
 }
