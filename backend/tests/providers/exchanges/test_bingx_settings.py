@@ -353,6 +353,72 @@ def test_no_window_of_a_credential_reaches_a_startup_refusal(
 
 
 # --------------------------------------------------------------------------------------
+# Spec 017, R4: a credential that is not UTF-8 is refused at startup, for both venues
+# --------------------------------------------------------------------------------------
+#
+# Before R4 a secret holding a lone surrogate -- what bytes from a file in another encoding
+# become under `surrogateescape` -- passed `Settings`, and the first signed request raised a
+# bare `UnicodeEncodeError` from `signing`, whose `args` held the whole secret. The key and
+# the passphrase would have been refused anyway, by the header rule; the secrets had no rule.
+
+#: Every exchange credential variable of both venues, and the `Settings` field it fills.
+EXCHANGE_CREDENTIAL_FIELDS: Final = {
+    KEY_VARIABLE: "bingx_api_key",
+    SIGNING_KEY_VARIABLE: "bingx_api_secret",
+    "PORTFOLIO_BITGET_API_KEY": "bitget_api_key",
+    "PORTFOLIO_BITGET_API_SECRET": "bitget_api_secret",
+    "PORTFOLIO_BITGET_API_PASSPHRASE": "bitget_api_passphrase",
+}
+
+#: A lone low surrogate: the code point `surrogateescape` decodes the byte 0xFF to.
+LONE_SURROGATE: Final = chr(0xDCFF)
+
+
+def both_venues_with(field: str, value: str) -> dict[str, SecretStr]:
+    """Both venues fully configured with valid values, and `field` set to `value`."""
+    fields = {
+        "bingx_api_key": SecretStr(ACCESS_KEY_SENTINEL),
+        "bingx_api_secret": SecretStr(SIGNING_SENTINEL),
+        **{name: SecretStr(text) for name, text in BITGET_FIELDS.items()},
+    }
+    fields[field] = SecretStr(value)
+    return fields
+
+
+@pytest.mark.parametrize("variable", sorted(EXCHANGE_CREDENTIAL_FIELDS))
+def test_a_credential_that_is_not_utf8_is_refused_at_startup(variable: str) -> None:
+    """Refused naming the variable and the rule, with no window of the value in it.
+
+    The value is a window sentinel split by a lone surrogate, so any fragment of it that
+    reached the refusal would be found; the surrogate itself is searched for too.
+    """
+    value = KEY_WINDOW_SENTINEL[:12] + LONE_SURROGATE + KEY_WINDOW_SENTINEL[12:]
+    field = EXCHANGE_CREDENTIAL_FIELDS[variable]
+
+    with pytest.raises(ValidationError) as caught:
+        Settings(**both_venues_with(field, value))  # type: ignore[arg-type]
+
+    message = str(caught.value)
+    rendered = f"{caught.value}\n{caught.value!r}"
+    assert variable in message
+    assert "UTF-8" in message
+    assert leaked_windows(rendered) == []
+    assert LONE_SURROGATE not in rendered
+
+
+@pytest.mark.parametrize("variable", sorted(EXCHANGE_CREDENTIAL_FIELDS))
+def test_the_same_credential_without_the_surrogate_is_accepted(variable: str) -> None:
+    """The companion: the sentinel alone is a valid value for every one of the five."""
+    field = EXCHANGE_CREDENTIAL_FIELDS[variable]
+
+    settings = Settings(**both_venues_with(field, KEY_WINDOW_SENTINEL))  # type: ignore[arg-type]
+
+    value = getattr(settings, field)
+    assert isinstance(value, SecretStr)
+    assert value.get_secret_value() == KEY_WINDOW_SENTINEL
+
+
+# --------------------------------------------------------------------------------------
 # From settings to credentials to the registry
 # --------------------------------------------------------------------------------------
 
