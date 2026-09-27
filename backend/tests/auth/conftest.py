@@ -10,10 +10,11 @@ Three things are arranged here and nowhere else:
   that matters is asserted against the *defaults* in `test_password_hasher.py`, which is
   immune to these overrides -- if it were asserted against the live settings, this file
   would be able to turn that check off.
-* **An HTTPS base URL.** The session cookie is `Secure` in every configuration this
-  product ships, and a cookie jar will not return a `Secure` cookie over `http://`. A test
-  suite that quietly set `session_cookie_secure=False` to get around that would be testing
-  a cookie the application never sends.
+* **An HTTPS base URL.** The session cookie is `Secure` in the default configuration, and
+  a cookie jar will not return a `Secure` cookie over `http://`. A test suite that quietly
+  set `session_cookie_secure=False` to get around that would be testing a cookie the
+  default deployment never sends. The plain-HTTP deployment has a test of its own in
+  `test_login.py`, which builds the environment that mode is defined by.
 * **Both schedules off, and an HTTP client that refuses every request.** Since #10 the
   lifespan starts two timers that reach vendors at startup and builds the shared client,
   which costs 117 ms of SSL setup per startup. `tests/offline_http.py` has the account; the
