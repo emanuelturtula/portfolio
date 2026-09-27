@@ -38,7 +38,7 @@ the whole point of the parser is that the venue's digits arrive as the venue wro
 body built by serialising a `float` would have gone through the very conversion the
 provider has to undo, and the test's expectation would share it.
 
-**Two symbols, with overlapping trade ids.** `spread_fills` alternates `KAS-USDT` and
+**Two symbols, with overlapping trade ids.** `spread_fills` alternates `ETH-USDT` and
 `BTC-USDT` and gives the two fills of each pair the same `id`, because spec 017 infers ids are
 per symbol and a provider that did not namespace them would silently merge two fills.
 
@@ -430,7 +430,7 @@ class FakeBingX:
 # --------------------------------------------------------------------------------------
 
 #: The two symbols a multi-symbol script alternates between.
-TWO_SYMBOLS: Final = ("KAS-USDT", "BTC-USDT")
+TWO_SYMBOLS: Final = ("ETH-USDT", "BTC-USDT")
 
 
 def spread_fills(

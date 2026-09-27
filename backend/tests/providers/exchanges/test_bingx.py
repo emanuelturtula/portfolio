@@ -189,7 +189,7 @@ def test_the_capabilities_are_the_specs() -> None:
     """Spec 017's declaration, field by field, from a literal written by hand.
 
     365 days is a declared bound, not a measured one: the documented 7 days was disproved by
-    the probe reading fills 10.9 days old. 30-day windows are headroom below the 365-day
+    the probe reading fills older than that. 30-day windows are headroom below the 365-day
     spans the probe saw accepted. 5 a second per UID is the documented myTrades budget.
     """
     assert (
@@ -396,7 +396,7 @@ async def test_no_request_names_a_symbol_and_discovery_is_empty() -> None:
         assert fake.requests == [], "discovery made a request"
 
         with pytest.raises(ValueError, match="symbol") as caught:
-            await provider.fetch_fill_page(WINDOW, cursor=None, symbol="KAS-USDT")
+            await provider.fetch_fill_page(WINDOW, cursor=None, symbol="ETH-USDT")
         assert not isinstance(caught.value, ExchangeError)
         assert fake.requests == [], "a caller's symbol cost a signed request"
 
@@ -406,14 +406,14 @@ async def test_no_request_names_a_symbol_and_discovery_is_empty() -> None:
     for params in fake.params():
         assert "symbol" not in params
         assert {"endTime", "limit", "startTime", "timestamp", "signature"} <= set(params)
-    assert {fill.symbol for page in pages for fill in page.fills} == {"KAS-USDT", "BTC-USDT"}
+    assert {fill.symbol for page in pages for fill in page.fills} == {"ETH-USDT", "BTC-USDT"}
 
 
 # --------------------------------------------------------------------------------------
 # Criterion 5: pagination terminates, by construction
 # --------------------------------------------------------------------------------------
 #
-# `spread_fills(n)` puts fill `i` at `since + 60000 * (i + 1)` ms, alternating KAS-USDT and
+# `spread_fills(n)` puts fill `i` at `since + 60000 * (i + 1)` ms, alternating ETH-USDT and
 # BTC-USDT with overlapping ids. The venue serves ascending, 500 at a time, both bounds
 # inclusive. Worked out by hand, for 1,200 fills:
 #
@@ -491,9 +491,9 @@ async def test_fills_sharing_the_boundary_millisecond_are_all_read() -> None:
     """
     boundary_ms = 1695802740000
     boundary = [
-        VenueFill(trade_id=41_000_001, executed_ms=boundary_ms, symbol="KAS-USDT"),
+        VenueFill(trade_id=41_000_001, executed_ms=boundary_ms, symbol="ETH-USDT"),
         VenueFill(trade_id=41_000_001, executed_ms=boundary_ms, symbol="BTC-USDT"),
-        VenueFill(trade_id=41_000_002, executed_ms=boundary_ms, symbol="KAS-USDT"),
+        VenueFill(trade_id=41_000_002, executed_ms=boundary_ms, symbol="ETH-USDT"),
     ]
     after = spread_fills(10, first_ms=boundary_ms + 60_000, first_id=42_000_000)
     fake = FakeBingX([*spread_fills(498), *boundary, *after])
@@ -505,8 +505,8 @@ async def test_fills_sharing_the_boundary_millisecond_are_all_read() -> None:
     assert [params["startTime"] for params in fake.params()] == [SINCE_TEXT, str(boundary_ms)]
     first = {fill.external_trade_id for fill in pages[0].fills}
     second = {fill.external_trade_id for fill in pages[1].fills}
-    assert "KAS-USDT:41000002" not in first, "the premise: the third did not fit page 1"
-    assert {"KAS-USDT:41000001", "BTC-USDT:41000001", "KAS-USDT:41000002"} <= second
+    assert "ETH-USDT:41000002" not in first, "the premise: the third did not fit page 1"
+    assert {"ETH-USDT:41000001", "BTC-USDT:41000001", "ETH-USDT:41000002"} <= second
     assert len(first | second) == 511
 
 
@@ -778,6 +778,9 @@ DOCUMENTED_CODES: Final[dict[int, type[ExchangeError]]] = {
     # Busy.
     100500: ExchangeUnavailableError,
     100503: ExchangeUnavailableError,
+    # A backend that is down: V3 moved a sibling endpoint from an empty success to this
+    # code on 2026-09-05 (spec 017, R3). Mapped defensively.
+    109500: ExchangeUnavailableError,
     # A request we built.
     100400: ExchangeInvalidRequestError,
     100204: ExchangeInvalidRequestError,
@@ -1226,6 +1229,11 @@ FLOAT_TABLE: Final = [
     ),
     pytest.param("1.50000000000000000", "1.50000000000000000", id="zeros only past the 15th"),
     pytest.param("0", "0", id="zero"),
+    pytest.param(
+        "-1.2345678901234567e-10",
+        "-1.23456789012346E-10",
+        id="seventeen digits ten places down, rounded and still 24 places",
+    ),
 ]
 
 
@@ -1291,20 +1299,33 @@ async def test_float_artefacts_are_rounded_to_fifteen_significant_digits(
     assert fill.quote_quantity_derived is False
 
 
-@pytest.mark.parametrize("field", ["quoteQty", "commission"])
+@pytest.mark.parametrize(
+    ("field", "fragment"),
+    [
+        pytest.param("commission", "-1.2345678901234567e-10", id="commission, rounded"),
+        pytest.param("quoteQty", '"1.2345678901234567e-10"', id="quoteQty, rounded"),
+        pytest.param("commission", "-1.2345e-20", id="commission, already short"),
+        pytest.param("quoteQty", '"1.2345e-20"', id="quoteQty, already short"),
+    ],
+)
 async def test_a_value_still_finer_than_the_fill_scale_after_rounding_is_refused(
-    field: str,
+    field: str, fragment: str
 ) -> None:
-    """Five significant digits twenty-four places down: rounding keeps them, the column
-    cannot. Refused as before, never rounded further."""
-    fragment = '"1.2345e-20"' if field == "quoteQty" else "-1.2345e-20"
+    """Rounding removes float noise; it never makes a value fit the column.
 
+    `1.2345678901234567e-10` has seventeen significant digits, so rounding **does** change
+    it: to `1.23456789012346E-10` (the sixteenth digit is 6, so the fifteenth, 5, rounds up;
+    `from_binary_float`'s table pins exactly that). That is still twenty-four places, past
+    `FILL_SCALE`'s eighteen, so it is refused rather than rounded further. The short cases are
+    five digits twenty-four places down, which rounding leaves alone.
+    """
     error = await refused(one_fill_fake(**{field: fragment}))
 
     assert type(error) is ExchangeSchemaError
+    assert names_field(error, "quote_quantity" if field == "quoteQty" else "fee_amount")
 
 
-#: Nineteen significant digits: a KAS-sized quantity no double could carry.
+#: Nineteen significant digits: a quantity no double could carry.
 NINETEEN_DIGITS: Final = "1234567890.123456789"
 NINETEEN_PLACES: Final = "0.0000000000000000001"
 EIGHTEEN_PLACES: Final = "0.000000000000000001"
@@ -1376,17 +1397,17 @@ async def test_a_non_zero_commission_needs_its_asset(asset: str | None) -> None:
 
 
 async def test_the_trade_id_is_namespaced_and_overlapping_ids_stay_distinct() -> None:
-    """`KAS-USDT:7` and `BTC-USDT:7` on one page are two fills, not one and a duplicate."""
+    """`ETH-USDT:7` and `BTC-USDT:7` on one page are two fills, not one and a duplicate."""
     fake = scripted(
-        VenueFill(trade_id=7, executed_ms=INSIDE_MS, symbol="KAS-USDT"),
+        VenueFill(trade_id=7, executed_ms=INSIDE_MS, symbol="ETH-USDT"),
         VenueFill(trade_id=7, executed_ms=INSIDE_MS, symbol="BTC-USDT"),
     )
 
     page = await fetch_page(fake)
 
-    assert [fill.external_trade_id for fill in page.fills] == ["KAS-USDT:7", "BTC-USDT:7"]
+    assert [fill.external_trade_id for fill in page.fills] == ["ETH-USDT:7", "BTC-USDT:7"]
     assert [(fill.base_asset, fill.quote_asset) for fill in page.fills] == [
-        ("KAS", "USDT"),
+        ("ETH", "USDT"),
         ("BTC", "USDT"),
     ]
 
@@ -1394,8 +1415,8 @@ async def test_the_trade_id_is_namespaced_and_overlapping_ids_stay_distinct() ->
 async def test_the_same_id_twice_in_one_symbol_is_still_refused() -> None:
     """The companion: namespacing does not hide a real duplicate."""
     fake = scripted(
-        VenueFill(trade_id=7, executed_ms=INSIDE_MS, symbol="KAS-USDT"),
-        VenueFill(trade_id=7, executed_ms=INSIDE_MS + 1, symbol="KAS-USDT"),
+        VenueFill(trade_id=7, executed_ms=INSIDE_MS, symbol="ETH-USDT"),
+        VenueFill(trade_id=7, executed_ms=INSIDE_MS + 1, symbol="ETH-USDT"),
     )
 
     error = await refused(fake)
@@ -1469,16 +1490,35 @@ async def test_a_malformed_order_id_is_a_schema_error(fragment: str) -> None:
     assert names_field(error, "orderId")
 
 
+#: Built with `chr`, so the source stays ASCII: `M`, a capital O with a stroke, `TH`.
+O_STROKE: Final = chr(0xD8)
+
+
 @pytest.mark.parametrize(
     ("symbol", "base", "quote"),
     [
-        ("KAS-USDT", "KAS", "USDT"),
-        ("AB12-CD3", "AB12", "CD3"),
-        ("A" * 20 + "-" + "B" * 20, "A" * 20, "B" * 20),
-        ("1INCH-USDT", "1INCH", "USDT"),
+        pytest.param("ETH-USDT", "ETH", "USDT", id="ETH-USDT"),
+        pytest.param("AB12-CD3", "AB12", "CD3", id="digits on both sides"),
+        pytest.param("1INCH-USDT", "1INCH", "USDT", id="a base starting with a digit"),
+        # The reviewer's live examples (spec 017, R1), read off BingX's public symbol list on
+        # 2026-09-27: a renamed pair, an underscore, a dollar sign, dots, parentheses, and a
+        # letter outside ASCII. Each must parse, or a page holding it fails on every run.
+        pytest.param("STRK-OLD-USDT", "STRK-OLD", "USDT", id="a hyphen in the base"),
+        pytest.param("H_OLD-USDT", "H_OLD", "USDT", id="an underscore"),
+        pytest.param("$U-USDT", "$U", "USDT", id="a dollar sign"),
+        pytest.param("D.O.G.E.-USDT", "D.O.G.E.", "USDT", id="dots"),
+        pytest.param("ATOM(ARC20)-USDT", "ATOM(ARC20)", "USDT", id="parentheses"),
+        pytest.param(f"M{O_STROKE}TH-USDT", f"M{O_STROKE}TH", "USDT", id="a non-ASCII letter"),
+        pytest.param("A-B-C", "A-B", "C", id="split on the last hyphen"),
+        pytest.param("eth-USDT", "eth", "USDT", id="a lower-case base"),
+        pytest.param("A" * 40 + "-" + "B" * 20, "A" * 40, "B" * 20, id="the longest of each"),
     ],
 )
-async def test_the_symbol_is_split_on_its_hyphen(symbol: str, base: str, quote: str) -> None:
+async def test_the_symbol_is_split_on_its_last_hyphen(symbol: str, base: str, quote: str) -> None:
+    """The quote is the upper-case run after the **last** hyphen; the base is the rest.
+
+    The id is namespaced by the symbol exactly as sent, whatever it holds.
+    """
     fake = scripted(VenueFill(trade_id=7, executed_ms=INSIDE_MS, symbol=symbol))
 
     page = await fetch_page(fake)
@@ -1491,30 +1531,43 @@ async def test_the_symbol_is_split_on_its_hyphen(symbol: str, base: str, quote: 
 @pytest.mark.parametrize(
     "fragment",
     [
-        pytest.param('"KASUSDT"', id="no hyphen"),
-        pytest.param('"A-B-C"', id="two hyphens"),
-        pytest.param('"kas-usdt"', id="lower case"),
-        pytest.param('"kas-USDT"', id="a lower-case base"),
-        pytest.param('"KAS-usdt"', id="a lower-case quote"),
-        pytest.param('"\\ud800"', id="a lone surrogate"),
+        pytest.param('"ETHUSDT"', id="no hyphen"),
+        pytest.param('"ETH_USDT"', id="an underscore and no hyphen"),
+        pytest.param('"eth-usdt"', id="lower case"),
+        pytest.param('"ETH-usdt"', id="a lower-case quote"),
+        pytest.param('"ETH-US.DT"', id="a dot in the quote"),
+        pytest.param('"ETH-' + O_STROKE + 'USD"', id="a non-ASCII quote"),
         pytest.param('""', id="empty"),
         pytest.param('"-USDT"', id="no base"),
-        pytest.param('"KAS-"', id="no quote"),
-        pytest.param('"' + "A" * 21 + '-USDT"', id="a 21-character base"),
-        pytest.param('"KAS-' + "U" * 21 + '"', id="a 21-character quote"),
-        pytest.param('"KAS_USDT"', id="an underscore"),
-        pytest.param('"KAS/USDT"', id="a slash"),
-        pytest.param('"KAS-USDT "', id="a trailing space"),
+        pytest.param('"ETH-"', id="no quote"),
+        pytest.param('"STRK-OLD-"', id="no quote after the last hyphen"),
+        pytest.param('"' + "A" * 41 + '-USDT"', id="a 41-character base"),
+        pytest.param('"ETH-' + "U" * 21 + '"', id="a 21-character quote"),
+        pytest.param('"ETH -USDT"', id="a space in the base"),
+        pytest.param('" ETH-USDT"', id="a leading space"),
+        pytest.param('"ETH-USDT "', id="a trailing space"),
+        pytest.param('"ETH\\t-USDT"', id="a tab"),
+        pytest.param('"ETH\\u00a0-USDT"', id="a no-break space"),
+        pytest.param('"ETH\\u0001-USDT"', id="a control character"),
+        pytest.param('"ETH\\u200b-USDT"', id="a zero-width space, format"),
+        pytest.param('"\\ue000-USDT"', id="a private-use character"),
+        pytest.param('"\\u0378-USDT"', id="an unassigned code point"),
+        pytest.param('"\\ud800-USDT"', id="a lone surrogate in the base"),
+        pytest.param('"\\ud800"', id="a lone surrogate alone"),
         pytest.param("12345", id="a number"),
         pytest.param("null", id="null"),
         pytest.param(None, id="absent"),
     ],
 )
 async def test_a_symbol_that_is_not_base_hyphen_quote_is_refused(fragment: str | None) -> None:
+    """No hyphen, a quote that is not upper-case ASCII, an empty or over-long side, or a base
+    holding whitespace, a control, format, private-use, unassigned or surrogate character."""
     error = await refused(one_fill_fake(symbol=fragment))
 
     assert type(error) is ExchangeSchemaError
     assert names_field(error, "symbol")
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 async def test_an_unencodable_commission_asset_is_refused_naming_the_venues_field() -> None:
@@ -1835,7 +1888,7 @@ FRAGMENTS: Final = st.one_of(
             '""',
             '"0"',
             '"BTC-USDT"',
-            '"KAS-USDT"',
+            '"ETH-USDT"',
             '"17.997667582000002"',
             "1704961925000",
             "9223372036854775807",
