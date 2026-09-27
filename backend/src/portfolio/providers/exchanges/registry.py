@@ -12,7 +12,8 @@ code path that could sign a request without one.
 
 Nothing is auto-discovered, for the reason `providers/registry.py` gives about
 `pkgutil.walk_packages`: a venue that was written but never wired should be visible as a
-missing line here rather than as fills that quietly never arrive. BingX arrives with #14.
+missing line here rather than as fills that quietly never arrive. Two venues are wired:
+Bitget (#13) and BingX (#14).
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from portfolio.config import get_settings
 from portfolio.domain.exchanges import ExchangeKey
+from portfolio.providers.exchanges.bingx import BingXProvider, bingx_credentials
 from portfolio.providers.exchanges.bitget import BitgetProvider, bitget_credentials
 
 if TYPE_CHECKING:
@@ -42,10 +44,11 @@ def exchange_providers(
 ) -> Mapping[ExchangeKey, ExchangeProvider]:
     """Every exchange venue this process has credentials for, keyed by venue.
 
-    **Bitget is present only when its credentials are configured**, and the test is
-    `bitget_credentials(...) is None` -- presence, never truthiness. `Settings` has already
-    refused a partial set and a blank value at startup, so the only two cases here are "all
-    three set" and "none set".
+    **Each venue is present only when its credentials are configured**, and the test is
+    `bitget_credentials(...) is None` or `bingx_credentials(...) is None` -- presence, never
+    truthiness. `Settings` has already refused a partial set and a blank value at startup, so
+    the only two cases per venue are "all set" and "none set". The two are independent: one
+    venue configured and the other not is a normal installation.
 
     Building the table makes no request: a provider's constructor binds to the client and
     keeps its credentials, and nothing more.
@@ -65,4 +68,7 @@ def exchange_providers(
     credentials = bitget_credentials(resolved)
     if credentials is not None:
         providers[ExchangeKey.BITGET] = BitgetProvider(client, credentials)
+    credentials = bingx_credentials(resolved)
+    if credentials is not None:
+        providers[ExchangeKey.BINGX] = BingXProvider(client, credentials)
     return MappingProxyType(providers)

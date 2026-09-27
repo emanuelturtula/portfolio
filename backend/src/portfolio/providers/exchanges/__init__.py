@@ -13,11 +13,14 @@ fixes one vocabulary for all of them, and each venue is written against it:
 | `signing` | HMAC-SHA256, hex and Base64, over a `SecretStr` |
 | `credentials` | `Credentials`, which cannot render a secret |
 | `bitget` | Bitget spot fills over the Classic v2 API (#13) |
+| `bingx` | BingX spot fills over the spot v1 API (#14) |
 | `registry` | `exchange_providers`: the venues this process has credentials for |
 
-**Bitget is the one venue so far.** BingX arrives with #14, with its endpoint paths, cursor
-parameters, error codes and retention confirmed against its own documentation, and a line
-in `registry`. #15 drives the providers. See `docs/providers.md`, "Exchange providers".
+**Two venues, and they page differently.** Bitget pages backwards by trade id
+(`trade_id_before`); BingX pages forwards by time (`time`), because its trade ids are very
+likely a sequence per symbol and a time orders every symbol at once. Each module's docstring
+separates what its venue's documentation confirmed from what was measured and what was
+assumed. #15 drives the providers. See `docs/providers.md`, "Exchange providers".
 
 Nothing is re-exported from here: a caller imports from the module that defines a name, so
 there is one spelling of each import.

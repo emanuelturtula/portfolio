@@ -355,6 +355,16 @@ class Settings(BaseSettings):
     bitget_api_secret: SecretStr | None = None
     bitget_api_passphrase: SecretStr | None = None
 
+    # The BingX API key and its secret, for the same import from the second venue (#14).
+    # **Read-only**: a new BingX key is read-only by default, and `docs/operations.md` says to
+    # leave it that way. Everything said of the Bitget three above holds for these two: kept
+    # as `SecretStr`, never persisted, returned or logged, **both or neither**, a blank value
+    # refused at startup, and the key -- which travels in the `X-BX-APIKEY` header -- refused
+    # when a header cannot carry it. The secret is exempt; it only ever enters an HMAC. BingX
+    # keys have no passphrase, so there is no third variable.
+    bingx_api_key: SecretStr | None = None
+    bingx_api_secret: SecretStr | None = None
+
     # The balance scheduler. Three settings, and each answers a question an operator
     # actually has.
     #
@@ -452,7 +462,7 @@ class Settings(BaseSettings):
           often. The per-host rate limiter would pace the requests, so the symptom is not a
           burst -- it is a process that never stops making them, quietly, for as long as it
           is up.
-        * a partial or blank set of Bitget credentials cannot sign a request, and would be
+        * a partial or blank set of Bitget or BingX credentials cannot sign a request, and would be
           discovered on the first exchange sync rather than here. `exchange_credentials_violation`
           says which variable, and never what it holds. Nor can a key or passphrase holding a
           character no HTTP header can carry -- and that one would also write the value into
@@ -592,6 +602,17 @@ class Settings(BaseSettings):
                 ("PORTFOLIO_BITGET_API_PASSPHRASE", self.bitget_api_passphrase),
             )
         )
+        if reason is not None:
+            raise ValueError(reason)
+        reason = exchange_credentials_violation(
+            (
+                ("PORTFOLIO_BINGX_API_KEY", self.bingx_api_key),
+                ("PORTFOLIO_BINGX_API_SECRET", self.bingx_api_secret),
+            )
+        )
+        if reason is not None:
+            raise ValueError(reason)
+        reason = credential_header_violation((("PORTFOLIO_BINGX_API_KEY", self.bingx_api_key),))
         if reason is not None:
             raise ValueError(reason)
         if (
