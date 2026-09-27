@@ -191,7 +191,8 @@ is a schema error.
 BingX produces `commission`, and evidently `quoteQty`, from IEEE-754 doubles:
 - the type is documented as `float64`;
 - the docs' own sample shows `"17.997667582000002"`;
-- a captured response elsewhere shows `-0.00005820000000000001`.
+- a live response quoted in a third-party wrapper's source (CCXT; an illustration, not a
+  source) shows `-0.00005820000000000001`, and `"4.9988562000000005"` for `quoteQty`.
 
 A double carries 15 significant decimal digits faithfully (`DBL_DIG`), and any digits after
 those are artefacts of the binary representation, not information the venue holds. Rounding
