@@ -52,6 +52,7 @@ from portfolio.providers.exchanges.bingx import (
     PAGE_LIMIT,
     build_fills_query,
     from_binary_float,
+    parse_fill,
     parse_fills_page,
     unwrap_envelope,
 )
@@ -1218,6 +1219,11 @@ FLOAT_TABLE: Final = [
     pytest.param("1.234567890123445", "1.23456789012344", id="a tie after an even digit"),
     pytest.param("1.234567890123455", "1.23456789012346", id="a tie after an odd digit"),
     pytest.param("123456789012345", "123456789012345", id="fifteen integer digits"),
+    pytest.param(
+        "1234567890123456789",
+        "1234567890123460000",
+        id="nineteen integer digits, in plain notation after rounding",
+    ),
     pytest.param("1.50000000000000000", "1.50000000000000000", id="zeros only past the 15th"),
     pytest.param("0", "0", id="zero"),
 ]
@@ -1650,6 +1656,98 @@ async def test_the_interpreter_limits_are_schema_errors(case: str) -> None:
     error = await refused(fake)
 
     assert type(error) is ExchangeSchemaError
+
+
+# -- the public pure functions refuse their own callers' mistakes -----------------------
+#
+# The provider never reaches these: it passes a clock's milliseconds, a `Decimal` from
+# `require_fill_amount`, a fill object `_fill_items` has already checked, and the list
+# `unwrap_envelope` returned. They are public so that they can be tested without HTTP, which
+# makes them callable without the provider too, and a direct caller's mistake is refused
+# rather than half-handled.
+
+
+@pytest.mark.parametrize(
+    "timestamp_ms",
+    [True, -1, "1684814440729", Decimal(1684814440729)],
+    ids=["a boolean", "negative", "a string", "a Decimal"],
+)
+def test_build_fills_query_refuses_a_timestamp_that_is_not_milliseconds(
+    timestamp_ms: object,
+) -> None:
+    with pytest.raises(ValueError, match="timestamp_ms"):
+        build_fills_query(WINDOW, cursor=None, timestamp_ms=timestamp_ms)  # type: ignore[arg-type]
+
+    # The companion: zero is a timestamp, the epoch itself.
+    assert build_fills_query(WINDOW, cursor=None, timestamp_ms=0).endswith("&timestamp=0")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("17.997667582000002"), "17.997667582000002", 17, None],
+    ids=["a float", "a string", "an int", "None"],
+)
+def test_from_binary_float_takes_only_a_decimal(value: object) -> None:
+    """Parse with `require_fill_amount` first; a float here would already have lost digits."""
+    with pytest.raises(TypeError, match="Decimal"):
+        from_binary_float(value)
+
+
+@pytest.mark.parametrize("value", ["NaN", "sNaN", "Infinity", "-Infinity"])
+def test_from_binary_float_takes_only_a_finite_decimal(value: str) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        from_binary_float(Decimal(value))
+
+
+def test_parse_fill_refuses_a_fill_that_is_not_an_object() -> None:
+    with pytest.raises(ExchangeSchemaError, match="JSON object"):
+        parse_fill([36767057])
+
+
+@pytest.mark.parametrize("fills", [None, {}, "[]", 0], ids=["None", "a dict", "a string", "zero"])
+def test_parse_fills_page_refuses_fills_that_are_not_an_array(fills: object) -> None:
+    """Never read as "no fills": the same rule `unwrap_envelope` applies to the envelope."""
+    with pytest.raises(ExchangeSchemaError, match="array"):
+        parse_fills_page(fills, window=WINDOW, cursor=None)
+
+    # The companion: an empty array is an empty page.
+    page = parse_fills_page([], window=WINDOW, cursor=None)
+    assert page.fills == ()
+    assert page.next_cursor is None
+
+
+EPOCH_INSTANT: Final = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+async def test_a_window_ending_at_the_epoch_is_a_caller_mistake_that_costs_no_request() -> None:
+    """`endTime` would be `-1`, which is not a time: refused, not sent."""
+    window = FillWindow(since=EPOCH_INSTANT - timedelta(milliseconds=2), until=EPOCH_INSTANT)
+    fake = FakeBingX()
+
+    with pytest.raises(ValueError, match="epoch"):
+        build_fills_query(window, cursor=None, timestamp_ms=GOLDEN_TIMESTAMP_MS)
+    with pytest.raises(ValueError, match="epoch"):
+        parse_fills_page([], window=window, cursor=None)
+    with pytest.raises(ValueError, match="epoch"):
+        await fetch_page(fake, window)
+
+    assert fake.requests == []
+
+
+async def test_a_window_starting_before_the_epoch_sends_zero() -> None:
+    """The companion: only the end must be after the epoch; the start is held at `0`, never
+    sent negative. A day after the epoch is 86400000 ms, so `endTime` is 86399999."""
+    window = FillWindow(
+        since=EPOCH_INSTANT - timedelta(days=1), until=EPOCH_INSTANT + timedelta(days=1)
+    )
+    fake = FakeBingX()
+
+    page = await fetch_page(fake, window)
+
+    assert page.fills == ()
+    (params,) = fake.params()
+    assert params["startTime"] == "0"
+    assert params["endTime"] == "86399999"
 
 
 # --------------------------------------------------------------------------------------
