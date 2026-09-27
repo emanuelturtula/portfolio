@@ -785,6 +785,11 @@ own. Each attempt is one row in `exchange_sync_runs` plus one row per account in
 an update or a delete of a fill, and re-reading history the sync already holds inserts
 nothing.
 
+The signed-in `/exchanges` page shows all of this without a terminal: the account list, a
+banner for any venue whose retention window truncated its history, and the run log. The
+`curl` commands below still work, and are what a script needs, but a human recovering an
+`auth_failed` key can do the last step from the page - see step 4 below.
+
 ### The four settings
 
 | Variable | Default | What it is |
@@ -871,7 +876,8 @@ every fifteen minutes is how an address gets banned. **To recover:**
    ```
 
 4. Trigger a sync by hand. **A manual sync is the one that retries an `auth_failed`
-   account**:
+   account**. On the `/exchanges` page, press **Sync now**; the same page shows the result
+   once it lands. Scripting the same thing:
 
    ```bash
    curl -X POST -H 'Content-Type: application/json' -H "Origin: https://<host>" \
