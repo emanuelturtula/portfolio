@@ -34,6 +34,7 @@ What they established is below and goes into `docs/providers.md`.
 | No time bounds | "the past 24 hours" (V3, V1) | **wrong**. Returns from the oldest fill, ascending, and `limit=5` gave the oldest five | never sent without bounds |
 | `startTime` / `endTime` | milliseconds; inclusivity not stated | **both inclusive**. `[T, T]` returns the fill at `T`; `[T+1, …]` and `[…, T−1]` do not | `[since, until − 1 ms]` |
 | Order | "sorted by time field, from smallest to largest" | ascending by time and by id | yes |
+| Which fills a capped page keeps | not stated; "by default, the latest trade will be retrieved" hints at the newest | **the oldest in range**, with both bounds, with one, and with none, without a symbol (third probe, 2026-09-27) | pages forward from the newest millisecond |
 | `fromId` | "Starting trade ID" | inclusive, ascending (`id >= fromId`) | not used, see Design |
 | Trade id | `int64` JSON number | a JSON integer of about 26 bits, like the docs' own sample (36767057) | namespaced by symbol |
 | `limit` | "Default 500, maximum 1000", and in the same page "limit = 500" | `1` and `5` honoured; `1001` accepted without error | 500 |
@@ -366,12 +367,22 @@ conflict. The secrets test runs with BingX configured.
 - `frontend/src/lib/exchanges.ts` no longer calls the BingX variable names a guess.
 - The empty state names operations sections 12 (Bitget) and 14 (BingX).
 
-**R8. Which end `limit` keeps when both bounds are sent is not established yet.** The design
-assumes the venue fills a capped page with the **oldest** fills in range, and pages forward.
-The probe showed that only for a query with no bounds, and the docs' "by default, the latest
-trade will be retrieved" hints the other way. If the venue kept the newest, a window of more
-than 500 fills would lose the rest silently. A third probe, run by the owner, settles it
-before this merges. Until then, nothing may say "the order does not matter".
+**R8. `limit` keeps the oldest fills in range, settled by a third probe (2026-09-27).** The
+design assumes the venue fills a capped page with the **oldest** fills in range and pages
+forward. The second probe had shown that only for a query with no bounds, and the docs' "by
+default, the latest trade will be retrieved" hinted the other way. So the owner ran a third
+probe, exactly as the provider asks: both bounds, no symbol. The results:
+
+- `limit` 5 and 2 over `[oldest − 1 h, now]`, and 5 over a one-hour span holding a burst of
+  fills, returned the **oldest** fills in range every time. So did `startTime` alone and
+  `endTime` alone.
+- Without a symbol, the bounds are inclusive as well: `[T, T]` holds the fill at `T`, and
+  `[T + 1, …]` and `[…, T − 1]` do not.
+- Two of the account's fills share one millisecond. That is the case the overlap at `m`
+  exists for.
+
+The cursor takes the newest millisecond by value, so the order *within* a page does not
+matter. Which fills fill a capped page does matter, and it is now established.
 
 **Accepted, not changed:**
 - A 401 or 403 from a CDN becomes `auth_failed`, through #12's shared fallback. Every BingX
