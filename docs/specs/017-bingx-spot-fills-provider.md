@@ -257,10 +257,10 @@ A success is HTTP 200 **and** a JSON object whose `code` is the integer `0` (not
 
 | Codes | Class | Why |
 |---|---|---|
-| `100001` signature mismatch, `100412` signature missing, `100413` key missing or wrong, `100419` IP not on the key's whitelist, `100441` account abnormal or KYC required (V3 spot table), `100401` authentication failed (V1's legacy list only) | `ExchangeAuthError` | the owner has to fix the key or the account. A signature mismatch is a wrong secret once the golden vectors prove the recipe. `100414`, cited by the research, is in no source, and was probably `100441` transposed |
+| `100001` signature mismatch, `100412` signature missing, `100413` key missing or wrong, `100419` IP not on the key's whitelist, `100414` account abnormal (deployed V1 spot common codes), `100441` account abnormal or KYC required (V3 spot table), `100401` authentication failed (V1's legacy list only) | `ExchangeAuthError` | the owner has to fix the key or the account. A signature mismatch is a wrong secret once the golden vectors prove the recipe. V3 may have renumbered `100414` as `100441`; both are mapped |
 | `100004` permission | `ExchangeInsufficientScopeError` | the key lacks Read |
 | `100421` timestamp mismatch | `ExchangeUnavailableError` | **never auth**: the transport replays signed requests, and a skewed clock is not a bad key. The same decision as Bitget's `40008` |
-| `100410`, `109429` rate limit; `(418, None)` "IP banned after 429" | `ExchangeRateLimitedError` | `109429` is listed under Futures in V3. V1's changelog of 2025-10-11 reports `100410` renamed to it, in a futures-oriented list. It is mapped defensively and recorded as such. A 418 must not read as a refused request that a person fixes |
+| `100410`, `109429` rate limit; `(418, None)` "IP banned after 429" | `ExchangeRateLimitedError` | `109429` is listed under Futures in V3. The deployed V1 bundle's changelog of 2025-10-11 reports "Old error code 100410 has been updated to new error code 109429, meaning: APIRateLimit", effective 2025-10-16, among futures codes. It is mapped defensively and recorded as such. A 418 must not read as a refused request that a person fixes |
 | `100500` busy (V3), `100503` busy (V1 only) | `ExchangeUnavailableError` | retry next run |
 | `100400` parameter error, `100204` "data not found / span too wide", `100404` path, `100490` pair offline | `ExchangeInvalidRequestError` | a request we built. The probe shows an empty window is code 0, so `100204` is never an empty answer |
 
