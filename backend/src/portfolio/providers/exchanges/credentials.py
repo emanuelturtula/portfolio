@@ -42,7 +42,13 @@ class Credentials:
       string something has already had the chance to log;
     * a blank value (`ValueError`) -- an empty or whitespace secret is a missing setting,
       and it should fail here rather than as an auth error from the venue, where it looks
-      exactly like a revoked key.
+      exactly like a revoked key;
+    * a value that does not encode as UTF-8 (`ValueError`) -- in practice a lone surrogate,
+      which is how Linux hands over environment bytes that are not UTF-8. Signing encodes
+      the secret, and the `UnicodeEncodeError` it would raise on the first fetch keeps the
+      **whole value** in its `args`, outside every exchange error class. `Settings` refuses
+      such a variable at startup, naming it; this is the same rule for `Credentials` built
+      any other way. Found by review on #14.
     """
 
     api_key: SecretStr
@@ -50,11 +56,11 @@ class Credentials:
     passphrase: SecretStr | None = None
 
     def __post_init__(self) -> None:
-        """Refuse an unwrapped or blank secret, naming the field and never its value.
+        """Refuse an unwrapped, blank or unencodable secret, naming the field and never its value.
 
         Raises:
             TypeError: a field is not a `SecretStr`.
-            ValueError: a field is empty or whitespace.
+            ValueError: a field is empty or whitespace, or does not encode as UTF-8.
         """
         _require_secret(self.api_key, field="api_key")
         _require_secret(self.api_secret, field="api_secret")
@@ -84,3 +90,18 @@ def _require_secret(value: object, *, field: str) -> None:
     if not value.get_secret_value().strip():
         message = f"Credentials.{field} is blank"
         raise ValueError(message)
+    if not _encodes_as_utf8(value):
+        # Raised here, after `_encodes_as_utf8` has returned, and not inside an `except`
+        # block: even `from None` leaves the `UnicodeEncodeError` as the suppressed
+        # `__context__`, and its `args` hold the whole value.
+        message = f"Credentials.{field} does not encode as UTF-8"
+        raise ValueError(message)
+
+
+def _encodes_as_utf8(value: SecretStr) -> bool:
+    """Whether a secret encodes as UTF-8. A predicate, so no refusal carries the error."""
+    try:
+        value.get_secret_value().encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
