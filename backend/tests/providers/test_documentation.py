@@ -725,15 +725,38 @@ def test_the_document_records_the_confirmed_bingx_facts(phrase: str) -> None:
 def test_the_bingx_section_links_the_documentation_and_states_the_retention_and_why() -> None:
     """The 365-day bound is declared, not measured, and the section says why.
 
-    The why is the probe's reading of fills 10.9 days old against the documented 7, and
-    BingX's only longer statement, a year, from its support centre.
+    The why is the probe's reading of fills more than a week old against the documented 7
+    days, and BingX's only longer statement, a year, from its support centre. Spec 017's R5
+    keeps the owner's account out of the repository, so the section states the relation --
+    "more than a week" -- and never the account's own figures.
     """
     section = flattened(bingx_section())
 
     assert BINGX_DOCS_URL.search(section), "no link into bingx-api.github.io"
     assert re.search(r"\b365[ -]days?\b", section), "the retention is not stated in days"
-    assert "10.9" in section, "the fills the probe read past the documented 7 days"
+    assert re.search(r"more than a week|older than a week", section), (
+        "the fills the probe read past the documented 7 days"
+    )
     assert re.search(r"\b(?:one|a) year\b", section), "the statement the bound rests on"
+
+
+#: Figures the owner's probe printed about their own account, which spec 017's R5 keeps out
+#: of the repository: the fill count and the age of the oldest fill.
+OWNER_ACCOUNT_FIGURES: Final = ("29 fills", "10.9")
+
+
+@pytest.mark.parametrize("path", [PROVIDER_DOC, REPO_ROOT / "docs" / "operations.md"])
+def test_the_documents_carry_no_figure_about_the_owners_account(path: Path) -> None:
+    """R5: facts about the venue, never about the account the probe ran against.
+
+    The positive companion: the account is still described, in the terms R5 allows.
+    """
+    text = flattened(path.read_text(encoding="utf-8"))
+
+    for figure in OWNER_ACCOUNT_FIGURES:
+        assert figure not in text, f"{path.name} carries {figure!r}"
+    if path == PROVIDER_DOC:
+        assert "a few dozen fills" in text
 
 
 #: The contradiction a statement must carry to count as recording one.
