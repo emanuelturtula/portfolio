@@ -1,7 +1,7 @@
 # 017 — BingX spot fills provider
 
 Issue: #14
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -545,6 +545,50 @@ It **verifies every request's signature** with `hmac` over the query bytes recei
 - **The secret scanner.** `.gitleaks.toml` matches `bingx…secret = "<16+ chars>"`. Test
   secrets stay `SECRET_KEY`-style and low-entropy, and are never assigned to a name holding
   `bingx`.
+
+## What the plan got wrong
+
+### The docs were wrong on four facts the design rested on, and only the venue could say so
+
+Read in full, the docs said:
+- 7 days of retention;
+- a default of the last 24 hours;
+- a required `symbol` (V1);
+- every timestamp in milliseconds.
+
+The owner's probe disproved all four. Designed from the docs, this provider would have
+declared 7 days and dropped the owner's fills from more than ten days back. It would also
+have built the symbol discovery the issue warns imports a silent subset. The probe was a
+stdlib script with a read-only key, run by the owner. It printed no value that identifies
+the account, and it cost an hour.
+
+**When a venue's docs contradict themselves, a read-only probe run by the owner is worth more
+than any further reading.** Write it to answer the questions the design depends on.
+
+### A probe was cited for more than it printed
+
+The spec said the probe had seen "every spot symbol `BASE-QUOTE` (probe: 2273 symbols)". The
+probe printed a count and three examples. The reviewer fetched the list: 38 symbols fail,
+some renamed by token migrations, and any of them would have failed every page it appeared
+in. The same mistake nearly happened a second time. "`limit` keeps the oldest" had been
+observed only for a query with **no** bounds, and the provider always sends both.
+
+**A probe must ask exactly as the code will ask: the same parameters, the same absences.**
+Cite it only for what it printed.
+
+### The gate enforced a different number from the one it showed
+
+`fail_under = 99.7` with coverage.py's default `precision = 0` passed 99.65%, while printing
+"FAIL Required test coverage of 99.7% not reached". Every floor recorded in
+`pyproject.toml` had been enforced half a point lower. backend-dev found it from an exit
+code that disagreed with its own message. It is now `precision = 2`.
+
+### #13's library question applies to the codec too
+
+Spec 014 asked, of every library a credential passes through, what it raises and what its
+message quotes. `str.encode` was not on that list. A non-UTF-8 secret raised a
+`UnicodeEncodeError` whose `args` carried the whole secret, outside the seven classes. It is
+now refused at startup and at the type, for both venues.
 
 ## Handed on
 
