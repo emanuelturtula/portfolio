@@ -257,12 +257,14 @@ A success is HTTP 200 **and** a JSON object whose `code` is the integer `0` (not
 
 | Codes | Class | Why |
 |---|---|---|
-| `100001` signature mismatch, `100412` signature missing, `100413` key missing or wrong, `100419` IP not on the key's whitelist, `100414` account abnormal | `ExchangeAuthError` | the owner has to fix the key. A signature mismatch is a wrong secret once the golden vectors prove the recipe |
+| `100001` signature mismatch, `100412` signature missing, `100413` key missing or wrong, `100419` IP not on the key's whitelist, `100441` account abnormal or KYC required (V3 spot table), `100401` authentication failed (V1's legacy list only) | `ExchangeAuthError` | the owner has to fix the key or the account. A signature mismatch is a wrong secret once the golden vectors prove the recipe. `100414`, cited by the research, is in no source, and was probably `100441` transposed |
 | `100004` permission | `ExchangeInsufficientScopeError` | the key lacks Read |
 | `100421` timestamp mismatch | `ExchangeUnavailableError` | **never auth**: the transport replays signed requests, and a skewed clock is not a bad key. The same decision as Bitget's `40008` |
-| `100410`, `109429` rate limit; `(418, None)` "IP banned after 429" | `ExchangeRateLimitedError` | the docs rename `100410` to `109429`, so both are mapped. A 418 must not read as a refused request that a person fixes |
-| `100500`, `100503` busy | `ExchangeUnavailableError` | retry next run |
+| `100410`, `109429` rate limit; `(418, None)` "IP banned after 429" | `ExchangeRateLimitedError` | `109429` is listed under Futures in V3. V1's changelog of 2025-10-11 reports `100410` renamed to it, in a futures-oriented list. It is mapped defensively and recorded as such. A 418 must not read as a refused request that a person fixes |
+| `100500` busy (V3), `100503` busy (V1 only) | `ExchangeUnavailableError` | retry next run |
 | `100400` parameter error, `100204` "data not found / span too wide", `100404` path, `100490` pair offline | `ExchangeInvalidRequestError` | a request we built. The probe shows an empty window is code 0, so `100204` is never an empty answer |
+
+`100403` is deliberately **unmapped**. V1 lists it as an authorisation failure, and V3's Account table uses it for "not the main account". A code with two meanings goes to the fallback: on a 200 that is a schema error, which is loud and needs a person.
 
 **Nothing maps to `ExchangeRetentionWindowError`**, because what BingX answers for a window
 older than it keeps is unknown. If it is an error, the unmapped code on a 200 is a schema
@@ -432,6 +434,7 @@ It **verifies every request's signature** with `hmac` over the query bytes recei
 - accept a positive one;
 - stop namespacing the id;
 - map `100421` to auth;
+- map `100441` to anything but auth;
 - drop `109429` or `(418, None)`;
 - read code `false` as success;
 - treat a missing `fills` as empty;
