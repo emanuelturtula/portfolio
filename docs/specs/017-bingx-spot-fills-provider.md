@@ -20,7 +20,8 @@ There are three sources, and each fact names which one it comes from:
 - **Probe**: two read-only scripts the **owner** ran on 2026-09-26/27 with their own read-only
   key. Nothing in this work saw the key. The scripts print codes, counts, JSON types, the
   symbols traded, and time relations. They never print an amount, an id, a key or a signature.
-  The account held 29 fills, all in one symbol, the oldest 10.9 days old.
+  The account held a few dozen fills in one symbol, the oldest under two weeks old. The
+  details of the owner's account stay out of this public repository.
 
 The scripts and their full output are in the tech lead's scratchpad, not in the repository.
 What they established is below and goes into `docs/providers.md`.
@@ -29,7 +30,7 @@ What they established is below and goes into `docs/providers.md`.
 |---|---|---|---|
 | Endpoint | `GET /openApi/spot/v1/trade/myTrades`, signed, permission "Read" (V3, V1) | answered as documented | yes |
 | `symbol` required? | V3: no. V1: yes | **no**. Without `symbol` the answer is code 0, with every fill and a `symbol` on each | omitted |
-| Retention | "Can only check data within the past 7 days range" (V3, V1) | **wrong**. A time-bounded query returned fills 10.9 days old, and spans of 14, 30, 90 and 365 days ending now all answered code 0 with every fill | 365 days, see Design |
+| Retention | "Can only check data within the past 7 days range" (V3, V1) | **wrong**. A time-bounded query returned fills more than ten days old, and spans of 14, 30, 90 and 365 days ending now all answered code 0 with every fill | 365 days, see Design |
 | No time bounds | "the past 24 hours" (V3, V1) | **wrong**. Returns from the oldest fill, ascending, and `limit=5` gave the oldest five | never sent without bounds |
 | `startTime` / `endTime` | milliseconds; inclusivity not stated | **both inclusive**. `[T, T]` returns the fill at `T`; `[T+1, …]` and `[…, T−1]` do not | `[since, until − 1 ms]` |
 | Order | "sorted by time field, from smallest to largest" | ascending by time and by id | yes |
@@ -92,11 +93,11 @@ ExchangeCapabilities(
 ```
 
 - **Retention of 365 days is a declared bound, not a measured one.** The 7 days in the API
-  docs is disproved: the probe read fills 10.9 days old with a time-bounded query. The only
+  docs is disproved: the probe read fills more than ten days old with a time-bounded query. The only
   longer statement BingX makes is its support centre's "trade records … available for up to
   one year", about the web export. Over-declaring would claim history the venue may not
-  return. Under-declaring would drop the owner's own fills: at 7 days, the 26 fills from 10.9
-  days ago would never be read. With 365, `history_truncated` tells the owner that nothing
+  return. Under-declaring would drop the owner's own fills: at 7 days, the fills from more than
+  ten days before the probe would never be read. With 365, `history_truncated` tells the owner that nothing
   before a year ago is promised, which is true.
 - **`max_query_window` is 30 days.** Spans up to 365 days were accepted, so this is headroom,
   not a limit. A first backfill is 13 windows, each one or two requests.
@@ -150,7 +151,7 @@ makes free.
 ### When a page is full
 
 The docs give two maxima, 1000 and 500. The probe could not tell which the venue enforces,
-because the account has 29 fills. So the provider asks for 500 and calls a page of exactly
+because the account has a few dozen fills. So the provider asks for 500 and calls a page of exactly
 500 full.
 
 If the venue silently capped below 500, a capped page would look complete, and the rest of
@@ -161,7 +162,7 @@ the docs are wrong in a direction they give no hint of.
 
 ### Trade ids are namespaced by symbol
 
-`external_trade_id = f"{symbol}:{id}"`, for example `KAS-USDT:36767057`. `NormalizedFill`
+`external_trade_id = f"{symbol}:{id}"`, for example `BTC-USDT:36767057`. `NormalizedFill`
 requires the id to be unique per account across symbols, and here that is not established.
 Namespacing costs nothing if ids turn out to be global. If they are per symbol, it is the
 difference between two fills and one silently dropped. The id must be a JSON **integer** in
@@ -175,7 +176,7 @@ is a schema error.
 | `external_trade_id` | `symbol`, `id` | `f"{symbol}:{id}"`, as above |
 | `external_order_id` | `orderId` | a JSON integer (61 bits in the probe), rendered with `str()`; `null` or absent gives `None` |
 | `symbol` | `symbol` | `\A[A-Z0-9]{1,20}-[A-Z0-9]{1,20}\Z` |
-| `base_asset`, `quote_asset` | `symbol` | split on the one `-`. BingX spells every spot symbol `BASE-QUOTE` (probe: 2273 symbols), so no symbol lookup is needed |
+| `base_asset`, `quote_asset` | `symbol` | split on the **last** `-`: the quote is `[A-Z0-9]{1,20}`, and the base is everything before it (see After review, R1). No symbol lookup is needed |
 | `side` | `isBuyer` | exactly `true` or `false`, which give buy or sell |
 | `quantity` | `qty` | `require_fill_amount`, as reported |
 | `price` | `price` | `require_fill_amount`, as reported |
@@ -310,11 +311,74 @@ There is no log call in the provider, as for Bitget. The transport logs the labe
 |---|---|
 | `requires_symbol=True` with discovery from balances and order history | the venue does not need it; discovery is the issue's named way to import a silent subset |
 | a `fromId` cursor (`TRADE_ID_AFTER`) | correct only if ids are one sequence per account, which the id size argues against, and wrong silently if not |
-| retention 7 days, as documented | disproved, and it would drop the owner's fills from 10.9 days ago |
+| retention 7 days, as documented | disproved, and it would drop the owner's fills from more than ten days back |
 | no retention (`None`) | would promise history since 2009 from a venue that states a year |
 | `limit=1000` | if the venue enforces 500, a 500-fill page would look short, and the rest of the window would be lost |
 | storing `commission` and `quoteQty` exactly as the JSON text | float noise past `FILL_SCALE` would fail pages forever; within it, it would store artefacts as amounts |
 | rounding `price` and `qty` too | they are exact strings; rounding would corrupt a 19-digit quantity |
+
+### After review (R1–R8)
+
+This section overrides the design above wherever the two disagree.
+
+**R1. Symbols are split on the last hyphen, and the base is wide.** The design said BingX
+spells every spot symbol `BASE-QUOTE`, citing the probe. That was wrong twice over: the
+probe printed only the count and three examples, and the reviewer's fetch of the live
+public list on 2026-09-27 found 38 of 2273 that fail the pattern. Among them:
+- `STRK-OLD-USDT` and `H_OLD-USDT`, pairs renamed when a token migrated;
+- `$U-USDT`, `D.O.G.E.-USDT` and `ATOM(ARC20)-USDT`;
+- `MØTH-USDT`.
+
+A rename can turn a pair the owner holds into one of these, and then every page containing it
+would fail forever. The rules now are:
+- The quote is `[A-Z0-9]{1,20}` after the **last** hyphen. Every live quote matches, and the
+  venue's own validation lists `USDT`, `USD1`, `USDT2`, `USDC`, `ETH` and `BTC`.
+- The base is everything before it: 1–40 characters, refusing whitespace, control characters
+  and anything not UTF-8, and accepting the rest.
+- `A-B-C` is accepted, as base `A-B`.
+
+**R2. A renamed pair can duplicate a fill.** The namespaced id embeds the symbol, so a fill
+re-read under a new name gets a new `external_trade_id` and is inserted again instead of
+meeting the collision check. That needs a rename inside a window read twice, which in practice
+means #15's five-minute overlap. It is recorded as a risk, not designed around.
+
+**R3. `109500` maps to unavailable.** V3's changelog of 2026-09-05 moved a sibling endpoint from
+`code=0, data=[]` to `109500` for a backend that is down. It is mapped defensively, as
+`109429` is.
+
+**R4. A credential that does not encode as UTF-8 is refused at startup**, for both venues,
+naming the variable. Before this, a non-UTF-8 secret passed `Settings`, and `signing` raised a
+bare `UnicodeEncodeError` whose `args` held the whole secret.
+
+**R5. No detail of the owner's account in the repository.** The probe's findings are recorded
+as facts about the venue, and the account is described only as "a few dozen fills in one
+symbol, the oldest under two weeks old". Test fixtures use neutral symbols.
+
+**R6. The real sync, end to end.** A test runs `BingXProvider` on the fake venue through the
+exchange sync service and repository. It shows that a window of more than 500 fills imports
+each fill once, and that the overlap millisecond's second read inserts nothing and raises no
+conflict. The secrets test runs with BingX configured.
+
+**R7. Small things.**
+- `docs/operations.md` says this application *assumes* a year, not that BingX promises one.
+- The float-noise test uses a value that rounding actually changes and that is then still
+  refused.
+- `frontend/src/lib/exchanges.ts` no longer calls the BingX variable names a guess.
+- The empty state names operations sections 12 (Bitget) and 14 (BingX).
+
+**R8. Which end `limit` keeps when both bounds are sent is not established yet.** The design
+assumes the venue fills a capped page with the **oldest** fills in range, and pages forward.
+The probe showed that only for a query with no bounds, and the docs' "by default, the latest
+trade will be retrieved" hints the other way. If the venue kept the newest, a window of more
+than 500 fills would lose the rest silently. A third probe, run by the owner, settles it
+before this merges. Until then, nothing may say "the order does not matter".
+
+**Accepted, not changed:**
+- A 401 or 403 from a CDN becomes `auth_failed`, through #12's shared fallback. Every BingX
+  error the probe saw came on a 200.
+- The transport-failure error's `__cause__` holds httpx's request, whose URL carries the
+  signature. No `str`, `repr`, `args` or log rendering shows it, and Bitget's is the same.
+- `fills_seen` counts the overlap's double read.
 
 ## API contract
 
@@ -410,7 +474,7 @@ It **verifies every request's signature** with `hmac` over the query bytes recei
 | 7 | `...::test_float_artefacts_are_rounded_to_fifteen_significant_digits` | `"17.997667582000002"` → `17.997667582`; `-1.2493e-7` → fee `1.2493E-7`; `-0.00005820000000000001` → `0.0000582`; a clean value unchanged; half-even at the 15th digit |
 | 7 | `...::test_price_and_qty_are_never_rounded` | a 19-significant-digit `qty` survives exactly; one past `FILL_SCALE` is refused |
 | 7 | `...::test_a_positive_commission_is_refused` | and zero with no asset is accepted as `None` |
-| 7 | `...::test_the_trade_id_is_namespaced_and_overlapping_ids_stay_distinct` | `KAS-USDT:7` and `BTC-USDT:7` on one page are two fills |
+| 7 | `...::test_the_trade_id_is_namespaced_and_overlapping_ids_stay_distinct` | `ETH-USDT:7` and `BTC-USDT:7` on one page are two fills |
 | 7 | `...::test_a_malformed_trade_id_is_a_schema_error` | a string, `0`, `-1`, `2**63`, a float, `null` |
 | 7 | `...::test_the_symbol_is_split_on_its_hyphen` | and `"KASUSDT"`, `"A-B-C"`, `"kas-usdt"` and `"\ud800"` are refused |
 | 7 | `...::test_the_interpreter_limits_are_schema_errors` | 5000 digits, 1500 deep, `1e1000000000000000000`, a lone surrogate |
@@ -460,8 +524,8 @@ It **verifies every request's signature** with `hmac` over the query bytes recei
 - **A silent cap below 500** would lose the rest of a full window. There is no evidence for
   one.
 - **Retention past a year is unknown**, and so is what the venue answers for a window older
-  than it keeps. An error is loud; an empty success is not. The owner's history starts 10.9
-  days before the probe, well inside the bound.
+  than it keeps. An error is loud; an empty success is not. The owner's history starts under two weeks
+  before the probe, well inside the bound.
 - **Ids per symbol is an inference** from their size. Namespacing makes it harmless either
   way.
 - **`from_binary_float` assumes every artefact lies past the 15th significant digit.** That is
