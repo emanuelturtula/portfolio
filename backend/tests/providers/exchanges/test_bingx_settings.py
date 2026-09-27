@@ -511,6 +511,19 @@ def test_the_provider_refuses_credentials_with_a_passphrase() -> None:
     assert UNWANTED_THIRD_VALUE not in rendered
 
 
+@pytest.mark.parametrize("field", ["api_key", "api_secret"])
+def test_no_provider_can_be_built_with_a_credential_that_is_not_utf8(field: str) -> None:
+    """R4: `Credentials` refuses first, so no `BingXProvider` ever holds such a value, and
+    nothing can reach `signing` with it."""
+    value = "synthetic" + LONE_SURROGATE + "value"
+
+    with pytest.raises(ValueError, match=field) as caught:
+        BingXProvider(httpx.AsyncClient(), synthetic_credentials(**{field: value}))
+
+    assert "UTF-8" in str(caught.value)
+    assert "synthetic" not in f"{caught.value}{caught.value!r}{caught.value.args}"
+
+
 def test_the_provider_accepts_the_two() -> None:
     """The companion: without a passphrase, the same construction succeeds."""
     provider = BingXProvider(httpx.AsyncClient(), synthetic_credentials())
