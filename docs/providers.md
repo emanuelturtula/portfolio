@@ -1466,11 +1466,12 @@ and where the probe and the documentation differ, the probe wins.
   repository's `gh-pages` branch on **2026-01-22**. Its `main` branch holds a 2023 build, so
   a reader has to follow the deployed `index.html` to the current bundle. The first reading
   of the error codes for this section made exactly that mistake.
-- **The probe**: two read-only scripts the **owner** ran on **2026-09-26** and 2026-09-27
-  against the live API with their own read-only key. Nothing in this repository, and no
-  agent, saw the key. The scripts print response codes, counts, JSON types, the symbols
-  traded and time relations ("the fill at `T` is returned for `[T, T]`"). They never print an
-  amount, an id, a key or a signature. The account held **a few dozen fills in one symbol,
+- **The probe**: three read-only scripts the **owner** ran on **2026-09-26** and 2026-09-27
+  against the live API with their own read-only key. The third asked exactly as the
+  provider does, with both bounds and no symbol, to settle which fills a capped page
+  keeps. Nothing in this repository, and no agent, saw the key. The scripts print response
+  codes, counts, JSON types, the symbols traded and time relations ("the fill at `T` is
+  returned for `[T, T]`"). They never print an amount, an id, a key or a signature. The account held **a few dozen fills in one symbol,
   the oldest under two weeks old**. The scripts and their output stayed on the owner's
   machine. They printed the number of spot symbols and three examples, not the list.
 
@@ -1482,8 +1483,10 @@ and where the probe and the documentation differ, the probe wins.
 | `symbol` required? | V3: "No". V1: yes | V1 is **wrong**: without `symbol` the answer is code 0, with every fill and a `symbol` on each | never sent |
 | retention | "Can only check data within the past 7 days range" (V3, V1) | **wrong**, disproved: a time-bounded query returned fills more than a week old, and spans of 14, 30, 90 and 365 days ending now all answered code 0 with every fill | 365 days, below |
 | no time bounds | "the data of the past 24 hours is returned by default" (V3, V1) | **wrong**: it returns from the oldest fill, ascending, and `limit=5` gave the oldest five | bounds are always sent |
-| `startTime`, `endTime` | milliseconds (V3); whether inclusive is not stated | **both inclusive**: `[T, T]` returns the fill at `T`; `[T+1, ...]` and `[..., T-1]` do not | `[since, until - 1 ms]` |
-| order | "sorted by time field, from smallest to largest" (V3, V1) | ascending by time and by id | the cursor does not depend on it |
+| `startTime`, `endTime` | milliseconds (V3); whether inclusive is not stated | **both inclusive**, with a symbol and without one: `[T, T]` returns the fill at `T`; `[T+1, ...]` and `[..., T-1]` do not | `[since, until - 1 ms]` |
+| order within a page | "sorted by time field, from smallest to largest" (V3, V1) | ascending by time and by id | the cursor takes the newest millisecond by value, so the order within a page does not matter |
+| which fills a capped page keeps | not stated; `fromId`'s "by default, the latest trade will be retrieved" (V3) hints at the newest | **the oldest in range**: `limit` 5 and 2 over a span reaching back past the oldest fill, and 5 over a one-hour burst, returned the oldest fills every time, with both bounds, with `startTime` alone and with `endTime` alone, and without a symbol (the third probe, 2026-09-27) | pages forward from the newest millisecond. **This does matter**: a venue keeping the newest would lose the rest of a full window silently |
+| fills sharing a millisecond | not stated | **they occur**: the probe saw fills sharing one millisecond | the next page starts **at** that millisecond, not after it |
 | `fromId` | "Starting trade ID" (V3) | inclusive and ascending: `id >= fromId` | not used, below |
 | trade id | `int64` (V3); the sample is `36767057` | a JSON integer of about 26 bits, like the sample | namespaced by symbol |
 | `limit` | "Default 500, maximum 1000" in the parameter table, and "limit = 500" in the notes, on the same page (V3) | `1` and `5` honoured exactly; `1001` accepted without an error | 500 |
@@ -1591,11 +1594,16 @@ and a page from a symbol with low ids would be skipped for good, silently. A tim
 whatever the id scheme, because the venue orders every symbol's fills by time. So:
 
 1. The first request asks `startTime = since`. A later one asks `startTime = cursor`.
-2. `m` is the newest fill's millisecond on the page, by value, not the last fill as served.
+2. `m` is the newest fill's millisecond on the page, by value, not the last fill as served,
+   so the order *within* a page does not matter. **Which fills a capped page holds does
+   matter**, and it is established: the venue keeps the **oldest** in range (the third
+   probe, 2026-09-27), so everything after `m` is still unread and paging forward from
+   it misses nothing.
 3. No fills, or fewer than 500: `next_cursor = None`.
 4. 500 fills and `m` after `startTime`: `next_cursor = str(m)`. The next request starts
-   **at** `m`, not `m + 1`, because more fills may share that millisecond. The fills at `m`
-   are read twice, and #15's unique constraint makes the second read insert nothing.
+   **at** `m`, not `m + 1`, because more fills may share that millisecond -- and fills
+   sharing a millisecond occur, as the probe saw. The fills at `m` are read twice, and
+   #15's unique constraint makes the second read insert nothing.
 5. 500 fills all at `startTime`: `ExchangeSchemaError`. More than a page of fills in one
    millisecond cannot be paged past with a time cursor, and a loud failure beats a silent
    loss.
@@ -1738,7 +1746,7 @@ owner's first sync with #15 is the first run of the provider itself against the 
 | trade ids are unique per account across symbols | **not documented**. One cursor pages every symbol, which only works if they are; a collision within a page is refused, and across windows #15 refuses a same-id fill whose accounting fields differ, as a `conflict` that stops the account | **not established**, and probably not: ids are namespaced `"{symbol}:{id}"`, and the cursor is a time | the first account with two symbols |
 | which string each venue signs, and in which encoding | **confirmed**: `timestamp + "GET" + path + "?" + query`, HMAC-SHA256, Base64. No published vector; the tests compute theirs outside the code | **confirmed and accepted live**: the sorted query with `timestamp`, HMAC-SHA256, lower-case hex. V3's recipe is one of the two golden vectors | -- |
 | `RETENTION_MARGIN` of five minutes is enough | **not measurable without a key.** "The last three months" in `40704` may be 89 days; if so the oldest window is refused as `ExchangeRetentionWindowError` and #15 steps it a day later (`RETENTION_STEP`, itself a guess) | not measured: what BingX answers past its retention is unknown, and nothing maps to the retention error | the owner's first sync |
-| whether `startTime` and `endTime` are inclusive, and the order within a page | **not documented**, and made not to matter: the window is widened and filtered, the cursor is the smallest id | **both inclusive**, by the probe; ascending by time. The cursor is the newest fill by value, so the order does not matter either | -- |
+| whether `startTime` and `endTime` are inclusive, and the order within a page | **not documented**, and made not to matter: the window is widened and filtered, the cursor is the smallest id | **both inclusive**, by the probe, with and without a symbol; ascending by time. The cursor is the newest fill by value, so the order within a page does not matter. Which fills a capped page keeps does matter, and it is the oldest in range (the third probe, 2026-09-27) | -- |
 | the sign of a fee, and the fields of a fee paid in BGB | **not documented**. A positive fee and a BGB deduction are refused loudly | negative for a fee paid, by the sample and the probe; a positive `commission` is refused loudly | the first real fill that shows either |
 | `FILL_SCALE` of 18 covers every fee a venue reports; a 19th place fails its page loudly | unmeasured | float noise past it is expected, and `from_binary_float` removes it from `commission` and `quoteQty` | whichever venue meets it |
 | a zero `quote_quantity` for a dust trade never happens; if it does, the page fails loudly | unmeasured | unmeasured | whichever venue meets it |

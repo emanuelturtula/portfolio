@@ -15,7 +15,7 @@ fact below names its source:
   where it was read.
 * **V1**: https://bingx-api.github.io/docs/, the older site, deployed from the
   `BingX-API/docs` repository's `gh-pages` branch on 2026-01-22.
-* **Probe**: two read-only scripts the owner ran on 2026-09-26/27 against the real API
+* **Probe**: three read-only scripts the owner ran on 2026-09-26/27 against the real API
   with their own read-only key. They printed codes, counts, JSON types and time relations,
   never an amount, an id, a key or a signature. The account held a few dozen fills in one
   symbol, the oldest under two weeks old. Where the probe and the documentation differ, the
@@ -29,6 +29,10 @@ fact below names its source:
   marks it required.
 * `startTime` and `endTime` are epoch milliseconds (V3) and **both inclusive** (the probe).
 * Fills are sorted by `time`, ascending. V3, V1; the probe saw ascending time and id.
+* **A capped page holds the oldest fills in range**, with both bounds, with one and with
+  none, and without a symbol. Not documented; the third probe, 2026-09-27. Paging
+  forward from the newest fill is complete because of it.
+* Fills sharing one millisecond occur. The probe only.
 * The envelope is `{code, msg, data: {fills: [...]}}`, code `0` on success. V3, V1, probe.
 * **Every error the probe saw arrived on HTTP 200**, with a non-zero integer `code`; an
   empty window is code `0` with `data.fills: []`. The probe only.
@@ -620,8 +624,17 @@ def parse_fills_page(fills: object, *, window: FillWindow, cursor: str | None) -
     5. **Exactly `PAGE_LIMIT`, `m` after `start`: `next_cursor` is `str(m)`.** The next
        request starts **at** `m`, not `m + 1`, because more fills may share that
        millisecond. The fills at `m` are read twice, and #15's unique constraint makes the
-       second read insert nothing. `m` is the newest by value, not the last as served, so
-       the rule does not depend on the order the venue sends.
+       second read insert nothing, and fills sharing a millisecond do occur (the probe).
+       `m` is the newest by value, not the last as served, so the order *within* a page
+       does not matter.
+
+       **Which fills a capped page holds does matter.** Paging forward from `m` misses
+       nothing only because the venue fills a capped page with the **oldest** fills in
+       range, so everything after `m` is still unread. That is not documented -- `fromId`'s
+       "by default, the latest trade will be retrieved" hints the other way -- and was
+       established by the owner's third probe on 2026-09-27, asking exactly as this
+       provider does. A venue that kept the newest would lose the rest of a full window
+       silently.
     6. **Exactly `PAGE_LIMIT`, all at `start`: `ExchangeSchemaError`.** More than a page of
        fills in one millisecond cannot be paged past with a time cursor, and a loud failure
        beats a silent loss.
