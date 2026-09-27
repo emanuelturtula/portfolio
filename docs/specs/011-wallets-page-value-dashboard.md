@@ -431,8 +431,9 @@ change, it comes back to the tech lead first.
   take at least thirty seconds. If a proxy ever cuts the request, the run continues server
   side, because the coordinator shields it. The UI shows the refresh as failed, and the next
   poll shows the result. It is worded so that "failed" does not claim the sync did not run.
-- **The clipboard API needs a secure context.** Production is HTTPS, since the `__Host-`
-  session cookie requires it, and `localhost` counts as secure. The failure path is rendered
+- **The clipboard API needs a secure context.** Production is normally HTTPS, since the
+  `__Host-` session cookie requires it (a plain-HTTP deployment is possible: `docs/operations.md`
+  section 1), and `localhost` counts as secure. The failure path is rendered
   anyway, because an unavailable clipboard is not an exception worth a blank button.
 - **#46 is not reached.** Backend values come out of a 38-digit `Decimal` context
   (`domain/money.py`; the draft said 28, and review corrected it). The margin is therefore
