@@ -106,13 +106,19 @@ def exchange_credentials_violation(
 ) -> str | None:
     """Why one venue's credential variables cannot be used, or `None` if they can.
 
-    `variables` is the venue's `(environment variable, value)` pairs. Two rules, checked in
+    `variables` is the venue's `(environment variable, value)` pairs. Three rules, checked in
     this order:
 
     1. **No value is blank.** An empty or whitespace credential is a variable somebody set
        and got wrong, and `Credentials` would refuse it anyway -- on the first sync, where it
        looks like any other failure, instead of at startup, where it is a rollback.
-    2. **All or none.** `None` for every variable means the venue is not configured and is
+    2. **Every value encodes as UTF-8.** On Linux, environment bytes that are not UTF-8
+       arrive as lone surrogates, and such a string passes every other check here. The
+       signing helper then encodes the secret and fails with a bare `UnicodeEncodeError`,
+       whose `args` hold **the whole secret** -- outside the exchange error taxonomy, on the
+       first sync, into any log that renders the exception. Found by review on #14; it holds
+       for every venue, so it is checked here once.
+    3. **All or none.** `None` for every variable means the venue is not configured and is
        not built. Some set and some not is a credential that cannot sign, and the reason
        names every variable that is missing.
 
@@ -122,6 +128,11 @@ def exchange_credentials_violation(
     for name, value in variables:
         if value is not None and not value.get_secret_value().strip():
             return f"{name} is set but blank. Set it to the credential, or unset the variable."
+        if value is not None and not _encodes_as_utf8(value):
+            return (
+                f"{name} holds text that cannot be encoded as UTF-8, usually bytes from a file "
+                "or a terminal in another encoding. Set it again from the original."
+            )
     missing = [name for name, value in variables if value is None]
     if missing and len(missing) < len(variables):
         verb = "is" if len(missing) == 1 else "are"
@@ -130,6 +141,20 @@ def exchange_credentials_violation(
             "the same venue are. Set all of them, or none."
         )
     return None
+
+
+def _encodes_as_utf8(value: SecretStr) -> bool:
+    """Whether a credential encodes as UTF-8. Never raises, and never lets the value escape.
+
+    A predicate rather than a raise, so the caller's refusal is built after the `except`
+    block has closed and carries no `__context__`: a `UnicodeEncodeError` keeps the whole
+    string it failed on in its `args`, and here that string is a credential.
+    """
+    try:
+        value.get_secret_value().encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 HEADER_SAFE_TEXT: Final = re.compile(r"\A[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?\Z")

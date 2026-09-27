@@ -1396,7 +1396,8 @@ says takes five minutes to clear anyway.
 
 **Credentials.** `PORTFOLIO_BITGET_API_KEY`, `PORTFOLIO_BITGET_API_SECRET` and
 `PORTFOLIO_BITGET_API_PASSPHRASE`, all `SecretStr`, **all or none**. The application refuses to
-start with a partial set (naming the missing variables), a blank value, or a key or passphrase
+start with a partial set (naming the missing variables), a blank value, a value that does not
+encode as UTF-8 (since #14; see the BingX section), or a key or passphrase
 holding a character no HTTP header can carry -- whitespace at either end, a control character,
 anything outside printable ASCII -- because h11 refuses such a header with a transport error
 whose message is the whole value. No refusal names a value. With none set, `exchange_providers`
@@ -1469,8 +1470,9 @@ and where the probe and the documentation differ, the probe wins.
   against the live API with their own read-only key. Nothing in this repository, and no
   agent, saw the key. The scripts print response codes, counts, JSON types, the symbols
   traded and time relations ("the fill at `T` is returned for `[T, T]`"). They never print an
-  amount, an id, a key or a signature. The account held **29 fills, all in one symbol, the
-  oldest 10.9 days old**. The scripts and their output stayed on the owner's machine.
+  amount, an id, a key or a signature. The account held **a few dozen fills in one symbol,
+  the oldest under two weeks old**. The scripts and their output stayed on the owner's
+  machine. They printed the number of spot symbols and three examples, not the list.
 
 #### What the documentation says, what the probe found, and what is used
 
@@ -1478,7 +1480,7 @@ and where the probe and the documentation differ, the probe wins.
 |---|---|---|---|
 | endpoint | `GET /openApi/spot/v1/trade/myTrades` on `https://open-api.bingx.com`, signed, key permission "Read" (V3, V1) | answered as documented | yes |
 | `symbol` required? | V3: "No". V1: yes | V1 is **wrong**: without `symbol` the answer is code 0, with every fill and a `symbol` on each | never sent |
-| retention | "Can only check data within the past 7 days range" (V3, V1) | **wrong**, disproved: a time-bounded query returned fills 10.9 days old, and spans of 14, 30, 90 and 365 days ending now all answered code 0 with every fill | 365 days, below |
+| retention | "Can only check data within the past 7 days range" (V3, V1) | **wrong**, disproved: a time-bounded query returned fills more than a week old, and spans of 14, 30, 90 and 365 days ending now all answered code 0 with every fill | 365 days, below |
 | no time bounds | "the data of the past 24 hours is returned by default" (V3, V1) | **wrong**: it returns from the oldest fill, ascending, and `limit=5` gave the oldest five | bounds are always sent |
 | `startTime`, `endTime` | milliseconds (V3); whether inclusive is not stated | **both inclusive**: `[T, T]` returns the fill at `T`; `[T+1, ...]` and `[..., T-1]` do not | `[since, until - 1 ms]` |
 | order | "sorted by time field, from smallest to largest" (V3, V1) | ascending by time and by id | the cursor does not depend on it |
@@ -1533,9 +1535,19 @@ history start re-read them. The provider refuses every *malformed* empty answer 
 `data`, a `null`, a missing `fills` -- but it cannot tell `fills: []` from a quiet window. That
 is the residual, recorded here rather than assumed away.
 
+**A renamed pair can duplicate a fill.** The namespaced id embeds the symbol, and BingX
+renames a pair when its token migrates (`STRK-USDT` becoming `STRK-OLD-USDT`, say). A fill
+read once under the old name and again under the new one gets a second
+`external_trade_id`, so it is inserted again instead of meeting #15's collision check,
+and the cost basis counts it twice. That needs the rename to fall between two reads of
+the same fill, which in practice means the sync's five-minute overlap, or a window
+re-read after an interruption. It is recorded, not designed around: the alternative, an
+id without the symbol, is the silent loss the namespacing exists to prevent.
+`docs/operations.md` has a troubleshooting row for it.
+
 The support article above adds a second caveat to the year: "Some regions and risk-controlled
 users are only able to export 30 days of data." That is about the web export, not the API, and
-the probe read 10.9 days back. If the owner's account is ever limited this way and the API
+the probe read more than a week back. If the owner's account is ever limited this way and the API
 follows, the oldest windows will come back empty, and nothing will say so.
 
 #### Decisions
@@ -1545,8 +1557,7 @@ follows, the oldest windows will come back empty, and nothing will say so.
 `candidate_symbols()` empty.
 
 - **Why 365 days.** It is a declared bound, not a measured one. The documented 7 days is
-  disproved, and at 7 the owner's own fills from 10.9 days before the probe would never be
-  read. The only longer statement BingX makes is the support article's "records are only
+  disproved, and at 7 the owner's own fills older than a week would never be read. The only longer statement BingX makes is the support article's "records are only
   available for up to one year", about the web export. Declaring more would claim history
   the venue may not return; declaring `None` would promise history back to 2009. With a
   year, `history_truncated` tells the owner that nothing before a year ago is promised,
@@ -1604,9 +1615,20 @@ difference between two fills and one silently dropped. The id must be a JSON **i
 compared with the bound rather than parsed. `orderId` follows the same rule, or is `null` or
 absent.
 
-**Parsing a fill.** `symbol` must match `\A[A-Z0-9]{1,20}-[A-Z0-9]{1,20}\Z` and is split on its
-one hyphen: BingX spells every spot symbol `BASE-QUOTE` (the probe listed all 2273), so no
-symbol endpoint is asked. `isBuyer` must be exactly `true` or `false`. `qty` and `price` go
+**Parsing a fill.** `symbol` is kept as the venue spells it and split on its **last**
+hyphen, so no symbol endpoint is asked. The quote after it must be `[A-Z0-9]{1,20}`; the
+base before it is 1 to 40 characters with no whitespace, no Unicode `C*` character (control,
+format, surrogate, private use, unassigned) and nothing that does not encode as UTF-8, and
+anything else is accepted. **The base is wide because BingX's symbols are not all
+`BASE-QUOTE` in letters and digits.** The public symbol list, read on 2026-09-27 by the
+reviewer and again for this section, holds 38 of 2273 that are not: pairs renamed when a
+token migrated (`STRK-OLD-USDT`, `ZK-OLD-USDT`, `H_OLD-USDT`, `PUMP_OLD-USDT`), and `$U-USDT`,
+`$1-USDT`, `D.O.G.E.-USDT`, `ATOM(ARC20)-USDT` and `MØTH-USDT`. Every quote in it matches,
+and so does every quote `myTrades`' own validation message names (`USDT`, `USD1`, `USDT2`,
+`USDC`, `ETH`, `BTC`). The longest base is 17 characters. A rename can turn a pair the owner
+holds into one of these, and a narrower rule would fail every page carrying it, forever.
+An earlier version of this section said the probe had checked every symbol; it printed
+the count and three examples. `isBuyer` must be exactly `true` or `false`. `qty` and `price` go
 through `require_fill_amount` and are stored as reported. `time` must be a JSON integer of
 epoch milliseconds. `isMaker` is kept in `raw_payload` only. A missing field, or one of the
 wrong JSON type, is an `ExchangeSchemaError` naming the field, never the value.
@@ -1661,7 +1683,7 @@ message carries the URL, and here the URL carries the signature.
 | `100004` permission denied | `ExchangeInsufficientScopeError` | V3 Common, V1; the key lacks Read |
 | `100421` timestamp mismatch | `ExchangeUnavailableError` | V3 Common, V1, the probe. **Never auth**: the transport replays signed requests, and a skewed clock is not a bad key. V3's Spot table also uses `100421` for "Request rejected", about order placement; unavailable fits every reading |
 | `100410` rate limit, `109429` APIRateLimit, `(418, None)` IP banned after a 429 | `ExchangeRateLimitedError` | `100410` V3, V1. V1's changelog of 2025-10-11: "Old error code 100410 has been updated to new error code 109429, meaning: APIRateLimit", from 2025-10-16 -- in a list of futures codes, and V3 lists `109429` under Futures only, so it is mapped defensively. `418` is V3's HTTP table |
-| `100500` system busy, `100503` server busy | `ExchangeUnavailableError` | V3 Common, V1; `100503` is V1 only |
+| `100500` system busy, `100503` server busy, `109500` system busy | `ExchangeUnavailableError` | V3 Common, V1; `100503` is V1 only. `109500` is V3's code for a sibling endpoint whose backend is down -- its changelog of 2026-09-05, above -- and is mapped defensively, like `109429` |
 | `100400` parameter error, `100204` data not found or span too wide, `100404` path not found, `100490` pair offline | `ExchangeInvalidRequestError` | V3, V1; a request this code built. The probe shows an empty window is code 0, so `100204` is never an empty answer |
 
 **`100403` is deliberately unmapped.** V1 calls it `AUTHORIZATION_FAIL`, and V3 uses it for "not
@@ -1676,8 +1698,12 @@ replay is the rarer path.
 
 **Credentials.** `PORTFOLIO_BINGX_API_KEY` and `PORTFOLIO_BINGX_API_SECRET`, both `SecretStr`,
 **both or neither**. The application refuses to start with one of them set and not the other
-(naming the missing one), a blank value, or a key holding a character no HTTP header can
-carry. The secret is not checked that way; it only ever enters an HMAC. BingX keys have no
+(naming the missing one), a blank value, a value that does not encode as UTF-8, or a key
+holding a character no HTTP header can carry. The secret is not checked for the header
+rule; it only ever enters an HMAC. **It is checked for UTF-8**, as every venue's
+credentials are: on Linux, environment bytes that are not UTF-8 arrive as lone
+surrogates, and the signing helper would then fail with a `UnicodeEncodeError` whose
+`args` hold the whole secret. Found by review on #14. BingX keys have no
 passphrase, and `BingXProvider` refuses `Credentials` carrying one: a set one means the caller
 is confused. With neither set, `exchange_providers` holds no BingX provider at all.
 
@@ -1898,10 +1924,10 @@ it by returning a stale number that looks exactly like a fresh one, which is the
 ## Not done yet, and who owns it
 
 - **BingX has been probed, and the provider has not yet run against it.** #14 wrote it from
-  the documentation and the owner's read-only probe, whose account held 29 fills in one
-  symbol. Three things only real use shows: a page past the first (no account had 500
-  fills), a second symbol in one answer (the premise of never sending `symbol`), and history
-  older than the probe's 10.9 days. The owner's first sync after trading a second symbol is
+  the documentation and the owner's read-only probe, whose account held a few dozen fills
+  in one symbol. Three things only real use shows: a page past the first (no account had
+  500 fills), a second symbol in one answer (the premise of never sending `symbol`), and
+  history older than the probe's two weeks. The owner's first sync after trading a second symbol is
   the check, and `docs/operations.md` section 14 says how to make it. BingX reuses the
   `exchange_fills` label; it has no public endpoint, so it needs no second one.
 - **BingX's empty success.** The provider refuses every malformed empty answer, but cannot

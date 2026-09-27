@@ -736,6 +736,8 @@ container **refuses to start** if:
 
 - only some of the three are set -- the log names the ones that are missing;
 - any of them is set but blank;
+- any of them holds text that cannot be encoded as UTF-8 -- usually a value copied from a
+  file or a terminal in another encoding;
 - the key or the passphrase holds a character an HTTP header cannot carry: a space or tab at
   either end, a line break or another control character, or anything outside printable
   ASCII. **A trailing space pasted along with the value is the usual cause.** The secret is
@@ -854,8 +856,10 @@ the process has one, never what it is.
 | `last_error` | the kind and detail of the latest attempt, when that attempt failed. A run that skipped the account does not replace it |
 
 `history_truncated: true` with the history start unset is the normal state at both venues:
-you asked for everything, and Bitget keeps 90 days. BingX promises a year: its documentation
-says 7 days, which it does not enforce, and the year is the most it states anywhere.
+you asked for everything, and Bitget keeps 90 days. At BingX this application **assumes** a
+year. BingX's API documentation says 7 days, which it does not enforce. The only year BingX
+states is its support centre's, about exporting trade history from the website, and the same
+article says some regions and risk-controlled accounts get 30 days.
 
 ### What an account's status means
 
@@ -1000,6 +1004,8 @@ container **refuses to start** if:
 
 - only one of the two is set -- the log names the one that is missing;
 - either is set but blank;
+- either holds text that cannot be encoded as UTF-8 -- usually a value copied from a file or
+  a terminal in another encoding;
 - the key holds a character an HTTP header cannot carry: a space or tab at either end, a line
   break or another control character, or anything outside printable ASCII. **A trailing space
   pasted along with the value is the usual cause.** The secret is not checked this way; it is
@@ -1032,8 +1038,11 @@ Three refusals come from this application rather than from BingX, and each names
 - **`commission` "is positive"**: BingX reported a fee with the opposite sign from its
   documentation. Refused rather than recorded as income. Report it; it needs a rule written
   from the real fill.
-- **`symbol` "must be BASE-QUOTE"**: a fill arrived for a pair not spelled like every BingX
-  spot pair so far, such as `KAS-USDT`. Report it.
+- **`symbol` "must be BASE-QUOTE"**: a fill arrived for a pair spelled in a way no BingX
+  spot pair has been. The rule is wide -- anything before the last hyphen, up to 40
+  characters, so `STRK-OLD-USDT`, `$U-USDT` and `MØTH-USDT` all pass -- and refuses only
+  whitespace, control characters and a quote that is not upper-case letters and digits.
+  Report it.
 - **"a full page of 500 fills all executed in the millisecond it was asked from"**: more than
   500 fills share one millisecond, and the time cursor BingX pages with cannot get past them.
   Report it. It is not expected from one person's trading.
@@ -1104,11 +1113,12 @@ first time BingX pages past a single answer.
 | Prices are all flagged stale | The last refresh is over an hour old. The price is still shown; it is the age that is being reported — section 10 |
 | KAS/EUR is the only pair that ever fails | Kraken is the only key-free source for it. CoinGecko is the only fallback — section 10 |
 | A pair reports `every_source_failed` while the vendor is plainly up | A vendor can be refused for what it *sent*: a price of zero or below, a non-finite number, or one too large or too small for the column. Failover treats that like any other refusal — section 10 |
-| Container refuses to start naming a `PORTFOLIO_BITGET_*` variable | Only some of the three are set, one is blank, or the key or passphrase has a character a header cannot carry — usually a trailing space from pasting — section 12 |
+| Container refuses to start naming a `PORTFOLIO_BITGET_*` variable | Only some of the three are set, one is blank, one is not valid UTF-8, or the key or passphrase has a character a header cannot carry — usually a trailing space from pasting — section 12 |
 | A Bitget error says venue code `40008` or `40005` | The host clock is more than 30 seconds off. Check `timedatectl`. A single one right after a throttle is harmless — section 12 |
 | A Bitget error names `feeDetail.deduction` | Fees paid in BGB are not supported yet. Turn off paying fees with BGB in Bitget — section 12 |
 | Bitget errors start, or Bitget syncs stop finding trades, right after accepting something in the Bitget app | Most likely the Unified Trading Account upgrade. What a Classic call returns then is not documented. Switch the main account back to Classic — section 12 |
-| Container refuses to start naming a `PORTFOLIO_BINGX_*` variable | Only one of the two is set, one is blank, or the key has a character a header cannot carry — usually a trailing space from pasting — section 14 |
+| Container refuses to start naming a `PORTFOLIO_BINGX_*` variable | Only one of the two is set, one is blank, one is not valid UTF-8, or the key has a character a header cannot carry — usually a trailing space from pasting — section 14 |
 | A BingX error says venue code `100421` | The host clock is more than 5 seconds off. Check `timedatectl`. A single one right after a throttle is harmless — section 14 |
 | A BingX error says venue code `100419` | The key has an IP whitelist that does not include the host's address — section 14 |
 | BingX holds fewer fills than BingX's own trade history shows | The case the application cannot detect by itself: report it with the two counts — section 14 |
+| BingX holds more fills than its own trade history, around the time BingX renamed a pair (to a name like `XYZ-OLD-USDT`) | A fill read under both names is stored twice, because its id includes the pair's name. Report it with the two counts and the date; do not edit the database — section 14 |

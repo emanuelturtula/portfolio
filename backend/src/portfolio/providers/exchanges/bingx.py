@@ -2,8 +2,8 @@
 
 The second venue behind the exchange seam. One signed endpoint,
 `GET /openApi/spot/v1/trade/myTrades`, pages the account's spot executions **forwards in
-time**. Every symbol comes back in one query, and each fill names its own `BASE-QUOTE`
-symbol, so there is no second endpoint to ask.
+time**. Every symbol comes back in one query, and each fill names its own symbol, spelled
+`BASE-QUOTE`, so there is no second endpoint to ask.
 
 ## Three sources, and which one each fact rests on
 
@@ -17,8 +17,9 @@ fact below names its source:
   `BingX-API/docs` repository's `gh-pages` branch on 2026-01-22.
 * **Probe**: two read-only scripts the owner ran on 2026-09-26/27 against the real API
   with their own read-only key. They printed codes, counts, JSON types and time relations,
-  never an amount, an id, a key or a signature. The account held 29 fills in one symbol,
-  the oldest 10.9 days old. Where the probe and the documentation differ, the probe wins.
+  never an amount, an id, a key or a signature. The account held a few dozen fills in one
+  symbol, the oldest under two weeks old. Where the probe and the documentation differ, the
+  probe wins.
 
 `docs/providers.md` carries the full table. What this module relies on, with its source:
 
@@ -48,8 +49,8 @@ fact below names its source:
   namespaced `"{symbol}:{id}"` and the cursor is a time, which is correct under either
   scheme. See `parse_fill` and `parse_fills_page`.
 * **Retention.** "Only the past 7 days" (V3, V1) is disproved by the probe, which read fills
-  10.9 days old. A year is the bound declared, and it is a bound, not a measurement. See
-  `BINGX_CAPABILITIES`.
+  more than a week old. A year is the bound declared, and it is a bound, not a measurement.
+  See `BINGX_CAPABILITIES`.
 * **The largest page.** V3 says "Default 500, maximum 1000" and, on the same page,
   "limit = 500". This provider asks for 500 and calls exactly 500 full.
 * **What the venue answers for a window older than it keeps.** Nothing maps to
@@ -60,8 +61,9 @@ fact below names its source:
 `fetch_fill_page` raises `ValueError` for a caller's mistake, before any request, and one of
 the seven `providers.exchanges.errors` classes for everything the venue or the network did.
 Every vendor-supplied value passes a bound before the interpreter sees it: an id is a JSON
-integer compared with `2**63 - 1`, never converted from text; a symbol matches an ASCII
-pattern; an amount is at most a hundred digits written out; a fill object is at most 32
+integer compared with `2**63 - 1`, never converted from text; a symbol is at most 61
+characters, with an ASCII quote and no whitespace or control character in its base; an
+amount is at most a hundred digits written out; a fill object is at most 32
 levels deep. **No message carries a value**, and no log call exists in this module: the
 transport logs `https://open-api.bingx.com/exchange_fills`, never a path, a query or a
 header. That matters more here than for Bitget, because **the signature travels in the
@@ -72,6 +74,7 @@ from __future__ import annotations
 
 import decimal
 import re
+import unicodedata
 from datetime import timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 from typing import TYPE_CHECKING, Final
@@ -167,9 +170,9 @@ PAGE_LIMIT: Final = 500
 
 V3 documents "Default 500, maximum 1000" in the parameter table and "limit = 500" in the
 notes on the same page. The probe could not tell which the venue enforces: the account held
-29 fills. **Asking for 500 and calling exactly 500 full** is right under both readings. At
-1000, a venue that enforces 500 would return 500, the page would look short, and the rest
-of the window would be lost without a word.
+a few dozen fills. **Asking for 500 and calling exactly 500 full** is right under both
+readings. At 1000, a venue that enforces 500 would return 500, the page would look short,
+and the rest of the window would be lost without a word.
 """
 
 MAX_TRADE_ID: Final = 9_223_372_036_854_775_807
@@ -206,14 +209,30 @@ No leading zero, so a cursor has one spelling. At most fifteen digits, so `int()
 a long string, and fifteen digits of milliseconds is past the year 30000.
 """
 
-_SYMBOL: Final = re.compile(r"\A([A-Z0-9]{1,20})-([A-Z0-9]{1,20})\Z")
-"""A BingX spot symbol: `BASE-QUOTE`, each side upper-case ASCII letters and digits.
+_QUOTE: Final = re.compile(r"\A[A-Z0-9]{1,20}\Z")
+"""A BingX quote asset: what follows the **last** hyphen of a spot symbol.
 
-Every spot symbol BingX lists is spelled this way. The probe read all 2273 on 2026-09-26,
-and V3 asks for `BTC-USDT` "in uppercase letters". So the hyphen is where the base ends,
-and no symbol endpoint needs asking. Twenty characters a side is a bound chosen here, well
-past any symbol seen. **Assumed, not documented**: that no symbol will ever break the
-pattern. One that does fails its page loudly, naming `symbol`.
+Upper-case ASCII letters and digits. Every quote in the live public symbol list matches
+(read on 2026-09-27: `BTC`, `DOG`, `ETH`, `L3`, `USDC`, `USDT`, `WHALES`, `ZKL`), and so
+does every quote `myTrades`' own validation message names: `USDT`, `USD1`, `USDT2`,
+`USDC`, `ETH` and `BTC`. Twenty is a bound chosen here, far past any of them.
+"""
+
+_MAX_QUOTE_LENGTH: Final = 20
+"""The longest quote `_QUOTE` admits, for bounding a symbol's length before it is split."""
+
+MAX_BASE_LENGTH: Final = 40
+"""The longest base asset accepted: everything before a symbol's last hyphen.
+
+**The base is wide on purpose.** BingX renames a pair when its token migrates, and the old
+name takes forms like `STRK-OLD-USDT`, `H_OLD-USDT` and `PUMP_OLD-USDT`. The live list also
+holds `$U-USDT`, `D.O.G.E.-USDT`, `ATOM(ARC20)-USDT` and `MØTH-USDT`: 38 of 2273 pairs are
+not two runs of letters and digits (the public `GET /openApi/spot/v1/common/symbols`, read
+on 2026-09-27). A pair the owner holds can become one of these at any time, and a pattern
+that refused them would fail every page carrying it, on every run. So a base may hold any
+character except whitespace and the Unicode control, format, surrogate, private-use and
+unassigned categories (`C*`). Forty characters is a bound chosen here, more than twice the
+longest base in that list (17).
 """
 
 BINGX_CAPABILITIES: Final = ExchangeCapabilities(
@@ -229,7 +248,8 @@ BINGX_CAPABILITIES: Final = ExchangeCapabilities(
 
 * **`retention` is 365 days: a declared bound, not a measured one.** V3 and V1 both say
   "Can only check data within the past 7 days range", and the probe disproved it: a
-  time-bounded query returned fills 10.9 days old, and spans of 14, 30, 90 and 365 days
+  time-bounded query returned fills more than a week old, and spans of 14, 30, 90 and
+  365 days
   ending now all answered code 0 with every fill. The only longer statement BingX makes is
   its support centre's, that trade records are "available for up to one year", about the
   web export. Declaring more would claim history the venue may not return; declaring the
@@ -269,6 +289,7 @@ BINGX_ERROR_MAP: Final = build_error_map(
         # Retry on the next run.
         (None, "100500"): ExchangeUnavailableError,  # System busy (V3, V1)
         (None, "100503"): ExchangeUnavailableError,  # Server busy (V1)
+        (None, "109500"): ExchangeUnavailableError,  # system busy (V3 changelog, 2026-09-05)
         # A request this code built wrongly, mapped so that it is not a schema error on a 200.
         (None, "100400"): ExchangeInvalidRequestError,  # parameter error (V3, V1; probe)
         (None, "100204"): ExchangeInvalidRequestError,  # data not found / span too wide (V3)
@@ -302,6 +323,10 @@ Notes on individual rows, from reading both documentation sites on 2026-09-27:
 * **`100403` is deliberately absent.** V1 calls it `AUTHORIZATION_FAIL`; V3 uses it for "not
   the main account". Two meanings is no meaning, so it takes the fallback: a schema error on
   a 200.
+* **`109500`** is V3's "system is busy" code for a sibling endpoint: its changelog of
+  2026-09-05 says `/openApi/swap/v2/user/positions` now answers a temporarily unavailable
+  backend with `109500` "instead of code=0 with data=[]". It is not documented for this
+  endpoint, and is mapped defensively, like `109429`.
 * **`100204` is never an empty page.** The probe shows an empty window is code 0 with
   `fills: []`, so `100204` ("data not found", "query time span is too wide") is a request
   this code should not have built.
@@ -495,8 +520,8 @@ def parse_fill(item: object) -> NormalizedFill:
     |---|---|---|
     | `external_trade_id` | `symbol`, `id` | `"{symbol}:{id}"`, the id an integer (below) |
     | `external_order_id` | `orderId` | an integer (below), as digits; `null` or absent: `None` |
-    | `symbol` | `symbol` | `\\A[A-Z0-9]{1,20}-[A-Z0-9]{1,20}\\Z` |
-    | `base_asset`, `quote_asset` | `symbol` | split on its one hyphen |
+    | `symbol` | `symbol` | as the venue spells it, at most 61 characters |
+    | `base_asset`, `quote_asset` | `symbol` | split on its **last** hyphen |
     | `side` | `isBuyer` | exactly `true` (buy) or `false` (sell) |
     | `quantity` | `qty` | `require_fill_amount`, as reported |
     | `price` | `price` | `require_fill_amount`, as reported |
@@ -516,6 +541,13 @@ def parse_fill(item: object) -> NormalizedFill:
     ids are very likely per symbol. `KAS-USDT:7` and `BTC-USDT:7` are two fills. Namespacing
     costs nothing if ids turn out to be global, and if they are per symbol it is the
     difference between two fills and one silently dropped by the unique constraint.
+
+    **The cost: the id embeds a name BingX can change.** BingX renames a pair when its token
+    migrates (`STRK-USDT` to `STRK-OLD-USDT`, say). If a fill is read once under the old name
+    and again under the new one, the second read has a different `external_trade_id`, so it
+    is inserted as a second fill instead of meeting #15's collision check. That needs the
+    rename to fall between two reads of the same window, which in practice means the sync's
+    five-minute overlap. It is a recorded risk, not designed around: `docs/providers.md`.
 
     **The id must be a JSON integer**, which `decode_json` returns as an `int` without a
     float in between; a string, a number with a point, and a `bool` are refused. Its size
@@ -888,16 +920,40 @@ def _required(document: Mapping[str, object], key: str) -> object:
 
 
 def _require_symbol(item: Mapping[str, object]) -> tuple[str, str, str]:
-    """The fill's `symbol`, its base asset and its quote asset."""
+    """The fill's `symbol`, as the venue spells it, with its base asset and its quote asset.
+
+    Split on the **last** hyphen: the quote after it must match `_QUOTE`, and the base
+    before it is 1 to `MAX_BASE_LENGTH` characters with no whitespace, no `C*` character and
+    nothing that does not encode as UTF-8. `STRK-OLD-USDT` is base `STRK-OLD`, quote `USDT`.
+    The length is checked first, so a long string costs nothing to refuse.
+    """
     value = _required(item, "symbol")
-    match = _SYMBOL.match(value) if isinstance(value, str) else None
-    if match is None:
-        detail = (
-            "symbol must be BASE-QUOTE: 1 to 20 upper-case ASCII letters and digits on each "
-            "side of one hyphen"
-        )
-        raise ExchangeSchemaError(detail)
-    return match.group(0), match.group(1), match.group(2)
+    if isinstance(value, str) and len(value) <= MAX_BASE_LENGTH + 1 + _MAX_QUOTE_LENGTH:
+        base, hyphen, quote = value.rpartition("-")
+        if hyphen and _QUOTE.match(quote) is not None and _is_base_asset(base):
+            return value, base, quote
+    detail = (
+        "symbol must be BASE-QUOTE: a quote of 1 to 20 upper-case ASCII letters and digits "
+        f"after the last hyphen, and a base of 1 to {MAX_BASE_LENGTH} characters before it, "
+        "with no whitespace or control character"
+    )
+    raise ExchangeSchemaError(detail)
+
+
+def _is_base_asset(base: str) -> bool:
+    """Whether `base` is 1 to `MAX_BASE_LENGTH` characters a base asset may hold.
+
+    Refused: whitespace, and every character in a Unicode `C*` category -- control, format,
+    surrogate, private use, unassigned. Everything else is accepted, `$ . ( ) _ -` and
+    non-ASCII letters included, because the venue's own list holds all of them.
+
+    **Refusing `Cs` is what makes the base encode as UTF-8.** A `str` fails to encode only
+    through a lone surrogate, which is category `Cs`, so no separate UTF-8 check is needed
+    here, and `NormalizedFill` and the database driver get text they can encode.
+    """
+    if not 1 <= len(base) <= MAX_BASE_LENGTH:
+        return False
+    return not any(char.isspace() or unicodedata.category(char).startswith("C") for char in base)
 
 
 def _require_id(value: object, *, field: str) -> str:
