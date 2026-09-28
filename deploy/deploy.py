@@ -712,17 +712,40 @@ def legacy_attempt_with_database(prod: Path) -> Path | None:
     return max(found, key=lambda path: path.name) if found else None
 
 
-def legacy_attempt_manifest(attempt: Path) -> bytes | None:
-    """The manifest describing a legacy attempt: its result if it recorded a healthy
-    deployment, otherwise its request. Returned verbatim, as the record it is."""
-    result = attempt / "result.json"
+SEEDED_WITHOUT_COMPOSE = (
+    "The compose file of the attempt this deployment was made in no longer exists, so this "
+    "backup has none."
+)
+SEEDED_WITHOUT_MANIFEST = (
+    "The attempt that took this database left no readable previous.json, so the deployment "
+    "it was taken from is unknown."
+)
+
+
+def legacy_backup_record(prod: Path, attempt: Path) -> tuple[bytes | None, bytes]:
+    """The compose file and ``current.json`` to keep beside a legacy attempt's database.
+
+    That database was taken, before the attempt, from the deployment its
+    ``previous.json`` names -- not from the attempt itself. So the manifest is
+    ``previous.json``, verbatim, and the compose file is the one that deployment ran from,
+    in the attempt it was made in. If that attempt has been pruned, there is no compose
+    file, and the manifest says why in ``backup_note``. An unreadable ``previous.json``
+    leaves only a note: the database is kept either way.
+    """
+    record = attempt / "previous.json"
     try:
-        if result.is_file() and read_json(result).get("status") == "healthy":
-            return result.read_bytes()
-    except ValueError:
-        pass  # A torn or foreign result.json is no reason to lose the database beside it.
-    request = attempt / "request.json"
-    return request.read_bytes() if request.is_file() else None
+        manifest = read_json(record)
+        if not isinstance(manifest, dict):
+            raise ValueError("previous.json is not an object")
+    except (OSError, ValueError):
+        return None, json_bytes({"backup_note": SEEDED_WITHOUT_MANIFEST})
+    try:
+        compose_file: Path | None = legacy_compose_file(prod, manifest)
+    except DeploymentError:
+        compose_file = None
+    if compose_file is None or not compose_file.is_file():
+        return None, json_bytes(dict(manifest, backup_note=SEEDED_WITHOUT_COMPOSE))
+    return compose_file.read_bytes(), record.read_bytes()
 
 
 def seed_backup_from_attempts(prod: Path, backup_new: Path) -> bool:
@@ -739,12 +762,11 @@ def seed_backup_from_attempts(prod: Path, backup_new: Path) -> bool:
     source = legacy_attempt_with_database(prod)
     if source is None:
         return False
+    compose_bytes, manifest = legacy_backup_record(prod, source)
     os.mkdir(backup_new)
-    if (source / "compose.yml").is_file():
-        write_atomic(backup_new / "compose.yml", (source / "compose.yml").read_bytes())
-    manifest = legacy_attempt_manifest(source)
-    if manifest is not None:
-        write_atomic(backup_new / "current.json", manifest)
+    if compose_bytes is not None:
+        write_atomic(backup_new / "compose.yml", compose_bytes)
+    write_atomic(backup_new / "current.json", manifest)
     # The database comes last, and appears whole under its name through a rename: its
     # presence is what tells settle_backups this directory is complete. Its data is on
     # disk before it takes that name.

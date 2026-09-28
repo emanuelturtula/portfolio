@@ -155,10 +155,12 @@ host by itself:
    `attempts/` in place until a deployment succeeds.
 4. If that successful deployment could not take a snapshot, because the old container was
    not healthy or not the one its manifest names, the newest attempt that still holds a
-   database becomes `backup/` instead: its database, its compose file, and its manifest
-   (its result if that records a healthy deployment, its request otherwise). Only then is
-   `attempts/` deleted, so the migration never leaves the host without a copy it had. If no
-   attempt holds one, the deployment says so in one line of its log.
+   database becomes `backup/` instead. That database was taken from the deployment the
+   attempt's `previous.json` names, so `previous.json` becomes `backup/current.json`, beside
+   the compose file that deployment ran from. If the attempt it was made in has been
+   pruned, there is no compose file, and `current.json` carries a `backup_note` saying so.
+   Only then is `attempts/` deleted, so the migration never leaves the host without a copy
+   it had. If no attempt holds one, the deployment says so in one line of its log.
 
 After the rename, the migration leaves a small **regular file** at `~/portfolio-app-deploy`
 saying where the root went. Leave it there. Every earlier version of `deploy.py` defaults to
