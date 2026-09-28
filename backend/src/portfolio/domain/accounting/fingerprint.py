@@ -28,7 +28,7 @@ import json
 from typing import TYPE_CHECKING
 
 from portfolio.domain.accounting.constants import AMOUNT_SCALE, ENGINE_VERSION, METHOD
-from portfolio.domain.accounting.events import Adjustment, EventKey, Trade, Transfer
+from portfolio.domain.accounting.events import Adjustment, EventKey, Trade
 from portfolio.domain.money import quantize
 
 if TYPE_CHECKING:
@@ -76,30 +76,29 @@ def event_kind(event: AccountingEvent) -> str:
 def _render(event: AccountingEvent) -> dict[str, _Json]:
     """One event as a JSON object: its kind, its key, and every field it has."""
     rendered: dict[str, _Json] = {"kind": event_kind(event), "key": _render_key(event.key)}
-    match event:
-        case Trade():
-            rendered |= {
-                "base_asset": event.base_asset,
-                "quote_asset": event.quote_asset,
-                "side": event.side.value,
-                "quantity": _amount(event.quantity),
-                "quote_quantity": _amount(event.quote_quantity),
-                "fee_amount": _amount(event.fee_amount),
-                "fee_asset": event.fee_asset,
-            }
-        case Adjustment():
-            rendered |= {
-                "asset": event.asset,
-                "quantity": _amount(event.quantity),
-                "unit_cost": None if event.unit_cost is None else _amount(event.unit_cost),
-            }
-        case Transfer():
-            rendered |= {
-                "asset": event.asset,
-                "quantity": _amount(event.quantity),
-                "from_location": event.from_location,
-                "to_location": event.to_location,
-            }
+    if isinstance(event, Trade):
+        rendered |= {
+            "base_asset": event.base_asset,
+            "quote_asset": event.quote_asset,
+            "side": event.side.value,
+            "quantity": _amount(event.quantity),
+            "quote_quantity": _amount(event.quote_quantity),
+            "fee_amount": _amount(event.fee_amount),
+            "fee_asset": event.fee_asset,
+        }
+    elif isinstance(event, Adjustment):
+        rendered |= {
+            "asset": event.asset,
+            "quantity": _amount(event.quantity),
+            "unit_cost": None if event.unit_cost is None else _amount(event.unit_cost),
+        }
+    else:
+        rendered |= {
+            "asset": event.asset,
+            "quantity": _amount(event.quantity),
+            "from_location": event.from_location,
+            "to_location": event.to_location,
+        }
     return rendered
 
 

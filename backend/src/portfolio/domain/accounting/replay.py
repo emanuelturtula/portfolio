@@ -128,16 +128,13 @@ def replay(
     ordered = _deduplicated_in_order(events)
     ledger = _Ledger(cash_assets=config.cash_assets)
     for event in ordered:
-        match event:
-            case Trade():
-                ledger.apply_trade(event)
-            case Adjustment():
-                ledger.apply_adjustment(event)
-            case Transfer():
-                # Weighted average pools an asset across every location, so a relocation
-                # is not an accounting event (I7). It is still input: it is counted, and
-                # it is in the fingerprint.
-                pass
+        # A `Transfer` is neither. Weighted average pools an asset across every location, so
+        # a relocation is not an accounting event (I7). It is still input: it is counted,
+        # and it is in the fingerprint.
+        if isinstance(event, Trade):
+            ledger.apply_trade(event)
+        elif isinstance(event, Adjustment):
+            ledger.apply_adjustment(event)
     return AccountingResult(
         method=METHOD,
         engine_version=ENGINE_VERSION,
