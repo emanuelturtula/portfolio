@@ -106,13 +106,19 @@ def exchange_credentials_violation(
 ) -> str | None:
     """Why one venue's credential variables cannot be used, or `None` if they can.
 
-    `variables` is the venue's `(environment variable, value)` pairs. Two rules, checked in
+    `variables` is the venue's `(environment variable, value)` pairs. Three rules, checked in
     this order:
 
     1. **No value is blank.** An empty or whitespace credential is a variable somebody set
        and got wrong, and `Credentials` would refuse it anyway -- on the first sync, where it
        looks like any other failure, instead of at startup, where it is a rollback.
-    2. **All or none.** `None` for every variable means the venue is not configured and is
+    2. **Every value encodes as UTF-8.** On Linux, environment bytes that are not UTF-8
+       arrive as lone surrogates, and such a string passes every other check here. The
+       signing helper then encodes the secret and fails with a bare `UnicodeEncodeError`,
+       whose `args` hold **the whole secret** -- outside the exchange error taxonomy, on the
+       first sync, into any log that renders the exception. Found by review on #14; it holds
+       for every venue, so it is checked here once.
+    3. **All or none.** `None` for every variable means the venue is not configured and is
        not built. Some set and some not is a credential that cannot sign, and the reason
        names every variable that is missing.
 
@@ -122,6 +128,11 @@ def exchange_credentials_violation(
     for name, value in variables:
         if value is not None and not value.get_secret_value().strip():
             return f"{name} is set but blank. Set it to the credential, or unset the variable."
+        if value is not None and not _encodes_as_utf8(value):
+            return (
+                f"{name} holds text that cannot be encoded as UTF-8, usually bytes from a file "
+                "or a terminal in another encoding. Set it again from the original."
+            )
     missing = [name for name, value in variables if value is None]
     if missing and len(missing) < len(variables):
         verb = "is" if len(missing) == 1 else "are"
@@ -130,6 +141,20 @@ def exchange_credentials_violation(
             "the same venue are. Set all of them, or none."
         )
     return None
+
+
+def _encodes_as_utf8(value: SecretStr) -> bool:
+    """Whether a credential encodes as UTF-8. Never raises, and never lets the value escape.
+
+    A predicate rather than a raise, so the caller's refusal is built after the `except`
+    block has closed and carries no `__context__`: a `UnicodeEncodeError` keeps the whole
+    string it failed on in its `args`, and here that string is a credential.
+    """
+    try:
+        value.get_secret_value().encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 HEADER_SAFE_TEXT: Final = re.compile(r"\A[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?\Z")
@@ -355,6 +380,16 @@ class Settings(BaseSettings):
     bitget_api_secret: SecretStr | None = None
     bitget_api_passphrase: SecretStr | None = None
 
+    # The BingX API key and its secret, for the same import from the second venue (#14).
+    # **Read-only**: a new BingX key is read-only by default, and `docs/operations.md` says to
+    # leave it that way. Everything said of the Bitget three above holds for these two: kept
+    # as `SecretStr`, never persisted, returned or logged, **both or neither**, a blank value
+    # refused at startup, and the key -- which travels in the `X-BX-APIKEY` header -- refused
+    # when a header cannot carry it. The secret is exempt; it only ever enters an HMAC. BingX
+    # keys have no passphrase, so there is no third variable.
+    bingx_api_key: SecretStr | None = None
+    bingx_api_secret: SecretStr | None = None
+
     # The balance scheduler. Three settings, and each answers a question an operator
     # actually has.
     #
@@ -457,7 +492,7 @@ class Settings(BaseSettings):
           often. The per-host rate limiter would pace the requests, so the symptom is not a
           burst -- it is a process that never stops making them, quietly, for as long as it
           is up.
-        * a partial or blank set of Bitget credentials cannot sign a request, and would be
+        * a partial or blank set of Bitget or BingX credentials cannot sign a request, and would be
           discovered on the first exchange sync rather than here. `exchange_credentials_violation`
           says which variable, and never what it holds. Nor can a key or passphrase holding a
           character no HTTP header can carry -- and that one would also write the value into
@@ -602,6 +637,17 @@ class Settings(BaseSettings):
                 ("PORTFOLIO_BITGET_API_PASSPHRASE", self.bitget_api_passphrase),
             )
         )
+        if reason is not None:
+            raise ValueError(reason)
+        reason = exchange_credentials_violation(
+            (
+                ("PORTFOLIO_BINGX_API_KEY", self.bingx_api_key),
+                ("PORTFOLIO_BINGX_API_SECRET", self.bingx_api_secret),
+            )
+        )
+        if reason is not None:
+            raise ValueError(reason)
+        reason = credential_header_violation((("PORTFOLIO_BINGX_API_KEY", self.bingx_api_key),))
         if reason is not None:
             raise ValueError(reason)
         if (

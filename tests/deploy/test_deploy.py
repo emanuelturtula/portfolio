@@ -1,15 +1,16 @@
 """Guardrail tests for the host-side deployment script.
 
-Only the pure logic is exercised here -- argument validation, rerun ordering and attempt
-pruning. Anything touching Docker or the filesystem lock is verified by an actual
-deployment, because a mock of Docker proves nothing about Docker.
+Only the pure logic is exercised here -- argument validation and rerun ordering. Whether
+Docker accepts what the script asks of it is verified by an actual deployment, because a
+mock of Docker proves nothing about Docker. The file choreography around it -- the layout,
+the migration, the backup and the rollback target -- is ours, and is tested against a
+scripted fake Docker in test_deploy_layout.py and test_deploy_rotation.py.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -101,21 +102,6 @@ class RunOrderTests(unittest.TestCase):
 
     def test_allows_the_first_ever_deployment(self) -> None:
         deploy.check_run_order(None, IMAGE, REVISION, 1)
-
-
-class PruneAttemptsTests(unittest.TestCase):
-    def test_keeps_the_most_recent_attempts_and_the_protected_one(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            attempts = Path(temp)
-            names = [f"2026010{index}T000000Z-{index:012d}" for index in range(1, 10)]
-            for name in names:
-                (attempts / name).mkdir()
-            protected = str(attempts / names[0])
-            deploy.KEEP_ATTEMPTS = 3
-            deploy.prune_attempts(attempts, {protected})
-            remaining = sorted(path.name for path in attempts.iterdir())
-            self.assertIn(names[0], remaining, "the protected attempt must survive")
-            self.assertEqual(len(remaining), 4, remaining)
 
 
 if __name__ == "__main__":

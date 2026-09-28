@@ -97,7 +97,8 @@ async def sync_exchanges(
     `200` whatever the run's own status, for the reason `POST /api/balances/sync` gives: a run
     in which one venue failed is a `partial` run this endpoint performed and reported. **A
     manual sync is the one that retries an `auth_failed` account** -- after the owner has
-    fixed the key and restarted the container.
+    fixed the key and recreated the container (`up --force-recreate`: a restart does not
+    re-read `secrets.env`).
     """
     del principal  # Authorisation only: the sync is process-wide.
     outcome = await coordinator.sync(SyncTrigger.MANUAL)
