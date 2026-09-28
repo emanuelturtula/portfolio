@@ -92,14 +92,14 @@ def check_values(expression: str) -> set[str]:
 
 def seed_owner_account_and_fill(connection: Connection) -> tuple[int, int, int]:
     """One owner, one Bitget account and one fill, by raw SQL. Returns their ids."""
-    user = connection.execute(
+    user: int = connection.execute(
         text(
             "INSERT INTO users (username, password_hash, created_at) "
             "VALUES ('owner', 'not-a-hash', :at) RETURNING id"
         ),
         {"at": AT},
     ).scalar_one()
-    account = connection.execute(
+    account: int = connection.execute(
         text(
             "INSERT INTO exchange_accounts (user_id, exchange_key, created_at) "
             "VALUES (:user, 'bitget', :at) RETURNING id"
@@ -107,7 +107,7 @@ def seed_owner_account_and_fill(connection: Connection) -> tuple[int, int, int]:
         {"user": user, "at": AT},
     ).scalar_one()
     connection.execute(text(FILL_INSERT), {"account": account, "trade": "1001", "at": AT})
-    fill = connection.execute(text("SELECT id FROM exchange_fills")).scalar_one()
+    fill: int = connection.execute(text("SELECT id FROM exchange_fills")).scalar_one()
     return int(user), int(account), int(fill)
 
 
@@ -547,14 +547,14 @@ def test_removing_an_account_without_fills_takes_its_windows_and_outcomes(
     upgrade_to_head(database_url)
     with sync_engine.connect() as connection:
         connection.exec_driver_sql("PRAGMA foreign_keys=ON")
-        user = connection.execute(
+        user: int = connection.execute(
             text(
                 "INSERT INTO users (username, password_hash, created_at) "
                 "VALUES ('owner', 'x', :at) RETURNING id"
             ),
             {"at": AT},
         ).scalar_one()
-        account = connection.execute(
+        account: int = connection.execute(
             text(
                 "INSERT INTO exchange_accounts (user_id, exchange_key, created_at) "
                 "VALUES (:user, 'bingx', :at) RETURNING id"

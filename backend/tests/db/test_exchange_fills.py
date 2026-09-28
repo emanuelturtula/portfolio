@@ -283,7 +283,7 @@ async def test_an_unknown_exchange_key_is_refused(
 ) -> None:
     del accounts
     async with migrated_engine.connect() as connection:
-        owner = (await connection.execute(text("SELECT id FROM users"))).scalar_one()
+        owner: int = (await connection.execute(text("SELECT id FROM users"))).scalar_one()
 
     rendered = await refused(
         migrated_engine,
@@ -300,7 +300,7 @@ async def test_one_account_per_venue_per_owner(
     """Credentials come from the environment, one set per venue, so one account per venue."""
     del accounts
     async with migrated_engine.connect() as connection:
-        owner = (await connection.execute(text("SELECT id FROM users"))).scalar_one()
+        owner: int = (await connection.execute(text("SELECT id FROM users"))).scalar_one()
 
     rendered = await refused(
         migrated_engine,

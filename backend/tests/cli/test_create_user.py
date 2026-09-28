@@ -178,7 +178,7 @@ def give_the_owner_a_portfolio(engine: Engine, owner_id: int, *, with_fill: bool
     """
     now = sqlite_timestamp(OBSERVED_AT)
     with engine.begin() as connection:
-        wallet_id = connection.execute(
+        wallet_id: int = connection.execute(
             text(
                 "INSERT INTO wallets (user_id, chain_key, address_canonical, address_display, "
                 "label, archived_at, created_at, updated_at) "
@@ -187,7 +187,7 @@ def give_the_owner_a_portfolio(engine: Engine, owner_id: int, *, with_fill: bool
             ),
             {"user_id": owner_id, "address": BIP173_TESTNET_P2WPKH, "now": now},
         ).scalar_one()
-        run_id = connection.execute(
+        run_id: int = connection.execute(
             text(
                 "INSERT INTO sync_runs (trigger, status, started_at, finished_at, duration_ms, "
                 "wallets_total, wallets_succeeded, wallets_failed) "
@@ -209,7 +209,7 @@ def give_the_owner_a_portfolio(engine: Engine, owner_id: int, *, with_fill: bool
             ),
             {"wallet_id": wallet_id, "run_id": run_id, "now": now},
         )
-        account_id = connection.execute(
+        account_id: int = connection.execute(
             text(
                 "INSERT INTO exchange_accounts (user_id, exchange_key, created_at) "
                 "VALUES (:user_id, 'bitget', :now) RETURNING id"
@@ -490,7 +490,7 @@ def test_create_user_replace_refuses_when_more_than_one_account_exists(
     del cli_database
     first_id = create_the_owner(monkeypatch, sync_engine, username=FIRST_OF_TWO)
     with sync_engine.begin() as connection:
-        second_id = connection.execute(
+        second_id: int = connection.execute(
             text(
                 "INSERT INTO users (username, password_hash, created_at) "
                 "VALUES (:username, :password_hash, :created_at) RETURNING id"
