@@ -20,9 +20,22 @@ the same reason.
 **Every amount obeys `NormalizedFill`'s rule**: a finite `Decimal` -- never a `bool`, an
 `int` or a `float` -- with at most `AMOUNT_SCALE` fractional digits and at most
 `MAX_AMOUNT_INTEGER_DIGITS` integer digits, both judged by value, so `1.50000000000000000000`
-is accepted with its twenty places (spec 019, R9). The rule is the same so that every stored
-fill converts: an event type stricter than the table it is read from is a replay that fails
-on data the application itself accepted.
+is accepted with its twenty places (spec 019, R9). The amount rule is the same so that no
+stored amount is refused for its precision or its size.
+
+**A stored fill does not always convert, though.** `Trade` refuses three shapes that
+`NormalizedFill`, and so the `exchange_fills` table, accepts:
+
+* a `base_asset` equal to the `quote_asset`;
+* a fee in the asset received that consumes everything received;
+* a rebate in the asset given that is as large as everything given.
+
+Each leaves the trade without a leg to account for -- nothing received to carry the cost,
+or nothing given to take it from -- so the refusals stay: a replay that guessed would be
+computing a position from something no venue meant. No venue is known to send any of the
+three. Refusing them where fills are ingested, so that every stored fill does convert, is a
+follow-up filed for #19 to rely on; until it lands, a stored fill of one of these shapes
+makes building its `Trade` raise `ValueError`, which is where #19 will see it.
 """
 
 from __future__ import annotations
