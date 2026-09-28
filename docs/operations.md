@@ -8,11 +8,17 @@ keeping the import of those trades running.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
-Throughout, `<deploy-root>` is the deployment root from `docs/deployment.md`
-(`~/portfolio-app-deploy/prod`), and `<origin>` is the scheme and host the browser actually
-shows when you open the application — for example `https://portfolio.example`. Neither the
-real host name nor any credential belongs in this repository, so both stay as placeholders
-here and as real values only in the host-local `secrets.env`.
+Throughout, `<deploy-root>` is the live deployment's directory on the host,
+`~/portfolio-app/prod` (its layout is in `docs/deployment.md`), and every command below
+spells it out so it can be pasted as it is. `<origin>` is the scheme and host the browser
+actually shows when you open the application — for example `https://portfolio.example`.
+Neither the real host name nor any credential belongs in this repository, so both stay as
+placeholders here and as real values only in the host-local `secrets.env`.
+
+Every command against the running container goes through
+`~/portfolio-app/prod/compose.sh`, which each successful deployment rewrites for what it
+deployed. It passes its arguments to docker compose along with the image, port, environment
+and secrets file that compose refuses to run without, so there is nothing to export first.
 
 ## 1. Required before the first deployment carrying authentication
 
@@ -25,7 +31,7 @@ Add both variables to the host-local secrets file — the same file exchange cre
 in, at mode 0600, never through GitHub:
 
 ```bash
-$EDITOR <deploy-root>/secrets.env
+$EDITOR ~/portfolio-app/prod/secrets.env
 ```
 
 ```
@@ -46,7 +52,7 @@ exists.
 `env_file` is read at container **creation**, so after editing this file:
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml up --force-recreate app
+~/portfolio-app/prod/compose.sh up -d --force-recreate app
 ```
 
 A plain restart silently keeps the old values. That is already the last row of the
@@ -89,7 +95,7 @@ If you would rather not put the password in a file at all, leave
 container:
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio create-user --username <name>
+~/portfolio-app/prod/compose.sh exec app python -m portfolio create-user --username <name>
 ```
 
 It prompts for the password twice, with no echo, and for nothing else. The account name is
@@ -113,7 +119,7 @@ either uselessly fast or slow enough to be a denial-of-service vector against th
 endpoint, so re-measure on any host that is not that one, and after any hardware change.
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio hash-benchmark
+~/portfolio-app/prod/compose.sh exec app python -m portfolio hash-benchmark
 ```
 
 It reports the median wall time of a hash with the parameters currently configured.
@@ -179,7 +185,7 @@ question, nothing to attack. Recover by setting a new password on the existing a
 the host:
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio create-user --replace
+~/portfolio-app/prod/compose.sh exec app python -m portfolio create-user --replace
 ```
 
 The command asks for confirmation, then for the new password twice. It changes the password
@@ -426,8 +432,7 @@ the interval, and it prints the prices where the scheduler logs a count.
 ### Refreshing by hand
 
 ```bash
-cd <deploy-root>
-docker compose exec app python -m portfolio refresh-prices
+~/portfolio-app/prod/compose.sh exec app python -m portfolio refresh-prices
 ```
 
 It fetches every supported pair once, writes what it got, and prints one line per pair:
@@ -715,7 +720,7 @@ They go in the host-local secrets file -- the same file as section 1, at mode 06
 through GitHub, never in this repository, never in any other file:
 
 ```bash
-$EDITOR <deploy-root>/secrets.env
+$EDITOR ~/portfolio-app/prod/secrets.env
 ```
 
 ```
@@ -727,7 +732,7 @@ PORTFOLIO_BITGET_API_PASSPHRASE=<the passphrase you chose>
 Then recreate the container, because `env_file` is read at creation:
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml up --force-recreate app
+~/portfolio-app/prod/compose.sh up -d --force-recreate app
 ```
 
 **All three, or none.** With none set, Bitget is not configured and the provider is not built
@@ -878,7 +883,7 @@ every fifteen minutes is how an address gets banned. **To recover:**
 3. Recreate the container -- `env_file` is read at creation, so a restart is not enough:
 
    ```bash
-   docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml up --force-recreate app
+   ~/portfolio-app/prod/compose.sh up -d --force-recreate app
    ```
 
 4. Trigger a sync by hand. **A manual sync is the one that retries an `auth_failed`
@@ -984,7 +989,7 @@ They go in the host-local secrets file -- the same file as section 1, at mode 06
 through GitHub, never in this repository, never in any other file:
 
 ```bash
-$EDITOR <deploy-root>/secrets.env
+$EDITOR ~/portfolio-app/prod/secrets.env
 ```
 
 ```
@@ -995,7 +1000,7 @@ PORTFOLIO_BINGX_API_SECRET=<the secret key>
 Then recreate the container, because `env_file` is read at creation:
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml up --force-recreate app
+~/portfolio-app/prod/compose.sh up -d --force-recreate app
 ```
 
 **Both, or neither.** With neither set, BingX is not configured and the provider is not built

@@ -60,8 +60,9 @@ function Remediation({ exchange }: RemediationProps) {
             .
           </li>
           <li>
-            Recreate the container with <code>docker compose up --force-recreate</code>. A restart
-            does not re-read <code>secrets.env</code>.
+            Recreate the container with{' '}
+            <code>~/portfolio-app/prod/compose.sh up -d --force-recreate app</code>. A restart does
+            not re-read <code>secrets.env</code>.
           </li>
           <li>
             Press <strong>Sync now</strong>. Scheduled syncs skip {venue} until a sync you start
@@ -85,8 +86,8 @@ function Remediation({ exchange }: RemediationProps) {
                   <code>{variable}</code>
                 </span>
               ))}
-              ), and the container be recreated with <code>docker compose up --force-recreate</code>
-              .
+              ), and the container be recreated with{' '}
+              <code>~/portfolio-app/prod/compose.sh up -d --force-recreate app</code>.
             </p>
           </li>
         </ol>

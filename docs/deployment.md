@@ -28,26 +28,154 @@ never disagree.
 `deploy/deploy.py` is uploaded for each run and deleted afterwards; the host keeps no copy
 of the tooling. In order:
 
-1. Take a host-wide lock, so two deployments cannot interleave.
-2. Refuse a workflow run older than the deployed one. Re-running an old workflow from the
+1. Take a host-wide lock, so two deployments cannot interleave. A host still on the
+   previous layout is migrated here, under the lock; see
+   [Migrating from the previous layout](#migrating-from-the-previous-layout).
+2. Find the live deployment's compose file, and refuse if it is missing: it is what a
+   failure rolls back to.
+3. Refuse a workflow run older than the deployed one. Re-running an old workflow from the
    Actions UI would otherwise roll production backwards without anyone noticing.
-3. Pull the digest and check the image's `org.opencontainers.image.revision` and `.version`
+4. Pull the digest and check the image's `org.opencontainers.image.revision` and `.version`
    labels against what CI claims. A digest that does not correspond to the commit is
    rejected.
-4. Back up the live SQLite database using sqlite3's backup API from inside the running
-   container, and verify it with `PRAGMA integrity_check`. This is a consistent snapshot
-   even while the application is writing.
-5. `docker compose up --wait`, then assert the container is healthy **and** running the
-   exact digest requested.
-6. On failure, restore the previous deployment and record the evidence.
+5. Stage the candidate in `prod/incoming/`, and back up the live SQLite database into it,
+   using sqlite3's backup API from inside the running container and verifying the copy
+   with `PRAGMA integrity_check`. This is a consistent snapshot even while the application
+   is writing.
+6. Bring the candidate up and wait for it, then assert the container is healthy **and**
+   running the exact digest requested.
+7. On success, make the candidate the live deployment and the previous one the backup. On
+   failure, restart the previous deployment against the live database and keep the failed
+   attempt's evidence in `prod/failed/`.
 
-State lives under `<deploy root>/prod/`:
+Nothing before step 6 changes the running container: the only writes are the migration's
+rename, the staging directory and the backup. A refusal at any of those steps leaves the
+live deployment running as it was.
 
-| Path | What it holds |
+## The layout on the host
+
+Everything lives under `~/portfolio-app/`. The environment directory holds the live
+deployment and at most one backup:
+
+| Path, under `~/portfolio-app/` | What it holds |
 |---|---|
-| `current.json` | the last healthy deployment, written atomically |
-| `secrets.env` | operator-managed credentials, mode 0600, never read by the script |
-| `attempts/<id>/` | the compose file, the request, the previous manifest, the database backup and the result for each attempt (last 10 kept) |
+| `deploy.lock` | the host-wide lock |
+| `prod/compose.yml` | the live deployment's compose file |
+| `prod/current.json` | the live deployment's manifest: the image digest, revision, version and the workflow run that delivered it |
+| `prod/secrets.env` | operator-managed credentials, mode 0600, never read by the script |
+| `prod/compose.sh` | runs docker compose against the live deployment; see below |
+| `prod/last-attempt.json` | the latest attempt's request and outcome, whether it succeeded or not |
+| `prod/backup/` | the previous deployment's `compose.yml` and `current.json` and, when there was a database to back up, `database.sqlite3`: the database as it was just before the live deployment replaced it, with `snapshot.json` naming the attempt that took it |
+| `prod/failed/` | only after a failed or interrupted deployment: its `compose.yml`, `request.json`, `result.json` and, when there was one, the database snapshot taken before it (or carried forward from the previous `failed/`) with its `snapshot.json`. The next failure replaces it and the next success deletes it |
+| `prod/incoming/` | only while a deployment runs: the candidate being staged |
+
+Every path is computed from this layout when it is used, and the manifests `deploy.py`
+writes store none, so renaming the root or moving a file between these directories leaves
+nothing pointing at the old place. Every JSON file, the compose file and `compose.sh` are written to a temporary
+file and renamed into place, so a crash leaves the old file or the new one, never a torn one.
+
+### `compose.sh`
+
+Compose refuses to run this project without four variables that only `deploy.py` knows:
+the image digest, the port, the environment name and the path of `secrets.env`. Every
+successful deployment rewrites `prod/compose.sh` with those values for what it just
+deployed, so it always addresses what is running:
+
+```bash
+~/portfolio-app/prod/compose.sh up -d --force-recreate app
+~/portfolio-app/prod/compose.sh ps
+~/portfolio-app/prod/compose.sh logs --tail 100 app
+~/portfolio-app/prod/compose.sh exec app python -m portfolio create-user --username <name>
+```
+
+Every deployment also writes it for the live deployment before it does anything else, if it
+is missing or names something other than what is live. So a host whose first deployment
+after the migration failed still has a working `compose.sh`, pointed at the compose file
+the old layout's live deployment runs from.
+
+Every argument is passed to compose unchanged. The script holds no secret: it names
+`secrets.env`, never its contents, and embeds only the three values `deploy.py` validated
+before running anything, plus the live compose file's name. Its paths are relative to the
+script itself, which it finds through any symlink, so it works from any directory.
+[Operations](operations.md) uses it for every command against the running container.
+
+### One backup, and why
+
+After a successful deployment the host keeps at most one copy of the database, in
+`prod/backup/`: exactly one once any deployment has had a database to back up, and none
+before that. That is the owner's decision: every copy is one more place the owner's data
+sits on disk, and one is enough to undo the deployment that is live. The previous layout
+kept ten.
+
+What that costs, accepted: a problem noticed two deployments late has no copy from before
+it.
+
+During a failed deployment's aftermath there can be two: `backup/`, and the snapshot in
+`failed/`. The second is the database as it was just before the failed attempt, which is
+the copy that matters if a migration went wrong.
+
+A deployment that cannot take a snapshot of its own, because the live container is not
+healthy, is not the one `current.json` names, or has no database yet, never throws a copy
+away:
+
+- If `failed/` holds a snapshot of the live deployment, taken by an attempt that failed or
+  was interrupted, that snapshot is carried forward. A success makes it the backup, and a
+  failure keeps it in its own `failed/`. A failure never changes `current.json`, so the
+  snapshot is of the same deployment.
+- A deployment interrupted part-way (a dropped connection, a reboot, the process killed for
+  memory), perhaps with its candidate already running, leaves `prod/incoming/` behind. The
+  next deployment keeps it as `failed/`, with a `result.json` saying it was interrupted,
+  when it holds a snapshot, so the database from before that candidate is carried forward
+  like any other.
+- Otherwise `backup/` stays exactly as it was. The one exception is a host being migrated
+  from the previous layout, which has no backup yet; see below.
+
+No older copy is deleted until the copy replacing it has been flushed to disk under its
+final name, so a power cut at any moment leaves at least one.
+
+The backup is there for a person to restore by hand. A failed deployment does not restore
+it: it restarts the previous image against the live database, as it always has.
+
+### Migrating from the previous layout
+
+Hosts deployed before #94 keep everything under `~/portfolio-app-deploy`, with one
+directory per attempt under `prod/attempts/<id>/`, each holding its own compose file and a
+full copy of the database. The first deployment that runs the new `deploy.py` migrates the
+host by itself:
+
+1. It takes the lock in `~/portfolio-app-deploy`, then renames that directory to
+   `~/portfolio-app` with a single rename. The lock is held on the open file, so it moves
+   with the directory, and a deployment already waiting on the old path carries on in the
+   new one. `secrets.env` moves with it, byte for byte and still mode 0600. The running
+   container is not touched: it mounts nothing from this directory, and its data lives in
+   a named Docker volume.
+2. The old manifest names its compose file under `attempts/<id>/`. That path is rebased
+   onto the new root, and it is what a failure rolls back to.
+3. On success, `backup/` receives the old deployment's compose file and manifest and the
+   new snapshot, and `attempts/` is deleted, ten database copies with it. A failure leaves
+   `attempts/` in place until a deployment succeeds.
+4. If that successful deployment could not take a snapshot, because the old container was
+   not healthy or not the one its manifest names, the newest attempt that still holds a
+   database becomes `backup/` instead. That database was taken from the deployment the
+   attempt's `previous.json` names, so `previous.json` becomes `backup/current.json`, beside
+   the compose file that deployment ran from. If the attempt it was made in has been
+   pruned, there is no compose file, and `current.json` carries a `backup_note` saying so.
+   Only then is `attempts/` deleted, so the migration never leaves the host without a copy
+   it had. If no attempt holds one, the deployment says so in one line of its log.
+
+After the rename, the migration leaves a small **regular file** at `~/portfolio-app-deploy`
+saying where the root went. Leave it there. Every earlier version of `deploy.py` defaults to
+that path, and a re-run of an old delivery from the Actions UI would otherwise recreate an
+empty directory there and deploy into it, with no secrets and no rerun protection, leaving
+two roots behind. With the file in the way, the old script fails before it runs any docker
+command. The new one does not count a file as a root. If the file goes missing, any regular
+file at that path does the same job: `touch ~/portfolio-app-deploy`.
+
+If both `~/portfolio-app-deploy` and `~/portfolio-app` exist as directories, the deployment
+refuses and changes nothing, so a person decides which one holds the live deployment. A
+refusal after the rename says the root was migrated. Anything of your own that refers to
+`~/portfolio-app-deploy`, such as a cron job or a script, needs the new path. The legacy
+application's `~/portfolio-deploy` is a different directory, and nothing here touches it.
 
 ## One-time setup
 
@@ -104,13 +232,24 @@ key is stored anywhere.
 Exchange API credentials never pass through GitHub. Write them directly on the host:
 
 ```bash
-install -m 600 /dev/null ~/portfolio-app-deploy/prod/secrets.env
-$EDITOR ~/portfolio-app-deploy/prod/secrets.env
+install -d -m 700 ~/portfolio-app ~/portfolio-app/prod
+install -m 600 /dev/null ~/portfolio-app/prod/secrets.env
+$EDITOR ~/portfolio-app/prod/secrets.env
 ```
 
+The first two commands are only for a host that has never been deployed to. On one that
+has, they would empty the file; on one not yet migrated, they would create a second root,
+which the next deployment refuses. A host not yet migrated keeps the file under its previous root until its
+next deployment moves it; see
+[Migrating from the previous layout](#migrating-from-the-previous-layout).
+
 `deploy.py` refuses to run if that file is group- or world-readable. Changing it requires
-recreating the container, not restarting it — `docker compose up --force-recreate app` —
-because `env_file` is read at container creation.
+recreating the container, not restarting it, because `env_file` is read at container
+creation:
+
+```bash
+~/portfolio-app/prod/compose.sh up -d --force-recreate app
+```
 
 Authentication adds two variables to this same file, one of which the application refuses
 to start without. See [Operations](operations.md), section 1 — a deployment that lands the
@@ -132,14 +271,17 @@ the run summary. Setting it back to `false` is the kill switch.
 The deploy script rolls back on its own when a new container fails to become healthy. To go
 back deliberately, revert the commit and merge the revert — that produces a new version and
 a new deployment through the normal path, with the database backup that a forward deployment
-always takes.
+takes.
 
 Do not re-run an old workflow to roll back: `deploy.py` rejects it by design.
 
 ## When something fails
 
-Read the attempt directory named in the error. It contains the exact request, the previous
-manifest, the compose file used, the database backup and the failure reason.
+Read `~/portfolio-app/prod/failed/`, which the error names as its evidence. It holds the
+exact request, the compose file used, the database as it was before the attempt when one
+was taken or carried forward, and `result.json` with the failure reason and whether the rollback came back healthy.
+`~/portfolio-app/prod/last-attempt.json` always describes the latest attempt, successful or
+not.
 
 | Symptom | Likely cause |
 |---|---|
@@ -147,4 +289,8 @@ manifest, the compose file used, the database backup and the failure reason.
 | "must not be group or world readable" | `secrets.env` permissions were loosened |
 | "This workflow run is older than" | an old workflow run was re-run; push instead |
 | "The deployment host is busy" | a concurrent deployment holds the lock; it will retry |
+| "Both ... exist, so this host cannot be migrated safely" | the old and the new root are both directories, usually because the file the migration left at the old path was replaced by one; keep the directory holding the live deployment, move the other away, and put the file back (see the migration section) |
+| "The live deployment's compose file ... is missing" | `prod/compose.yml`, or the old layout's `attempts/<id>/compose.yml`, was deleted by hand; there is nothing to roll back to, so the deployment stops there. The live deployment was not touched |
+| "[Errno 17] File exists: ..." naming the previous layout's root | a workflow run from before the new layout was re-run. Its `deploy.py` still targets the old root, and the file the migration left there stops it before it runs anything, by design ([Migrating from the previous layout](#migrating-from-the-previous-layout)). Nothing was deployed; push a new commit instead |
+| "running and healthy, but recording it failed" | the new version is live, but a file under `prod/` could not be written; the next deployment repairs the files. Until then `compose.sh` may still name the previous image, so `up --force-recreate` through it would bring that image back: deploy again rather than recreating by hand |
 | Healthy container, stale behaviour | `secrets.env` changed but the container was restarted rather than recreated |
