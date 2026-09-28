@@ -800,6 +800,28 @@ def test_the_statement_splitter_keeps_table_rows_apart() -> None:
     assert not any(re.search(r"7 days", unit) and CONTRADICTED.search(unit) for unit in units)
 
 
+def test_the_document_records_which_fills_a_capped_page_keeps() -> None:
+    """Spec 017, R8, settled by the owner's third probe: a capped page keeps the **oldest**
+    fills in range.
+
+    The time cursor pages forward from a full page's newest millisecond. That is right only
+    because the venue fills a capped page with the oldest fills; one that kept the newest
+    would lose the rest of a full window without a word. So the fact the design rests on is
+    pinned where the design is recorded: one row of the facts table naming the question, the
+    answer and the probe it came from.
+    """
+    rows = [
+        statement
+        for statement in statements(bingx_section())
+        if statement.startswith("|") and "which fills a capped page keeps" in statement
+    ]
+
+    assert len(rows) == 1, "the facts table has no single row for which fills a capped page keeps"
+    (row,) = rows
+    assert "the oldest in range" in row
+    assert "third probe" in row, "the answer does not name the probe it came from"
+
+
 @pytest.mark.parametrize("path", [PROVIDER_DOC, OPERATIONS_DOC], ids=["providers", "operations"])
 def test_the_documents_assign_no_value_to_a_bingx_variable(path: Path) -> None:
     """Rule 3: the variable names are documentation; a value beside one is a leak or a lure.
