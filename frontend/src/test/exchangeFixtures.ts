@@ -188,13 +188,16 @@ function fail(message: string): never {
  *
  * `_read_account` asks for candidate symbols only when the provider
  * `requires_symbol`; otherwise it commits `requested_since`,
- * `effective_since` and the planned windows, **then** fetches. Bitget does not
- * require a symbol (`BITGET_CAPABILITIES`, `requires_symbol=False`). BingX is
- * unknown until #14 builds its provider, so it is left unconstrained.
+ * `effective_since` and the planned windows, **then** fetches. Neither venue
+ * requires a symbol: Bitget (`BITGET_CAPABILITIES`, `requires_symbol=False`,
+ * spec 014) and BingX (`BINGX_CAPABILITIES`, `requires_symbol=False`, spec 017,
+ * because the live probe showed its fills endpoint answers every symbol
+ * without one). So both commit their plan before the first fetch, and a
+ * fetch-born failure always has `requested_since` set and a window pending.
  */
 const PLANS_BEFORE_FIRST_FETCH: Readonly<Record<ExchangeKey, boolean>> = {
   bitget: true,
-  bingx: false,
+  bingx: true,
 };
 
 /**

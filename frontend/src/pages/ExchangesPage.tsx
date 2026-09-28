@@ -27,8 +27,9 @@ const SYNC_FAILURE_FALLBACK = 'No answer came back from the server.';
 
 const EMPTY_DESCRIPTION =
   'Exchange API keys are read from environment variables on the host, for example ' +
-  'PORTFOLIO_BITGET_API_KEY, and are never entered in this app. docs/operations.md, section 12, ' +
-  'explains how to create a read-only key and where to put it.';
+  'PORTFOLIO_BITGET_API_KEY, and are never entered in this app. docs/operations.md, ' +
+  'sections 12 (Bitget) and 14 (BingX) explain how to create a read-only key and where to ' +
+  'put it.';
 
 /**
  * Which venues get a truncation banner (spec criterion 5): `history_truncated` with a known

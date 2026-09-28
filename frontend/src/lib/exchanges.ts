@@ -33,8 +33,9 @@ export interface ExchangeInfo {
 }
 
 /**
- * `bingx`'s variables are a guess at #14's naming, called out in the spec's "Handed on"
- * section: #14 must confirm them, or correct this table, once it configures the venue.
+ * `bingx`'s variables are confirmed: `PORTFOLIO_BINGX_API_KEY` and
+ * `PORTFOLIO_BINGX_API_SECRET`, per docs/specs/017-bingx-spot-fills-provider.md and defined
+ * in `backend/src/portfolio/config.py`.
  */
 export const EXCHANGES: Record<ExchangeKey, ExchangeInfo> = {
   bingx: {

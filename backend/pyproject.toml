@@ -271,7 +271,15 @@ concurrency = ["thread", "greenlet"]
 # ceiling yet" paths, and the two cases where a floor that is already high enough stays put.
 # None of them can claim history as covered. 99.8 would leave 6.1 units of headroom, below
 # nine, so the floor waits.
+#
+# **`precision = 2` since the BingX provider (#14), because without it the floor above was
+# not the floor.** coverage.py compares `round(total, precision) < fail_under`, and the
+# precision defaults to 0: 99.65% rounds to 100 and passes a floor of 99.7, so every number
+# above was enforced as its value minus half a point. backend-dev found it when a gate run at
+# 99.65% printed "FAIL Required test coverage of 99.7% not reached" and still exited 0. The
+# ratchet notes' headroom arithmetic assumed an exact comparison; with two places it now is.
 fail_under = 99.7
+precision = 2
 show_missing = true
 skip_covered = true
 exclude_also = [
