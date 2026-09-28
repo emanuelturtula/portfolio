@@ -662,7 +662,9 @@ async def test_the_error_kind_check_admits_null_and_each_member(
     await insert_chain_with(session, run_id, error_kind=error_kind)
     await session.commit()
 
-    stored = (await session.execute(text("SELECT error_kind FROM sync_run_chains"))).scalar_one()
+    stored: str = (
+        await session.execute(text("SELECT error_kind FROM sync_run_chains"))
+    ).scalar_one()
     assert stored == error_kind
 
 

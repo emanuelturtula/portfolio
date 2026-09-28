@@ -463,13 +463,13 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
     """
     upgrade_to_head(database_url)
     with sync_engine.begin() as connection:
-        user_id = connection.execute(
+        user_id: int = connection.execute(
             text(
                 "INSERT INTO users (username, password_hash, created_at) "
                 "VALUES ('owner', 'not-a-hash', '2026-09-25 12:00:00.000000') RETURNING id"
             )
         ).scalar_one()
-        account_id = connection.execute(
+        account_id: int = connection.execute(
             text(
                 "INSERT INTO exchange_accounts (user_id, exchange_key, created_at) "
                 "VALUES (:user_id, 'bitget', '2026-09-25 12:00:00.000000') RETURNING id"
