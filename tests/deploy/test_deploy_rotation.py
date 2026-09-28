@@ -199,6 +199,26 @@ class DurableBeforeDeletingTests(unittest.TestCase):
         self.assertIsNotNone(self.host.current().get("backup_carried_from"))
         self.assertGreaterEqual(self.assert_named_only_once_synced(tap), 3)
 
+    def test_a_carried_copy_is_recorded_before_it_moves_into_a_failure(self) -> None:
+        # One tap over both failures, so the carried copy's first sync, in the attempt
+        # that took it, is seen too.
+        tap = FilesystemTap()
+        self.host.deploy(R1)
+        self.host.docker.fail_up.update({R2.image, R3.image})
+        self.host.docker.unhealthy.add(R1.image)
+        with self.assertRaises(deploy.DeploymentError):
+            self.host.deploy(R2, tap=tap)  # snapshots, fails, its rollback unhealthy
+        with self.assertRaises(deploy.DeploymentError):
+            self.host.deploy(R3, tap=tap)  # cannot snapshot: carries failed/'s copy
+        carried = [
+            s
+            for s in tap.named("os.rename")
+            if Path(s.args[0]).parent.name == "failed"
+            and Path(s.args[1]).name == "database.sqlite3"
+        ]
+        self.assertEqual(len(carried), 1, "the premise: the copy was carried")
+        self.assertGreaterEqual(self.assert_named_only_once_synced(tap), 2)
+
     def test_a_seeded_database_takes_its_name_only_once_synced(self) -> None:
         self.host.build_legacy()
         self.host.docker.containers[self.host.docker.running or ""].health = "unhealthy"

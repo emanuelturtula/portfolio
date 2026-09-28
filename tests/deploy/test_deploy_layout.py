@@ -971,6 +971,7 @@ class CarryForwardTests(HostTestCase):
         self.assertEqual(len(self.host.sqlite_files()), 1)
 
     def test_a_failure_that_cannot_snapshot_carries_it_into_its_own_evidence(self) -> None:
+        took_it = taken_by(self.prod / "failed")
         self.docker.fail_up.add(R3.image)
         self.assert_fails(R3)
 
@@ -978,11 +979,17 @@ class CarryForwardTests(HostTestCase):
         request = read_manifest(self.prod / "failed" / "request.json")
         self.assertEqual(request["image"], R3.image)
         self.assertEqual((self.prod / "failed" / "database.sqlite3").read_bytes(), self.only_copy)
+        # The copy keeps the time it was taken, not the time it was carried: the carry
+        # rule compares that time with the backup's, and a later label would let an old
+        # copy displace a newer backup.
+        self.assertEqual(taken_by(self.prod / "failed"), took_it)
+        self.assertNotEqual(took_it, request["attempt"])
         self.assertEqual(len(self.host.sqlite_files()), 1)
 
         self.host.deploy(R4)
 
         self.assertEqual(tree(self.prod / "backup")["database.sqlite3"], self.only_copy)
+        self.assertEqual(taken_by(self.prod / "backup"), took_it)
         self.assertEqual(len(self.host.sqlite_files()), 1)
 
     def test_a_success_that_takes_a_snapshot_supersedes_the_failed_one(self) -> None:
