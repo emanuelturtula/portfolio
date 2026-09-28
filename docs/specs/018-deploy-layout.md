@@ -1,7 +1,7 @@
 # 018 — One live deployment at the root, one backup, and commands that work
 
 Issue: #94
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -239,6 +239,45 @@ otherwise the backup's compose file is omitted, and the manifest records why.
 - The docs no longer promise that `backup/` or `failed/` always holds a database.
 - The "recording failed" row warns that `compose.sh` may still name the previous image until
   the next deployment.
+
+### Second review (S1)
+
+**Which copy is kept is decided by when it was taken, not by which deployment it came from.**
+"The backup names the live deployment" proved only that two copies came from the same
+deployment, and the reviewer built a chain in which that rule deleted the newest one. So every
+database copy now travels with a `snapshot.json` recording `taken_by`, the id of the attempt
+that took it. It is written before the database, so a complete `backup.new` always has it. A
+`failed/` copy is carried forward unless it is known to be no newer than the backup's.
+Attempt ids gained microseconds and never go backwards, so they sort in time order even for
+attempts in the same second, and even when the Pi boots before NTP corrects its clock.
+
+## What the plan got wrong
+
+### Every older version of the tool could still run against the host
+
+The plan migrated the host and treated the old root as gone. But every earlier commit's
+`deploy.py` defaults to that root, and a re-run of an old delivery uploads exactly that
+script. It would have recreated the old root, skipped rerun protection, and taken production
+down. **A migration of on-disk state must consider every older version of the tool that can
+still be pointed at it.** The fix, a tombstone file, is tested against the vendored pre-#94
+script in CI.
+
+### Three rules deleted the newest copy of the database, and each looked right on its own
+
+1. A migration that could not snapshot deleted `attempts/`, the only copies.
+2. Seeding moved the only legacy copy instead of copying it.
+3. The carry rule trusted "same deployment" over "taken later".
+
+Each was found by a crash sweep or a reproduction, not by reading. **Every step that deletes
+a copy needs an argument that a newer or equal copy already exists and is durable.** "Newer"
+means when it was taken, recorded beside it.
+
+### The documented commands had never been run
+
+Seven `docker compose` commands in the docs failed as written, and so did the page's
+remediation. Nothing tested them. The operator's commands are now `compose.sh`, which is
+tested for its exact text, its mode and a run under `sh`. A docs test refuses any
+`docker compose` instruction to the owner.
 
 ## API contract
 
