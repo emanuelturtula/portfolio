@@ -314,3 +314,87 @@ def test_the_repository_wide_floor_has_not_dropped() -> None:
     configuration = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
 
     assert configuration["tool"]["coverage"]["report"]["fail_under"] >= 99.7
+
+
+# --------------------------------------------------------------------------------------
+# N5: the floor is skipped only when pytest was skipped
+# --------------------------------------------------------------------------------------
+#
+# `run_steps` is what `main` runs the gate through. The pytest step is replaced by a stand-in
+# whose outcome is chosen -- an executable that does not exist (SKIPPED), a Python that exits
+# 1 (FAILED) or 0 (PASSED) -- and the floor step is the real one, over a report path.
+
+MISSING_TOOL: Final = "portfolio-check-no-such-tool-17"
+
+
+def gate_steps(pytest_command: list[str], report_path: Path) -> list[tuple[str, list[str], Path]]:
+    return [
+        ("pytest", pytest_command, REPO_ROOT),
+        (
+            "domain coverage",
+            [sys.executable, "scripts/domain_coverage.py", str(report_path)],
+            REPO_ROOT,
+        ),
+    ]
+
+
+def test_the_floor_waits_on_pytest_and_nothing_else() -> None:
+    check = load_script(CHECK_SCRIPT, "check_under_test_prerequisites")
+
+    assert check.PREREQUISITES == {"domain coverage": "pytest"}
+
+
+def test_a_skipped_pytest_skips_the_floor_and_says_why(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`uv` missing: pytest is skipped, and the floor is skipped rather than failed as unusable."""
+    check = load_script(CHECK_SCRIPT, "check_under_test_skip")
+
+    failures = check.run_steps(gate_steps([MISSING_TOOL, "run", "pytest"], tmp_path / "none.json"))
+    printed = capsys.readouterr().out.splitlines()
+
+    assert failures == []
+    assert f"  SKIP  pytest: {MISSING_TOOL} is not installed" in printed
+    assert (
+        "  SKIP  domain coverage: pytest was skipped, so there is no coverage report to hold "
+        "to the floor"
+    ) in printed
+
+
+def test_a_failed_pytest_with_no_report_fails_both(tmp_path: Path) -> None:
+    """Only a skip propagates: pytest ran, so the floor runs, and fails closed on no report."""
+    check = load_script(CHECK_SCRIPT, "check_under_test_failed")
+    failing = [sys.executable, "-c", "raise SystemExit(1)"]
+
+    failures = check.run_steps(gate_steps(failing, tmp_path / "never-written.json"))
+
+    assert failures == ["pytest", "domain coverage"]
+
+
+def test_a_passing_pytest_with_no_report_fails_the_floor(tmp_path: Path) -> None:
+    check = load_script(CHECK_SCRIPT, "check_under_test_passed")
+    passing = [sys.executable, "-c", "raise SystemExit(0)"]
+
+    failures = check.run_steps(gate_steps(passing, tmp_path / "never-written.json"))
+
+    assert failures == ["domain coverage"]
+
+
+def test_a_passing_pytest_with_a_passing_report_passes(tmp_path: Path) -> None:
+    check = load_script(CHECK_SCRIPT, "check_under_test_green")
+    report_path = tmp_path / "coverage.json"
+    report_path.write_text(
+        json.dumps(report({DOMAIN_FILE: summary(100, 100, 100, 100)})), encoding="utf-8"
+    )
+    passing = [sys.executable, "-c", "raise SystemExit(0)"]
+
+    assert check.run_steps(gate_steps(passing, report_path)) == []
+
+
+def test_main_runs_the_gate_through_run_steps() -> None:
+    """The helper is only worth pinning if `main` uses it, and not a copy of the old loop."""
+    source = CHECK_SCRIPT.read_text(encoding="utf-8")
+    main_body = source[source.index("def main(") :]
+
+    assert "run_steps(steps)" in main_body
+    assert "if not run(step)" not in source

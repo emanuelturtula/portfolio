@@ -12,11 +12,13 @@ its unknown quantity, and neither is negative.
 
 from __future__ import annotations
 
+import copy
 import decimal
+import pickle
 import re
 from decimal import Decimal
 from fractions import Fraction
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import pytest
 
@@ -43,6 +45,8 @@ from tests.domain.accounting.support import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from portfolio.domain.accounting import AccountingResult
     from portfolio.domain.accounting.events import AccountingEvent
 
@@ -974,3 +978,97 @@ def test_a_position_offers_its_known_quantity() -> None:
     )
 
     assert position(result, "BTC").known_quantity == Decimal("0.5")
+
+
+# --------------------------------------------------------------------------------------
+# Review follow-ups: a conflict that crosses a boundary, and the edge of the range
+# --------------------------------------------------------------------------------------
+
+
+def _conflict() -> ConflictingEventError:
+    original = buy(key(10, "trade-73519"), "BTC", "USDT", "1", "30000")
+    conflicting = buy(key(10, "trade-73519"), "BTC", "USDT", "2", "30000")
+    with pytest.raises(ConflictingEventError) as caught:
+        run(original, conflicting)
+    return caught.value
+
+
+def test_a_conflict_names_its_identity_on_attributes_and_not_in_its_message() -> None:
+    error = _conflict()
+
+    assert (error.kind, error.source, error.external_id) == ("trade", "bitget", "trade-73519")
+    assert "trade-73519" not in str(error)
+    assert "73519" not in str(error)
+    assert "bitget" not in str(error)
+
+
+@pytest.mark.parametrize(
+    "round_trip",
+    [
+        pytest.param(lambda error: pickle.loads(pickle.dumps(error)), id="pickle"),  # noqa: S301 - our own bytes
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+    ],
+)
+def test_a_conflict_survives_pickling_and_copying(
+    round_trip: Callable[[ConflictingEventError], ConflictingEventError],
+) -> None:
+    """N2: a worker pool or a future hands the caller this error, not a `TypeError` about it.
+
+    The identity comes back on the attributes, the message is unchanged -- and so still
+    quotes neither the source nor the id -- and a note added on the way survives too.
+    """
+    error = _conflict()
+    error.add_note("while replaying account 7")
+
+    restored = round_trip(error)
+
+    assert type(restored) is ConflictingEventError
+    assert (restored.kind, restored.source, restored.external_id) == (
+        "trade",
+        "bitget",
+        "trade-73519",
+    )
+    assert str(restored) == str(error)
+    assert restored.args == error.args
+    assert "trade-73519" not in str(restored)
+    assert "bitget" not in str(restored)
+    assert restored.__notes__ == ["while replaying account 7"]
+
+
+#: N1: 9E19 is the largest round amount the amount rule admits; a fee as large doubles it.
+NINE_E19: Final = "90000000000000000000"
+
+
+def test_n1_a_basis_past_1e20_is_reported_while_it_is_only_summed() -> None:
+    """A buy of 1 BTC for 9E19 USDT with a 9E19 USDT fee: a basis of 1.8E20, 21 digits.
+
+    Addition is exact and unbounded, so the basis is carried and reported. The average
+    does not fit, and R1 reports it as `None` rather than raising.
+    """
+    result = run(buy(key(10, "e1"), "BTC", "USDT", "1", NINE_E19, NINE_E19, "USDT"))
+
+    found = position(result, "BTC")
+    assert found.cost_basis == Decimal("1.8E+20")
+    assert found.quantity == 1
+    assert found.average_cost is None
+
+
+def test_n1_a_division_of_that_basis_raises_invalid_operation_without_quoting_it() -> None:
+    """The documented edge of the range: selling 0.9 of it divides 1.8E20 x 0.9 by 1.
+
+    That share needs 21 integer digits, so `divide` raises `decimal.InvalidOperation` out of
+    `replay` -- the accepted behaviour for a basis summed past 10**20 (spec 019, R1,
+    remaining range). The message states the rule, not the amounts.
+    """
+    with pytest.raises(decimal.InvalidOperation) as caught:
+        run(
+            buy(key(10, "e1"), "BTC", "USDT", "1", NINE_E19, NINE_E19, "USDT"),
+            sell(key(11, "e2"), "BTC", "USDT", "0.9", "1000"),
+        )
+
+    message = str(caught.value)
+    assert message
+    assert not re.search(r"\d{6,}", message.replace(",", "")), message
+    for spelling in ("1.8E+20", "1.62E+20", "9E+19", "0.9", NINE_E19):
+        assert spelling not in message, message

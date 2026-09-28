@@ -628,7 +628,7 @@ DOMAIN_MODULE: Final = "portfolio.domain"
 #: Spec 019, criterion 1, in the spec's order: the frameworks and clients, then the stdlib
 #: modules that do I/O or introduce nondeterminism. Pinned as a literal, so dropping one is
 #: a red test rather than a contract that forbids a little less than it did.
-DOMAIN_FORBIDDEN: Final = [
+SPEC_FORBIDDEN: Final = [
     "sqlalchemy",
     "httpx",
     "fastapi",
@@ -651,6 +651,26 @@ DOMAIN_FORBIDDEN: Final = [
     "uuid",
     "logging",
 ]
+
+#: Added after review (N4), in this order: modules that read host state -- the local time
+#: zone database, temporary and globbed files, processes, signals, the locale -- which the
+#: spec's list left reachable. The contract lists the spec's 21 first, then these.
+HOST_STATE_FORBIDDEN: Final = [
+    "zoneinfo",
+    "tempfile",
+    "shutil",
+    "glob",
+    "multiprocessing",
+    "concurrent",
+    "ctypes",
+    "signal",
+    "select",
+    "selectors",
+    "platform",
+    "locale",
+]
+
+DOMAIN_FORBIDDEN: Final = [*SPEC_FORBIDDEN, *HOST_STATE_FORBIDDEN]
 
 
 def plant_domain_shadow(root: Path, body: str, *, via: str | None = None) -> None:
@@ -680,9 +700,12 @@ def run_domain_contract(package_root: Path) -> tuple[int, str]:
 
 
 def test_the_domain_contract_forbids_exactly_the_spec_list() -> None:
-    """Forbidden, `portfolio.domain` as the source, the 21 modules of criterion 1 in order."""
+    """Forbidden, `portfolio.domain` as the source: criterion 1's 21 modules, then N4's 12."""
     parser = configuration()
 
+    assert len(SPEC_FORBIDDEN) == 21
+    assert len(HOST_STATE_FORBIDDEN) == 12
+    assert len(set(DOMAIN_FORBIDDEN)) == 33
     assert parser.has_section(DOMAIN_CONTRACT_SECTION)
     assert parser.get(DOMAIN_CONTRACT_SECTION, "type") == "forbidden"
     assert module_list(parser, DOMAIN_CONTRACT_SECTION, "source_modules") == [DOMAIN_MODULE]
@@ -812,6 +835,30 @@ def plant_domain_chain_through_outside(root: Path) -> None:
         (directory / "__init__.py").write_text("", encoding="utf-8")
     (root / "portfolio/outside.py").write_text("import socket\n\n__all__ = ['socket']\n", "utf-8")
     (root / "portfolio/domain/caller.py").write_text(import_line("portfolio.outside"), "utf-8")
+
+
+def test_every_host_state_module_is_reported_by_its_top_level_name(tmp_path: Path) -> None:
+    """N4's twelve, planted together in one domain module; each is named in the verdict.
+
+    `from concurrent import futures` rather than `import concurrent`, because the submodule
+    is what anyone would reach for, and the contract names the top-level package.
+    """
+    imports = [f"import {name}" for name in HOST_STATE_FORBIDDEN if name != "concurrent"] + [
+        "from concurrent import futures"
+    ]
+    exported = [name for name in HOST_STATE_FORBIDDEN if name != "concurrent"] + ["futures"]
+    body = "\n".join(imports) + f"\n\n__all__ = {exported!r}\n"
+    plant_domain_shadow(tmp_path, body)
+
+    code, output = run_domain_contract(tmp_path)
+
+    assert code != 0, output
+    missing = [
+        name
+        for name in HOST_STATE_FORBIDDEN
+        if f"portfolio.domain.accounting.leaky -> {name} " not in output
+    ]
+    assert missing == [], f"not reported: {missing}\n{output}"
 
 
 def test_the_domain_contract_reports_a_chain_that_leaves_the_package(tmp_path: Path) -> None:
