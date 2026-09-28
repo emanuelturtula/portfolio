@@ -25,6 +25,21 @@ updates:
       # moves together and is not worth reviewing one package at a time.
       dev-tooling:
         dependency-type: development
+    # A major bump here breaks the group instead of just itself: eslint 10 drops the peer
+    # range every eslint-plugin-jsx-a11y release still requires, and typescript 7 is above
+    # what typescript-eslint 8.70 accepts. Either one turns the whole grouped PR into an
+    # ERESOLVE that CI can't install, taking the other nine patches down with it. Moving
+    # off eslint 9 or typescript 5 is a decision for its own PR, not a Monday bump.
+    ignore:
+      - dependency-name: eslint
+        update-types:
+          - version-update:semver-major
+      - dependency-name: "@eslint/js"
+        update-types:
+          - version-update:semver-major
+      - dependency-name: typescript
+        update-types:
+          - version-update:semver-major
 
   - package-ecosystem: docker
     directory: /
