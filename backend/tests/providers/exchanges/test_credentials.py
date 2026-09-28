@@ -208,3 +208,105 @@ def test_a_plain_string_or_blank_secret_is_refused() -> None:
         Credentials(api_key=SecretStr(""), api_secret=SecretStr(SIGNING_SENTINEL))
 
     assert without_passphrase().api_secret.get_secret_value() == SIGNING_SENTINEL
+
+
+# --------------------------------------------------------------------------------------
+# Spec 017, R4: a field that does not encode as UTF-8 is refused, and carries nothing
+# --------------------------------------------------------------------------------------
+#
+# `Settings` refuses such a value at startup. `Credentials` refuses it too, so a set built any
+# other way cannot reach `signing`, where `secret.encode("utf-8")` raised a bare
+# `UnicodeEncodeError` whose `args` held the whole secret -- outside the seven classes, and
+# into any traceback. Measured by the tester on #14 before the fix.
+
+#: Two runs of cycles no ordinary text contains, split by a lone surrogate: what a byte in
+#: another encoding becomes under `surrogateescape`. Searched for in five-character windows.
+WINDOW: Final = 5
+UNENCODABLE_HEAD: Final = "qjqjqjqjqjqj"
+UNENCODABLE_TAIL: Final = "wzwzwzwzwzwz"
+LONE_SURROGATE: Final = chr(0xDCFF)
+UNENCODABLE: Final = UNENCODABLE_HEAD + LONE_SURROGATE + UNENCODABLE_TAIL
+
+
+def windows_of(value: str) -> set[str]:
+    return {value[index : index + WINDOW] for index in range(len(value) - WINDOW + 1)}
+
+
+def leaked(rendered: str) -> list[str]:
+    """Each window of the two runs, and the surrogate, found in `rendered`."""
+    found = [
+        window
+        for run in (UNENCODABLE_HEAD, UNENCODABLE_TAIL)
+        for window in sorted(windows_of(run))
+        if window in rendered
+    ]
+    if LONE_SURROGATE in rendered:
+        found.append("the lone surrogate")
+    return found
+
+
+def every_link(error: BaseException) -> list[BaseException]:
+    """`error` and everything reachable by `__cause__` or `__context__`, suppressed or not."""
+    links: list[BaseException] = []
+    pending: list[BaseException] = [error]
+    while pending:
+        link = pending.pop()
+        if all(link is not seen for seen in links):
+            links.append(link)
+            pending.extend(
+                nested for nested in (link.__cause__, link.__context__) if nested is not None
+            )
+    return links
+
+
+def test_the_window_search_finds_a_fragment_of_the_unencodable_value() -> None:
+    """The control: a four-character tail is too short to count, five are enough."""
+    assert leaked(f"field api_secret ...{UNENCODABLE_TAIL[-5:]}") != []
+    assert leaked("Credentials.api_secret does not encode as UTF-8") == []
+    assert leaked(repr(UnicodeEncodeError("utf-8", UNENCODABLE, 12, 13, "surrogates"))) != []
+
+
+@pytest.mark.parametrize("field", FIELDS)
+def test_a_field_that_is_not_utf8_is_refused_naming_the_field_and_carrying_nothing(
+    field: str,
+) -> None:
+    """A `ValueError` naming the field and the rule; no link of its chain holds the value.
+
+    The chain is searched to the end, `__context__` included: `raise ... from None` inside
+    an `except UnicodeEncodeError` would still keep that error, whose `args` hold the whole
+    string, as the suppressed context a debugger or an error tracker walks.
+    """
+    arguments: dict[str, SecretStr] = {
+        "api_key": SecretStr(KEY_SENTINEL),
+        "api_secret": SecretStr(SIGNING_SENTINEL),
+        "passphrase": SecretStr(PHRASE_SENTINEL),
+        field: SecretStr(UNENCODABLE),
+    }
+
+    with pytest.raises(ValueError, match="UTF-8") as caught:
+        Credentials(**arguments)
+
+    error = caught.value
+    assert field in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    for link in every_link(error):
+        rendered = f"{link}|{link!r}|{link.args!r}"
+        assert leaked(rendered) == [], f"a fragment of {field} reached {type(link).__name__}"
+
+
+@pytest.mark.parametrize("field", FIELDS)
+def test_the_same_value_without_the_surrogate_constructs(field: str) -> None:
+    """The companion: the two runs alone are an ordinary secret, in every field."""
+    arguments: dict[str, SecretStr] = {
+        "api_key": SecretStr(KEY_SENTINEL),
+        "api_secret": SecretStr(SIGNING_SENTINEL),
+        "passphrase": SecretStr(PHRASE_SENTINEL),
+        field: SecretStr(UNENCODABLE_HEAD + UNENCODABLE_TAIL),
+    }
+
+    credentials = Credentials(**arguments)
+
+    held = getattr(credentials, field)
+    assert isinstance(held, SecretStr)
+    assert held.get_secret_value() == UNENCODABLE_HEAD + UNENCODABLE_TAIL
