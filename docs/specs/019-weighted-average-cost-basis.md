@@ -103,7 +103,7 @@ All three are frozen dataclasses that validate in `__post_init__` and raise `Val
   locations are non-blank and differ. It changes no position.
 - **Every amount**: a finite `Decimal` (never `bool`, `int` or `float`), at most 18 fractional
   digits and at most `MONEY_PRECISION - 18` integer digits. This is the rule `NormalizedFill`
-  applies, so a stored fill always converts.
+  applies, so a stored fill's amounts always convert. Its shape may not; see R8.
 - `AccountingConfig(cash_assets: frozenset[str])`: non-empty, non-blank members.
 
 ### Ordering and identity
@@ -239,8 +239,10 @@ wrong snapshot in place forever.
 
 ### Rejected alternatives
 
-- **FIFO.** Under incomplete history, it matches disposals against the wrong lots and is
-  confidently wrong. Weighted average fails loudly instead. See the ADR.
+- **FIFO.** Under incomplete history, it matches disposals against specific wrong lots, and
+  repairing it needs every missing lot. Weighted average spreads a missing buy over one
+  average, and one opening balance repairs it. Neither method can see a gap that no sale
+  exceeds. See the ADR.
 - **State `(Q, average)` with basis derived as `average × Q`.** It makes I2 hold by
   construction, but every acquisition then rounds the average and leaks the residue.
   `(Q, C)` loses nothing, and I8 can be exact.
@@ -270,10 +272,14 @@ Copied from #17, with the interpretation where one was needed.
    contract with source `portfolio.domain` forbids `sqlalchemy`, `httpx`, `fastapi`,
    `starlette`, `pydantic`, and the stdlib modules that do I/O or introduce nondeterminism:
    `os`, `io`, `pathlib`, `socket`, `ssl`, `subprocess`, `urllib`, `http`, `sqlite3`,
-   `asyncio`, `threading`, `time`, `random`, `secrets`, `uuid`, `logging`. A planted-violation
-   test proves the contract can fail. The clock is a call, not an import, because `datetime`
-   is needed for the key. An AST test therefore forbids `now`, `utcnow`, `today` and
-   `fromtimestamp` calls in `domain/`.
+   `asyncio`, `threading`, `time`, `random`, `secrets`, `uuid`, `logging`. The review added
+   `zoneinfo`, `tempfile`, `shutil`, `glob`, `multiprocessing`, `concurrent`, `ctypes`,
+   `signal`, `select`, `selectors`, `platform` and `locale`. A planted-violation test proves
+   the contract can fail. The clock is a call, not an import, because `datetime` is needed
+   for the key. An AST test therefore forbids `now`, `utcnow`, `today` and `fromtimestamp`
+   calls in `domain/`, and also an argument-less `astimezone()`, which reads the host's time
+   zone. The builtins `open`, `print` and `input` need no import at all, so the same test
+   forbids them too.
 2. **I1, no negative inventory.** A violation emits a warning naming the asset and timestamp,
    and never crashes. Covered by `dispose` above. It is checked after every prefix of the
    event sequence, not only at the end.
@@ -375,10 +381,18 @@ and amounts at 18 decimals, so rounding paths are exercised rather than avoided.
   silently. The planted-violation test is therefore what proves the contract, not a green
   run.
 - **The engine's range is 10²⁰ cash units.** That is the same range as the `NumericText(18)`
-  columns #19 writes to. The average cost and `Adjustment` cost are guarded (see *Rulings*),
-  but a basis or proceeds total summed past 10²⁰ from many validated fills still makes
-  `divide` raise `InvalidOperation`. No personal portfolio reaches that total, and the
-  property strategies stay inside it.
+  columns #19 writes to. The average cost and `Adjustment` cost are guarded (see *Rulings*).
+  A basis or proceeds total past 10²⁰ is not, and as few as one absurd fill reaches it: a
+  buy of 1 BTC for 9E19 USDT with a 9E19 USDT fee returns a basis of 1.8E20. `add` returns
+  such a value unbounded, #19's write refuses it, and the next proportional `divide` raises
+  `InvalidOperation`, which quotes no amount. No personal portfolio reaches that total, and
+  the property strategies stay inside it.
+- **A gap that no sale exceeds is invisible to replay.** Suppose an early buy is older than
+  the venue's retention and the owner still holds it. Every sale then fits inside the
+  recorded pool, so nothing warns, and the average and realized P&L are computed without that
+  buy. Any method has this blind spot, since what is missing leaves no trace in the events.
+  Only a comparison of replay's quantity with the balances actually held can surface it,
+  which #19 should consider.
 - **Bitget's BGB fee deduction** is the likely real-world third-asset fee. What Bitget reports
   in `feeDetail` for it is undocumented (spec 014). If the provider records BGB fees, they
   land in `UnattributedFee` unless BGB was bought through a fill.
@@ -414,8 +428,17 @@ The tester's oracle surfaced these. Each is binding on the engine and the oracle
   configuration. No venue pays that, and every invariant still holds.
 - **R8. A fee asset may be named beside a zero fee**, as `NormalizedFill` allows. The rule
   becomes: `fee_asset` is required when the fee is not zero, and a zero fee creates no leg
-  and touches no position. The spec's claim that a stored fill always converts then holds
-  for every field, not just the amounts.
+  and touches no position.
+
+  **Correction from the review:** a stored fill still does not always convert. `Trade`
+  refuses three shapes that `NormalizedFill` accepts:
+  - `base_asset == quote_asset`;
+  - a fee in the asset received that consumes everything received;
+  - a rebate in the asset given that exceeds what was given.
+
+  The refusals stay, because the engine cannot account for any of them. No venue is known to
+  produce them. Refusing them at ingestion, so that the stored log never holds a row replay
+  cannot read, is #99. #19 depends on it.
 - **R9. The fractional-digit rule is value-based**, as in `NormalizedFill`: the amount is
   refused when `quantize(v, 18) != v`. So `1.0000000000000000000` is accepted and
   `0.0000000000000000001` is refused.

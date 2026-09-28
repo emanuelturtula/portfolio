@@ -23,14 +23,15 @@ and never runs short.
 |---|---|
 | `quantity` | What the events say is held. |
 | `cost_basis` | What the known-cost part of that quantity cost. |
-| `average_cost` | `cost_basis ÷ known quantity`, rounded for display. Never fed back into the basis. Absent when no known-cost quantity is held. |
+| `average_cost` | `cost_basis ÷ known quantity`, rounded for display. Never fed back into the basis. Absent when no known-cost quantity is held, and when the quotient would be 10²⁰ or more per unit, since it is a display figure and not a reason for replay to fail. |
 | `unknown_basis_quantity` | Units held whose cost nobody recorded, such as an opening balance entered without a cost. They are kept out of the average rather than valued at zero, because zero would report a fictitious profit on the next sale. |
 | `realized_pnl` | Proceeds minus basis, over every sale of known-cost units for cash. |
 | `unmatched_proceeds` | Proceeds from units whose cost is unknown: unknown-basis units, or units sold beyond what the history holds. Kept out of realized P&L for the same reason. |
 
-**The events are replayed in one total order**: time, then source, then id. Same-millisecond
-fills therefore always come out the same way, whatever order the database returned them in.
-A fill read twice counts once.
+**The events are replayed in one total order**: time, then source, then id, then kind (trade,
+adjustment or transfer) for the rare tie between kinds. Same-millisecond fills therefore
+always come out the same way, whatever order the database returned them in. A fill read twice
+counts once.
 
 ### A trade, whatever its pair
 
@@ -51,12 +52,21 @@ Then one of four things happens:
 | an asset | another asset | a swap | The given asset's basis moves to the received asset. Nothing is realized, because no price exists to realize it at. |
 | cash | cash | a conversion | Nothing changes, since both sides are pinned at 1. A fee is recorded in `unallocated_costs`. |
 
-**When the history is short, the engine says so rather than guessing:**
+**When a short history shows, the engine says so rather than guessing:**
 
-- A sale larger than the pool takes everything the pool holds and emits a `NegativeInventory`
-  warning naming the asset, the moment and the shortfall. The pool never goes below zero.
-- A fee in a third asset whose cost is unknown emits an `UnattributedFee` warning. The
-  position it was charged to is flagged, because its basis is understated by that fee.
+- **A sale larger than the pool.** It takes everything the pool holds and emits a
+  `NegativeInventory` warning naming the asset, the moment and the shortfall. The pool never
+  goes below zero.
+- **A fee in a third asset whose cost is unknown.** It emits an `UnattributedFee` warning,
+  and the trade's non-cash asset is flagged. On a buy or a swap, that asset's basis leaves
+  the fee out. On a sale, its proceeds are overstated by the fee. A conversion has no such
+  asset, so only the warning remains.
+
+**A short history does not always show.** Suppose a buy is older than the venue's retention
+and the coins are still held. Every later sale then fits inside the recorded pool, so nothing
+warns, and the average and realized P&L leave that buy out. No method can see such a gap in
+the events alone. Comparing the replayed quantity with the balances actually held is what
+reveals it. An opening balance (example 9) is how to repair it.
 
 **Rounding happens in one place**, a division rounded once, half to even, to 18 decimals. The
 other side of every split is computed by subtraction, so nothing leaks. When a pool is emptied,
@@ -287,7 +297,8 @@ No position exists, since both sides are cash. The fee has no asset to attach to
 | `unallocated_costs` | Known costs that belong to no position: conversion fees, and value given in a swap whose received quantity has no known-cost part. |
 | `input_fingerprint` | A SHA-256 over the method, the engine version, the cash assets and every event. Equal fingerprints mean an equal answer, so #19 can skip a recompute. |
 
-Taken together, the figures always reconcile: current basis, minus realized P&L, minus
+Taken together, the figures always reconcile. Current basis, minus realized P&L, minus
 unmatched proceeds, plus unallocated costs, equals the net cash the trades put in plus the known
-cost of the adjustments. The property tests hold this exactly for random event sequences, with
-no tolerance.
+cost of the adjustments of non-cash assets. For a conversion, the net cash counts only its fee,
+since both sides are pinned at 1. The property tests hold this exactly for random event
+sequences, with no tolerance.

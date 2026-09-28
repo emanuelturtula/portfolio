@@ -23,10 +23,17 @@ rules are in `docs/accounting.md`.
 1. **Weighted average is the requested output.** "Amount invested in BTC" is what a
    weighted-average pool holds natively: the basis of what is still held. Other methods need a
    lot-matching step to arrive at the same kind of number.
-2. **It fails loudly under incomplete history.** A sale larger than the recorded holdings
-   empties the pool and emits a negative-inventory warning naming the asset and the moment.
-   FIFO in the same situation matches the sale against whichever lots happen to be recorded,
-   and it reports a realized gain that is confidently wrong, with nothing to say so.
+2. **It degrades more gracefully under incomplete history, and one number repairs it.**
+   - **What no method can see.** Suppose a buy is missing and no later sale exceeds what was
+     recorded. The events hold no trace of that buy, so every method computes without it.
+   - **What differs is the damage and the repair.** Under FIFO, the answer depends on *which*
+     lots are missing. Every sale is matched against a specific wrong lot, and the error
+     carries into what is left. Repairing it needs every missing lot with its date and
+     price. Under weighted average, a missing buy shifts one average. An opening balance, a
+     quantity plus a cost if known, repairs it.
+   - **Where a sale does exceed the recorded holdings, this engine does not guess.** It
+     empties the pool and emits a negative-inventory warning naming the asset and the moment.
+     It also keeps the proceeds that no recorded cost stands behind out of realized P&L.
 3. **Transfers are free.** Moving coins between a venue and a wallet relocates quantity, and
    the average is untouched. Lot methods have to carry lots across locations.
 4. **Stablecoins are the unit of account.** The configured cash assets (USDT and USDC by
@@ -58,9 +65,13 @@ figure on a tax return, and it must not be used to file one.
   migration. `replay` returns the acquisitions it saw as lots, and #19 persists them with the
   method that produced them. A FIFO pass writes its own lots under its own method into the
   same table.
-- **Incomplete history shows as flags, never as confident numbers.** The manual adjustments
-  of #18 are the designed way to fill the hole: an opening balance, with or without a known
-  cost.
+- **Incomplete history shows as flags wherever replay can detect it.** That covers a sale
+  beyond the recorded holdings, units of unknown cost, and a fee whose cost is unknown.
+- **A gap that no sale exceeds cannot be detected from the events alone.** Only comparing
+  replay's quantity with the balances actually held can show it, and #19 should consider
+  doing that.
+- **The designed way to fill the hole is the manual adjustments of #18**: an opening balance,
+  with or without a known cost.
 - **A depeg is invisible.** So is the spread of a USDC/USDT conversion, because both sides are
   pinned at 1.
 - The result depends only on the events, the configuration and the engine version. Its
@@ -68,9 +79,10 @@ figure on a tax return, and it must not be used to file one.
 
 ## Alternatives rejected
 
-- **FIFO as the dashboard method** fails silently under incomplete history (point 2 above), and
-  it is what a tax computation needs rather than what the dashboard is asked to show.
-- **LIFO and specific identification** have the same silent-failure mode. Specific
+- **FIFO as the dashboard method** answers the question a tax computation asks, not the one
+  the dashboard is asked. Under missing lots it concentrates the error on specific sales, and
+  repairing that needs every missing lot (point 2 above).
+- **LIFO and specific identification** also depend on which lots are missing. Specific
   identification also needs a per-lot choice from the owner that nothing records.
 - **Market-value swaps and fees** would need a price on the day. Presenting today's price as
   the price on the day is the one mistake that is worse than admitting the number is unknown.
