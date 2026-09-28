@@ -982,6 +982,22 @@ class CarryForwardTests(HostTestCase):
         self.assertEqual(len(self.docker.snapshots), self.snapshots + 1)
         self.assertEqual(tree(self.prod / "backup")["database.sqlite3"], self.docker.snapshots[-1])
         self.assertEqual(len(self.host.sqlite_files()), 1)
+        current = self.host.current()
+        self.assertIs(current["backup"], True)
+        self.assertNotIn("backup_carried_from", current, "the record claims a carry it never made")
+
+    def test_a_failure_that_takes_a_snapshot_keeps_its_own(self) -> None:
+        self.docker.unhealthy.discard(R1.image)
+        self.docker.containers[self.docker.running or ""].health = "healthy"
+        self.docker.fail_up.add(R3.image)
+
+        self.assert_fails(R3)
+
+        result = read_manifest(self.prod / "failed" / "result.json")
+        self.assertIs(result["backup"], True)
+        self.assertNotIn("backup_carried_from", result)
+        own = self.docker.snapshots[-1]
+        self.assertEqual((self.prod / "failed" / "database.sqlite3").read_bytes(), own)
 
 
 class InterruptedAttemptTests(HostTestCase):
