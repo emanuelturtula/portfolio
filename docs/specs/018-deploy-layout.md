@@ -177,6 +177,69 @@ exec docker compose --project-name portfolio-app-prod --file "$PWD/compose.yml" 
   - the recreate instruction reads `~/portfolio-app/prod/compose.sh up -d --force-recreate app`.
 - The `deploy.py` module docstring describes the new layout.
 
+### After review (R1–R6)
+
+This section overrides the design above wherever the two disagree.
+
+**R1. A tombstone at the old root.** Every earlier commit's `deploy.py` defaults to
+`~/portfolio-app-deploy`, and a re-run of an old delivery uploads that script. After the
+migration it would:
+1. recreate the empty old root;
+2. find no `current.json`, and so skip rerun protection;
+3. start a container with an empty `secrets.env`, which the app refuses;
+4. tear it down;
+5. leave both roots in place, so every later deployment refuses.
+
+The reviewer reproduced this. So the migration leaves a **regular file** at
+`~/portfolio-app-deploy`, whose content says where the root moved and why. An old script's
+`root.mkdir(exist_ok=True)` then raises before any docker command. The new script treats the
+old root as present only when it is a directory. A test runs `origin/main`'s `deploy.py`
+against a migrated host, and asserts that no docker command runs and that the host still
+deploys.
+
+**R2. A snapshot is carried forward, never dropped, when a deployment takes none.** The
+reviewer reproduced the case:
+1. a young host has had one success, and has no `backup/`;
+2. a failed deployment's rollback comes up unhealthy, leaving the only copy in `failed/`;
+3. the next deployment, which cannot snapshot, deletes `failed/`.
+
+The result was zero copies. The rules now are:
+- When this deployment takes no snapshot, **`failed/database.sqlite3` is carried forward**:
+  - on success, it becomes the rotation's snapshot. It was taken from the same live
+    deployment, because a failure never changes `current.json`.
+  - on failure, it moves into the new `failed/`.
+- **A stale `incoming/` holding a snapshot** is an interrupted attempt. Staging moves it to
+  `failed/` instead of deleting it, so the same carry-forward covers it. This closes the
+  `up --wait` window that Risks had accepted.
+
+**R3. fsync before deleting.** The snapshot, a seeded or carried-forward copy, and the
+directories they land in are fsynced before any older copy is removed. On ext4, a new file
+renamed into a new name can lag its data by about 30 seconds, while the unlinks of the older
+copies commit in about 5. A power cut just after a migration would then leave an empty backup
+and no legacy copies.
+
+**R4. `compose.sh` exists whenever a deployment is live.** Before the candidate's `up`, if
+`prod/compose.sh` is missing or names a deployment other than the live one, it is written for
+the live deployment: legacy or new, using the live compose file. So a failed first migration
+still leaves a working `compose.sh`. After a successful rotation it names the new deployment,
+as before.
+
+**R5. A seeded backup pairs the database with the right manifest.** A legacy
+`attempts/<id>/database.sqlite3` was taken from the deployment named in that attempt's
+`previous.json`, not from `<id>` itself. So `backup/current.json` is `previous.json`. The
+compose file comes from the attempt that deployment was made in, where it still exists;
+otherwise the backup's compose file is omitted, and the manifest records why.
+
+**R6. Small things.**
+- The both-roots check re-checks the old root before refusing.
+- Messages say "the root was migrated" once the rename has happened, never "nothing was
+  changed".
+- `compose.sh` resolves its own path through symlinks and ignores `CDPATH`.
+- The first-install command creates `prod/` first.
+- The docs no longer promise that `backup/` or `failed/` always holds a database.
+- The "recording failed" row warns that `compose.sh` may still name the previous image until
+  the next deployment.
+
 ## API contract
 
 None.
