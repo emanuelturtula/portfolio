@@ -128,3 +128,66 @@ source_modules =
     portfolio.api
 forbidden_modules =
     portfolio.providers.exchanges
+
+[importlinter:contract:domain-is-pure]
+name = portfolio domain is pure
+# Criterion 1 of #17: `portfolio.domain` does no I/O and has no source of nondeterminism,
+# so that `accounting.replay` -- and everything else here -- is a function of its
+# arguments and nothing else. The `layers` contract above already stops `domain` importing
+# the application; this contract is about what it may not import from *outside* it.
+#
+# **Two halves.** The frameworks and clients (`sqlalchemy`, `httpx`, `fastapi`, `starlette`,
+# `pydantic`), and the standard-library modules that do I/O or introduce nondeterminism.
+# Naming a stdlib module here works because `include_external_packages = True` above makes
+# grimp add every top-level package an application module imports -- the standard library
+# included -- to the graph as one squashed node, so `from urllib import parse` arrives as an
+# import of `urllib`. Measured with import-linter 2.15 and grimp 3.17 by planting
+# `import os`, `import socket`, `import time`, `from urllib import parse`, `import logging`,
+# `import http.client` and `import sqlalchemy` in a domain module of a shadow copy of the
+# package: each was reported BROKEN, by its top-level name, and without them the contract
+# was KEPT. `logging` and `http` resolve to the standard library rather than to
+# `portfolio.logging` or `portfolio.providers.http`, because an absolute import is. Only
+# top-level names are accepted (`os`, never `os.path`); import-linter refuses a submodule of
+# an external package with a configuration error rather than ignoring it.
+#
+# **Vacuous per module until something imports it**, and that is inherent rather than a
+# gap: import-linter checks only the forbidden modules that are in the graph, and an
+# external module enters the graph when any application module imports it. `socket` is in
+# no graph until somebody writes `import socket`, and that is exactly the edit this contract
+# then reports. What proves the harness can see such an edit at all is the planted-violation
+# test in `tests/test_import_contracts.py`.
+#
+# **The clock is not here, because it is a call, not an import.** `datetime` is needed for
+# an event's key, and `datetime.now()` needs nothing more; `tests/security/` forbids the
+# calls with an AST test instead. `hashlib` is deliberately absent too: SHA-256 is a pure
+# function, and the accounting fingerprint is built on it.
+#
+# **Deliberately without `allow_indirect_imports`**, so a chain `domain.a -> domain.b ->
+# socket` is reported from `domain.a` as well as from `domain.b`. Every module in such a
+# chain is a source module, so the flag would hide nothing today; its absence means nothing
+# is hidden tomorrow either.
+type = forbidden
+source_modules =
+    portfolio.domain
+forbidden_modules =
+    sqlalchemy
+    httpx
+    fastapi
+    starlette
+    pydantic
+    os
+    io
+    pathlib
+    socket
+    ssl
+    subprocess
+    urllib
+    http
+    sqlite3
+    asyncio
+    threading
+    time
+    random
+    secrets
+    uuid
+    logging
