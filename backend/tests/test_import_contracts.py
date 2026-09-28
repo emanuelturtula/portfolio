@@ -797,3 +797,51 @@ def test_the_verdict_comes_from_the_forbidden_list(tmp_path: Path) -> None:
 
     assert result.returncode == 0, output
     assert "KEPT" in output, output
+
+
+def plant_domain_chain_through_outside(root: Path) -> None:
+    """`portfolio.domain.caller -> portfolio.outside -> socket`: a chain that leaves the package.
+
+    Inside `portfolio.domain` the source collapses into one node, so a chain between two
+    domain modules is reported at its last hop whether or not indirect imports are allowed.
+    A chain through a module *outside* the source is where the flag decides the verdict.
+    """
+    for package in ("portfolio", "portfolio/domain"):
+        directory = root / package
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "__init__.py").write_text("", encoding="utf-8")
+    (root / "portfolio/outside.py").write_text("import socket\n\n__all__ = ['socket']\n", "utf-8")
+    (root / "portfolio/domain/caller.py").write_text(import_line("portfolio.outside"), "utf-8")
+
+
+def test_the_domain_contract_reports_a_chain_that_leaves_the_package(tmp_path: Path) -> None:
+    """The shipped contract, with no `allow_indirect_imports`, reports the whole chain."""
+    plant_domain_chain_through_outside(tmp_path)
+
+    code, output = run_domain_contract(tmp_path)
+
+    assert code != 0, f"the domain reached socket through another package unreported:\n{output}"
+    assert "BROKEN" in output, output
+    assert "portfolio.domain.caller" in output, output
+    assert "portfolio.outside" in output, output
+
+
+def test_allowing_indirect_imports_would_hide_that_chain(tmp_path: Path) -> None:
+    """The discriminator for the flag's absence: the same tree, the flag added, is kept."""
+    lines = IMPORT_LINTER_CONFIG.read_text(encoding="utf-8").splitlines()
+    header = lines.index(f"[{DOMAIN_CONTRACT_SECTION}]")
+    relaxed = tmp_path / "relaxed.importlinter"
+    relaxed.write_text(
+        "\n".join([*lines[: header + 1], "allow_indirect_imports = True", *lines[header + 1 :]])
+        + "\n",
+        encoding="utf-8",
+    )
+    plant_domain_chain_through_outside(tmp_path)
+
+    result = run_lint_imports(
+        package_root=tmp_path, config=relaxed, contracts=(DOMAIN_CONTRACT_ID,)
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 0, output
+    assert "KEPT" in output, output
