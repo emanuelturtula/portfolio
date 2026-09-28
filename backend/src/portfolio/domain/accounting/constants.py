@@ -10,9 +10,21 @@ good.
 **Every scale is eighteen**, the value of `db.models.FILL_SCALE`. It is spelled again here
 rather than imported, because `db` sits above `domain` and `domain` imports nothing from the
 application. Three reasons it has to be this number and not a larger one: a sum of stored
-fill amounts stays exact at eighteen places, every value the engine derives fits the
-`NumericText(18)` columns #19 writes it into, and eighteen leaves `MONEY_PRECISION - 18` = 20
-digits in front of the point, which is the engine's range (spec 019, *Risks*).
+fill amounts stays exact at eighteen places; every value the engine derives has at most
+eighteen places, the scale of the `NumericText(18)` columns #19 writes it into, so nothing is
+rounded on the way there; and eighteen leaves `MONEY_PRECISION - 18` = 20 digits in front of
+the point.
+
+**The engine's range is therefore `|value| < 10**20`**, in units or in cash units (spec 019,
+*Risks*), and it is a range, not a guarantee about every derived value. Each event amount is
+held inside it, but `add` and `subtract` are exact and unbounded, so a basis, a quantity,
+proceeds or a P&L summed past it is returned as it stands; and a `divide` whose quotient
+would land past it raises `decimal.InvalidOperation` instead. It takes as few as one or two
+absurd fills, not many: a single buy of 1 BTC for 9E19 USDT with a 9E19 USDT fee returns a
+basis of 1.8E20 without raising, and a following sale of 0.9 BTC makes `replay` raise. Only
+the average cost is guarded, because it is a display figure (spec 019, R1). A value past the
+range cannot be stored either way: #19's write through `NumericText(18)` refuses it with a
+`ValueError`.
 """
 
 from __future__ import annotations

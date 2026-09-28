@@ -28,7 +28,7 @@ stored amount is refused for its precision or its size.
 
 * a `base_asset` equal to the `quote_asset`;
 * a fee in the asset received that consumes everything received;
-* a rebate in the asset given that is as large as everything given.
+* a rebate in the asset given that is at least as large as everything given.
 
 Each leaves the trade without a leg to account for -- nothing received to carry the cost,
 or nothing given to take it from -- so the refusals stay: a replay that guessed would be

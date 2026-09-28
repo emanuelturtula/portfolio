@@ -115,14 +115,21 @@ def replay(
     **Nothing about the owner's history raises.** A sale larger than the pool, a fee in an
     asset nobody bought, a swap from units of unknown cost: each is reported, as a warning,
     a flag or unmatched proceeds, and replay carries on. What raises is input that is not a
-    history at all.
+    history at all, and a history whose figures leave the engine's range.
+
+    **The range is `|value| < 10**20`, and it is not enforced on what is returned** (see
+    `constants`). A basis, a quantity, proceeds or a P&L past it comes back unbounded from
+    `add`, and a split whose quotient would land past it raises. One or two absurd fills
+    are enough, not many: a buy of 1 BTC for 9E19 USDT with a 9E19 USDT fee returns a basis
+    of 1.8E20, and a sale of 0.9 BTC after it raises. #19's write refuses any such value.
 
     Raises:
         TypeError: an item of `events` is not a `Trade`, an `Adjustment` or a `Transfer`,
             or `config` is not an `AccountingConfig`.
         ConflictingEventError: two events share an identity and differ in content.
-        decimal.InvalidOperation: a basis, a quantity or proceeds summed past 10**20 across
-            many events (spec 019, *Risks*): past the range `NumericText(18)` can store.
+        decimal.InvalidOperation: a split -- a disposal's known part or basis, a sale's
+            matched proceeds, a swap's known quantity -- whose rounded quotient would be
+            10**20 or more (spec 019, *Risks*).
     """
     _require_config(config)
     ordered = _deduplicated_in_order(events)
