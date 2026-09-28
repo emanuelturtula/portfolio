@@ -2,10 +2,12 @@
 
 React + TypeScript + Vite frontend for the crypto portfolio tracker.
 
-Signed in, there are two pages: the dashboard at `/`, showing the total portfolio
-value, one row per held asset and one row per wallet with its freshness; and
-`/wallets`, where an address is registered, archived or restored. `/health` is
-still the reference page for the four-state rendering pattern below.
+Signed in, there are three pages: the dashboard at `/`, showing the total portfolio
+value, one row per held asset and one row per wallet with its freshness;
+`/wallets`, where an address is registered, archived or restored; and
+`/exchanges`, showing each configured venue's sync status, a banner where a retention
+window has truncated its history, a manual **Sync now** trigger, and the run log.
+`/health` is still the reference page for the four-state rendering pattern below.
 
 ## Requirements
 
@@ -27,12 +29,13 @@ Node 24 or newer (the repository is developed on Node 24.14.0 with npm 11).
 
 ## API types
 
-`npm run gen:api` reads the OpenAPI document over HTTP from a backend listening
-on the loopback interface and writes `src/api/generated/schema.ts`. The schema is
-never read from a checked-in file in the backend folder, because that file drifts
-from the running service. CI does the same thing: it starts the backend (or
-serves a schema the backend dumped itself) on the loopback address and then runs
-the script, so generated types are always produced from a real schema.
+`npm run gen:api` reads the OpenAPI document from `../openapi.json` - a file, not a running
+server - and writes `src/api/generated/schema.ts`. That file is written by running
+`uv run python ../scripts/dump_openapi.py` from `backend/`, which imports the FastAPI app
+and dumps its schema without binding a socket at all. `openapi.json` is gitignored at the
+repository root, because it is a build artifact and would otherwise drift from the backend
+that actually ships. CI does the same two steps in order, so generated types are always
+produced from the real schema, never hand-edited and never read from a checked-in copy.
 
 ## Conventions this skeleton sets
 

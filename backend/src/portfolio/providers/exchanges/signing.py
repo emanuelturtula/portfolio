@@ -1,9 +1,10 @@
-"""HMAC-SHA256 request signing, in the two encodings the target venues are believed to use.
+"""HMAC-SHA256 request signing, in the two encodings the two venues use.
 
 Two functions and no knowledge of any venue. **Which string is signed is the venue's
-business** -- Bitget is believed to sign `timestamp + METHOD + path + query + body` and
-BingX its query string, both unconfirmed until #13 and #14 read the documentation -- and it
-belongs in the provider that builds the request. What is shared is the primitive, and
+business**, and it belongs in the provider that builds the request: Bitget signs
+`timestamp + "GET" + path + "?" + query` and wants Base64 (#13, from its documentation);
+BingX signs its sorted query string, `timestamp` included, and wants lower-case hex (#14,
+from its documentation and accepted by the live API). What is shared is the primitive, and
 getting the primitive exactly right once: UTF-8 on both inputs, SHA-256, and the output
 encoding the venue asks for.
 
@@ -16,8 +17,8 @@ and what a well-meaning `logger.debug` picks up. A plain `str` is refused static
 
 ## The signature is itself sensitive
 
-For the length of a request's receive window a signature authorises that request, and one
-venue carries it in the query string. Nothing here logs it; the transport logs
+For the length of a request's receive window a signature authorises that request, and BingX
+carries it in the query string. Nothing here logs it; the transport logs
 `request_target` -- scheme, host and a label -- and never a path or a query, which is the
 control a venue signing in the query string relies on.
 
@@ -25,8 +26,8 @@ control a venue signing in the query string relies on.
 
 Both encodings are checked against RFC 4231's HMAC-SHA256 test vectors, which are
 published independently of this code. That confirms the primitive. It confirms nothing
-about any venue: the string a venue expects to be signed, and the encoding it expects back,
-are #13's and #14's to confirm against their documentation.
+about any venue: each provider's tests pin the string it signs with golden vectors computed
+outside this code, and `docs/providers.md` records where each recipe comes from.
 """
 
 from __future__ import annotations

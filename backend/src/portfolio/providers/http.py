@@ -265,13 +265,19 @@ make impossible, observed from the other side.
 """
 
 EXCHANGE_FILLS: Final = "exchange_fills"
-"""A signed read of one page of an account's fills: Bitget's `GET /api/v2/spot/trade/fills`.
+"""A signed read of one page of an account's fills, at either venue.
 
-**This is the label that stands between a signature and a log line.** The request carries
-the key, the passphrase and a signature in its headers and the account's time window and
-paging cursor in its query string; the log carries the scheme, the host and these two words.
-It says which kind of call failed -- the one an operator needs to tell a sync failure from a
-market-data failure -- and nothing about whose account it was or which page.
+Bitget's `GET /api/v2/spot/trade/fills` and BingX's `GET /openApi/spot/v1/trade/myTrades` both
+use it. One label for both, because the host already says which venue it was.
+
+**This is the label that stands between a signature and a log line.** A Bitget request
+carries the key, the passphrase and a signature in its headers, and the account's time window
+and paging cursor in its query string. **A BingX request carries the signature itself in its
+query string**, after the window, the cursor and the timestamp, with the key in a header. The
+log carries the scheme, the host and these two words, and never the path or the query, so
+neither signature is ever logged. The label says which kind of call failed -- the one an
+operator needs to tell a sync failure from a market-data failure -- and nothing about whose
+account it was or which page.
 """
 
 EXCHANGE_SYMBOL: Final = "exchange_symbol"

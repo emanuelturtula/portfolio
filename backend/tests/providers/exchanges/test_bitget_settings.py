@@ -426,6 +426,19 @@ def test_the_provider_refuses_credentials_without_a_passphrase() -> None:
     assert SIGNING_SENTINEL not in rendered
 
 
+@pytest.mark.parametrize("field", ["api_key", "api_secret", "passphrase"])
+def test_no_provider_can_be_built_with_a_credential_that_is_not_utf8(field: str) -> None:
+    """Spec 017, R4, for Bitget: `Credentials` refuses first, so no `BitgetProvider` ever
+    holds such a value, and nothing can reach `signing` with it."""
+    value = "synthetic" + chr(0xDCFF) + "value"
+
+    with pytest.raises(ValueError, match=field) as caught:
+        BitgetProvider(httpx.AsyncClient(), synthetic_credentials(**{field: value}))
+
+    assert "UTF-8" in str(caught.value)
+    assert "synthetic" not in f"{caught.value}{caught.value!r}{caught.value.args}"
+
+
 def test_the_provider_accepts_the_three() -> None:
     """The companion: with a passphrase, the same construction succeeds."""
     provider = BitgetProvider(httpx.AsyncClient(), synthetic_credentials())

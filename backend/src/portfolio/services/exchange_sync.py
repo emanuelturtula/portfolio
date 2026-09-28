@@ -430,7 +430,7 @@ class ExchangeSyncService:
         An `auth_failed` account is skipped by a scheduled or startup run without calling the
         venue -- retrying on a timer asks a venue to refuse the same key every interval, which
         some answer with an IP ban -- and retried by a manual one, which is how the owner
-        recovers after fixing the key and restarting.
+        recovers after fixing the key and recreating the container.
 
         On failure the page in flight is rolled back, and the status and the outcome are
         committed together, so an account's status and the outcome `last_error` is read from
