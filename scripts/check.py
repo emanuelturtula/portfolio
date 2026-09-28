@@ -17,6 +17,7 @@ import argparse
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -27,10 +28,22 @@ FRONTEND = REPO_ROOT / "frontend"
 Step = tuple[str, list[str], Path]
 
 
-def backend_steps(fast: bool) -> list[Step]:
+def backend_steps(fast: bool, scratch: Path) -> list[Step]:
+    """The backend gate. In full mode, pytest also writes a JSON coverage report to `scratch`.
+
+    The domain coverage floor (criterion 13 of #17) runs over that report, straight after
+    the run that wrote it. `scratch` is a directory made fresh for this invocation, so a
+    pytest that died before writing its report leaves nothing behind for the floor to read
+    and pass on: `domain_coverage.py` refuses a missing report as unusable.
+    """
     if not (BACKEND / "pyproject.toml").exists():
         return []
-    pytest_args = ["-q", "-x"] if fast else ["--cov", "--cov-report=term-missing"]
+    domain_report = scratch / "coverage.json"
+    pytest_args = (
+        ["-q", "-x"]
+        if fast
+        else ["--cov", "--cov-report=term-missing", f"--cov-report=json:{domain_report}"]
+    )
     steps: list[Step] = [
         ("ruff check", ["uv", "run", "ruff", "check", "."], BACKEND),
         ("ruff format", ["uv", "run", "ruff", "format", "--check", "."], BACKEND),
@@ -38,6 +51,14 @@ def backend_steps(fast: bool) -> list[Step]:
         ("import layering", ["uv", "run", "lint-imports"], BACKEND),
         ("pytest", ["uv", "run", "pytest", *pytest_args], BACKEND),
     ]
+    if not fast:
+        steps.append(
+            (
+                "domain coverage",
+                [sys.executable, "scripts/domain_coverage.py", str(domain_report)],
+                REPO_ROOT,
+            )
+        )
     return steps
 
 
@@ -132,19 +153,20 @@ def main(argv: list[str] | None = None) -> int:
     only_backend = args.backend and not args.frontend
     only_frontend = args.frontend and not args.backend
 
-    steps: list[Step] = []
-    if not only_frontend:
-        steps += backend_steps(args.fast)
-    if not only_backend:
-        steps += frontend_steps(args.fast)
-    if not (only_backend or only_frontend):
-        steps += shared_steps(args.fast)
+    with tempfile.TemporaryDirectory(prefix="portfolio-check-", ignore_cleanup_errors=True) as tmp:
+        steps: list[Step] = []
+        if not only_frontend:
+            steps += backend_steps(args.fast, Path(tmp))
+        if not only_backend:
+            steps += frontend_steps(args.fast)
+        if not (only_backend or only_frontend):
+            steps += shared_steps(args.fast)
 
-    if not steps:
-        print("Nothing to check yet.")
-        return 0
+        if not steps:
+            print("Nothing to check yet.")
+            return 0
 
-    failures = [step[0] for step in steps if not run(step)]
+        failures = [step[0] for step in steps if not run(step)]
     print()
     if failures:
         print(f"FAILED: {', '.join(failures)}")
