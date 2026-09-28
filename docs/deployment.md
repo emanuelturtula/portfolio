@@ -66,7 +66,7 @@ deployment and exactly one backup:
 | `prod/compose.sh` | runs docker compose against the live deployment; see below |
 | `prod/last-attempt.json` | the latest attempt's request and outcome, whether it succeeded or not |
 | `prod/backup/` | the previous deployment's `compose.yml` and `current.json`, and `database.sqlite3`: the database as it was just before the live deployment replaced it |
-| `prod/failed/` | only after a failed deployment: its `compose.yml`, `request.json`, `result.json` and the database snapshot taken before it. The next failure replaces it and the next success deletes it |
+| `prod/failed/` | only after a failed or interrupted deployment: its `compose.yml`, `request.json`, `result.json` and, when there was one, the database snapshot taken before it (or carried forward from the previous `failed/`). The next failure replaces it and the next success deletes it |
 | `prod/incoming/` | only while a deployment runs: the candidate being staged |
 
 Every path is computed from this layout when it is used, and the manifests `deploy.py`
@@ -104,25 +104,28 @@ kept ten.
 What that costs, accepted: a problem noticed two deployments late has no copy from before
 it.
 
-A second gap is accepted too. A deployment interrupted while its candidate starts, during
-the up to three minutes the script waits for it to become healthy (a dropped connection, a
-reboot, the process killed for memory), can leave the candidate running with the snapshot
-taken just before it still in `prod/incoming/`. The next deployment clears `incoming/`, and
-cannot take a snapshot of its own because the running container is not the one
-`current.json` names, so the backup stays one deployment older. That matters only if the
-interrupted candidate's migration damaged data. So after an interrupted deployment, check
-`prod/last-attempt.json` before deploying again: an interrupted run never writes it, so if
-it does not describe that run, `prod/incoming/database.sqlite3` is the database from before
-that candidate, and worth copying somewhere safe first.
-
 During a failed deployment's aftermath there can be two: `backup/`, and the snapshot in
 `failed/`. The second is the database as it was just before the failed attempt, which is
 the copy that matters if a migration went wrong.
 
-A deployment that could not take a snapshot, because the previous container was not
-healthy or had no database yet, leaves `backup/` exactly as it was rather than replacing
-the only copy with nothing. The one exception is a host being migrated from the previous
-layout, which has no backup yet; see below.
+A deployment that cannot take a snapshot of its own, because the live container is not
+healthy, is not the one `current.json` names, or has no database yet, never throws a copy
+away:
+
+- If `failed/` holds a snapshot of the live deployment, taken by an attempt that failed or
+  was interrupted, that snapshot is carried forward. A success makes it the backup, and a
+  failure keeps it in its own `failed/`. A failure never changes `current.json`, so the
+  snapshot is of the same deployment.
+- A deployment interrupted part-way (a dropped connection, a reboot, the process killed for
+  memory), perhaps with its candidate already running, leaves `prod/incoming/` behind. The
+  next deployment keeps it as `failed/`, with a `result.json` saying it was interrupted,
+  when it holds a snapshot, so the database from before that candidate is carried forward
+  like any other.
+- Otherwise `backup/` stays exactly as it was. The one exception is a host being migrated
+  from the previous layout, which has no backup yet; see below.
+
+No older copy is deleted until the copy replacing it has been flushed to disk under its
+final name, so a power cut at any moment leaves at least one.
 
 The backup is there for a person to restore by hand. A failed deployment does not restore
 it: it restarts the previous image against the live database, as it always has.

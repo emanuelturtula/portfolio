@@ -14,8 +14,9 @@ directory holds the live deployment and exactly one backup::
       last-attempt.json      the latest attempt's request and outcome
       backup/                the previous deployment, and the database as it was before
                              the live one: compose.yml, current.json, database.sqlite3
-      failed/                only after a failed deployment, replaced by the next failure:
-                             compose.yml, request.json, result.json, database.sqlite3
+      failed/                only after a failed or interrupted deployment, replaced by
+                             the next one: compose.yml, request.json, result.json,
+                             database.sqlite3
       incoming/              only while a deployment runs: the candidate being staged
 
 Every path is computed from the root and this layout at the moment it is used; a manifest
@@ -44,6 +45,9 @@ Safety properties, in the order they are enforced:
   does not correspond to the commit CI claims is refused;
 * the live SQLite database is backed up, with an integrity check, before anything is
   replaced;
+* a snapshot is never dropped: a deployment that cannot take one carries forward the one
+  a failed or interrupted attempt took of the same live deployment, and no older copy is
+  deleted before the copy replacing it is fsynced under its final name;
 * the new container must report healthy *and* be running the exact digest, otherwise the
   previous deployment is restored;
 * every file this script writes is written to a temporary file and then renamed over the
@@ -536,6 +540,93 @@ def compose_script(manifest: Manifest) -> str:
     )
 
 
+def deployment_id(manifest: Manifest) -> str | None:
+    """The id of the attempt that made a deployment. Layout 2 stores the id itself; the
+    attempts/ layout stored that attempt's directory, whose name is the id."""
+    return Path(str(manifest.get("attempt") or "")).name or None
+
+
+def carried_snapshot(prod: Path, live: Live | None) -> Path | None:
+    """``failed/database.sqlite3``, when a deployment that took no snapshot must keep it.
+
+    A failure never changes ``current.json``, so a failed (or interrupted) attempt took
+    its snapshot from the deployment still live: it is newer than the backup, and may be
+    the only copy there is. So it is carried by default. It is left behind only on
+    positive evidence that the backup already holds something newer:
+
+    * the backup's ``current.json`` names the live deployment itself: a later attempt
+      snapshotted the live deployment and crashed mid-rotation, and ``settle_backups``
+      promoted its ``backup.new/``;
+    * the failed attempt's ``request.json`` says it replaced a deployment other than the
+      live one: it survived a rotation that crashed before deleting it, so it predates
+      the backup.
+
+    With no database in the backup at all, it is always carried: an older copy still
+    beats none. Call this only once ``settle_backups`` has run.
+    """
+    database = prod / "failed" / "database.sqlite3"
+    if live is None or not database.is_file():
+        return None
+    backup = prod / "backup"
+    if not os.path.lexists(backup / "database.sqlite3"):
+        return database
+    live_id = deployment_id(live.manifest)
+    try:
+        backed_up = deployment_id(read_json(backup / "current.json"))
+    except (OSError, ValueError):
+        backed_up = None
+    if backed_up is not None and backed_up == live_id:
+        return None
+    try:
+        replaces = read_json(prod / "failed" / "request.json").get("replaces")
+    except (OSError, ValueError, AttributeError):
+        replaces = None
+    if replaces is not None and replaces != live_id:
+        return None
+    return database
+
+
+def retire_incoming(prod: Path) -> None:
+    """Clear what an earlier deployment left in ``incoming/`` before staging a new one.
+
+    One holding ``database.sqlite3`` was interrupted after its snapshot, perhaps with its
+    candidate already running, and that snapshot may be the only copy of the database
+    from before it. So it becomes ``failed/``, like any failed attempt, and the
+    carry-forward keeps its database. It is newer than any ``failed/`` already there,
+    which it replaces. Anything else is deleted.
+    """
+    incoming, failed = prod / "incoming", prod / "failed"
+    database = incoming / "database.sqlite3"
+    if not database.is_file():
+        remove_tree(incoming)
+        return
+    fsync_file(database)
+    fsync_directory(incoming)
+    if not (incoming / "result.json").exists():
+        try:
+            request = read_json(incoming / "request.json")
+        except (OSError, ValueError):
+            request = {}
+        interrupted = dict(
+            request,
+            status="interrupted",
+            error="The deployment stopped before it finished; its snapshot was kept.",
+        )
+        write_atomic(incoming / "result.json", json_bytes(interrupted))
+    remove_tree(failed)
+    os.rename(incoming, failed)
+    fsync_directory(prod)
+
+
+def settle_database(prod: Path) -> None:
+    """Make the database just placed in ``backup.new/`` durable, name and all, before any
+    older copy can be removed."""
+    new = prod / "backup.new"
+    fsync_file(new / "database.sqlite3")
+    fsync_directory(new)
+    fsync_directory(prod)
+
+
 def swap_backup(prod: Path) -> None:
     """Rename ``backup.new/`` in for ``backup/``: the old one aside, the new one in, then
     the old one deleted, so no moment passes without a complete backup directory."""
@@ -544,6 +635,7 @@ def swap_backup(prod: Path) -> None:
         remove_tree(old)  # An aside left by an earlier crash; backup/ supersedes it.
         os.rename(current, old)
     os.rename(new, current)
+    fsync_directory(prod)  # The new backup's name is on disk before the old one goes.
     remove_tree(old)
 
 
@@ -620,10 +712,13 @@ def seed_backup_from_attempts(prod: Path, backup_new: Path) -> bool:
     if manifest is not None:
         write_atomic(backup_new / "current.json", manifest)
     # The database comes last, and appears whole under its name through a rename: its
-    # presence is what tells settle_backups this directory is complete.
+    # presence is what tells settle_backups this directory is complete. Its data is on
+    # disk before it takes that name.
     partial = backup_new / ".database.sqlite3.tmp"
     shutil.copyfile(source / "database.sqlite3", partial)
+    fsync_file(partial)
     os.replace(partial, backup_new / "database.sqlite3")
+    settle_database(prod)
     return True
 
 
@@ -635,11 +730,16 @@ def rotate(prod: Path, candidate: Manifest, previous: Live | None, snapshot: Pat
     runs. The next deployment then finds the container does not match that manifest,
     skips its backup, and deploys normally.
 
-    The backup is replaced only when this deployment took a snapshot. One that could not
-    -- the previous container was unhealthy, or had no database -- leaves ``backup/`` as
-    it was, rather than deleting the only copy of the database for one that has none.
-    If ``backup/`` holds no database either and the legacy ``attempts/`` is about to be
-    deleted, the newest legacy attempt holding a database becomes the backup instead.
+    The backup is replaced only when there is a database to replace it with: this
+    deployment's snapshot, or one carried forward from ``failed/`` (``carried_snapshot``).
+    One without either -- the previous container was unhealthy, or had no database --
+    leaves ``backup/`` as it was, rather than deleting the only copy of the database for
+    one that has none. If ``backup/`` holds no database either and the legacy
+    ``attempts/`` is about to be deleted, the newest legacy attempt holding a database
+    becomes the backup instead.
+
+    No older copy -- ``backup.old/``, ``failed/``, ``attempts/`` -- is removed before the
+    database replacing it is fsynced under its final name.
     """
     incoming = prod / "incoming"
     backup_dir, backup_new = prod / "backup", prod / "backup.new"
@@ -654,6 +754,7 @@ def rotate(prod: Path, candidate: Manifest, previous: Live | None, snapshot: Pat
             write_atomic(backup_new / "compose.yml", previous.compose_file.read_bytes())
             write_atomic(backup_new / "current.json", (prod / "current.json").read_bytes())
         os.rename(snapshot, backup_new / "database.sqlite3")
+        settle_database(prod)
     elif os.path.lexists(prod / "attempts") and not os.path.lexists(
         backup_dir / "database.sqlite3"
     ):
@@ -681,18 +782,26 @@ def rotate(prod: Path, candidate: Manifest, previous: Live | None, snapshot: Pat
         remove_tree(leftover)
 
 
-def record_failure(prod: Path, result: Manifest) -> str:
+def record_failure(prod: Path, result: Manifest, carry: Path | None = None) -> str:
     """Keep the failed attempt as ``failed/``, and return where, for the error message.
 
     ``compose.yml``, ``current.json`` and ``backup/`` are not touched: they still describe
-    what is running. Recording can itself fail; that is reported rather than allowed to
-    hide the failure it was recording.
+    what is running. An attempt that took no snapshot moves ``carry`` -- the previous
+    ``failed/`` database, see ``carried_snapshot`` -- into its own evidence first, so
+    replacing ``failed/`` never deletes it. Recording can itself fail; that is reported
+    rather than allowed to hide the failure it was recording.
     """
     incoming, failed = prod / "incoming", prod / "failed"
+    database = incoming / "database.sqlite3"
     try:
+        if carry is not None and not database.exists():
+            os.rename(carry, database)
+            fsync_file(database)
+            fsync_directory(incoming)
         write_atomic(incoming / "result.json", json_bytes(result))
         remove_tree(failed)
         os.rename(incoming, failed)
+        fsync_directory(prod)
         write_atomic(prod / "last-attempt.json", json_bytes(result))
     except OSError as error:
         return f"not recorded ({describe(error)})"
@@ -778,12 +887,19 @@ def deploy_locked(
         "version": version,
         "status": "pending",
         "attempt": attempt,
+        # The deployment this attempt replaces, and so the one its snapshot comes from.
+        "replaces": deployment_id(previous.manifest) if previous is not None else None,
         "delivery": {"run_number": run_number, "source_run_url": source_run_url},
     }
 
-    # Stage the candidate, replacing whatever an interrupted deployment left behind.
+    # Settle what a crashed rotation left of the backup first: the carry-forward below
+    # must compare against the backup as it really is.
+    settle_backups(prod)
+
+    # Stage the candidate. What an interrupted deployment left behind is kept as failed/
+    # if it holds a snapshot, and deleted otherwise.
     incoming = prod / "incoming"
-    remove_tree(incoming)
+    retire_incoming(prod)
     os.mkdir(incoming)
     candidate_compose = incoming / "compose.yml"
     write_atomic(candidate_compose, kit_compose_file().read_bytes())
@@ -793,17 +909,34 @@ def deploy_locked(
     candidate["backup"] = False
     if previous is not None:
         try:
-            candidate["backup"] = backup(
-                previous.manifest, previous.compose_file, secrets, snapshot, attempt
-            )
+            # docker cp writes in place, so it writes a temporary name: only a finished,
+            # fsynced copy is ever called database.sqlite3.
+            partial = incoming / ".database.sqlite3.tmp"
+            if backup(previous.manifest, previous.compose_file, secrets, partial, attempt):
+                fsync_file(partial)
+                os.replace(partial, snapshot)
+                fsync_directory(incoming)
+                candidate["backup"] = True
         except Exception as failure:
             evidence = record_failure(
-                prod, dict(candidate, status="failed", stage="backup", error=str(failure))
+                prod,
+                dict(candidate, status="failed", stage="backup", error=str(failure)),
+                carried_snapshot(prod, previous),
             )
             raise DeploymentError(
                 f"The backup failed before the service was replaced: {failure}; "
                 f"evidence={evidence}"
             ) from failure
+
+    # With no snapshot of its own, this attempt keeps the one a failed attempt took of the
+    # same live deployment: on success as the backup, on failure in its own failed/.
+    carry = None if candidate["backup"] else carried_snapshot(prod, previous)
+    if carry is not None:
+        try:
+            carried_from = read_json(carry.parent / "request.json").get("attempt")
+        except (OSError, ValueError):
+            carried_from = None
+        candidate["backup_carried_from"] = carried_from
 
     try:
         compose(
@@ -841,14 +974,14 @@ def deploy_locked(
         except Exception as rollback_failure:
             result["rollback"] = "failed"
             result["rollback_error"] = str(rollback_failure)
-        evidence = record_failure(prod, result)
+        evidence = record_failure(prod, result, carry)
         raise DeploymentError(
             f"Deployment failed; rollback={result['rollback']}; evidence={evidence}"
         ) from failure
 
     candidate.update(status="healthy", deployed_at=datetime.now(UTC).isoformat())
     try:
-        rotate(prod, candidate, previous, snapshot if candidate["backup"] else None)
+        rotate(prod, candidate, previous, snapshot if candidate["backup"] else carry)
     except OSError as error:
         raise DeploymentError(
             "The new deployment is running and healthy, but recording it failed: "
