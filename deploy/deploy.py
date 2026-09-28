@@ -597,7 +597,10 @@ def attempt_time(attempt_id: object) -> datetime | None:
     if match is None:
         return None
     seconds, microseconds = match.groups()
-    started = datetime.strptime(seconds, "%Y%m%dT%H%M%S").replace(tzinfo=UTC)
+    try:
+        started = datetime.strptime(seconds, "%Y%m%dT%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None  # The right shape but no real time: a damaged record, not an attempt.
     return started.replace(microsecond=int(microseconds or 0))
 
 
@@ -639,7 +642,10 @@ def new_attempt_id(prod: Path) -> str:
     started = datetime.now(UTC)
     latest = max(recorded_attempt_times(prod), default=None)
     if latest is not None and started <= latest:
-        started = latest + timedelta(microseconds=1)
+        try:
+            started = latest + timedelta(microseconds=1)
+        except OverflowError:
+            pass  # A record dated at the end of year 9999 is damaged; the clock is better.
     return f"{started:%Y%m%dT%H%M%S%f}Z-{uuid.uuid4().hex[:12]}"
 
 
