@@ -49,7 +49,7 @@ POSIX = os.name == "posix"
 
 # Stands in for exchange credentials in secrets.env. It must never appear anywhere the
 # script writes, prints or passes to Docker.
-SENTINEL_SECRET = b"SENTINEL_VALUE=never-leave-secrets-env-4417\n"
+SENTINEL_ENV_LINE = b"SENTINEL_VALUE=never-leave-secrets-env-4417\n"
 
 LEGACY_ATTEMPT_IDS = (
     "20260901T101500Z-0123456789ab",
@@ -73,7 +73,7 @@ def load_deploy() -> types.ModuleType:
 
 deploy = load_deploy()
 REAL_DEPLOYMENT_LOCK = deploy.deployment_lock
-REAL_PREPARE_SECRETS = deploy.prepare_secrets_env_file
+REAL_PREPARE_ENV_FILE = deploy.prepare_secrets_env_file
 
 
 @dataclass(frozen=True)
@@ -284,9 +284,9 @@ class FakeDocker:
             return self.running or ""
         if verb == UP_ARGS:
             call.kind = "compose-up"
-            secrets = env.get("PORTFOLIO_SECRETS_ENV_FILE", "")
-            if secrets and not Path(secrets).is_file():
-                raise deploy.DeploymentError(f"env file {secrets} not found")
+            env_file = env.get("PORTFOLIO_SECRETS_ENV_FILE", "")
+            if env_file and not Path(env_file).is_file():
+                raise deploy.DeploymentError(f"env file {env_file} not found")
             image = env["PORTFOLIO_IMAGE"]
             health = "unhealthy" if image in self.unhealthy else "healthy"
             container = self.start(self.substitute.get(image, image), health)
@@ -396,7 +396,7 @@ def fcntl_available() -> Iterator[None]:
         yield
 
 
-def windows_prepare_secrets(root: Path, environment: str) -> Path:
+def windows_prepare_env_file(root: Path, environment: str) -> Path:
     """prepare_secrets_env_file without the mode check Windows cannot express.
 
     Windows reports every writable file as 0o666, so the real check refuses any existing
@@ -406,7 +406,7 @@ def windows_prepare_secrets(root: Path, environment: str) -> Path:
     path = Path(root) / environment / "secrets.env"
     if path.exists():
         return path
-    result: Path = REAL_PREPARE_SECRETS(root, environment)
+    result: Path = REAL_PREPARE_ENV_FILE(root, environment)
     return result
 
 
@@ -479,7 +479,7 @@ class Host:
             )
             if not POSIX:
                 stack.enter_context(
-                    mock.patch.object(deploy, "prepare_secrets_env_file", windows_prepare_secrets)
+                    mock.patch.object(deploy, "prepare_secrets_env_file", windows_prepare_env_file)
                 )
             for patch in self.extra_patches:
                 stack.enter_context(patch)
@@ -518,10 +518,10 @@ class Host:
 
     # -- host layouts -------------------------------------------------------------------
 
-    def write_secrets(self, directory: Path) -> Path:
+    def write_env_file(self, directory: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "secrets.env"
-        path.write_bytes(SENTINEL_SECRET)
+        path.write_bytes(SENTINEL_ENV_LINE)
         os.chmod(path, 0o600)
         return path
 
@@ -540,7 +540,7 @@ class Host:
         prod = root / "prod"
         prod.mkdir(parents=True)
         (root / "deploy.lock").write_bytes(b"")
-        secrets = self.write_secrets(prod)
+        env_file = self.write_env_file(prod)
         previous: dict[str, Any] | None = None
         for index, release in enumerate(releases):
             attempt = prod / "attempts" / LEGACY_ATTEMPT_IDS[index]
@@ -553,7 +553,7 @@ class Host:
                 "revision": release.revision,
                 "version": release.version,
                 "compose": str(compose),
-                "secrets_env_file": str(secrets),
+                "secrets_env_file": str(env_file),
                 "status": "pending",
                 "attempt": str(attempt),
                 "delivery": {

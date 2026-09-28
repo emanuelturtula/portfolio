@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from deploy_harness import (
-    SENTINEL_SECRET,
+    SENTINEL_ENV_LINE,
     Crash,
     FilesystemTap,
     Host,
@@ -440,7 +440,7 @@ class CrashSweep(unittest.TestCase):
         prod = self.live_prod(host)
         for path in host.home.rglob("*.json"):
             json.loads(path.read_bytes())  # never torn
-        self.assertEqual((prod / "secrets.env").read_bytes(), SENTINEL_SECRET)
+        self.assertEqual((prod / "secrets.env").read_bytes(), SENTINEL_ENV_LINE)
         return prod
 
     def check_next_deployment_recovers(
@@ -494,7 +494,7 @@ class CrashSweep(unittest.TestCase):
 
     def test_a_crash_at_any_step_of_a_deployment_is_recovered(self) -> None:
         def prepare(host: Host) -> None:
-            host.write_secrets(host.prod)
+            host.write_env_file(host.prod)
             host.deploy(R1)
             host.deploy(R2)
             host.next_release = R4
@@ -541,7 +541,7 @@ class CrashSweep(unittest.TestCase):
 
     def test_a_crash_at_any_step_of_a_first_deployment_is_recovered(self) -> None:
         def prepare(host: Host) -> None:
-            host.write_secrets(host.prod)
+            host.write_env_file(host.prod)
             host.next_release = R2
 
         def check(host: Host, before: dict[str, Any]) -> None:
@@ -619,7 +619,7 @@ class CrashSweep(unittest.TestCase):
     def prepare_young_host(self, host: Host) -> None:
         """One success, no backup/, then a failure whose rollback came up unhealthy: the
         only database copy on the host is the snapshot in failed/."""
-        host.write_secrets(host.prod)
+        host.write_env_file(host.prod)
         host.deploy(R1)
         host.docker.fail_up.add(R2.image)
         host.docker.unhealthy.add(R1.image)
@@ -649,7 +649,7 @@ class CrashSweep(unittest.TestCase):
         # failed/ holds an older failure's snapshot while this success takes a newer one.
         # Whatever the crash leaves, the recovery must keep the newer.
         def prepare(host: Host) -> None:
-            host.write_secrets(host.prod)
+            host.write_env_file(host.prod)
             host.deploy(R1)
             host.deploy(R2)
             host.docker.fail_up.add(R3.image)
@@ -669,7 +669,7 @@ class CrashSweep(unittest.TestCase):
 
     def test_a_crash_at_any_step_of_a_failed_deployment_is_recovered(self) -> None:
         def prepare(host: Host) -> None:
-            host.write_secrets(host.prod)
+            host.write_env_file(host.prod)
             host.deploy(R1)
             host.deploy(R2)
             host.next_release = R4
@@ -705,7 +705,7 @@ class CrashThenFailuresSweep(unittest.TestCase):
             self.assertLess(k, MAX_STEPS, "the deployment never completed")
             with tempfile.TemporaryDirectory() as temp:
                 host = Host(Path(temp))
-                host.write_secrets(host.prod)
+                host.write_env_file(host.prod)
                 host.deploy(R1)
                 host.deploy(R2)
                 docker = host.docker

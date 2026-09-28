@@ -26,7 +26,7 @@ from deploy_harness import (
     LEGACY_ATTEMPT_IDS,
     POSIX,
     REAL_DEPLOYMENT_LOCK,
-    SENTINEL_SECRET,
+    SENTINEL_ENV_LINE,
     Crash,
     Host,
     RecordingLock,
@@ -178,7 +178,7 @@ class LegacyMigrationTests(HostTestCase):
         )
         (line,) = [x for x in self.host.stderr[-1].splitlines() if x.startswith("Migrated")]
         self.assertIn("portfolio-app-deploy", line)
-        self.assertEqual((self.prod / "secrets.env").read_bytes(), SENTINEL_SECRET)
+        self.assertEqual((self.prod / "secrets.env").read_bytes(), SENTINEL_ENV_LINE)
         if POSIX:
             self.assertEqual(mode(self.prod / "secrets.env"), 0o600)
         # The lock file moved with the directory: the same file, and only one of it.
@@ -550,7 +550,7 @@ class BothRootsTests(HostTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.host.build_legacy()
-        self.host.write_secrets(self.prod).write_bytes(b"OTHER=root\n")
+        self.host.write_env_file(self.prod).write_bytes(b"OTHER=root\n")
         self.before = tree(self.host.home)
 
     def test_both_roots_are_refused_before_anything_runs(self) -> None:
@@ -1252,7 +1252,7 @@ class GuardTests(HostTestCase):
 
 class SecretTests(HostTestCase):
     def test_the_secret_never_leaves_secrets_env(self) -> None:
-        self.host.write_secrets(self.prod)
+        self.host.write_env_file(self.prod)
         self.host.deploy(R1)
         self.host.deploy(R2)
         self.docker.fail_up.add(R3.image)
@@ -1285,14 +1285,14 @@ class SecretTests(HostTestCase):
             )
         self.assertEqual(code, 0, stderr.getvalue())
 
-        secret = SENTINEL_SECRET.strip()
-        self.assertEqual((self.prod / "secrets.env").read_bytes(), SENTINEL_SECRET)
+        sentinel = SENTINEL_ENV_LINE.strip()
+        self.assertEqual((self.prod / "secrets.env").read_bytes(), SENTINEL_ENV_LINE)
         for name, data in tree(self.host.home).items():
             if name != "portfolio-app/prod/secrets.env":
-                self.assertNotIn(secret, data, name)
+                self.assertNotIn(sentinel, data, name)
         for call in self.docker.calls:
-            self.assertNotIn(secret.decode(), repr(call.argv) + repr(call.env))
-        self.assertNotIn(secret.decode(), stdout.getvalue() + stderr.getvalue())
+            self.assertNotIn(sentinel.decode(), repr(call.argv) + repr(call.env))
+        self.assertNotIn(sentinel.decode(), stdout.getvalue() + stderr.getvalue())
 
 
 if __name__ == "__main__":

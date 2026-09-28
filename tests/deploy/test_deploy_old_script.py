@@ -82,7 +82,7 @@ class OldScriptAfterMigrationTests(unittest.TestCase):
             if not POSIX:
                 stack.enter_context(
                     mock.patch.object(
-                        self.old, "prepare_secrets_env_file", old_windows_secrets(self.old)
+                        self.old, "prepare_secrets_env_file", old_windows_env_file(self.old)
                     )
                 )
             stack.enter_context(contextlib.redirect_stdout(output))
@@ -160,7 +160,7 @@ class OldScriptAfterMigrationTests(unittest.TestCase):
         self.assertEqual(self.host.legacy.read_bytes(), tombstone)
 
 
-def old_windows_secrets(old: types.ModuleType) -> object:
+def old_windows_env_file(old: types.ModuleType) -> object:
     """The old script's secrets check, minus the mode test Windows cannot express."""
     original = old.prepare_secrets_env_file
 

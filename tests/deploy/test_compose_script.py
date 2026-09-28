@@ -19,7 +19,7 @@ from pathlib import Path
 from deploy_harness import (
     LEGACY_ATTEMPT_IDS,
     POSIX,
-    SENTINEL_SECRET,
+    SENTINEL_ENV_LINE,
     FilesystemTap,
     Host,
     Release,
@@ -67,10 +67,10 @@ class ComposeScriptTests(unittest.TestCase):
         self.assertEqual(self.script.read_bytes(), expected_compose_sh(R2))
 
     def test_it_carries_no_secret_and_no_host_path(self) -> None:
-        self.host.write_secrets(self.host.prod)
+        self.host.write_env_file(self.host.prod)
         self.host.deploy(R1)
         text = self.script.read_bytes()
-        self.assertNotIn(SENTINEL_SECRET.strip(), text)
+        self.assertNotIn(SENTINEL_ENV_LINE.strip(), text)
         self.assertNotIn(str(self.host.home).encode(), text)
         self.assertNotIn(self.host.home.as_posix().encode(), text)
 
@@ -199,7 +199,7 @@ class RunningComposeScriptTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         base = Path(temp.name)
         self.host = Host(base)
-        self.host.write_secrets(self.host.prod)
+        self.host.write_env_file(self.host.prod)
         self.host.deploy(R1)
         bin_dir = base / "bin"
         bin_dir.mkdir()
@@ -246,8 +246,8 @@ class RunningComposeScriptTests(unittest.TestCase):
         self.assertEqual(recorded["PORTFOLIO_IMAGE"], [R1.image])
         self.assertEqual(recorded["PORTFOLIO_PORT"], ["8083"])
         self.assertEqual(recorded["PORTFOLIO_ENVIRONMENT"], ["prod"])
-        (secrets,) = recorded["PORTFOLIO_SECRETS_ENV_FILE"]
-        self.assertEqual(os.path.realpath(secrets), os.path.realpath(prod / "secrets.env"))
+        (env_file,) = recorded["PORTFOLIO_SECRETS_ENV_FILE"]
+        self.assertEqual(os.path.realpath(env_file), os.path.realpath(prod / "secrets.env"))
 
     def test_it_runs_the_documented_commands_against_the_live_deployment(self) -> None:
         for args in (
