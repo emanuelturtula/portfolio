@@ -421,6 +421,19 @@ def tree(path: Path) -> dict[str, bytes]:
     }
 
 
+RECORD = "snapshot.json"
+
+
+def without_record(files: dict[str, bytes]) -> dict[str, bytes]:
+    """A tree() without snapshot.json, the record every database copy carries with it."""
+    return {name: data for name, data in files.items() if Path(name).name != RECORD}
+
+
+def taken_by(directory: Path) -> Any:
+    """Which attempt took the database in ``directory``, from its snapshot.json."""
+    return json.loads((directory / RECORD).read_bytes())["taken_by"]
+
+
 def mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
 

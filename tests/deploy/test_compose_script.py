@@ -158,6 +158,24 @@ class ComposeScriptWhileLiveTests(unittest.TestCase):
         self.deploy_failing(R3)
         self.assertEqual(self.script.read_bytes(), expected_compose_sh(R2))
 
+    def test_a_compose_sh_that_cannot_be_written_never_blocks_a_deployment(self) -> None:
+        # Something in the way of compose.sh (here a directory) is reported in one line;
+        # the deployment carries on, and fails or succeeds on its own merits.
+        self.host.deploy(R1)
+        self.host.deploy(R2)
+        self.script.unlink()
+        self.script.mkdir()
+        self.host.docker.fail_up.add(R3.image)
+
+        with self.assertRaises(deploy.DeploymentError) as caught:
+            self.host.deploy(R3)
+
+        self.assertIn("rollback=healthy", str(caught.exception))
+        self.assertTrue((self.host.prod / "failed" / "result.json").is_file())
+        said = [line for line in self.host.stderr[-1].splitlines() if "compose.sh" in line]
+        self.assertEqual(len(said), 1, self.host.stderr[-1])
+        self.assertNotIn(str(self.host.home), said[0])
+
     def test_a_live_manifest_that_does_not_validate_never_blocks_a_deployment(self) -> None:
         self.host.deploy(R1)
         current = self.host.prod / "current.json"

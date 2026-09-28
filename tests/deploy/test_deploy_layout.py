@@ -27,6 +27,7 @@ from deploy_harness import (
     POSIX,
     REAL_DEPLOYMENT_LOCK,
     SENTINEL_SECRET,
+    Crash,
     Host,
     RecordingLock,
     Release,
@@ -35,7 +36,9 @@ from deploy_harness import (
     legacy_write_json,
     mode,
     read_manifest,
+    taken_by,
     tree,
+    without_record,
 )
 
 R1, R2, R3, R4, R5 = (Release(n) for n in range(1, 6))
@@ -214,13 +217,14 @@ class LegacyMigrationTests(HostTestCase):
 
         self.assertFalse((self.prod / "attempts").exists(), "the ten old copies must go")
         self.assertEqual(
-            tree(self.prod / "backup"),
+            without_record(tree(self.prod / "backup")),
             {
                 "compose.yml": R3.compose,
                 "current.json": self.legacy_current,
                 "database.sqlite3": snapshot,
             },
         )
+        self.assertEqual(taken_by(self.prod / "backup"), self.host.current()["attempt"])
         self.assertEqual(self.host.sqlite_files(), [self.prod / "backup" / "database.sqlite3"])
         self.assertEqual((self.prod / "compose.yml").read_bytes(), R4.compose)
         self.assertEqual(self.host.current()["image"], R4.image)
@@ -330,13 +334,14 @@ class MigrationWithoutSnapshotTests(HostTestCase):
 
         self.assertEqual(self.docker.snapshots, [], "the premise: no snapshot was taken")
         self.assertEqual(
-            tree(self.prod / "backup"),
+            without_record(tree(self.prod / "backup")),
             {
                 "compose.yml": its_deployment["compose.yml"],
                 "current.json": newest["previous.json"],
                 "database.sqlite3": newest["database.sqlite3"],
             },
         )
+        self.assertEqual(taken_by(self.prod / "backup"), LEGACY_ATTEMPT_IDS[-1])
         self.assertEqual(its_deployment["compose.yml"], R2.compose)
         self.assertFalse((self.prod / "attempts").exists())
         self.assertEqual(self.host.sqlite_files(), [self.prod / "backup" / "database.sqlite3"])
@@ -372,7 +377,7 @@ class MigrationWithoutSnapshotTests(HostTestCase):
 
         self.host.deploy(R4)
 
-        backup = tree(self.prod / "backup")
+        backup = without_record(tree(self.prod / "backup"))
         self.assertEqual(set(backup), {"current.json", "database.sqlite3"})
         self.assertEqual(backup["database.sqlite3"], database)
         recorded = json.loads(backup["current.json"])
@@ -386,7 +391,7 @@ class MigrationWithoutSnapshotTests(HostTestCase):
 
         self.host.deploy(R4)
 
-        backup = tree(self.prod / "backup")
+        backup = without_record(tree(self.prod / "backup"))
         self.assertEqual(set(backup), {"current.json", "database.sqlite3"})
         self.assertEqual(backup["database.sqlite3"], database)
         self.assertEqual(set(json.loads(backup["current.json"])), {"backup_note"})
@@ -435,9 +440,10 @@ class NewLayoutTests(HostTestCase):
         self.host.deploy(R2)
 
         self.assertEqual(
-            tree(self.prod / "backup"),
+            without_record(tree(self.prod / "backup")),
             {"compose.yml": R1.compose, "current.json": first_bytes, "database.sqlite3": snapshot},
         )
+        self.assertEqual(taken_by(self.prod / "backup"), self.host.current()["attempt"])
         self.assertEqual(json.loads(first_bytes), first)
         self.assertEqual((self.prod / "compose.yml").read_bytes(), R2.compose)
         self.assertEqual(self.host.current()["image"], R2.image)
@@ -471,7 +477,7 @@ class NewLayoutTests(HostTestCase):
 
         self.host.deploy(R3)
 
-        backup = tree(self.prod / "backup")
+        backup = without_record(tree(self.prod / "backup"))
         self.assertEqual(
             backup,
             {
@@ -480,6 +486,7 @@ class NewLayoutTests(HostTestCase):
                 "database.sqlite3": new_snapshot,
             },
         )
+        self.assertEqual(taken_by(self.prod / "backup"), self.host.current()["attempt"])
         self.assertNotEqual(backup["database.sqlite3"], old_snapshot)
         self.assertEqual(self.docker.snapshots[-1], new_snapshot)
         for leftover in ("incoming", "failed", "backup.new", "backup.old", "attempts"):
@@ -693,7 +700,11 @@ class FailureTests(HostTestCase):
 
     def assert_evidence(self, release: Release, *, snapshot: bytes | None) -> dict[str, Any]:
         failed = tree(self.prod / "failed")
-        expected = EVIDENCE if snapshot is not None else EVIDENCE - {"database.sqlite3"}
+        expected = (
+            EVIDENCE | {"snapshot.json"}
+            if snapshot is not None
+            else EVIDENCE - {"database.sqlite3"}
+        )
         self.assertEqual(set(failed), expected)
         self.assertEqual(failed["compose.yml"], release.compose)
         request = json.loads(failed["request.json"])
@@ -761,7 +772,7 @@ class FailureTests(HostTestCase):
         self.assertFalse((self.prod / "attempts").exists())
         self.assertFalse((self.prod / "failed").exists())
         self.assertEqual(
-            tree(self.prod / "backup"),
+            without_record(tree(self.prod / "backup")),
             {
                 "compose.yml": R3.compose,
                 "current.json": legacy_current,
@@ -948,13 +959,14 @@ class CarryForwardTests(HostTestCase):
         self.assertIs(current["backup"], False, "no snapshot of its own")
         self.assertEqual(current["backup_carried_from"], failed_attempt)
         self.assertEqual(
-            tree(self.prod / "backup"),
+            without_record(tree(self.prod / "backup")),
             {
                 "compose.yml": R1.compose,
                 "current.json": self.first_live,
                 "database.sqlite3": self.only_copy,
             },
         )
+        self.assertEqual(taken_by(self.prod / "backup"), failed_attempt)
         self.assertFalse((self.prod / "failed").exists())
         self.assertEqual(len(self.host.sqlite_files()), 1)
 
@@ -998,6 +1010,56 @@ class CarryForwardTests(HostTestCase):
         self.assertNotIn("backup_carried_from", result)
         own = self.docker.snapshots[-1]
         self.assertEqual((self.prod / "failed" / "database.sqlite3").read_bytes(), own)
+
+
+class NewestCopyAfterAPromotedBackupTests(HostTestCase):
+    """The reviewer's second-pass chain: carry by attempt time, not by what backup/ names.
+
+    X dies after building a complete backup.new of the live deployment (DATA-A). F
+    promotes it, takes no snapshot, fails and rolls back. The application writes DATA-B.
+    G snapshots DATA-B and fails. H takes no snapshot and succeeds. backup/ still names
+    the live deployment, which the first carry rule read as "the backup is newer" -- and
+    DATA-B, the newest copy on the host, was deleted with failed/.
+    """
+
+    def test_the_failed_snapshot_newer_than_the_backup_becomes_the_backup(self) -> None:
+        host, docker = self.host, self.docker
+        host.deploy(Release(1))
+        host.deploy(R2)
+        docker.database = b"DATA-A, before X\n"
+
+        real_write = deploy.write_atomic
+
+        def dies_before_the_live_pair(path: Path, data: bytes, **kwargs: Any) -> None:
+            if Path(path) == self.prod / "compose.yml":
+                raise Crash("X killed after rotation step 1")
+            real_write(path, data, **kwargs)
+
+        with mock.patch.object(deploy, "write_atomic", dies_before_the_live_pair):
+            with self.assertRaises(Crash):
+                host.deploy(R3)  # X
+        self.assertEqual(tree(self.prod / "backup.new")["database.sqlite3"], b"DATA-A, before X\n")
+
+        docker.fail_up.add(R4.image)
+        self.assert_fails(R4)  # F: X's candidate runs, so no snapshot; rolls back to R2
+        self.assertEqual(tree(self.prod / "backup")["database.sqlite3"], b"DATA-A, before X\n")
+
+        docker.database = b"DATA-B, written after F\n"
+        docker.fail_up.add(R5.image)
+        self.assert_fails(R5)  # G: snapshots DATA-B, fails
+        self.assertEqual(
+            (self.prod / "failed" / "database.sqlite3").read_bytes(), b"DATA-B, written after F\n"
+        )
+
+        docker.containers[docker.running or ""].health = "unhealthy"
+        host.deploy(Release(6))  # H: no snapshot of its own
+
+        self.assertEqual(
+            tree(self.prod / "backup")["database.sqlite3"],
+            b"DATA-B, written after F\n",
+            "the newest copy on the host was deleted",
+        )
+        self.assertEqual(len(host.sqlite_files()), 1)
 
 
 class InterruptedAttemptTests(HostTestCase):

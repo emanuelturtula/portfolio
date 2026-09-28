@@ -14,6 +14,7 @@ layout a clean one would.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import tempfile
 import unittest
@@ -30,11 +31,12 @@ from deploy_harness import (
     deploy,
     expected_compose_sh,
     tree,
+    without_record,
 )
 
 R1, R2, R3, R4, R5 = (Release(n) for n in range(1, 6))
 MAX_STEPS = 300
-BACKUP = {"compose.yml", "current.json", "database.sqlite3"}
+BACKUP = {"compose.yml", "current.json", "database.sqlite3", "snapshot.json"}
 EVIDENCE = {"compose.yml", "request.json", "result.json", "database.sqlite3"}
 
 
@@ -172,6 +174,15 @@ class DurableBeforeDeletingTests(unittest.TestCase):
                 continue
             synced = {s.extra for s in tap.steps[:index] if s.name == "fsync_file"}
             self.assertIn(step.extra[1], synced, f"{step.args[1]} named before it was synced")
+            recorded = [
+                s
+                for s in tap.steps[:index]
+                if s.name == "os.replace"
+                and Path(s.args[1]).name == "snapshot.json"
+                and s.extra is not None
+                and s.extra[0] == step.extra[0]
+            ]
+            self.assertTrue(recorded, f"{step.args[1]} named before its snapshot.json was written")
             checked += 1
         return checked
 
@@ -305,6 +316,28 @@ class InterruptedBackupSwapTests(unittest.TestCase):
     def test_a_backup_left_aside_after_the_swap_completed_is_removed(self) -> None:
         self.leave("backup.old", {"database.sqlite3": b"the generation before\n"})
         self.assertEqual(self.deploy_without_a_snapshot(), self.backup)
+
+    def test_prod_is_synced_before_a_backup_left_aside_is_removed(self) -> None:
+        # The crashed swap renamed backup.new in but may not have synced prod/: the name
+        # backup/ must be on disk before the copy set aside is deleted.
+        self.leave("backup.old", {"database.sqlite3": b"the generation before\n"})
+        docker = self.host.docker
+        docker.containers[docker.running or ""].health = "unhealthy"
+        tap = FilesystemTap()
+        self.host.deploy(R3, tap=tap)
+        prod_inode = self.prod.stat().st_ino
+        (removal,) = [
+            index
+            for index, step in enumerate(tap.steps)
+            if step.name == "shutil.rmtree" and Path(step.args[0]).name == "backup.old"
+        ]
+        self.assertTrue(
+            any(
+                step.name == "fsync_directory" and step.extra == prod_inode
+                for step in tap.steps[:removal]
+            ),
+            "backup.old removed before prod/ was synced",
+        )
 
 
 class CrashSweep(unittest.TestCase):
@@ -462,14 +495,15 @@ class CrashSweep(unittest.TestCase):
                 "current.json": before["current"],
                 "database.sqlite3": before["database"],
             }
+            old_backup = without_record(before["backup"])
             if (prod / "backup").exists():
-                backup = tree(prod / "backup")
-                self.assertIn(backup, (before["backup"], new_backup), "backup/ is never a mixture")
+                backup = without_record(tree(prod / "backup"))
+                self.assertIn(backup, (old_backup, new_backup), "backup/ is never a mixture")
                 if backup == new_backup:
                     self.assertTrue(promoted, "the backup is swapped only after current.json")
             else:
-                self.assertEqual(tree(prod / "backup.old"), before["backup"])
-                self.assertEqual(tree(prod / "backup.new"), new_backup)
+                self.assertEqual(without_record(tree(prod / "backup.old")), old_backup)
+                self.assertEqual(without_record(tree(prod / "backup.new")), new_backup)
                 self.assertTrue(promoted)
             script = (prod / "compose.sh").read_bytes()
             self.assertIn(script, (before["compose.sh"], expected_compose_sh(R3)))
@@ -517,7 +551,7 @@ class CrashSweep(unittest.TestCase):
                 self.assertTrue(promoted, "attempts/ goes only after the new manifest is in")
             if (prod / "backup").exists():
                 self.assertEqual(
-                    tree(prod / "backup"),
+                    without_record(tree(prod / "backup")),
                     {
                         "compose.yml": R3.compose,
                         "current.json": before["current"],
@@ -627,9 +661,56 @@ class CrashSweep(unittest.TestCase):
             self.assertEqual(tree(prod / "backup"), before["backup"])
             self.assertEqual((prod / "compose.sh").read_bytes(), before["compose.sh"])
             if (prod / "failed").exists():
-                self.assertEqual(set(tree(prod / "failed")), EVIDENCE, "failed/ is never partial")
+                self.assertEqual(
+                    set(tree(prod / "failed")),
+                    EVIDENCE | {"snapshot.json"},
+                    "failed/ is never partial",
+                )
 
         self.sweep(prepare, R3, check, fails=True, newest=True)
+
+
+class CrashThenFailuresSweep(unittest.TestCase):
+    """A crash at any step, then the chain the reviewer's second pass found.
+
+    After the crash, F cannot snapshot and fails; the application writes new data; G
+    snapshots that data and fails; H cannot snapshot and succeeds. Whatever the crash
+    left, G's snapshot is the newest copy on the host, and H must keep it as the backup.
+    """
+
+    def test_a_failure_s_newer_snapshot_outlives_whatever_a_crash_left(self) -> None:
+        latest = b"DATA-B, written after the crash and F\n"
+        k = 0
+        while True:
+            self.assertLess(k, MAX_STEPS, "the deployment never completed")
+            with tempfile.TemporaryDirectory() as temp:
+                host = Host(Path(temp))
+                host.write_secrets(host.prod)
+                host.deploy(R1)
+                host.deploy(R2)
+                docker = host.docker
+                tap = FilesystemTap(crash_at=k)
+                with self.subTest(crash_before_step=k):
+                    with contextlib.suppress(Crash):
+                        host.deploy(R3, tap=tap)
+                    if tap.crashed:
+                        docker.containers[docker.running or ""].health = "unhealthy"
+                        docker.fail_up.add(R4.image)
+                        with self.assertRaises(deploy.DeploymentError):
+                            host.deploy(R4)  # F
+                        docker.database = latest
+                        docker.fail_up.add(R5.image)
+                        with self.assertRaises(deploy.DeploymentError):
+                            host.deploy(R5)  # G
+                        self.assertEqual(docker.snapshots[-1], latest, "the premise: G snapshots")
+                        docker.containers[docker.running or ""].health = "unhealthy"
+                        host.deploy(Release(6))  # H
+                        self.assertEqual(tree(host.prod / "backup").get("database.sqlite3"), latest)
+                        self.assertEqual(len(host.sqlite_files()), 1)
+                if not tap.crashed:
+                    self.assertGreater(k, 10)
+                    return
+            k += 1
 
 
 class CrashThenNoSnapshotSweep(CrashSweep):
