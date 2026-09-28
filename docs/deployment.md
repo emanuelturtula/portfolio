@@ -55,7 +55,7 @@ live deployment running as it was.
 ## The layout on the host
 
 Everything lives under `~/portfolio-app/`. The environment directory holds the live
-deployment and exactly one backup:
+deployment and at most one backup:
 
 | Path, under `~/portfolio-app/` | What it holds |
 |---|---|
@@ -65,7 +65,7 @@ deployment and exactly one backup:
 | `prod/secrets.env` | operator-managed credentials, mode 0600, never read by the script |
 | `prod/compose.sh` | runs docker compose against the live deployment; see below |
 | `prod/last-attempt.json` | the latest attempt's request and outcome, whether it succeeded or not |
-| `prod/backup/` | the previous deployment's `compose.yml` and `current.json`, and `database.sqlite3`: the database as it was just before the live deployment replaced it |
+| `prod/backup/` | the previous deployment's `compose.yml` and `current.json` and, when there was a database to back up, `database.sqlite3`: the database as it was just before the live deployment replaced it |
 | `prod/failed/` | only after a failed or interrupted deployment: its `compose.yml`, `request.json`, `result.json` and, when there was one, the database snapshot taken before it (or carried forward from the previous `failed/`). The next failure replaces it and the next success deletes it |
 | `prod/incoming/` | only while a deployment runs: the candidate being staged |
 
@@ -101,8 +101,9 @@ script itself, which it finds through any symlink, so it works from any director
 
 ### One backup, and why
 
-After a successful deployment exactly one copy of the database exists on the host, in
-`prod/backup/`. That is the owner's decision: every copy is one more place the owner's data
+After a successful deployment the host keeps at most one copy of the database, in
+`prod/backup/`: exactly one once any deployment has had a database to back up, and none
+before that. That is the owner's decision: every copy is one more place the owner's data
 sits on disk, and one is enough to undo the deployment that is live. The previous layout
 kept ten.
 
@@ -231,12 +232,14 @@ key is stored anywhere.
 Exchange API credentials never pass through GitHub. Write them directly on the host:
 
 ```bash
+install -d -m 700 ~/portfolio-app ~/portfolio-app/prod
 install -m 600 /dev/null ~/portfolio-app/prod/secrets.env
 $EDITOR ~/portfolio-app/prod/secrets.env
 ```
 
-The first command is for a host that has never been deployed to; on any other it would
-empty the file. A host not yet migrated keeps the file under its previous root until its
+The first two commands are only for a host that has never been deployed to. On one that
+has, they would empty the file; on one not yet migrated, they would create a second root,
+which the next deployment refuses. A host not yet migrated keeps the file under its previous root until its
 next deployment moves it; see
 [Migrating from the previous layout](#migrating-from-the-previous-layout).
 
@@ -268,15 +271,15 @@ the run summary. Setting it back to `false` is the kill switch.
 The deploy script rolls back on its own when a new container fails to become healthy. To go
 back deliberately, revert the commit and merge the revert — that produces a new version and
 a new deployment through the normal path, with the database backup that a forward deployment
-always takes.
+takes.
 
 Do not re-run an old workflow to roll back: `deploy.py` rejects it by design.
 
 ## When something fails
 
 Read `~/portfolio-app/prod/failed/`, which the error names as its evidence. It holds the
-exact request, the compose file used, the database as it was before the attempt, and
-`result.json` with the failure reason and whether the rollback came back healthy.
+exact request, the compose file used, the database as it was before the attempt when one
+was taken or carried forward, and `result.json` with the failure reason and whether the rollback came back healthy.
 `~/portfolio-app/prod/last-attempt.json` always describes the latest attempt, successful or
 not.
 
@@ -288,5 +291,5 @@ not.
 | "The deployment host is busy" | a concurrent deployment holds the lock; it will retry |
 | "Both ... exist, so this host cannot be migrated safely" | the old and the new root are both directories, usually because the file the migration left at the old path was replaced by one; keep the directory holding the live deployment, move the other away, and put the file back (see the migration section) |
 | "The live deployment's compose file ... is missing" | `prod/compose.yml`, or the old layout's `attempts/<id>/compose.yml`, was deleted by hand; there is nothing to roll back to, so nothing was changed |
-| "running and healthy, but recording it failed" | the new version is live, but a file under `prod/` could not be written; the next deployment repairs the files |
+| "running and healthy, but recording it failed" | the new version is live, but a file under `prod/` could not be written; the next deployment repairs the files. Until then `compose.sh` may still name the previous image, so `up --force-recreate` through it would bring that image back: deploy again rather than recreating by hand |
 | Healthy container, stale behaviour | `secrets.env` changed but the container was restarted rather than recreated |

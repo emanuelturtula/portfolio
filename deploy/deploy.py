@@ -3,7 +3,7 @@
 
 Runs on the Pi, standard library only, uploaded fresh for every deployment so the host
 keeps no copy of the tooling. State lives under ``~/portfolio-app/``, and the environment
-directory holds the live deployment and exactly one backup::
+directory holds the live deployment and at most one backup::
 
     deploy.lock              host-wide lock, so two deployments can never interleave
     prod/
@@ -13,7 +13,8 @@ directory holds the live deployment and exactly one backup::
       compose.sh             docker compose against the live deployment, for a person
       last-attempt.json      the latest attempt's request and outcome
       backup/                the previous deployment, and the database as it was before
-                             the live one: compose.yml, current.json, database.sqlite3
+                             the live one: compose.yml, current.json, and
+                             database.sqlite3 once there has been a database to back up
       failed/                only after a failed or interrupted deployment, replaced by
                              the next one: compose.yml, request.json, result.json,
                              database.sqlite3
