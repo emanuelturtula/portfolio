@@ -1013,3 +1013,47 @@ def test_divide_agrees_with_one_exact_half_even_rounding(
 
     assert Fraction(quotient) == expected
     assert quotient.as_tuple().exponent == -scale
+
+
+@pytest.mark.parametrize(
+    ("dividend", "divisor"),
+    [
+        pytest.param("1E+20", "1.1", id="gap of 20, quotient 9.09E+19"),
+        pytest.param("1E+20", "9.999999999999999999", id="gap of 20, just over 1E+19"),
+        pytest.param("5E+19", "0.6", id="gap of 20 through a fractional divisor"),
+        pytest.param("-1E+20", "1.000000000000000001", id="gap of 20, negative"),
+    ],
+)
+def test_divide_computes_a_quotient_that_fits_even_when_the_exponents_are_20_apart(
+    dividend: str, divisor: str
+) -> None:
+    """The refusal read off the exponents must not refuse what fits.
+
+    With the adjusted exponents 20 apart, the quotient lies between 10**19 and 10**21, so
+    only the digits can say whether it fits in 20 integer digits. Each of these does, and
+    must be computed, not refused. The mutation sweep found a pre-check one digit too early
+    surviving every other test, because random operands rarely land here.
+    """
+    expected = round_half_even(Fraction(Decimal(dividend)) / Fraction(Decimal(divisor)), 18)
+    assert abs(expected) < Fraction(10) ** 20
+
+    quotient = divide(Decimal(dividend), Decimal(divisor), 18)
+
+    assert Fraction(quotient) == expected
+
+
+@pytest.mark.parametrize(
+    ("dividend", "divisor", "scale"),
+    [
+        pytest.param("1E+38", "1.1", 0, id="scale 0: 38 digits fit"),
+        pytest.param("1E+30", "1.1", 8, id="scale 8: 30 digits fit"),
+    ],
+)
+def test_divide_computes_the_widest_quotients_at_other_scales(
+    dividend: str, divisor: str, scale: int
+) -> None:
+    """The same edge at other scales: `MONEY_PRECISION - scale` integer digits fit."""
+    expected = round_half_even(Fraction(Decimal(dividend)) / Fraction(Decimal(divisor)), scale)
+    assert abs(expected) < Fraction(10) ** (MONEY_PRECISION - scale)
+
+    assert Fraction(divide(Decimal(dividend), Decimal(divisor), scale)) == expected

@@ -1072,3 +1072,69 @@ def test_n1_a_division_of_that_basis_raises_invalid_operation_without_quoting_it
     assert not re.search(r"\d{6,}", message.replace(",", "")), message
     for spelling in ("1.8E+20", "1.62E+20", "9E+19", "0.9", NINE_E19):
         assert spelling not in message, message
+
+
+# --------------------------------------------------------------------------------------
+# Complements at a tie: where a second rounding would differ from a subtraction
+# --------------------------------------------------------------------------------------
+#
+# Every split rounds one part and takes the other by subtraction. A second `divide` for the
+# other part agrees with the subtraction everywhere except at an exact half-unit tie on an
+# amount with an odd number of units, where half-even rounds the two parts the same way and
+# a unit appears or vanishes. Random histories almost never land on such a tie, so each
+# split gets one here, built to land on it. The mutation sweep found all three unguarded.
+
+
+def test_a_proportional_disposal_at_a_tie_removes_exactly_what_was_sold() -> None:
+    """The unknown part taken is the complement of the known part taken, never re-rounded.
+
+    Qk = k and Qu = 3k with k = 1.000000000000000001 (an odd number of units); selling two
+    units takes a known share of 2k/4k = 0.5 units, a tie, rounded to even: 0. So both units
+    come out of the unknown part, and exactly 4k - 2 units remain. Rounding the unknown part
+    remaining a second time -- 3k x (4k - 2) / 4k -- lands one unit off.
+    """
+    result = run(
+        adjust(key(9, "m1", "manual"), "KAS", "3.000000000000000003", None),
+        buy(key(10, "e1"), "KAS", "USDT", "1.000000000000000001", "1"),
+        sell(key(11, "e2"), "KAS", "USDT", "0.000000000000000002", "0.000000000000000001"),
+    )
+
+    found = position(result, "KAS")
+    assert found.quantity == Decimal("4.000000000000000002")
+    assert found.unknown_basis_quantity == Decimal("3.000000000000000001")
+    assert found.known_quantity == Decimal("1.000000000000000001")
+    assert found.cost_basis == Decimal("1")
+
+
+def test_unmatched_proceeds_at_a_tie_are_the_complement_of_the_matched_share() -> None:
+    """Selling 2 BTC with 1 held for 3.000000000000000001: half the proceeds is a tie.
+
+    The matched share rounds to even, 1.5; unmatched is the rest, 1.500000000000000001, so
+    matched plus unmatched is the proceeds to the unit. A second rounding would give 1.5
+    for both and lose the unit.
+    """
+    result = run(
+        buy(key(10, "e1"), "BTC", "USDT", "1", "30000"),
+        sell(key(12, "e2"), "BTC", "USDT", "2", "3.000000000000000001"),
+    )
+
+    found = position(result, "BTC")
+    assert found.realized_pnl == Decimal("1.5") - Decimal("30000")
+    assert found.unmatched_proceeds == Decimal("1.500000000000000001")
+
+
+def test_a_swap_at_a_tie_receives_exactly_what_was_received() -> None:
+    """2 ETH given with 1 held, for 3.000000000000000001 BTC: the known share is a tie.
+
+    known_in rounds to even, 1.5 BTC, and the unknown part is the complement,
+    1.500000000000000001, so the BTC position holds exactly what arrived.
+    """
+    result = run(
+        buy(key(10, "e1"), "ETH", "USDT", "1", "100"),
+        sell(key(11, "e2"), "ETH", "BTC", "2", "3.000000000000000001"),
+    )
+
+    found = position(result, "BTC")
+    assert found.quantity == Decimal("3.000000000000000001")
+    assert found.unknown_basis_quantity == Decimal("1.500000000000000001")
+    assert found.cost_basis == Decimal("100")

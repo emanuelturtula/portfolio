@@ -90,10 +90,18 @@ def amounts(draw: st.DrawFn, *, maximum: int = MAX_WHOLE) -> Decimal:
     One draw in ten is the smallest amount there is, one unit at 18 places, and one in ten
     is `maximum` itself. The extremes are where R1's unrepresentable average and the
     one-unit fee boundaries live, and a uniform draw would reach them too rarely.
+
+    One draw in ten is a handful of units at 18 places -- 2E-18 to 16E-18. Among small
+    integers of units, a proportional share is often an exact half-unit tie, and a tie on
+    an odd number of units is the one input where a complement taken by a second rounding
+    differs from one taken by subtraction. The mutation sweep showed such splits going
+    unchecked without this branch.
     """
-    extreme = draw(st.sampled_from(["no"] * 8 + ["dust", "maximum"]))
+    extreme = draw(st.sampled_from(["no"] * 7 + ["dust", "maximum", "units"]))
     if extreme == "dust":
         return Decimal("1E-18")
+    if extreme == "units":
+        return Decimal(f"{draw(st.integers(min_value=2, max_value=16))}E-18")
     if extreme == "maximum":
         return Decimal(maximum)
     places = draw(st.sampled_from(PLACES))
