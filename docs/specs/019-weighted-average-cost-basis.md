@@ -369,12 +369,56 @@ and amounts at 18 decimals, so rounding paths are exercised rather than avoided.
   asset in the same millisecond, where the sell's id sorts first, show a transient shortfall
   and a `NegativeInventory` warning that the true order would not. It is rare for a personal
   account, and a warning rather than a wrong number.
-- **`import-linter` and stdlib modules.** If `include_external_packages` does not let a
-  forbidden contract name stdlib modules, the planted test will show it. The stdlib half then
-  moves into the AST test, and the spec is amended.
-- **An average cost beyond `MONEY_PRECISION`** (20 integer digits) raises
-  `InvalidOperation`. That takes a basis above 10²⁰ cash units per unit, and no input that
-  passes validation reaches it.
+- **`import-linter` and stdlib modules.** This was confirmed to work, with import-linter
+  2.15 and grimp 3.17, when the contract was written. `import-linter` only checks a forbidden
+  external that is already in the graph, so a stdlib name that nothing imports passes
+  silently. The planted-violation test is therefore what proves the contract, not a green
+  run.
+- **The engine's range is 10²⁰ cash units.** That is the same range as the `NumericText(18)`
+  columns #19 writes to. The average cost and `Adjustment` cost are guarded (see *Rulings*),
+  but a basis or proceeds total summed past 10²⁰ from many validated fills still makes
+  `divide` raise `InvalidOperation`. No personal portfolio reaches that total, and the
+  property strategies stay inside it.
 - **Bitget's BGB fee deduction** is the likely real-world third-asset fee. What Bitget reports
   in `feeDetail` for it is undocumented (spec 014). If the provider records BGB fees, they
   land in `UnattributedFee` unless BGB was bought through a fill.
+
+## Rulings during implementation
+
+The tester's oracle surfaced these. Each is binding on the engine and the oracle alike.
+
+- **R1. The average cost never raises.** `average_cost` is `None` when `Qk == 0`, and also
+  when the quotient does not fit `AVERAGE_COST_SCALE` within `MONEY_PRECISION` (10²⁰ or
+  more cash units per unit). Validated input reached this: a buy of 1E-18 BTC for 100 USDT,
+  or a fee in the received asset leaving 1E-18. The average is a display figure, and the
+  basis and quantity beside it are still reported.
+- **R2. `Adjustment` refuses a cost it cannot represent.** When
+  `quantize(multiply(unit_cost, quantity), BASIS_SCALE)` does not fit, construction raises
+  `ValueError` naming the rule, not the amounts. For example, 1E19 at a unit cost of 1E19
+  passes each amount's own rule and would otherwise raise out of `replay`.
+- **R3. `charged_to`.** An `UnattributedFee` names the non-cash principal of the trade: the
+  received asset for a buy or a swap, the given asset for a sale, and `None` for a
+  conversion.
+- **R4. Order of work inside one trade**, which fixes the order of warnings and lots:
+  1. dispose the given leg;
+  2. then the third-asset fee leg (a disposal, or a rebate acquisition);
+  3. then acquire the received leg.
+- **R5. `Lot.quantity` is the total received**, with `unknown_basis_quantity` beside it, as
+  on `Position`. An unknown-cost acquisition (an `Adjustment` without a cost, a third-asset
+  rebate, or a swap with `known_in == 0`) is a lot with `cost_basis == 0` and all of its
+  quantity unknown.
+- **R6. I8's `A` counts adjustments of non-cash assets only.** An `Adjustment` of a cash asset
+  changes nothing, so it is outside both sides of the equation.
+- **R7. A third-asset cash rebate larger than the trade is accepted.** It can drive the basis
+  negative. `Trade` cannot refuse it at construction, because what counts as cash is
+  configuration. No venue pays that, and every invariant still holds.
+- **R8. A fee asset may be named beside a zero fee**, as `NormalizedFill` allows. The rule
+  becomes: `fee_asset` is required when the fee is not zero, and a zero fee creates no leg
+  and touches no position. The spec's claim that a stored fill always converts then holds
+  for every field, not just the amounts.
+- **R9. The fractional-digit rule is value-based**, as in `NormalizedFill`: the amount is
+  refused when `quantize(v, 18) != v`. So `1.0000000000000000000` is accepted and
+  `0.0000000000000000001` is refused.
+- **R10. Kind strings** are `"adjustment"`, `"trade"` and `"transfer"`, compared as strings in
+  the tie-break. The fingerprint's JSON key names are the engine's to choose. Fingerprints are
+  tested by their properties, not against a stored digest.
