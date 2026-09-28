@@ -104,6 +104,17 @@ kept ten.
 What that costs, accepted: a problem noticed two deployments late has no copy from before
 it.
 
+A second gap is accepted too. A deployment interrupted while its candidate starts, during
+the up to three minutes the script waits for it to become healthy (a dropped connection, a
+reboot, the process killed for memory), can leave the candidate running with the snapshot
+taken just before it still in `prod/incoming/`. The next deployment clears `incoming/`, and
+cannot take a snapshot of its own because the running container is not the one
+`current.json` names, so the backup stays one deployment older. That matters only if the
+interrupted candidate's migration damaged data. So after an interrupted deployment, check
+`prod/last-attempt.json` before deploying again: an interrupted run never writes it, so if
+it does not describe that run, `prod/incoming/database.sqlite3` is the database from before
+that candidate, and worth copying somewhere safe first.
+
 During a failed deployment's aftermath there can be two: `backup/`, and the snapshot in
 `failed/`. The second is the database as it was just before the failed attempt, which is
 the copy that matters if a migration went wrong.
