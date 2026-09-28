@@ -704,6 +704,11 @@ class FilesystemTap:
             extra = None
             if name == "shutil.rmtree" and args and Path(args[0]).is_dir():
                 extra = sorted(Path(args[0]).rglob("*.sqlite3"))
+            elif name in ("os.rename", "os.replace") and len(args) >= 2:
+                # The directory the name lands in, by inode, and the file's own inode.
+                source, target = Path(args[0]), Path(args[1])
+                if source.exists() and target.parent.exists():
+                    extra = (target.parent.stat().st_ino, source.stat().st_ino)
             try:
                 self.step(name, args, extra)
             except Crash:
@@ -764,7 +769,15 @@ class FilesystemTap:
 
 def _method(tap: FilesystemTap, name: str, original: Callable[..., Any]) -> Callable[..., Any]:
     def method(path: Path, *args: Any, **kwargs: Any) -> Any:
-        tap.step(name, (path, *args))
+        alive = not tap.crashed
+        try:
+            tap.step(name, (path, *args))
+        except Crash:
+            if alive and name == "Path.write_bytes" and args:
+                # docker cp killed part-way: half the file, under the name it was given.
+                with builtins.open(path, "wb") as partial:
+                    partial.write(args[0][: len(args[0]) // 2])
+            raise
         return original(path, *args, **kwargs)
 
     return method

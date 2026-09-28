@@ -939,9 +939,14 @@ class CarryForwardTests(HostTestCase):
         self.assertEqual(len(self.docker.snapshots), self.snapshots)
 
     def test_a_success_that_cannot_snapshot_makes_the_failed_snapshot_the_backup(self) -> None:
+        failed_attempt = read_manifest(self.prod / "failed" / "request.json")["attempt"]
+
         self.host.deploy(R3)
 
         self.assert_no_snapshot_was_taken()
+        current = self.host.current()
+        self.assertIs(current["backup"], False, "no snapshot of its own")
+        self.assertEqual(current["backup_carried_from"], failed_attempt)
         self.assertEqual(
             tree(self.prod / "backup"),
             {

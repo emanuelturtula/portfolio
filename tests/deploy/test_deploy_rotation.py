@@ -132,14 +132,68 @@ class DurableBeforeDeletingTests(unittest.TestCase):
             )
         ]
         self.assertTrue(deletions, "the premise: an older copy was deleted")
-        before = tap.steps[: deletions[0]]
+        first = deletions[0]
+        before = tap.steps[:first]
         synced_files = {step.extra for step in before if step.name == "fsync_file"}
-        synced_dirs = {step.extra for step in before if step.name == "fsync_directory"}
         self.assertIn(copy.stat().st_ino, synced_files, f"{copy} not fsynced before deleting")
+        moved = {copy.stat().st_ino, copy.parent.stat().st_ino}
         for directory in (copy.parent, *dirs):
-            self.assertIn(
-                directory.stat().st_ino, synced_dirs, f"{directory} not fsynced before deleting"
+            inode = directory.stat().st_ino
+            # A directory's sync only covers the names already in it, so it must follow the
+            # last rename that put the copy (or the directory holding it) there, and precede
+            # the first deletion.
+            last_rename = max(
+                (
+                    index
+                    for index, step in enumerate(before)
+                    if step.name in ("os.rename", "os.replace")
+                    and step.extra is not None
+                    and step.extra[0] == inode
+                    and step.extra[1] in moved
+                ),
+                default=-1,
             )
+            self.assertTrue(
+                any(
+                    step.name == "fsync_directory" and step.extra == inode
+                    for step in before[last_rename + 1 :]
+                ),
+                f"{directory} not fsynced between its last rename and the first deletion",
+            )
+
+    def assert_named_only_once_synced(self, tap: FilesystemTap) -> int:
+        """Every file renamed to database.sqlite3 had its data synced first, so a crash
+        can never leave a partial file under the name that means complete."""
+        checked = 0
+        for index, step in enumerate(tap.steps):
+            if step.name not in ("os.rename", "os.replace") or step.extra is None:
+                continue
+            if Path(step.args[1]).name != "database.sqlite3":
+                continue
+            synced = {s.extra for s in tap.steps[:index] if s.name == "fsync_file"}
+            self.assertIn(step.extra[1], synced, f"{step.args[1]} named before it was synced")
+            checked += 1
+        return checked
+
+    def test_every_database_takes_its_name_only_once_synced(self) -> None:
+        tap = FilesystemTap()
+        self.host.deploy(R1, tap=tap)
+        self.host.deploy(R2, tap=tap)  # a snapshot, from docker cp
+        self.host.docker.fail_up.add(R3.image)
+        self.host.docker.unhealthy.add(R2.image)
+        with self.assertRaises(deploy.DeploymentError):
+            self.host.deploy(R3, tap=tap)  # a snapshot kept in failed/
+        self.host.docker.fail_up.clear()
+        self.host.deploy(R4, tap=tap)  # none of its own: failed/'s is carried
+        self.assertIsNotNone(self.host.current().get("backup_carried_from"))
+        self.assertGreaterEqual(self.assert_named_only_once_synced(tap), 3)
+
+    def test_a_seeded_database_takes_its_name_only_once_synced(self) -> None:
+        self.host.build_legacy()
+        self.host.docker.containers[self.host.docker.running or ""].health = "unhealthy"
+        tap = FilesystemTap()
+        self.host.deploy(R4, tap=tap)
+        self.assertGreaterEqual(self.assert_named_only_once_synced(tap), 1)
 
     def test_a_snapshot_is_durable_before_the_old_backup_goes(self) -> None:
         self.host.deploy(R1)
