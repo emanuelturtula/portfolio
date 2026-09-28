@@ -9,11 +9,16 @@ which is the check that catches a digit no invariant constrains.
 ## Example budgets
 
 The CI pytest step is already about 150 s and the per-test ceiling is 30 s, so the budgets
-are chosen, not defaulted. Measured on a developer machine, this module runs in about 20 s:
+are chosen, not defaulted. Measured on a developer machine, this module runs in about 25 s:
 
 * **200** for oracle agreement and for conservation (I8), about 3 s each. They are the two
   strongest checks -- one compares every field, the other balances the books exactly --
   so they get the most examples.
+* **200** for oracle agreement over few-unit histories, about 3 s, and **50** for I8 over
+  them. These exist because a mutation sweep showed ordinary histories almost never put a
+  split on a half-unit tie. They kill a complement re-rounded in a disposal or a sale on
+  every run measured, and one re-rounded in a swap on two runs of three; the example tests
+  in `test_replay.py` kill all three deterministically.
 * **60** for the prefix tests (I1, I2, I4), about 1.2 s each. Each example replays every
   prefix of a history of up to 16 events, so it is really up to 17 examples.
 * **50** for the rest (I3, I5, I6, I7 and the ambient context), under 1 s each, which
@@ -752,3 +757,54 @@ def test_a_history_with_all_four_shapes_agrees_with_the_oracle() -> None:
 
     assert engine_to_json(result) == oracle.result_to_json(oracle_replay(events))
     assert result.event_count == len(events)
+
+
+# --------------------------------------------------------------------------------------
+# Histories of a few units, where every split can land on a tie
+# --------------------------------------------------------------------------------------
+#
+# Ordinary histories almost never put a proportional share exactly on a half unit, so the
+# checks above cannot tell a complement taken by subtraction from one rounded a second
+# time. Histories whose every amount is 1 to 16 units at 18 places make those ties routine.
+
+
+@STRONG
+@given(events=histories(few_units=True))
+def test_the_engine_agrees_with_the_oracle_where_splits_tie(
+    events: list[AccountingEvent],
+) -> None:
+    assert engine_to_json(replay(events, CONFIG)) == oracle.result_to_json(oracle_replay(events))
+
+
+@STANDARD
+@given(events=histories(few_units=True))
+def test_i8_conservation_where_splits_tie(events: list[AccountingEvent]) -> None:
+    result = replay(events, CONFIG)
+
+    left = (
+        sum((Fraction(found.cost_basis) for found in result.positions), Fraction(0))
+        - sum((Fraction(found.realized_pnl) for found in result.positions), Fraction(0))
+        - sum((Fraction(found.unmatched_proceeds) for found in result.positions), Fraction(0))
+        + Fraction(result.unallocated_costs)
+    )
+
+    assert left == oracle.invested([to_oracle(event) for event in events], CASH)
+
+
+def test_the_few_units_mode_reaches_a_tie(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Proven, not assumed: a few-units history in which the oracle divides onto a tie."""
+    ties: list[Fraction] = []
+    real_divide = oracle.divide
+
+    def recording_divide(dividend: Fraction, divisor: Fraction) -> Fraction:
+        if (dividend / divisor * oracle.UNIT) % 1 == Fraction(1, 2):
+            ties.append(dividend / divisor)
+        return real_divide(dividend, divisor)
+
+    def has_a_tie(events: list[AccountingEvent]) -> bool:
+        ties.clear()
+        oracle_replay(events)
+        return bool(ties)
+
+    monkeypatch.setattr(oracle, "divide", recording_divide)
+    find(histories(few_units=True, min_size=2), has_a_tie, settings=FIND_SETTINGS)

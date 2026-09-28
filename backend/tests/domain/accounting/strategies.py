@@ -84,19 +84,20 @@ def to_units(value: Decimal) -> int:
 
 
 @st.composite
-def amounts(draw: st.DrawFn, *, maximum: int = MAX_WHOLE) -> Decimal:
+def amounts(draw: st.DrawFn, *, maximum: int = MAX_WHOLE, few_units: bool = False) -> Decimal:
     """A positive amount with 0, 2, 8 or 18 places and at most `maximum` in value.
+
+    With `few_units`, every amount is 1E-18 to 16E-18 instead: see `histories`.
 
     One draw in ten is the smallest amount there is, one unit at 18 places, and one in ten
     is `maximum` itself. The extremes are where R1's unrepresentable average and the
     one-unit fee boundaries live, and a uniform draw would reach them too rarely.
 
-    One draw in ten is a handful of units at 18 places -- 2E-18 to 16E-18. Among small
-    integers of units, a proportional share is often an exact half-unit tie, and a tie on
-    an odd number of units is the one input where a complement taken by a second rounding
-    differs from one taken by subtraction. The mutation sweep showed such splits going
-    unchecked without this branch.
+    One draw in ten is a handful of units at 18 places, 2E-18 to 16E-18, for variety; it is
+    `few_units` that makes ties the norm rather than an accident.
     """
+    if few_units:
+        return Decimal(f"{draw(st.integers(min_value=1, max_value=16))}E-18")
     extreme = draw(st.sampled_from(["no"] * 7 + ["dust", "maximum", "units"]))
     if extreme == "dust":
         return Decimal("1E-18")
@@ -131,11 +132,11 @@ def keys(draw: st.DrawFn, index: int) -> EventKey:
 
 
 @st.composite
-def trades(draw: st.DrawFn, event_key: EventKey) -> Trade:
+def trades(draw: st.DrawFn, event_key: EventKey, *, few_units: bool = False) -> Trade:
     base, quote = draw(st.permutations(UNIVERSE))[:2]
     side = draw(st.sampled_from([FillSide.BUY, FillSide.SELL]))
-    quantity = draw(amounts())
-    quote_quantity = draw(amounts())
+    quantity = draw(amounts(few_units=few_units))
+    quote_quantity = draw(amounts(few_units=few_units))
     received_asset, received = (base, quantity) if side is FillSide.BUY else (quote, quote_quantity)
     given_asset, given = (quote, quote_quantity) if side is FillSide.BUY else (base, quantity)
     thirds_cash = [asset for asset in CASH if asset not in (base, quote)]
@@ -147,23 +148,24 @@ def trades(draw: st.DrawFn, event_key: EventKey) -> Trade:
     if position == "received":
         fee, fee_asset = units_below(draw, received), received_asset
     elif position == "received rebate":
-        fee, fee_asset = draw(amounts()).copy_negate(), received_asset
+        fee, fee_asset = draw(amounts(few_units=few_units)).copy_negate(), received_asset
     elif position == "given":
-        fee, fee_asset = draw(amounts()), given_asset
+        fee, fee_asset = draw(amounts(few_units=few_units)), given_asset
     elif position == "given rebate":
         below = units_below(draw, given)
         fee, fee_asset = (None if below is None else below.copy_negate()), given_asset
     elif position == "third cash" and thirds_cash:
-        paid = draw(amounts(maximum=1000))
+        paid = draw(amounts(maximum=1000, few_units=few_units))
         rebate = draw(st.sampled_from([False, False, True]))
         fee, fee_asset = (
             (paid.copy_negate() if rebate else paid),
             draw(st.sampled_from(thirds_cash)),
         )
     elif position == "third non-cash" and thirds_non_cash:
-        fee, fee_asset = draw(amounts(maximum=1000)), draw(st.sampled_from(thirds_non_cash))
+        paid = draw(amounts(maximum=1000, few_units=few_units))
+        fee, fee_asset = paid, draw(st.sampled_from(thirds_non_cash))
     elif position == "third non-cash rebate" and thirds_non_cash:
-        rebated = draw(amounts(maximum=1000)).copy_negate()
+        rebated = draw(amounts(maximum=1000, few_units=few_units)).copy_negate()
         fee, fee_asset = rebated, draw(st.sampled_from(thirds_non_cash))
     elif position == "zero named":
         fee, fee_asset = Decimal(0), draw(st.sampled_from(UNIVERSE))
@@ -182,37 +184,47 @@ def trades(draw: st.DrawFn, event_key: EventKey) -> Trade:
 
 
 @st.composite
-def adjustments(draw: st.DrawFn, event_key: EventKey) -> Adjustment:
+def adjustments(draw: st.DrawFn, event_key: EventKey, *, few_units: bool = False) -> Adjustment:
     asset = draw(st.sampled_from(UNIVERSE))
-    unit_cost = draw(st.one_of(st.none(), st.just(Decimal(0)), amounts()))
-    return Adjustment(key=event_key, asset=asset, quantity=draw(amounts()), unit_cost=unit_cost)
+    unit_cost = draw(st.one_of(st.none(), st.just(Decimal(0)), amounts(few_units=few_units)))
+    quantity = draw(amounts(few_units=few_units))
+    return Adjustment(key=event_key, asset=asset, quantity=quantity, unit_cost=unit_cost)
 
 
 @st.composite
-def transfers(draw: st.DrawFn, event_key: EventKey) -> Transfer:
+def transfers(draw: st.DrawFn, event_key: EventKey, *, few_units: bool = False) -> Transfer:
     origin, destination = draw(st.permutations(LOCATIONS))[:2]
     return Transfer(
         key=event_key,
         asset=draw(st.sampled_from(UNIVERSE)),
-        quantity=draw(amounts()),
+        quantity=draw(amounts(few_units=few_units)),
         from_location=origin,
         to_location=destination,
     )
 
 
 @st.composite
-def events(draw: st.DrawFn, index: int) -> AccountingEvent:
+def events(draw: st.DrawFn, index: int, *, few_units: bool = False) -> AccountingEvent:
     event_key = draw(keys(index))
     kind = draw(st.sampled_from(["trade"] * 6 + ["adjustment", "transfer"]))
     if kind == "trade":
-        return draw(trades(event_key))
+        return draw(trades(event_key, few_units=few_units))
     if kind == "adjustment":
-        return draw(adjustments(event_key))
-    return draw(transfers(event_key))
+        return draw(adjustments(event_key, few_units=few_units))
+    return draw(transfers(event_key, few_units=few_units))
 
 
 @st.composite
-def histories(draw: st.DrawFn, *, min_size: int = 0, max_size: int = 16) -> list[AccountingEvent]:
-    """A list of valid events with distinct identities, in no particular order."""
+def histories(
+    draw: st.DrawFn, *, min_size: int = 0, max_size: int = 16, few_units: bool = False
+) -> list[AccountingEvent]:
+    """A list of valid events with distinct identities, in no particular order.
+
+    **`few_units=True` makes every amount 1 to 16 units at 18 places.** Among integers that
+    small, a proportional share is often an exact half-unit tie, and a tie on an odd number
+    of units is the one input where a complement taken by a second rounding differs from one
+    taken by subtraction. The mutation sweep showed that ordinary histories almost never
+    produce one: three such mutants survived every property test until this mode existed.
+    """
     size = draw(st.integers(min_value=min_size, max_value=max_size))
-    return [draw(events(index)) for index in range(size)]
+    return [draw(events(index, few_units=few_units)) for index in range(size)]
