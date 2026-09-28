@@ -152,11 +152,19 @@ host by itself:
    `attempts/` deleted, so the migration never leaves the host without a copy it had. If no
    attempt holds one, the deployment says so in one line of its log.
 
-If both `~/portfolio-app-deploy` and `~/portfolio-app` exist, the deployment refuses and
-changes nothing, so a person decides which one holds the live deployment. Anything of your
-own that refers to `~/portfolio-app-deploy`, such as a cron job or a script, needs the new
-path. The legacy application's `~/portfolio-deploy` is a different directory, and nothing
-here touches it.
+After the rename, the migration leaves a small **regular file** at `~/portfolio-app-deploy`
+saying where the root went. Leave it there. Every earlier version of `deploy.py` defaults to
+that path, and a re-run of an old delivery from the Actions UI would otherwise recreate an
+empty directory there and deploy into it, with no secrets and no rerun protection, leaving
+two roots behind. With the file in the way, the old script fails before it runs any docker
+command. The new one does not count a file as a root. If the file goes missing, any regular
+file at that path does the same job: `touch ~/portfolio-app-deploy`.
+
+If both `~/portfolio-app-deploy` and `~/portfolio-app` exist as directories, the deployment
+refuses and changes nothing, so a person decides which one holds the live deployment. A
+refusal after the rename says the root was migrated. Anything of your own that refers to
+`~/portfolio-app-deploy`, such as a cron job or a script, needs the new path. The legacy
+application's `~/portfolio-deploy` is a different directory, and nothing here touches it.
 
 ## One-time setup
 
@@ -268,7 +276,7 @@ not.
 | "must not be group or world readable" | `secrets.env` permissions were loosened |
 | "This workflow run is older than" | an old workflow run was re-run; push instead |
 | "The deployment host is busy" | a concurrent deployment holds the lock; it will retry |
-| "Both ... exist, so this host cannot be migrated safely" | the old and the new root both exist; keep the one holding the live deployment and move the other away |
+| "Both ... exist, so this host cannot be migrated safely" | the old and the new root are both directories, usually because the file the migration left at the old path was replaced by one; keep the directory holding the live deployment, move the other away, and put the file back (see the migration section) |
 | "The live deployment's compose file ... is missing" | `prod/compose.yml`, or the old layout's `attempts/<id>/compose.yml`, was deleted by hand; there is nothing to roll back to, so nothing was changed |
 | "running and healthy, but recording it failed" | the new version is live, but a file under `prod/` could not be written; the next deployment repairs the files |
 | Healthy container, stale behaviour | `secrets.env` changed but the container was restarted rather than recreated |

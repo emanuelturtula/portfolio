@@ -29,7 +29,10 @@ the new one with a single ``os.rename``, rolls back (if it must) to the compose 
 old manifest names, rebased onto the new root, and on success deletes ``attempts/``. If
 that deployment could not snapshot the live database, the newest attempt holding a copy
 becomes ``backup/`` first, so deleting ``attempts/`` never leaves the host without one it
-had. If both roots exist it refuses and changes nothing, so a person decides.
+had. A regular file, the tombstone, is left at the old path: every earlier deploy.py
+defaults to it, and fails on a file before running anything, where it would otherwise
+recreate an empty root and deploy into it. If both roots exist as directories it refuses
+and changes nothing, so a person decides.
 
 Safety properties, in the order they are enforced:
 
@@ -85,6 +88,17 @@ LEGACY_ATTEMPT = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}")
 # The lock directory can move at most once (the migration), so one retry is enough;
 # the third is margin.
 LOCK_ATTEMPTS = 3
+# Left as a regular file where the legacy root was. Every earlier deploy.py defaults to that
+# path and creates it with mkdir(exist_ok=True), which raises on a file before any docker
+# command runs; without it, re-running an old delivery would recreate an empty root there,
+# deploy into it, and leave two roots behind.
+TOMBSTONE = (
+    f"This directory moved to ~/{ROOT_NAME} (issue #94).\n"
+    "\n"
+    "This file stands in its place so that re-running an older delivery, whose deploy.py\n"
+    f"defaults to ~/{LEGACY_ROOT_NAME}, fails at once instead of deploying into an empty\n"
+    "directory here. Leave it where it is.\n"
+)
 
 Manifest = dict[str, Any]
 
@@ -139,6 +153,35 @@ def write_atomic(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     os.replace(temporary, path)
 
 
+def fsync_file(path: Path) -> None:
+    """Force a file's data to disk.
+
+    A new file renamed into a new name is not covered by ext4's rename heuristics, so its
+    data can reach the disk well after the unlinks of the older copies it replaces. Every
+    database copy is fsynced before an older one is removed.
+    """
+    descriptor = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_directory(path: Path) -> None:
+    """Force a directory's entries (a rename into it, a new file) to disk.
+
+    POSIX only: Windows cannot open a directory this way, and the tests that run there
+    do not depend on durability. Always called, so it can be observed on every platform.
+    """
+    if os.name != "posix":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def remove_tree(path: Path) -> None:
     if os.path.lexists(path):
         shutil.rmtree(path)
@@ -186,15 +229,28 @@ def both_roots_exist(root: Path, legacy_root: Path) -> DeploymentError:
     )
 
 
+def legacy_root_present(root: Path, legacy_root: Path | None) -> bool:
+    """Whether a legacy root still waits to be migrated.
+
+    Only a directory counts (a symlink to one included): the file a migration leaves at
+    that path is the tombstone, not a root.
+    """
+    return legacy_root is not None and legacy_root != root and os.path.isdir(legacy_root)
+
+
 def lock_directory(root: Path, legacy_root: Path | None) -> Path:
     """The directory whose ``deploy.lock`` serialises deployments right now.
 
     A host still on the legacy root is locked there, so the migration itself happens
     under the lock. Read-only: it creates, renames and runs nothing.
     """
-    if legacy_root is None or legacy_root == root or not os.path.lexists(legacy_root):
+    if not legacy_root_present(root, legacy_root):
         return root
+    assert legacy_root is not None
     if os.path.lexists(root):
+        # Looked again: a concurrent deployment may have migrated it between the checks.
+        if not legacy_root_present(root, legacy_root):
+            return root
         raise both_roots_exist(root, legacy_root)
     return legacy_root
 
@@ -239,17 +295,36 @@ def settle_root(root: Path, legacy_root: Path | None) -> Path:
 
     The migration is a single ``os.rename`` of the whole directory, which leaves the
     running container untouched: it mounts nothing from the root, and reads the secrets
-    file only when it is created. A process that waited on the legacy root's lock may
-    find another process migrated it in the meantime; it then renames nothing and carries
-    on in the new root, holding the same lock file.
+    file only when it is created. The tombstone then takes the old path. A process that
+    waited on the legacy root's lock may find another process migrated it in the
+    meantime; it then renames nothing and carries on in the new root, holding the same
+    lock file.
     """
-    if legacy_root is not None and legacy_root != root and os.path.lexists(legacy_root):
+    migrated = False
+    if legacy_root_present(root, legacy_root):
+        assert legacy_root is not None
         if os.path.lexists(root):
             raise both_roots_exist(root, legacy_root)
         os.rename(legacy_root, root)
+        fsync_directory(root.parent)
+        migrated = True
+        print(
+            f"Migrated the deployment root from {display(legacy_root)} to {display(root)}.",
+            file=sys.stderr,
+        )
     if not root.is_dir():
         raise DeploymentError(f"The deployment root {display(root)} is not a directory")
     root.chmod(0o700)
+    if (
+        legacy_root is not None
+        and legacy_root != root
+        and not os.path.lexists(legacy_root)
+        # Just migrated, or migrated by a run that stopped before it wrote the tombstone,
+        # which the legacy attempts/ still shows until a deployment succeeds.
+        and (migrated or any((root / env / "attempts").is_dir() for env in ENVIRONMENTS))
+    ):
+        write_atomic(legacy_root, TOMBSTONE.encode("utf-8"), mode=0o644)
+        fsync_directory(legacy_root.parent)
     return root
 
 
@@ -400,7 +475,8 @@ def legacy_compose_file(prod: Path, previous: Manifest) -> Path:
     ):
         raise DeploymentError(
             "The live deployment's manifest does not name a compose file this script can "
-            "locate, so there would be nothing to roll back to. Nothing was changed."
+            "locate, so there would be nothing to roll back to. The live deployment was not "
+            "touched."
         )
     return prod / "attempts" / attempt.name / "compose.yml"
 
@@ -421,7 +497,7 @@ def live_deployment(prod: Path) -> Live | None:
     if not compose_file.is_file():
         raise DeploymentError(
             f"The live deployment's compose file {display(compose_file)} is missing, so "
-            "there would be nothing to roll back to. Nothing was changed."
+            "there would be nothing to roll back to. The live deployment was not touched."
         )
     return Live(manifest, compose_file)
 
@@ -650,9 +726,18 @@ def deploy(
             try:
                 with deployment_lock(directory):
                     settle_root(root, legacy)
-                    return deploy_locked(
-                        environment, image, revision, version, run_number, source_run_url, root
-                    )
+                    try:
+                        return deploy_locked(
+                            environment, image, revision, version, run_number, source_run_url, root
+                        )
+                    except DeploymentError as error:
+                        if directory == root:
+                            raise
+                        # Locked in the legacy root, so it has been migrated, and stays so.
+                        raise DeploymentError(
+                            f"{error} The deployment root was migrated to {display(root)} "
+                            "first, and that stands."
+                        ) from error
             except RootMoved:
                 continue
         raise DeploymentError("The deployment root kept moving while waiting for its lock")
