@@ -17,7 +17,7 @@ dependencies = [
     "pydantic>=2",
     "pydantic-settings",
     "structlog",
-    "sqlalchemy[asyncio]>=2.0",
+    "sqlalchemy[asyncio]>=2.1.1",
     "aiosqlite",
     "alembic",
     # Already present transitively through Starlette, but the lifespan calls

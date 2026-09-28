@@ -152,7 +152,7 @@ async def stored_text(session: AsyncSession, *, symbol: str, currency: str) -> s
         ),
         {"symbol": symbol, "currency": currency},
     )
-    value = raw.scalar_one()
+    value: str = raw.scalar_one()
     assert isinstance(value, str), f"the amount column read back as {type(value).__name__}"
     return value
 
