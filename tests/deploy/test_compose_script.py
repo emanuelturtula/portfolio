@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from deploy_harness import (
     LEGACY_ATTEMPT_IDS,
@@ -167,7 +168,13 @@ class ComposeScriptWhileLiveTests(unittest.TestCase):
         self.script.mkdir()
         self.host.docker.fail_up.add(R3.image)
 
-        with self.assertRaises(deploy.DeploymentError) as caught:
+        # Home is the fake one, as on the host, where every path is under it. Without
+        # this, a temporary directory outside the real home (Linux's /tmp) is correctly
+        # printed in full, and the check below would be about the test machine instead.
+        with (
+            mock.patch.object(Path, "home", staticmethod(lambda: self.host.home)),
+            self.assertRaises(deploy.DeploymentError) as caught,
+        ):
             self.host.deploy(R3)
 
         self.assertIn("rollback=healthy", str(caught.exception))
@@ -175,6 +182,7 @@ class ComposeScriptWhileLiveTests(unittest.TestCase):
         said = [line for line in self.host.stderr[-1].splitlines() if "compose.sh" in line]
         self.assertEqual(len(said), 1, self.host.stderr[-1])
         self.assertNotIn(str(self.host.home), said[0])
+        self.assertNotIn(self.host.home.as_posix(), said[0])
 
     def test_a_live_manifest_that_does_not_validate_never_blocks_a_deployment(self) -> None:
         self.host.deploy(R1)
