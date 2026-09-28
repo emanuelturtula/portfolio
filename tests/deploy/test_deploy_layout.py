@@ -1107,6 +1107,56 @@ class InterruptedAttemptTests(HostTestCase):
             self.assertFalse((self.prod / leftover).exists(), leftover)
 
 
+class AttemptIdTests(HostTestCase):
+    """Attempt ids carry the time the carry-forward compares, so they never go backwards,
+    and a damaged record never stops a deployment.
+
+    A Raspberry Pi without an RTC battery can boot with its clock behind the last attempt
+    until NTP catches up, so a record from the future is the ordinary case here.
+    """
+
+    def rewrite_live_attempt(self, attempt: str) -> None:
+        current = self.host.current()
+        current["attempt"] = attempt
+        legacy_write_json(self.prod / "current.json", current)
+
+    def test_an_id_is_never_earlier_than_the_latest_the_host_records(self) -> None:
+        self.host.deploy(R1)
+        self.rewrite_live_attempt("20990101T000000000000Z-0123456789ab")
+
+        self.host.deploy(R2)
+
+        attempt = self.host.current()["attempt"]
+        self.assertEqual(attempt[:22], "20990101T000000000001Z", attempt)
+
+    def test_ids_are_ordered_to_the_microsecond(self) -> None:
+        self.host.deploy(R1)
+        first = deploy.attempt_time(self.host.current()["attempt"])
+        self.host.deploy(R2)
+        second = deploy.attempt_time(self.host.current()["attempt"])
+        self.assertIsNotNone(first)
+        self.assertGreater(second, first)
+        self.assertRegex(self.host.current()["attempt"], r"^[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}$")
+
+    def test_a_damaged_attempt_id_never_stops_a_deployment(self) -> None:
+        self.host.deploy(R1)
+        self.rewrite_live_attempt("20261399T999999Z-0123456789ab")  # the shape, no real time
+
+        self.host.deploy(R2)
+
+        self.assertEqual(self.host.current()["image"], R2.image)
+        self.assertIsNone(deploy.attempt_time("20261399T999999Z-0123456789ab"))
+
+    def test_a_record_from_the_end_of_time_never_stops_a_deployment(self) -> None:
+        self.host.deploy(R1)
+        self.rewrite_live_attempt("99991231T235959999999Z-0123456789ab")
+
+        self.host.deploy(R2)
+
+        self.assertEqual(self.host.current()["image"], R2.image)
+        self.assertIsNotNone(deploy.attempt_time(self.host.current()["attempt"]))
+
+
 class OneBackupTests(HostTestCase):
     def test_exactly_one_database_copy_after_two_successes(self) -> None:
         self.host.deploy(R1)
