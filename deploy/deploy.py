@@ -511,6 +511,10 @@ def seed_backup_from_attempts(prod: Path, backup_new: Path) -> bool:
     Used only when this deployment took no snapshot and ``backup/`` holds no database,
     just before ``attempts/`` is deleted. Without it, a migrating deployment whose previous
     container was unhealthy would delete every database copy on the host.
+
+    The database is copied, not moved: it may be the only copy on the host, and a crash
+    before ``backup.new/`` is swapped in leaves a directory the next deployment discards as
+    incomplete. The original stays in ``attempts/`` until the swap is done.
     """
     source = legacy_attempt_with_database(prod)
     if source is None:
@@ -521,7 +525,7 @@ def seed_backup_from_attempts(prod: Path, backup_new: Path) -> bool:
     manifest = legacy_attempt_manifest(source)
     if manifest is not None:
         write_atomic(backup_new / "current.json", manifest)
-    os.rename(source / "database.sqlite3", backup_new / "database.sqlite3")
+    shutil.copyfile(source / "database.sqlite3", backup_new / "database.sqlite3")
     return True
 
 
