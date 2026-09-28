@@ -150,6 +150,28 @@ name = portfolio domain is pure
 # top-level names are accepted (`os`, never `os.path`); import-linter refuses a submodule of
 # an external package with a configuration error rather than ignoring it.
 #
+# **The second twelve, from `zoneinfo` on, were added at review**, and each is here for the
+# same two reasons as the first sixteen:
+#
+# * `zoneinfo` reads the host's time-zone database from disk, and its answer for one instant
+#   changes with the tzdata release installed. An event key is UTC and needs neither.
+# * `tempfile`, `shutil` and `glob` are the filesystem, by other names than `os` and
+#   `pathlib`.
+# * `multiprocessing` and `concurrent` run work in other processes and threads, where the
+#   order things finish in is the scheduler's rather than the input's.
+# * `ctypes` calls native code, which can do anything at all.
+# * `signal`, `select` and `selectors` are the operating system's signals and I/O waits.
+# * `platform` describes the host it runs on, so an answer built on it differs by machine.
+# * `locale` is process-wide state that changes how numbers format and strings collate, so a
+#   result built on it differs by the host's settings rather than by the events.
+#
+# Planted together in a shadow domain module, `from concurrent import futures` included, all
+# twelve were reported BROKEN by their top-level names, as the first batch was. Criterion 1
+# of spec 019 lists all thirty-three. Builtins that do I/O without any import -- `open`,
+# `print`, `input` -- and an argument-less `astimezone()`, which reads the host's zone, are
+# beyond what an import contract can see; they are for the AST test in `tests/security/` to
+# forbid, beside the clock calls.
+#
 # **Vacuous per module until something imports it**, and that is inherent rather than a
 # gap: import-linter checks only the forbidden modules that are in the graph, and an
 # external module enters the graph when any application module imports it. `socket` is in
@@ -196,3 +218,15 @@ forbidden_modules =
     secrets
     uuid
     logging
+    zoneinfo
+    tempfile
+    shutil
+    glob
+    multiprocessing
+    concurrent
+    ctypes
+    signal
+    select
+    selectors
+    platform
+    locale
