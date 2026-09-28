@@ -101,7 +101,9 @@ def measure(report: object) -> DomainCoverage:
     if matched == 0:
         raise UnusableReportError(f"no file under {DOMAIN_PATH} is in the report")
     if totals["num_statements"] == 0 or totals["num_branches"] == 0:
-        raise UnusableReportError(f"the files under {DOMAIN_PATH} have no statements or no branches")
+        raise UnusableReportError(
+            f"the files under {DOMAIN_PATH} have no statements or no branches"
+        )
     return DomainCoverage(
         files=matched,
         covered_lines=totals["covered_lines"],
