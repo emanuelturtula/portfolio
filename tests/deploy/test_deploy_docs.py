@@ -132,6 +132,30 @@ class OperatorDocsTests(unittest.TestCase):
         definition = next(p for p in paragraphs if "`<deploy-root>`" in p)
         self.assertIn(f"`{LIVE}`", definition)
 
+    def test_no_ui_string_or_api_text_tells_an_operator_to_run_docker_compose(self) -> None:
+        # The exchanges page tells the owner how to apply a new key. It is read at the
+        # moment something is broken, so its command has to be the one that works.
+        sources = [
+            *(REPO_ROOT / "frontend" / "src").rglob("*.ts"),
+            *(REPO_ROOT / "frontend" / "src").rglob("*.tsx"),
+            *(REPO_ROOT / "backend" / "src").rglob("*.py"),
+            REPO_ROOT / "README.md",
+        ]
+        sources = [path for path in sources if ".test." not in path.name and path.is_file()]
+        self.assertGreater(len(sources), 20, "the scan found almost nothing to scan")
+        offenders = [
+            f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
+            for path in sources
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if DOCKER_COMPOSE.search(line)
+        ]
+        self.assertEqual(offenders, [])
+
+    def test_the_exchanges_page_gives_the_live_recreate_command(self) -> None:
+        page = REPO_ROOT / "frontend" / "src" / "pages" / "exchanges" / "ExchangeList.tsx"
+        recreate = f"<code>{LIVE}/compose.sh up -d --force-recreate app</code>"
+        self.assertIn(recreate, page.read_text(encoding="utf-8"))
+
     def test_the_deploy_py_docstring_describes_the_layout(self) -> None:
         doc = deploy.__doc__ or ""
         for name in ("~/portfolio-app/", "compose.sh", "backup/", "failed/", "last-attempt.json"):

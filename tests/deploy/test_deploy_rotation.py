@@ -103,8 +103,76 @@ class AtomicWriteTests(unittest.TestCase):
             self.assertEqual(chmods.get(temporary), expected, final)
 
 
+class InterruptedBackupSwapTests(unittest.TestCase):
+    """What the next deployment makes of a backup swap a crash interrupted.
+
+    ``backup.new/`` is complete exactly when it holds ``database.sqlite3``, which is moved
+    in last. A complete one holds the newest database copy on the host, so it is promoted;
+    an incomplete one is discarded, and a backup moved aside is put back. Each deployment
+    here cannot snapshot -- the live container is unhealthy -- so what it keeps is what
+    the crash left, not a fresh copy that would hide a lost one.
+    """
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.host = Host(Path(temp.name))
+        self.host.deploy(R1)
+        self.host.deploy(R2)
+        self.prod = self.host.prod
+        self.backup = tree(self.prod / "backup")
+        self.newer = {
+            "compose.yml": R2.compose,
+            "current.json": (self.prod / "current.json").read_bytes(),
+            "database.sqlite3": b"the newer snapshot a crashed deployment took\n",
+        }
+
+    def leave(self, name: str, files: dict[str, bytes]) -> None:
+        directory = self.prod / name
+        directory.mkdir()
+        for file, data in files.items():
+            (directory / file).write_bytes(data)
+
+    def deploy_without_a_snapshot(self) -> dict[str, bytes]:
+        docker = self.host.docker
+        docker.containers[docker.running or ""].health = "unhealthy"
+        self.host.deploy(R3)
+        self.assertEqual(self.host.current()["image"], R3.image)
+        self.assertIs(self.host.current()["backup"], False, "the premise: no snapshot")
+        for leftover in ("backup.new", "backup.old"):
+            self.assertFalse((self.prod / leftover).exists(), leftover)
+        self.assertEqual(len(self.host.sqlite_files()), 1)
+        return tree(self.prod / "backup")
+
+    def test_a_complete_backup_new_beside_the_backup_is_promoted(self) -> None:
+        self.leave("backup.new", self.newer)
+        self.assertEqual(self.deploy_without_a_snapshot(), self.newer)
+
+    def test_a_complete_backup_new_after_the_backup_moved_aside_is_promoted(self) -> None:
+        (self.prod / "backup").rename(self.prod / "backup.old")
+        self.leave("backup.new", self.newer)
+        self.assertEqual(self.deploy_without_a_snapshot(), self.newer)
+
+    def test_an_incomplete_backup_new_is_discarded(self) -> None:
+        self.leave("backup.new", {k: v for k, v in self.newer.items() if k != "database.sqlite3"})
+        self.assertEqual(self.deploy_without_a_snapshot(), self.backup)
+
+    def test_an_incomplete_backup_new_after_the_backup_moved_aside_restores_it(self) -> None:
+        (self.prod / "backup").rename(self.prod / "backup.old")
+        self.leave("backup.new", {"compose.yml": R2.compose})
+        self.assertEqual(self.deploy_without_a_snapshot(), self.backup)
+
+    def test_a_backup_left_aside_after_the_swap_completed_is_removed(self) -> None:
+        self.leave("backup.old", {"database.sqlite3": b"the generation before\n"})
+        self.assertEqual(self.deploy_without_a_snapshot(), self.backup)
+
+
 class CrashSweep(unittest.TestCase):
     """Kill a deployment before each of its filesystem steps in turn."""
+
+    # Whether the deployment after the crash finds the running container unable to give
+    # a snapshot. See CrashThenNoSnapshotSweep.
+    RECOVER_WITHOUT_SNAPSHOT = False
 
     def sweep(
         self,
@@ -114,6 +182,7 @@ class CrashSweep(unittest.TestCase):
         *,
         fails: bool = False,
         copies: tuple[int, ...] = (1,),
+        newest: bool = False,
     ) -> int:
         k = 0
         while True:
@@ -134,7 +203,9 @@ class CrashSweep(unittest.TestCase):
                         self.assertTrue(fails, "only the failing sweep may fail cleanly")
                     if tap.crashed:
                         check_crashed(host, before)
-                        self.check_next_deployment_recovers(host, copies)
+                        self.check_databases_are_whole(host, before)
+                        self.check_next_deployment_recovers(host, copies, newest=newest)
+                        self.check_databases_are_whole(host, before)
                 if not tap.crashed:
                     self.assertGreater(k, 10, "the tap saw too few steps to mean anything")
                     return k
@@ -156,7 +227,14 @@ class CrashSweep(unittest.TestCase):
             else None,
             "database": host.docker.database,
             "running": host.docker.running_image,
+            "databases": {path.read_bytes() for path in host.sqlite_files()},
         }
+
+    def check_databases_are_whole(self, host: Host, before: dict[str, Any]) -> None:
+        """Every database copy on the host is one that was taken whole: never a torn one."""
+        known = before["databases"] | set(host.docker.snapshots)
+        for path in host.sqlite_files():
+            self.assertIn(path.read_bytes(), known, f"{path.name} in {path.parent.name} is torn")
 
     def live_prod(self, host: Host) -> Path:
         exists = [path for path in (host.root, host.legacy) if path.exists()]
@@ -170,10 +248,19 @@ class CrashSweep(unittest.TestCase):
         self.assertEqual((prod / "secrets.env").read_bytes(), SENTINEL_SECRET)
         return prod
 
-    def check_next_deployment_recovers(self, host: Host, copies: tuple[int, ...]) -> None:
+    def check_next_deployment_recovers(
+        self, host: Host, copies: tuple[int, ...], *, newest: bool = False
+    ) -> None:
         release = host.next_release
         assert release is not None
+        crashed_prod = self.live_prod(host)
+        left_new = tree(crashed_prod / "backup.new").get("database.sqlite3")
+        left_backup = tree(crashed_prod / "backup").get("database.sqlite3")
+        left_old = tree(crashed_prod / "backup.old").get("database.sqlite3")
+        snapshots = len(host.docker.snapshots)
         host.docker.fail_up.clear()
+        if self.RECOVER_WITHOUT_SNAPSHOT and host.docker.running is not None:
+            host.docker.containers[host.docker.running].health = "unhealthy"
         host.deploy(release)
         prod = host.prod
         self.assertFalse(host.legacy.exists())
@@ -190,6 +277,21 @@ class CrashSweep(unittest.TestCase):
         self.assertIn(len(host.sqlite_files()), copies, "database copies after recovering")
         for path in host.home.rglob("*.json"):
             json.loads(path.read_bytes())
+        if newest:
+            # backup/ ends up with the newest database copy the host had: this deployment's
+            # snapshot, else a complete backup.new the crash left (its snapshot is moved in
+            # last), else the backup the crash left in place or aside.
+            if len(host.docker.snapshots) > snapshots:
+                expected = host.docker.snapshots[-1]
+            elif left_new is not None:
+                expected = left_new
+            else:
+                expected = left_backup if left_backup is not None else left_old
+            self.assertEqual(
+                tree(prod / "backup").get("database.sqlite3"),
+                expected,
+                "the recovered backup is not the newest copy the crash left",
+            )
 
     # -- a deployment on the new layout ---------------------------------------------------
 
@@ -234,7 +336,7 @@ class CrashSweep(unittest.TestCase):
                 self.assertTrue(promoted)
             self.assertGreaterEqual(len(host.sqlite_files()), 1, "a crash never costs the backup")
 
-        steps = self.sweep(prepare, R3, check)
+        steps = self.sweep(prepare, R3, check, newest=True)
         self.assertGreaterEqual(steps, 12)
 
     # -- the first deployment on a host --------------------------------------------------
@@ -332,7 +434,19 @@ class CrashSweep(unittest.TestCase):
             if (prod / "failed").exists():
                 self.assertEqual(set(tree(prod / "failed")), EVIDENCE, "failed/ is never partial")
 
-        self.sweep(prepare, R3, check, fails=True)
+        self.sweep(prepare, R3, check, fails=True, newest=True)
+
+
+class CrashThenNoSnapshotSweep(CrashSweep):
+    """Every sweep again, with a recovery deployment that cannot take a snapshot.
+
+    A crash is rarely alone: the container it leaves running may be the reason the
+    deployment after it is needed, and then that deployment has nothing to back up. It
+    must still find, in whatever the crash left, the copy it is not allowed to lose --
+    a complete backup.new included.
+    """
+
+    RECOVER_WITHOUT_SNAPSHOT = True
 
 
 if __name__ == "__main__":

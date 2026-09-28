@@ -570,6 +570,8 @@ SHUTIL_MUTATIONS = (
     "copymode",
     "copystat",
 )
+# A copy is not atomic: a crash during one leaves a partial destination file.
+TORN_BY_A_CRASH = ("shutil.copyfile", "shutil.copy", "shutil.copy2")
 PATH_MUTATIONS = (
     "mkdir",
     "rename",
@@ -598,7 +600,8 @@ class FilesystemTap:
     It intercepts ``os``, ``shutil`` and ``open`` as deploy.py's own globals, and the
     mutating ``Path`` methods, so a mutation reached any of those ways is a numbered step.
     Once it has crashed, every later step crashes too: a dead process changes nothing, so
-    no ``finally`` in deploy.py gets to tidy up on its behalf.
+    no ``finally`` in deploy.py gets to tidy up on its behalf. A crash at a copy leaves half
+    the data at the destination, because that is what a copy cut short leaves.
     """
 
     crash_at: int | None = None
@@ -615,7 +618,17 @@ class FilesystemTap:
 
     def _wrap(self, name: str, function: Callable[..., Any]) -> Callable[..., Any]:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            self.step(name, args)
+            alive = not self.crashed
+            try:
+                self.step(name, args)
+            except Crash:
+                if alive and name in TORN_BY_A_CRASH:
+                    # Killed part-way through a copy: the destination holds half the data
+                    # under whatever name the caller chose for it.
+                    data = Path(args[0]).read_bytes()
+                    with builtins.open(args[1], "wb") as partial:
+                        partial.write(data[: len(data) // 2])
+                raise
             return function(*args, **kwargs)
 
         return wrapper
