@@ -162,10 +162,15 @@ name = portfolio domain is pure
 # calls with an AST test instead. `hashlib` is deliberately absent too: SHA-256 is a pure
 # function, and the accounting fingerprint is built on it.
 #
-# **Deliberately without `allow_indirect_imports`**, so a chain `domain.a -> domain.b ->
-# socket` is reported from `domain.a` as well as from `domain.b`. Every module in such a
-# chain is a source module, so the flag would hide nothing today; its absence means nothing
-# is hidden tomorrow either.
+# **Deliberately without `allow_indirect_imports`**, and what that does and does not buy
+# was measured rather than assumed. The source is the whole `portfolio.domain` package, so
+# imports between domain modules collapse into one node: in a chain `domain.a -> domain.b
+# -> socket` only `domain.b -> socket` is reported, with the flag or without it. The flag
+# matters for a chain that *leaves* the package. With a planted `domain.caller ->
+# portfolio.outside -> socket`, this contract reports the whole chain as it stands, and
+# with the flag added it is KEPT. `domain` importing the application at all is the layers
+# contract's to refuse, but a module that sits in no layer is one that contract does not
+# constrain, and this one still sees through it.
 type = forbidden
 source_modules =
     portfolio.domain
