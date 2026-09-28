@@ -152,14 +152,20 @@ class Trade:
         if self.fee_asset is None:
             message = "Trade.fee_asset must name an asset when Trade.fee_amount is not zero"
             raise ValueError(message)
+        # At `AMOUNT_SCALE`, as replay carries them: exact, since each amount passed the rule
+        # above, and it keeps the sum's integers as small as the values rather than as wide
+        # as a caller's spelling -- `1` followed by a point and ten thousand zeros is one.
+        fee = quantize(self.fee_amount, AMOUNT_SCALE)
+        received = quantize(self.received_quantity, AMOUNT_SCALE)
+        given = quantize(self.given_quantity, AMOUNT_SCALE)
         if self.fee_asset == self.received_asset:
-            if subtract(self.received_quantity, self.fee_amount) <= 0:
+            if subtract(received, fee) <= 0:
                 message = (
                     "Trade.fee_amount, paid in the asset received, must leave a quantity "
                     "received greater than zero"
                 )
                 raise ValueError(message)
-        elif self.fee_asset == self.given_asset and add(self.given_quantity, self.fee_amount) <= 0:
+        elif self.fee_asset == self.given_asset and add(given, fee) <= 0:
             message = (
                 "Trade.fee_amount, rebated in the asset given, must leave a quantity given "
                 "greater than zero"
