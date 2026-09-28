@@ -39,6 +39,7 @@ fail is a guard nobody knows the state of.
 
 from __future__ import annotations
 
+import ast
 import configparser
 import os
 import shutil
@@ -389,7 +390,7 @@ def test_the_relaxed_configuration_still_catches_a_direct_import(tmp_path: Path)
     assert "BROKEN" in output, output
 
 
-def test_the_file_holds_exactly_these_five_contracts() -> None:
+def test_the_file_holds_exactly_these_six_contracts() -> None:
     """The contract set, pinned against a literal, so a deletion is a red test.
 
     Exact rather than `>=`, for the reason `APPLICATION_TABLES` in `tests/db/` gives: a
@@ -397,7 +398,7 @@ def test_the_file_holds_exactly_these_five_contracts() -> None:
     loss is the thing worth knowing about. `PRICES_CONTRACT_ID` appears here as the literal
     string as well as through the constant, because the constant is also what `--contract`
     is given above -- if the two ever disagreed, every subprocess run in this module would
-    fail with a usage error rather than a verdict.
+    fail with a usage error rather than a verdict. Six since #17 added `domain-is-pure`.
     """
     parser = configuration()
 
@@ -413,10 +414,14 @@ def test_the_file_holds_exactly_these_five_contracts() -> None:
         "framework-free-services",
         "prices-are-never-fetched-in-a-request",
         "api-never-reaches-an-exchange-provider",
+        "domain-is-pure",
     }
     assert PRICES_CONTRACT_ID in contracts
     assert EXCHANGES_CONTRACT_ID in contracts
+    assert DOMAIN_CONTRACT_ID in contracts
     assert parser.get("importlinter", "root_package") == "portfolio"
+    # What lets a forbidden contract name `socket` or `sqlalchemy` at all.
+    assert parser.getboolean("importlinter", "include_external_packages") is True
 
 
 # --------------------------------------------------------------------------------------
@@ -601,4 +606,194 @@ def test_allowing_indirect_imports_would_hide_the_exchange_chain(tmp_path: Path)
     code, output = run_exchange_contract(tmp_path, relaxed)
 
     assert code == 0, output
+    assert "KEPT" in output, output
+
+
+# --------------------------------------------------------------------------------------
+# #17 criterion 1: `portfolio.domain` is pure, proven able to fail
+# --------------------------------------------------------------------------------------
+#
+# The same two halves again. The subject differs in one way that matters: most forbidden
+# modules are the **standard library** (`socket`, `os`, `time`, ...), which `import-linter`
+# sees only because `include_external_packages = True` makes grimp add each top-level
+# package an application module imports as a node. It checks only forbidden modules that
+# are in the graph, so a stdlib name nothing imports is skipped without a word -- which is
+# why the planted violation, not the contract's presence, is the evidence.
+
+#: The section header of #17's contract, and the identifier `--contract` takes.
+DOMAIN_CONTRACT_ID: Final = "domain-is-pure"
+DOMAIN_CONTRACT_SECTION: Final = f"importlinter:contract:{DOMAIN_CONTRACT_ID}"
+DOMAIN_MODULE: Final = "portfolio.domain"
+
+#: Spec 019, criterion 1, in the spec's order: the frameworks and clients, then the stdlib
+#: modules that do I/O or introduce nondeterminism. Pinned as a literal, so dropping one is
+#: a red test rather than a contract that forbids a little less than it did.
+DOMAIN_FORBIDDEN: Final = [
+    "sqlalchemy",
+    "httpx",
+    "fastapi",
+    "starlette",
+    "pydantic",
+    "os",
+    "io",
+    "pathlib",
+    "socket",
+    "ssl",
+    "subprocess",
+    "urllib",
+    "http",
+    "sqlite3",
+    "asyncio",
+    "threading",
+    "time",
+    "random",
+    "secrets",
+    "uuid",
+    "logging",
+]
+
+
+def plant_domain_shadow(root: Path, body: str, *, via: str | None = None) -> None:
+    """A throwaway `portfolio` whose `domain.accounting.leaky` module holds `body`.
+
+    `via`, when given, names a second domain module that imports `leaky`, so the violation
+    is one hop away from it.
+    """
+    for package in ("portfolio", "portfolio/domain", "portfolio/domain/accounting"):
+        directory = root / package
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "__init__.py").write_text("", encoding="utf-8")
+    (root / "portfolio/domain/accounting/leaky.py").write_text(body, encoding="utf-8")
+    if via is not None:
+        (root / f"portfolio/domain/{via}.py").write_text(
+            import_line("portfolio.domain.accounting.leaky"), encoding="utf-8"
+        )
+
+
+def run_domain_contract(package_root: Path) -> tuple[int, str]:
+    result = run_lint_imports(
+        package_root=package_root,
+        config=IMPORT_LINTER_CONFIG,
+        contracts=(DOMAIN_CONTRACT_ID,),
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+def test_the_domain_contract_forbids_exactly_the_spec_list() -> None:
+    """Forbidden, `portfolio.domain` as the source, the 21 modules of criterion 1 in order."""
+    parser = configuration()
+
+    assert parser.has_section(DOMAIN_CONTRACT_SECTION)
+    assert parser.get(DOMAIN_CONTRACT_SECTION, "type") == "forbidden"
+    assert module_list(parser, DOMAIN_CONTRACT_SECTION, "source_modules") == [DOMAIN_MODULE]
+    assert module_list(parser, DOMAIN_CONTRACT_SECTION, "forbidden_modules") == DOMAIN_FORBIDDEN
+    assert not parser.has_option(DOMAIN_CONTRACT_SECTION, "allow_indirect_imports")
+    assert parser.get(DOMAIN_CONTRACT_SECTION, "name").strip() != ""
+
+
+def test_the_domain_contract_does_not_forbid_what_the_domain_needs() -> None:
+    """`datetime` for an event's key, `hashlib` for the fingerprint, `decimal` for money.
+
+    The clock is a call, not an import, and `tests/security/test_domain_has_no_clock.py`
+    forbids it; forbidding `datetime` here would forbid the key along with it.
+    """
+    parser = configuration()
+    forbidden = module_list(parser, DOMAIN_CONTRACT_SECTION, "forbidden_modules")
+
+    assert not {"datetime", "hashlib", "decimal", "json", "fractions"} & set(forbidden)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("import socket\n\n__all__ = ['socket']\n", id="stdlib socket"),
+        pytest.param("import sqlalchemy\n\n__all__ = ['sqlalchemy']\n", id="external sqlalchemy"),
+        pytest.param("import time\n\n__all__ = ['time']\n", id="stdlib time"),
+        pytest.param("from urllib import parse\n\n__all__ = ['parse']\n", id="stdlib submodule"),
+        pytest.param("import logging\n\n__all__ = ['logging']\n", id="stdlib logging"),
+    ],
+)
+def test_the_shipped_domain_contract_reports_a_planted_violation(tmp_path: Path, body: str) -> None:
+    """The real `.importlinter`, unmodified, against a domain module that imports I/O.
+
+    Both halves of the forbidden list are planted: standard-library modules and an external
+    package. `urllib.parse` shows a submodule import is reported by its top-level name, and
+    `logging` that the name resolves to the standard library, not to `portfolio.logging`.
+    """
+    plant_domain_shadow(tmp_path, body)
+
+    code, output = run_domain_contract(tmp_path)
+
+    assert code != 0, f"the domain contract accepted a planted import:\n{output}"
+    assert "BROKEN" in output, output
+    assert "portfolio.domain.accounting.leaky" in output, output
+
+
+def test_a_pure_domain_passes_the_same_contract(tmp_path: Path) -> None:
+    """The control: the same shadow and invocation, importing only what the domain may.
+
+    If a planted package broke the contract by itself -- a `PYTHONPATH` reaching the real
+    package, a config path typo, a tree `import-linter` cannot walk -- this goes red first.
+    """
+    body = (
+        "import datetime\nimport decimal\nimport hashlib\nimport json\n\n"
+        "__all__ = ['datetime', 'decimal', 'hashlib', 'json']\n"
+    )
+    plant_domain_shadow(tmp_path, body, via="caller")
+
+    code, output = run_domain_contract(tmp_path)
+
+    assert code == 0, f"a pure domain was reported:\n{output}"
+    assert "KEPT" in output, output
+
+
+def test_the_real_domain_imports_none_of_the_forbidden_modules() -> None:
+    """A direct AST read of the real package, independent of `import-linter`'s graph.
+
+    The contract runs over the real tree in the gate; this says the same thing from the
+    source text, so a `lint-imports` step that stopped running would not be the only thing
+    standing between the domain and an `import os`.
+    """
+    source_root = BACKEND_ROOT / "src" / "portfolio" / "domain"
+    modules = sorted(source_root.rglob("*.py"))
+    found: list[str] = []
+    for path in modules:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names, line = [alias.name for alias in node.names], node.lineno
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names, line = [node.module], node.lineno
+            else:
+                continue
+            found.extend(
+                f"{path.relative_to(source_root)}:{line} {name}"
+                for name in names
+                if name.split(".")[0] in DOMAIN_FORBIDDEN
+            )
+
+    assert any(path.parts[-2:] == ("accounting", "replay.py") for path in modules)
+    assert found == []
+
+
+def test_the_verdict_comes_from_the_forbidden_list(tmp_path: Path) -> None:
+    """The discriminator: the same plant against a config with `socket` struck from the list.
+
+    It is kept. So the red verdict above is caused by the list naming `socket`, and not by
+    anything else about the shadow tree or the invocation; and a list that lost an entry
+    would lose exactly that protection, which is why the list is pinned as a literal.
+    """
+    lines = IMPORT_LINTER_CONFIG.read_text(encoding="utf-8").splitlines()
+    header = lines.index(f"[{DOMAIN_CONTRACT_SECTION}]")
+    socket_line = lines.index("    socket", header)
+    relaxed = tmp_path / "relaxed.importlinter"
+    relaxed.write_text("\n".join(lines[:socket_line] + lines[socket_line + 1 :]) + "\n", "utf-8")
+    plant_domain_shadow(tmp_path, "import socket\n\n__all__ = ['socket']\n")
+
+    result = run_lint_imports(
+        package_root=tmp_path, config=relaxed, contracts=(DOMAIN_CONTRACT_ID,)
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 0, output
     assert "KEPT" in output, output

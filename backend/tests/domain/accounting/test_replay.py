@@ -926,3 +926,51 @@ def test_replay_inside_a_hostile_decimal_context_is_unchanged() -> None:
     assert [str(found.cost_basis) for found in inside.positions] == [
         str(found.cost_basis) for found in outside.positions
     ]
+
+
+# --------------------------------------------------------------------------------------
+# What replay refuses, and what its result offers
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        pytest.param(None, id="None"),
+        pytest.param("trade", id="a str"),
+        pytest.param(key(10, "e1"), id="a bare key"),
+        pytest.param({"kind": "trade"}, id="a dict"),
+    ],
+)
+def test_an_item_that_is_not_an_event_is_a_type_error(item: object) -> None:
+    """A caller's defect, refused before anything is computed from the rest."""
+    with pytest.raises(TypeError):
+        replay([buy(key(10, "e1"), "BTC", "USDT", "1", "30000"), item], CONFIG)  # type: ignore[list-item]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(frozenset({"USDT"}), id="a bare frozenset"),
+        pytest.param(None, id="None"),
+    ],
+)
+def test_a_config_that_is_not_an_accounting_config_is_a_type_error(config: object) -> None:
+    with pytest.raises(TypeError):
+        replay([], config)  # type: ignore[arg-type]
+
+
+def test_the_default_config_is_usdc_and_usdt() -> None:
+    events = [buy(key(10, "e1"), "USDC", "USDT", "100", "100", "0.1", "USDT")]
+
+    assert replay(events) == replay(events, AccountingConfig(frozenset({"USDC", "USDT"})))
+
+
+def test_a_position_offers_its_known_quantity() -> None:
+    """`known_quantity` is `quantity - unknown_basis_quantity`, the `Qk` the average divides by."""
+    result = run(
+        adjust(key(9, "m1", "manual"), "BTC", "2", None),
+        buy(key(10, "e1"), "BTC", "USDT", "0.5", "15000"),
+    )
+
+    assert position(result, "BTC").known_quantity == Decimal("0.5")
