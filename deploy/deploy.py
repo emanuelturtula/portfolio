@@ -506,13 +506,21 @@ def live_deployment(prod: Path) -> Live | None:
     return Live(manifest, compose_file)
 
 
-def compose_script(manifest: Manifest) -> str:
+# The compose file compose.sh may name, relative to the environment directory: the live
+# one, or a legacy attempt's while a migrated host's live deployment still runs from it.
+SCRIPT_COMPOSE_FILE = re.compile(rf"compose\.yml|attempts/{LEGACY_ATTEMPT.pattern}/compose\.yml")
+
+
+def compose_script(manifest: Manifest, compose_file: str = "compose.yml") -> str:
     """The text of ``compose.sh``: docker compose against the live deployment.
 
     It embeds only values ``validate()`` accepted -- a digest, a port and an environment
-    name from ``ENVIRONMENTS`` -- and checks them again here, because a value that could
-    carry a quote would turn this file into a shell injection. It holds no secret, and
-    its paths are relative to the script, so renaming the root does not break it.
+    name from ``ENVIRONMENTS`` -- plus ``compose_file``, the live compose file relative to
+    the script, which must be ``compose.yml`` or a legacy attempt's. It checks them all
+    again here, because a value that could carry a quote would turn this file into a
+    shell injection. It holds no secret. It finds its own directory through any symlink
+    and ignoring ``CDPATH``, and names everything relative to it, so renaming the root
+    does not break it.
     """
     image = manifest["image"]
     environment = manifest["environment"]
@@ -521,6 +529,7 @@ def compose_script(manifest: Manifest) -> str:
         IMAGE.fullmatch(image)
         and re.fullmatch(r"[a-z]+", environment)
         and re.fullmatch(r"[0-9]+", port)
+        and SCRIPT_COMPOSE_FILE.fullmatch(compose_file)
     ):
         raise DeploymentError("Refusing to write compose.sh from an unvalidated manifest")
     return (
@@ -530,14 +539,39 @@ def compose_script(manifest: Manifest) -> str:
         "#   ./compose.sh ps\n"
         "#   ./compose.sh exec app python -m portfolio create-user --username <name>\n"
         "set -eu\n"
-        'cd "$(dirname "$0")"\n'
+        'CDPATH= cd -- "$(dirname -- "$(readlink -f -- "$0")")"\n'
         f"export PORTFOLIO_IMAGE='{image}'\n"
         f"export PORTFOLIO_PORT='{port}'\n"
         f"export PORTFOLIO_ENVIRONMENT='{environment}'\n"
         'export PORTFOLIO_SECRETS_ENV_FILE="$PWD/secrets.env"\n'
         f"exec docker compose --project-name {PROJECT_PREFIX}-{environment} "
-        '--file "$PWD/compose.yml" "$@"\n'
+        f'--file "$PWD/{compose_file}" "$@"\n'
     )
+
+
+def write_live_compose_script(prod: Path, live: Live) -> None:
+    """Make ``compose.sh`` address the live deployment, before anything can refuse.
+
+    Rotation rewrites it after every success, but a host whose live deployment has none
+    -- one just migrated from the attempts/ layout, or one a crash left mid-rotation --
+    would otherwise have no working ``compose.sh`` until a deployment succeeds, and a
+    failed deployment would leave it that way. It is rewritten only if missing or
+    different. A live manifest that does not validate is reported and skipped: this must
+    never be what stops a deployment.
+    """
+    try:
+        script = compose_script(live.manifest, live.compose_file.relative_to(prod).as_posix())
+    except (DeploymentError, KeyError, TypeError, ValueError):
+        print(
+            "compose.sh was not written for the live deployment: its manifest does not "
+            "validate.",
+            file=sys.stderr,
+        )
+        return
+    target = prod / "compose.sh"
+    data = script.encode("utf-8")
+    if not target.is_file() or target.read_bytes() != data:
+        write_atomic(target, data, mode=0o700)
 
 
 def deployment_id(manifest: Manifest) -> str | None:
@@ -865,6 +899,8 @@ def deploy_locked(
 ) -> Manifest:
     prod = root / environment
     previous = live_deployment(prod)
+    if previous is not None:
+        write_live_compose_script(prod, previous)
     check_run_order(
         previous.manifest if previous is not None else None, image, revision, run_number
     )

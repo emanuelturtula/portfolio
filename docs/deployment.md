@@ -88,11 +88,16 @@ deployed, so it always addresses what is running:
 ~/portfolio-app/prod/compose.sh exec app python -m portfolio create-user --username <name>
 ```
 
+Every deployment also writes it for the live deployment before it does anything else, if it
+is missing or names something other than what is live. So a host whose first deployment
+after the migration failed still has a working `compose.sh`, pointed at the compose file
+the old layout's live deployment runs from.
+
 Every argument is passed to compose unchanged. The script holds no secret: it names
 `secrets.env`, never its contents, and embeds only the three values `deploy.py` validated
-before running anything. Its paths are relative to the script itself, so it works from any
-directory. [Operations](operations.md) uses it for every command against the running
-container.
+before running anything, plus the live compose file's name. Its paths are relative to the
+script itself, which it finds through any symlink, so it works from any directory.
+[Operations](operations.md) uses it for every command against the running container.
 
 ### One backup, and why
 
