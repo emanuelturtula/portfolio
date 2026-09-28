@@ -75,32 +75,110 @@ class AtomicWriteTests(unittest.TestCase):
             )
             self.assertNotEqual(replaced[final], final)
 
+        # Database copies arrive by docker cp or a file copy, not by a write of deploy.py's.
         written = [
             Path(step.args[0])
             for step in tap.steps
             if step.name in ("open", "Path.write_text", "Path.write_bytes")
+            and "database.sqlite3" not in Path(step.args[0]).name
         ]
-        snapshot_copies = [p for p in written if p.name == "database.sqlite3"]
-        for path in written:
-            if path in snapshot_copies:
-                continue  # the fake `docker cp`, standing in for Docker, not deploy.py
-            self.assertIn(path, set(replaced.values()), f"{path} was written in place")
         self.assertTrue(written, "the tap saw no writes at all, so this proved nothing")
-
-        opened = [Path(step.args[0]) for step in tap.named("open")]
-        synced_then_replaced = [Path(step.args[0]) for step in tap.named("os.replace")]
-        self.assertEqual(sorted(map(str, opened)), sorted(map(str, synced_then_replaced)))
-        self.assertGreaterEqual(len(tap.named("os.fsync")), len(opened), "every write is synced")
+        sources = [Path(step.args[0]) for step in tap.named("os.replace")]
+        for path in written:
+            self.assertIn(path, sources, f"{path} was written in place, not replaced")
+            self.assertEqual(sources.count(path), written.count(path), f"{path} left behind")
+        self.assertGreaterEqual(len(tap.named("os.fsync")), len(written), "every write is synced")
 
     def test_modes_are_set_on_the_temporary_file_before_it_is_renamed_in(self) -> None:
         tap = FilesystemTap()
         self.host.deploy(R1, tap=tap)
         self.host.deploy(R2, tap=tap)
         chmods = {Path(step.args[0]): step.args[1] for step in tap.named("os.chmod")}
+        written = {Path(step.args[0]) for step in tap.named("open")}
+        checked = 0
         for step in tap.named("os.replace"):
             temporary, final = Path(step.args[0]), Path(step.args[1])
+            if temporary not in written:
+                continue  # a database copy renamed into place, not a file deploy.py wrote
             expected = 0o700 if final.name == "compose.sh" else 0o600
             self.assertEqual(chmods.get(temporary), expected, final)
+            checked += 1
+        self.assertGreaterEqual(checked, 10)
+
+
+class DurableBeforeDeletingTests(unittest.TestCase):
+    """The new database copy is on disk before any older copy is deleted.
+
+    On ext4 a new file renamed into a new name can lag its data by about thirty seconds,
+    while the unlinks of the copies it replaces commit in about five. A power cut in
+    between would leave an empty backup and nothing else. So the file, the directory it
+    lands in and, after a swap, prod/ itself are fsynced first. fsync_directory is a no-op
+    off POSIX, but it is still called, and the tap sees the call on every platform.
+    """
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.host = Host(Path(temp.name))
+
+    def assert_durable_before_deleting(self, tap: FilesystemTap, copy: Path, *dirs: Path) -> None:
+        deletions = [
+            index
+            for index, step in enumerate(tap.steps)
+            if (step.name == "shutil.rmtree" and step.extra)
+            or (
+                step.name in ("os.remove", "os.unlink", "Path.unlink")
+                and str(step.args[0]).endswith(".sqlite3")
+            )
+        ]
+        self.assertTrue(deletions, "the premise: an older copy was deleted")
+        before = tap.steps[: deletions[0]]
+        synced_files = {step.extra for step in before if step.name == "fsync_file"}
+        synced_dirs = {step.extra for step in before if step.name == "fsync_directory"}
+        self.assertIn(copy.stat().st_ino, synced_files, f"{copy} not fsynced before deleting")
+        for directory in (copy.parent, *dirs):
+            self.assertIn(
+                directory.stat().st_ino, synced_dirs, f"{directory} not fsynced before deleting"
+            )
+
+    def test_a_snapshot_is_durable_before_the_old_backup_goes(self) -> None:
+        self.host.deploy(R1)
+        self.host.deploy(R2)
+        tap = FilesystemTap()
+        self.host.deploy(R3, tap=tap)
+        prod = self.host.prod
+        self.assert_durable_before_deleting(tap, prod / "backup" / "database.sqlite3", prod)
+
+    def test_a_migration_snapshot_is_durable_before_attempts_goes(self) -> None:
+        self.host.build_legacy()
+        tap = FilesystemTap()
+        self.host.deploy(R4, tap=tap)
+        prod = self.host.prod
+        self.assert_durable_before_deleting(tap, prod / "backup" / "database.sqlite3", prod)
+        self.assertIn(
+            self.host.home.stat().st_ino,
+            {s.extra for s in tap.named("fsync_directory")},
+            "the rename of the root is made durable",
+        )
+
+    def test_a_seeded_copy_is_durable_before_attempts_goes(self) -> None:
+        self.host.build_legacy()
+        self.host.docker.containers[self.host.docker.running or ""].health = "unhealthy"
+        tap = FilesystemTap()
+        self.host.deploy(R4, tap=tap)
+        prod = self.host.prod
+        self.assertEqual(self.host.docker.snapshots, [], "the premise: seeded, not snapshotted")
+        self.assert_durable_before_deleting(tap, prod / "backup" / "database.sqlite3", prod)
+
+    def test_a_failures_snapshot_is_durable_before_the_older_failure_goes(self) -> None:
+        self.host.deploy(R1)
+        self.host.docker.fail_up.update({R2.image, R3.image})
+        with self.assertRaises(deploy.DeploymentError):
+            self.host.deploy(R2)
+        tap = FilesystemTap()
+        with self.assertRaises(deploy.DeploymentError):
+            self.host.deploy(R3, tap=tap)
+        self.assert_durable_before_deleting(tap, self.host.prod / "failed" / "database.sqlite3")
 
 
 class InterruptedBackupSwapTests(unittest.TestCase):
@@ -161,6 +239,14 @@ class InterruptedBackupSwapTests(unittest.TestCase):
         (self.prod / "backup").rename(self.prod / "backup.old")
         self.leave("backup.new", {"compose.yml": R2.compose})
         self.assertEqual(self.deploy_without_a_snapshot(), self.backup)
+
+    def test_a_stale_aside_does_not_block_promoting_a_complete_backup_new(self) -> None:
+        # No crash sequence leaves all three: settle_backups clears backup.old first. A
+        # person restoring by hand can, and the swap must not then fail after the
+        # candidate is already healthy.
+        self.leave("backup.old", {"database.sqlite3": b"a copy someone set aside\n"})
+        self.leave("backup.new", self.newer)
+        self.assertEqual(self.deploy_without_a_snapshot(), self.newer)
 
     def test_a_backup_left_aside_after_the_swap_completed_is_removed(self) -> None:
         self.leave("backup.old", {"database.sqlite3": b"the generation before\n"})
@@ -237,9 +323,11 @@ class CrashSweep(unittest.TestCase):
             self.assertIn(path.read_bytes(), known, f"{path.name} in {path.parent.name} is torn")
 
     def live_prod(self, host: Host) -> Path:
-        exists = [path for path in (host.root, host.legacy) if path.exists()]
-        self.assertEqual(len(exists), 1, "exactly one root, always")
-        return exists[0] / "prod"
+        roots = [path for path in (host.root, host.legacy) if path.is_dir()]
+        self.assertEqual(len(roots), 1, "exactly one root directory, always")
+        if roots[0] == host.root and host.legacy.exists():
+            self.assertEqual(host.legacy.read_bytes(), deploy.TOMBSTONE.encode("utf-8"))
+        return roots[0] / "prod"
 
     def check_common(self, host: Host) -> Path:
         prod = self.live_prod(host)
@@ -253,17 +341,20 @@ class CrashSweep(unittest.TestCase):
     ) -> None:
         release = host.next_release
         assert release is not None
-        crashed_prod = self.live_prod(host)
-        left_new = tree(crashed_prod / "backup.new").get("database.sqlite3")
-        left_backup = tree(crashed_prod / "backup").get("database.sqlite3")
-        left_old = tree(crashed_prod / "backup.old").get("database.sqlite3")
+        left = {path.read_bytes() for path in host.sqlite_files()}
         snapshots = len(host.docker.snapshots)
         host.docker.fail_up.clear()
         if self.RECOVER_WITHOUT_SNAPSHOT and host.docker.running is not None:
             host.docker.containers[host.docker.running].health = "unhealthy"
+        migrated = host.legacy.exists() or (self.live_prod(host) / "attempts").is_dir()
         host.deploy(release)
         prod = host.prod
-        self.assertFalse(host.legacy.exists())
+        if migrated:
+            self.assertTrue(host.legacy.is_file(), "a migrated host keeps its tombstone")
+            self.assertEqual(host.legacy.read_bytes(), deploy.TOMBSTONE.encode("utf-8"))
+        else:
+            self.assertFalse(host.legacy.exists())
+        self.assertEqual(list(host.home.glob(".*.tmp")), [], "a temporary file in home")
         current = host.current()
         self.assertEqual((current["image"], current["status"]), (release.image, "healthy"))
         self.assertEqual((prod / "compose.yml").read_bytes(), release.compose)
@@ -278,15 +369,14 @@ class CrashSweep(unittest.TestCase):
         for path in host.home.rglob("*.json"):
             json.loads(path.read_bytes())
         if newest:
-            # backup/ ends up with the newest database copy the host had: this deployment's
-            # snapshot, else a complete backup.new the crash left (its snapshot is moved in
-            # last), else the backup the crash left in place or aside.
+            # backup/ ends up with the newest database copy on the host: this deployment's
+            # own snapshot, else the most recently taken of the copies the crash left,
+            # wherever it left them (incoming/, failed/, backup.new/, backup/, backup.old/).
             if len(host.docker.snapshots) > snapshots:
                 expected = host.docker.snapshots[-1]
-            elif left_new is not None:
-                expected = left_new
             else:
-                expected = left_backup if left_backup is not None else left_old
+                taken = host.docker.snapshots
+                expected = max((c for c in left if c in taken), key=taken.index, default=None)
             self.assertEqual(
                 tree(prod / "backup").get("database.sqlite3"),
                 expected,
@@ -415,6 +505,57 @@ class CrashSweep(unittest.TestCase):
             )
 
         self.sweep(prepare, R4, check)
+
+    # -- carrying a snapshot forward ------------------------------------------------------
+
+    def prepare_young_host(self, host: Host) -> None:
+        """One success, no backup/, then a failure whose rollback came up unhealthy: the
+        only database copy on the host is the snapshot in failed/."""
+        host.write_secrets(host.prod)
+        host.deploy(R1)
+        host.docker.fail_up.add(R2.image)
+        host.docker.unhealthy.add(R1.image)
+        with self.assertRaises(deploy.DeploymentError):
+            host.deploy(R2)
+        host.docker.fail_up.clear()
+        self.assertEqual(len(host.sqlite_files()), 1)
+        self.assertFalse((host.prod / "backup").exists())
+        host.next_release = R4
+
+    def check_only_copy_survives(self, host: Host, before: dict[str, Any]) -> None:
+        self.check_common(host)
+        copies = [path.read_bytes() for path in host.sqlite_files()]
+        self.assertGreaterEqual(len(copies), 1, "a crash never costs the only copy")
+        for copy in copies:
+            self.assertIn(copy, before["databases"], "the carried copy is byte-identical")
+
+    def test_a_crash_while_a_success_carries_the_only_copy_is_recovered(self) -> None:
+        self.sweep(self.prepare_young_host, R3, self.check_only_copy_survives, newest=True)
+
+    def test_a_crash_while_a_failure_carries_the_only_copy_is_recovered(self) -> None:
+        self.sweep(
+            self.prepare_young_host, R3, self.check_only_copy_survives, fails=True, newest=True
+        )
+
+    def test_a_crash_in_the_success_after_a_failure_is_recovered(self) -> None:
+        # failed/ holds an older failure's snapshot while this success takes a newer one.
+        # Whatever the crash leaves, the recovery must keep the newer.
+        def prepare(host: Host) -> None:
+            host.write_secrets(host.prod)
+            host.deploy(R1)
+            host.deploy(R2)
+            host.docker.fail_up.add(R3.image)
+            with self.assertRaises(deploy.DeploymentError):
+                host.deploy(R3)
+            host.docker.fail_up.clear()
+            self.assertEqual(len(host.sqlite_files()), 2)
+            host.next_release = R5
+
+        def check(host: Host, before: dict[str, Any]) -> None:
+            self.check_common(host)
+            self.assertGreaterEqual(len(host.sqlite_files()), 1)
+
+        self.sweep(prepare, R4, check, newest=True)
 
     # -- the failure path -----------------------------------------------------------------
 

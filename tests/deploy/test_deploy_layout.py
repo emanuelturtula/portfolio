@@ -31,6 +31,7 @@ from deploy_harness import (
     RecordingLock,
     Release,
     deploy,
+    expected_compose_sh,
     legacy_write_json,
     mode,
     read_manifest,
@@ -152,6 +153,11 @@ class FreshHostTests(HostTestCase):
 
 
 class LegacyMigrationTests(HostTestCase):
+    def assert_tombstone(self) -> None:
+        self.assertTrue(self.host.legacy.is_file(), "the old root is a regular file")
+        self.assertFalse(self.host.legacy.is_symlink())
+        self.assertEqual(self.host.legacy.read_bytes(), deploy.TOMBSTONE.encode("utf-8"))
+
     def setUp(self) -> None:
         super().setUp()
         self.host.build_legacy()
@@ -162,8 +168,13 @@ class LegacyMigrationTests(HostTestCase):
     def test_the_legacy_root_is_renamed_and_secrets_env_kept_byte_for_byte(self) -> None:
         self.host.deploy(R4)
 
-        self.assertFalse(os.path.lexists(self.host.legacy))
-        self.assertEqual(sorted(p.name for p in self.host.home.iterdir()), ["portfolio-app"])
+        self.assert_tombstone()
+        self.assertEqual(
+            sorted(p.name for p in self.host.home.iterdir()),
+            ["portfolio-app", "portfolio-app-deploy"],
+        )
+        (line,) = [x for x in self.host.stderr[-1].splitlines() if x.startswith("Migrated")]
+        self.assertIn("portfolio-app-deploy", line)
         self.assertEqual((self.prod / "secrets.env").read_bytes(), SENTINEL_SECRET)
         if POSIX:
             self.assertEqual(mode(self.prod / "secrets.env"), 0o600)
@@ -265,7 +276,11 @@ class LegacyMigrationTests(HostTestCase):
             )
 
         self.assertEqual(code, 0, stderr.getvalue())
-        self.assertFalse(self.host.legacy.exists())
+        self.assert_tombstone()
+        self.assertEqual(
+            stderr.getvalue(),
+            "Migrated the deployment root from ~/portfolio-app-deploy to ~/portfolio-app.\n",
+        )
         printed = json.loads(stdout.getvalue())
         self.assertEqual(printed, self.host.current())
         # stdout reaches the public Actions log through ssh: no host path in it.
@@ -298,13 +313,18 @@ class MigrationWithoutSnapshotTests(HostTestCase):
         return self.attempts / LEGACY_ATTEMPT_IDS[index]
 
     def deploy_capturing_stderr(self) -> str:
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            self.host.deploy(R4)
-        return stderr.getvalue()
+        """R4's stderr, without the one line every migration prints."""
+        self.host.deploy(R4)
+        lines = self.host.stderr[-1].splitlines()
+        return "".join(
+            line + "\n" for line in lines if not line.startswith("Migrated the deployment root")
+        )
 
     def test_backup_is_seeded_from_the_newest_legacy_attempt_with_a_database(self) -> None:
+        # attempts/<id>/database.sqlite3 was taken from the deployment that attempt
+        # replaced, the one its previous.json names, which was made in the attempt before.
         newest = tree(self.attempt(-1))
+        its_deployment = tree(self.attempt(-2))
 
         self.assertEqual(self.deploy_capturing_stderr(), "")
 
@@ -312,11 +332,12 @@ class MigrationWithoutSnapshotTests(HostTestCase):
         self.assertEqual(
             tree(self.prod / "backup"),
             {
-                "compose.yml": newest["compose.yml"],
-                "current.json": newest["result.json"],
+                "compose.yml": its_deployment["compose.yml"],
+                "current.json": newest["previous.json"],
                 "database.sqlite3": newest["database.sqlite3"],
             },
         )
+        self.assertEqual(its_deployment["compose.yml"], R2.compose)
         self.assertFalse((self.prod / "attempts").exists())
         self.assertEqual(self.host.sqlite_files(), [self.prod / "backup" / "database.sqlite3"])
 
@@ -328,21 +349,47 @@ class MigrationWithoutSnapshotTests(HostTestCase):
 
         backup = tree(self.prod / "backup")
         self.assertEqual(backup["database.sqlite3"], second["database.sqlite3"])
-        self.assertEqual(backup["compose.yml"], R2.compose)
-        self.assertEqual(backup["current.json"], second["result.json"])
+        self.assertEqual(backup["compose.yml"], R1.compose)
+        self.assertEqual(backup["current.json"], second["previous.json"])
         self.assertEqual(len(self.host.sqlite_files()), 1)
 
-    def test_a_failed_attempt_contributes_its_request_not_its_result(self) -> None:
+    def test_a_failed_attempt_still_names_the_deployment_its_database_came_from(self) -> None:
         # The old script took its backup before `up`, so a failed attempt holds a
-        # database too. Its result describes a deployment that never ran.
+        # database too, taken from the same deployment its previous.json names.
         newest = self.attempt(-1)
         result = read_manifest(newest / "result.json")
         legacy_write_json(newest / "result.json", dict(result, status="failed"))
-        request = (newest / "request.json").read_bytes()
+        previous = (newest / "previous.json").read_bytes()
 
         self.host.deploy(R4)
 
-        self.assertEqual(tree(self.prod / "backup")["current.json"], request)
+        self.assertEqual(tree(self.prod / "backup")["current.json"], previous)
+
+    def test_a_missing_compose_file_is_omitted_and_the_reason_recorded(self) -> None:
+        (self.attempt(-2) / "compose.yml").unlink()
+        previous = read_manifest(self.attempt(-1) / "previous.json")
+        database = (self.attempt(-1) / "database.sqlite3").read_bytes()
+
+        self.host.deploy(R4)
+
+        backup = tree(self.prod / "backup")
+        self.assertEqual(set(backup), {"current.json", "database.sqlite3"})
+        self.assertEqual(backup["database.sqlite3"], database)
+        recorded = json.loads(backup["current.json"])
+        note = recorded.pop("backup_note")
+        self.assertIn("compose file", note)
+        self.assertEqual(recorded, previous)
+
+    def test_an_unreadable_previous_json_leaves_only_a_note(self) -> None:
+        (self.attempt(-1) / "previous.json").write_bytes(b"{ torn")
+        database = (self.attempt(-1) / "database.sqlite3").read_bytes()
+
+        self.host.deploy(R4)
+
+        backup = tree(self.prod / "backup")
+        self.assertEqual(set(backup), {"current.json", "database.sqlite3"})
+        self.assertEqual(backup["database.sqlite3"], database)
+        self.assertEqual(set(json.loads(backup["current.json"])), {"backup_note"})
 
     def test_with_no_legacy_database_it_says_so_without_naming_anything(self) -> None:
         for path in self.attempts.rglob("database.sqlite3"):
@@ -355,7 +402,7 @@ class MigrationWithoutSnapshotTests(HostTestCase):
         self.assertFalse((self.prod / "backup").exists())
         self.assertEqual(self.host.sqlite_files(), [])
         lines = stderr.splitlines()
-        self.assertEqual(len(lines), 1, stderr)
+        self.assertEqual(len(lines), 1, self.host.stderr[-1])
         self.assertIn("No database backup", lines[0])
         for revealing in (str(self.host.home), self.host.home.as_posix(), "~/", "sqlite3"):
             self.assertNotIn(revealing, lines[0])
@@ -535,7 +582,12 @@ class LockTests(HostTestCase):
 
         self.assertEqual(self.host.lock.taken, [self.host.legacy])
         self.assertEqual(seen, [["portfolio-app-deploy"]], "the rename must follow the lock")
-        self.assertEqual(sorted(p.name for p in self.host.home.iterdir()), ["portfolio-app"])
+        self.assertEqual(
+            sorted(p.name for p in self.host.home.iterdir()),
+            ["portfolio-app", "portfolio-app-deploy"],
+        )
+        self.assertTrue(self.host.legacy.is_file(), "the old root is a tombstone file")
+        self.assertEqual(self.host.legacy.read_bytes(), deploy.TOMBSTONE.encode("utf-8"))
 
     def test_resolution_before_the_lock(self) -> None:
         root, legacy = self.host.root, self.host.legacy
@@ -549,7 +601,12 @@ class LockTests(HostTestCase):
             deploy.lock_directory(root, legacy)
         legacy.rmdir()
         self.assertEqual(deploy.lock_directory(root, legacy), root)
-        self.assertEqual(sorted(p.name for p in self.host.home.iterdir()), ["portfolio-app"])
+        # A file at the old path is a tombstone, never a root: no refusal, nothing moved.
+        legacy.write_bytes(b"a tombstone\n")
+        self.assertEqual(deploy.lock_directory(root, legacy), root)
+        root.rmdir()
+        self.assertEqual(deploy.lock_directory(root, legacy), root)
+        self.assertEqual(sorted(p.name for p in self.host.home.iterdir()), ["portfolio-app-deploy"])
 
     def test_a_waiter_on_the_old_path_re_resolves_to_the_new_root(self) -> None:
         self.host.build_legacy()
@@ -561,7 +618,8 @@ class LockTests(HostTestCase):
         self.assertEqual(deploy.settle_root(self.host.root, self.host.legacy), self.host.root)
         self.assertEqual(deploy.lock_directory(self.host.root, self.host.legacy), self.host.root)
         self.assertEqual(tree(self.host.home), after_migration, "it renames nothing")
-        self.assertFalse(self.host.legacy.exists())
+        self.assertTrue(self.host.legacy.is_file(), "the old root is a tombstone file")
+        self.assertEqual(self.host.legacy.read_bytes(), deploy.TOMBSTONE.encode("utf-8"))
 
     def test_a_root_moved_before_its_lock_opened_is_retried_in_the_new_root(self) -> None:
         self.host.build_legacy()
@@ -577,7 +635,10 @@ class LockTests(HostTestCase):
         self.host.deploy(R4)
 
         self.assertEqual(self.host.lock.taken, [self.host.legacy, self.host.root])
-        self.assertFalse(self.host.legacy.exists())
+        # The other deployment died before writing the tombstone; this one writes it,
+        # because the legacy attempts/ shows the host was migrated.
+        self.assertTrue(self.host.legacy.is_file(), "the old root is a tombstone file")
+        self.assertEqual(self.host.legacy.read_bytes(), deploy.TOMBSTONE.encode("utf-8"))
         self.assertEqual(self.host.current()["image"], R4.image)
         self.assertEqual(tree(self.prod / "backup")["compose.yml"], R3.compose)
 
@@ -680,9 +741,12 @@ class FailureTests(HostTestCase):
         self.assertEqual(Path(rollback.compose_file or ""), self.host.legacy_compose_path())
         self.assertEqual((rollback.image, rollback.compose_bytes), (R3.image, R3.compose))
         self.assertEqual(self.docker.running_image, R3.image)
-        self.assertEqual(
-            self.prod_without_evidence(), legacy_prod, "attempts/ and current.json untouched"
-        )
+        after = self.prod_without_evidence()
+        # R4: the one addition, compose.sh for the live legacy deployment, so a failed first
+        # migration still leaves the owner a working command.
+        legacy_live = self.host.legacy_compose_path().relative_to(self.prod).as_posix()
+        self.assertEqual(after.pop("compose.sh"), expected_compose_sh(R3, legacy_live))
+        self.assertEqual(after, legacy_prod, "attempts/ and current.json untouched")
         self.assertEqual(self.assert_evidence(R4, snapshot=snapshot)["rollback"], "healthy")
 
     def test_a_legacy_host_that_failed_once_migrates_on_its_next_success(self) -> None:
@@ -746,12 +810,15 @@ class FailureTests(HostTestCase):
         self.host.deploy(R1)
         self.docker.fail_up.update({R2.image, R3.image})
         self.assert_fails(R2)
-        self.docker.database = None  # the second failure has no snapshot
+        first = (self.prod / "failed" / "database.sqlite3").read_bytes()
+        # The second failure cannot snapshot. Its evidence replaces the first failure's,
+        # and the first failure's snapshot, the only copy, is carried into it.
+        self.docker.containers[self.docker.running or ""].health = "unhealthy"
 
         self.assert_fails(R3)
 
-        self.assert_evidence(R3, snapshot=None)
-        self.assertEqual(self.host.sqlite_files(), [], "the first failure's snapshot is gone")
+        self.assert_evidence(R3, snapshot=first)
+        self.assertEqual(self.host.sqlite_files(), [self.prod / "failed" / "database.sqlite3"])
 
     def test_a_success_removes_the_failure_evidence(self) -> None:
         self.host.deploy(R1)
@@ -845,6 +912,116 @@ class MissingRollbackTargetTests(HostTestCase):
 
                 self.assertEqual(self.docker.calls, [])
                 self.assertFalse((self.prod / "incoming").exists())
+
+
+class CarryForwardTests(HostTestCase):
+    """A snapshot is carried forward, never dropped, by a deployment that takes none.
+
+    The reviewer's case: a young host has had one success and has no backup/. A failed
+    deployment's rollback comes up unhealthy, so the only database copy on the host is the
+    snapshot in failed/. The next deployment cannot snapshot the unhealthy container.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.host.deploy(R1)
+        self.docker.fail_up.add(R2.image)
+        self.docker.unhealthy.add(R1.image)  # the rollback's container
+        message = self.assert_fails(R2)
+        self.assertIn("rollback=failed", message)
+        self.assertFalse((self.prod / "backup").exists(), "the premise: a young host")
+        self.only_copy = (self.prod / "failed" / "database.sqlite3").read_bytes()
+        self.assertEqual(self.host.sqlite_files(), [self.prod / "failed" / "database.sqlite3"])
+        self.first_live = (self.prod / "current.json").read_bytes()
+        self.snapshots = len(self.docker.snapshots)
+
+    def assert_no_snapshot_was_taken(self) -> None:
+        self.assertEqual(len(self.docker.snapshots), self.snapshots)
+
+    def test_a_success_that_cannot_snapshot_makes_the_failed_snapshot_the_backup(self) -> None:
+        self.host.deploy(R3)
+
+        self.assert_no_snapshot_was_taken()
+        self.assertEqual(
+            tree(self.prod / "backup"),
+            {
+                "compose.yml": R1.compose,
+                "current.json": self.first_live,
+                "database.sqlite3": self.only_copy,
+            },
+        )
+        self.assertFalse((self.prod / "failed").exists())
+        self.assertEqual(len(self.host.sqlite_files()), 1)
+
+    def test_a_failure_that_cannot_snapshot_carries_it_into_its_own_evidence(self) -> None:
+        self.docker.fail_up.add(R3.image)
+        self.assert_fails(R3)
+
+        self.assert_no_snapshot_was_taken()
+        request = read_manifest(self.prod / "failed" / "request.json")
+        self.assertEqual(request["image"], R3.image)
+        self.assertEqual((self.prod / "failed" / "database.sqlite3").read_bytes(), self.only_copy)
+        self.assertEqual(len(self.host.sqlite_files()), 1)
+
+        self.host.deploy(R4)
+
+        self.assertEqual(tree(self.prod / "backup")["database.sqlite3"], self.only_copy)
+        self.assertEqual(len(self.host.sqlite_files()), 1)
+
+    def test_a_success_that_takes_a_snapshot_supersedes_the_failed_one(self) -> None:
+        self.docker.unhealthy.discard(R1.image)
+        self.docker.containers[self.docker.running or ""].health = "healthy"
+
+        self.host.deploy(R3)
+
+        self.assertEqual(len(self.docker.snapshots), self.snapshots + 1)
+        self.assertEqual(tree(self.prod / "backup")["database.sqlite3"], self.docker.snapshots[-1])
+        self.assertEqual(len(self.host.sqlite_files()), 1)
+
+
+class InterruptedAttemptTests(HostTestCase):
+    """A stale incoming/ holding a snapshot is an attempt a crash interrupted mid-``up``."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.host.deploy(R1)
+        self.host.deploy(R2)
+        self.backup = tree(self.prod / "backup")
+        incoming = self.prod / "incoming"
+        incoming.mkdir()
+        (incoming / "compose.yml").write_bytes(R3.compose)
+        (incoming / "request.json").write_bytes(b'{"image": "interrupted"}\n')
+        self.interrupted = b"snapshot taken just before the interrupted candidate ran\n"
+        (incoming / "database.sqlite3").write_bytes(self.interrupted)
+        # The interrupted candidate is what runs now, so nothing matches current.json.
+        self.docker.start(R3.image)
+        self.snapshots = len(self.docker.snapshots)
+
+    def test_its_snapshot_becomes_the_backup_of_the_next_success(self) -> None:
+        self.host.deploy(R4)
+
+        self.assertEqual(len(self.docker.snapshots), self.snapshots, "the premise: no snapshot")
+        self.assertEqual(tree(self.prod / "backup")["database.sqlite3"], self.interrupted)
+        for leftover in ("incoming", "failed"):
+            self.assertFalse((self.prod / leftover).exists(), leftover)
+        self.assertEqual(len(self.host.sqlite_files()), 1)
+
+    def test_its_snapshot_survives_a_failure_too(self) -> None:
+        self.docker.fail_up.add(R4.image)
+        self.assert_fails(R4)
+
+        self.assertEqual((self.prod / "failed" / "database.sqlite3").read_bytes(), self.interrupted)
+        self.assertEqual(tree(self.prod / "backup"), self.backup)
+        self.assertEqual(len(self.host.sqlite_files()), 2)
+
+    def test_a_stale_incoming_without_a_snapshot_is_simply_cleared(self) -> None:
+        (self.prod / "incoming" / "database.sqlite3").unlink()
+
+        self.host.deploy(R4)
+
+        self.assertEqual(tree(self.prod / "backup"), self.backup)
+        for leftover in ("incoming", "failed"):
+            self.assertFalse((self.prod / leftover).exists(), leftover)
 
 
 class OneBackupTests(HostTestCase):

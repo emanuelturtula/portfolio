@@ -9,6 +9,7 @@ environment, which is everything compose would act on.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -16,6 +17,7 @@ import unittest
 from pathlib import Path
 
 from deploy_harness import (
+    LEGACY_ATTEMPT_IDS,
     POSIX,
     SENTINEL_SECRET,
     FilesystemTap,
@@ -26,7 +28,8 @@ from deploy_harness import (
     mode,
 )
 
-R1, R2, R3 = Release(1), Release(2), Release(3)
+R1, R2, R3, R4 = Release(1), Release(2), Release(3), Release(4)
+LEGACY_LIVE = f"attempts/{LEGACY_ATTEMPT_IDS[-1]}/compose.yml"
 
 FAKE_DOCKER = """#!/bin/sh
 {
@@ -98,6 +101,77 @@ class ComposeScriptTests(unittest.TestCase):
                 with self.assertRaises(deploy.DeploymentError):
                     deploy.compose_script(dict(good, **bad))
         self.assertEqual(deploy.compose_script(good).encode(), expected_compose_sh(R1))
+        self.assertEqual(
+            deploy.compose_script(good, LEGACY_LIVE).encode(),
+            expected_compose_sh(R1, LEGACY_LIVE),
+        )
+        for bad_file in (
+            "../secrets.env",
+            "/etc/compose.yml",
+            "attempts/attempt-3/compose.yml",
+            "attempts/../compose.yml",
+            f"attempts/{LEGACY_ATTEMPT_IDS[-1]}/compose.yml'",
+            "failed/compose.yml",
+        ):
+            with self.subTest(compose_file=bad_file):
+                with self.assertRaises(deploy.DeploymentError):
+                    deploy.compose_script(good, bad_file)
+
+
+class ComposeScriptWhileLiveTests(unittest.TestCase):
+    """R4: whenever a deployment is live, compose.sh exists and names it.
+
+    It is written before the candidate's ``up``, so a deployment that then fails --
+    including the first, migrating one -- still leaves the owner a working command.
+    """
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.host = Host(Path(temp.name))
+        self.script = self.host.prod / "compose.sh"
+
+    def deploy_failing(self, release: Release) -> None:
+        self.host.docker.fail_up.add(release.image)
+        with self.assertRaises(deploy.DeploymentError):
+            self.host.deploy(release)
+
+    def test_a_failed_first_migration_leaves_compose_sh_for_the_legacy_deployment(self) -> None:
+        self.host.build_legacy()
+        self.deploy_failing(R4)
+        self.assertEqual(self.script.read_bytes(), expected_compose_sh(R3, LEGACY_LIVE))
+        self.assertTrue((self.host.prod / LEGACY_LIVE).is_file(), "it names a file that exists")
+        if POSIX:
+            self.assertEqual(mode(self.script), 0o700)
+
+    def test_a_missing_compose_sh_is_restored_before_a_failed_deployment(self) -> None:
+        self.host.deploy(R1)
+        self.host.deploy(R2)
+        self.script.unlink()
+        self.deploy_failing(R3)
+        self.assertEqual(self.script.read_bytes(), expected_compose_sh(R2))
+
+    def test_a_stale_compose_sh_is_rewritten_for_the_live_deployment(self) -> None:
+        self.host.deploy(R1)
+        self.host.deploy(R2)
+        self.script.write_bytes(expected_compose_sh(R1))
+        self.deploy_failing(R3)
+        self.assertEqual(self.script.read_bytes(), expected_compose_sh(R2))
+
+    def test_a_live_manifest_that_does_not_validate_never_blocks_a_deployment(self) -> None:
+        self.host.deploy(R1)
+        current = self.host.prod / "current.json"
+        manifest = json.loads(current.read_bytes())
+        manifest["image"] = R1.image[:-1] + "Z"  # not a digest compose.sh may embed
+        current.write_bytes(json.dumps(manifest).encode())
+        self.script.unlink()
+
+        self.host.deploy(R2)
+
+        self.assertEqual(self.host.current()["image"], R2.image)
+        self.assertEqual(self.script.read_bytes(), expected_compose_sh(R2))
+        said = [line for line in self.host.stderr[-1].splitlines() if "compose.sh" in line]
+        self.assertEqual(len(said), 1, self.host.stderr[-1])
 
 
 @unittest.skipUnless(POSIX, "compose.sh is a POSIX shell script; Linux CI runs it")
@@ -120,14 +194,16 @@ class RunningComposeScriptTests(unittest.TestCase):
         self.environment = {
             "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
             "FAKE_DOCKER_RECORD": str(self.record),
-            # Decoys: the script must set these itself, not inherit them.
+            # Decoys: the script must set these itself, not inherit them, and a CDPATH
+            # must not steer its cd anywhere else.
             "PORTFOLIO_IMAGE": "decoy-image",
             "PORTFOLIO_SECRETS_ENV_FILE": "/decoy/secrets.env",
+            "CDPATH": str(self.elsewhere),
         }
 
     def run_script(self, script: str, *args: str, cwd: Path | None = None) -> dict[str, list[str]]:
         self.record.unlink(missing_ok=True)
-        subprocess.run(
+        done = subprocess.run(
             [script, *args],
             cwd=cwd or self.elsewhere,
             env=self.environment,
@@ -135,6 +211,7 @@ class RunningComposeScriptTests(unittest.TestCase):
             timeout=30,
             capture_output=True,
         )
+        self.assertEqual(done.stdout, b"", "cd printed a CDPATH match into the command's output")
         lines = self.record.read_text(encoding="utf-8").splitlines()
         self.assertEqual(lines[-1], "end")
         recorded: dict[str, list[str]] = {"arg": []}
@@ -168,6 +245,12 @@ class RunningComposeScriptTests(unittest.TestCase):
     def test_it_works_from_its_own_directory_too(self) -> None:
         # A path with a slash, as a person types it; a bare name would search $PATH.
         recorded = self.run_script("./compose.sh", "ps", cwd=self.host.prod)
+        self.assert_invocation(recorded, self.host.prod, "ps")
+
+    def test_it_works_through_a_symlink(self) -> None:
+        link = self.elsewhere / "portfolio-compose"
+        link.symlink_to(self.host.prod / "compose.sh")
+        recorded = self.run_script(str(link), "ps")
         self.assert_invocation(recorded, self.host.prod, "ps")
 
     def test_it_survives_a_rename_of_the_root(self) -> None:

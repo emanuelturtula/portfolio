@@ -29,9 +29,11 @@ from __future__ import annotations
 import builtins
 import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import types
 from collections.abc import Callable, Iterator
@@ -331,6 +333,69 @@ class RecordingLock:
         yield
 
 
+# The last commit on main before #94. Every delivery run up to it uploads a deploy.py that
+# defaults to ~/portfolio-app-deploy, and GitHub lets anyone with write access re-run one.
+PRE_94_COMMIT = "edcf88930097473562b36c4c8a04e95e468fd8ce"
+
+
+PRE_94_FIXTURE = Path(__file__).with_name("fixtures") / "deploy_pre94.py"
+FIXTURE_MARKER = b"# --- verbatim below this line ---\n"
+
+
+def pre_94_source() -> bytes:
+    """The vendored pre-#94 deploy.py, without the fixture's explanatory header."""
+    header, marker, source = PRE_94_FIXTURE.read_bytes().partition(FIXTURE_MARKER)
+    assert marker and header.startswith(b"# Test fixture"), "the fixture lost its header"
+    return source
+
+
+def pre_94_source_from_git() -> bytes | None:
+    """The same file from git, or None where the object is absent (a shallow clone)."""
+    try:
+        return subprocess.run(
+            ["git", "show", f"{PRE_94_COMMIT}:deploy/deploy.py"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=True,
+            timeout=60,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def load_pre_94_deploy(directory: Path) -> types.ModuleType:
+    """The deploy.py an old delivery run uploads, as a module of its own.
+
+    It is written beside a compose.yml, as the runner uploads it, and loaded under its own
+    name so it never replaces the module under test.
+    """
+    path = directory / "deploy.py"
+    path.write_bytes(pre_94_source())
+    (directory / "compose.yml").write_bytes(KIT_COMPOSE.read_bytes())
+    spec = importlib.util.spec_from_file_location("pre_94_deploy", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@contextlib.contextmanager
+def fcntl_available() -> Iterator[None]:
+    """Let the old script import fcntl on Windows, so its own code runs unchanged.
+
+    The stand-in's flock never blocks. On POSIX the real module is used.
+    """
+    if POSIX:
+        yield
+        return
+    stand_in = types.ModuleType("fcntl")
+    stand_in.LOCK_EX = 2  # type: ignore[attr-defined]
+    stand_in.LOCK_NB = 4  # type: ignore[attr-defined]
+    stand_in.flock = lambda file, operation: None  # type: ignore[attr-defined]
+    with mock.patch.dict(sys.modules, {"fcntl": stand_in}):
+        yield
+
+
 def windows_prepare_secrets(root: Path, environment: str) -> Path:
     """prepare_secrets_env_file without the mode check Windows cannot express.
 
@@ -382,6 +447,8 @@ class Host:
         self.extra_patches: list[contextlib.AbstractContextManager[Any]] = []
         # What a crash test deploys after the crash, to prove the host recovers.
         self.next_release: Release | None = None
+        # What each deploy() printed to stderr, in order.
+        self.stderr: list[str] = []
 
     @property
     def prod(self) -> Path:
@@ -420,12 +487,20 @@ class Host:
         if publish:
             self.docker.publish(release)
         self.stage_kit(release)
-        with self.patched(), tap.installed() if tap else contextlib.nullcontext():
-            result: dict[str, Any] = deploy.deploy(
-                **release.arguments(**overrides),
-                root=self.root,
-                legacy_root=self.legacy if migrate else None,
-            )
+        stderr = io.StringIO()
+        try:
+            with (
+                self.patched(),
+                tap.installed() if tap else contextlib.nullcontext(),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result: dict[str, Any] = deploy.deploy(
+                    **release.arguments(**overrides),
+                    root=self.root,
+                    legacy_root=self.legacy if migrate else None,
+                )
+        finally:
+            self.stderr.append(stderr.getvalue())
         return result
 
     # -- host layouts -------------------------------------------------------------------
@@ -505,8 +580,12 @@ def legacy_write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_bytes((json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
 
-def expected_compose_sh(release: Release) -> bytes:
-    """The exact compose.sh docs/specs/018-deploy-layout.md specifies."""
+def expected_compose_sh(release: Release, compose_file: str = "compose.yml") -> bytes:
+    """The exact compose.sh spec 018 specifies, with R6's symlink- and CDPATH-proof cd.
+
+    ``compose_file`` is relative to prod/: the live deployment's own file, which for a
+    host still on the legacy layout is ``attempts/<id>/compose.yml``.
+    """
     lines = [
         "#!/bin/sh",
         "# Written by deploy.py for the live deployment: docker compose against it.",
@@ -514,12 +593,12 @@ def expected_compose_sh(release: Release) -> bytes:
         "#   ./compose.sh ps",
         "#   ./compose.sh exec app python -m portfolio create-user --username <name>",
         "set -eu",
-        'cd "$(dirname "$0")"',
+        'CDPATH= cd -- "$(dirname -- "$(readlink -f -- "$0")")"',
         f"export PORTFOLIO_IMAGE='{release.image}'",
         "export PORTFOLIO_PORT='8083'",
         "export PORTFOLIO_ENVIRONMENT='prod'",
         'export PORTFOLIO_SECRETS_ENV_FILE="$PWD/secrets.env"',
-        'exec docker compose --project-name portfolio-app-prod --file "$PWD/compose.yml" "$@"',
+        f'exec docker compose --project-name portfolio-app-prod --file "$PWD/{compose_file}" "$@"',
     ]
     return ("\n".join(lines) + "\n").encode("utf-8")
 
@@ -591,6 +670,9 @@ PATH_MUTATIONS = (
 class Step:
     name: str
     args: tuple[Any, ...]
+    # For fsync_file/fsync_directory, the inode synced; for shutil.rmtree, the database
+    # copies it was about to delete.
+    extra: Any = None
 
 
 @dataclass
@@ -608,19 +690,22 @@ class FilesystemTap:
     steps: list[Step] = field(default_factory=list)
     crashed: bool = False
 
-    def step(self, name: str, args: tuple[Any, ...]) -> None:
+    def step(self, name: str, args: tuple[Any, ...], extra: Any = None) -> None:
         if self.crashed:
             raise Crash(name)
         if self.crash_at is not None and len(self.steps) == self.crash_at:
             self.crashed = True
             raise Crash(f"killed before {name}{args!r}")
-        self.steps.append(Step(name, args))
+        self.steps.append(Step(name, args, extra))
 
     def _wrap(self, name: str, function: Callable[..., Any]) -> Callable[..., Any]:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             alive = not self.crashed
+            extra = None
+            if name == "shutil.rmtree" and args and Path(args[0]).is_dir():
+                extra = sorted(Path(args[0]).rglob("*.sqlite3"))
             try:
-                self.step(name, args)
+                self.step(name, args, extra)
             except Crash:
                 if alive and name in TORN_BY_A_CRASH:
                     # Killed part-way through a copy: the destination holds half the data
@@ -659,7 +744,19 @@ class FilesystemTap:
                 stack.enter_context(
                     mock.patch.object(Path, name, _method(self, f"Path.{name}", original))
                 )
+            for name in ("fsync_file", "fsync_directory"):
+                if hasattr(deploy, name):
+                    stack.enter_context(
+                        mock.patch.object(deploy, name, self._synced(name, getattr(deploy, name)))
+                    )
             yield self
+
+    def _synced(self, name: str, function: Callable[[Path], None]) -> Callable[[Path], None]:
+        def wrapper(path: Path) -> None:
+            self.step(name, (path,), os.stat(path).st_ino if os.path.exists(path) else None)
+            function(path)
+
+        return wrapper
 
     def named(self, name: str) -> list[Step]:
         return [step for step in self.steps if step.name == name]
