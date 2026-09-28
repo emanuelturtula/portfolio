@@ -123,8 +123,10 @@ rename of the root makes every one of them wrong. So:
 
 **A migrating deployment that took no snapshot** (the running container unhealthy, not the one
 `current.json` names, or without a database) must not delete the only copies. Before
-`attempts/` is removed, `backup/` is seeded from the newest legacy attempt that has a
-`database.sqlite3`: that database, that attempt's `compose.yml`, and its manifest (`result.json`
+`attempts/` is removed, and only when `backup/` holds no database (a crash after the swap but
+before the removal must not be re-seeded over), `backup/` is seeded from the newest legacy
+attempt that has a `database.sqlite3`, **copied, never moved** (a move lost the only copy at
+eight crash points in tester-94's sweep): that database, that attempt's `compose.yml`, and its manifest (`result.json`
 when it records a healthy deployment, else `request.json`), written as `backup/current.json`. If
 no legacy attempt has a database, `attempts/` goes anyway, and one line on stderr says no
 backup exists. On a new-layout host, a deployment without a snapshot leaves `backup/` as it
