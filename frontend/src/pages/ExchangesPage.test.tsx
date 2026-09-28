@@ -153,13 +153,14 @@ const EMPTY_TEXT =
   'put it.';
 const NO_RUNS_LINE = 'No exchange sync has run yet.';
 
+/** #94: the one recreate command that works on the host, with the four variables it needs. */
+const RECREATE = '~/portfolio-app/prod/compose.sh up -d --force-recreate app';
 const keySteps = (venue: string): readonly string[] => [
   `At ${venue}, check that the API key still exists, or create a new read-only key. ` +
     'If the key has an IP allowlist, it must include the address the host reaches the ' +
     'internet from.',
   'Put the values in secrets.env on the host',
-  'Recreate the container with docker compose up --force-recreate. ' +
-    'A restart does not re-read secrets.env.',
+  `Recreate the container with ${RECREATE}. A restart does not re-read secrets.env.`,
   `Press Sync now. Scheduled syncs skip ${venue} until a sync you start succeeds.`,
 ];
 const scopeSteps = (venue: string): readonly string[] => [
@@ -170,7 +171,7 @@ const scopeSteps = (venue: string): readonly string[] => [
 /** R3: the scope note, inline, with the venue's own variables. */
 const newKeyNote = (variables: readonly string[]): string =>
   `A new key must first go into secrets.env on the host (${variables.join(', ')}), and the ` +
-  'container be recreated with docker compose up --force-recreate.';
+  `container be recreated with ${RECREATE}.`;
 const FULL_PROCEDURE = 'docs/operations.md, section 13, has the full procedure.';
 
 /** The `ERROR_KIND_SENTENCES` the tests below meet, for Bitget and BingX. */
@@ -1011,7 +1012,8 @@ describe('ExchangesPage: remediation', () => {
     for (const variable of VENUE_VARIABLES.bitget) {
       expect(within(secretsStep).getByText(variable).tagName).toBe('CODE');
     }
-    expect(within(steps[2] ?? item).getByText(/docker compose up --force-recreate/)).toBeTruthy();
+    expect(within(steps[2] ?? item).getByText(RECREATE).tagName).toBe('CODE');
+    expect(item).not.toHaveTextContent(/docker compose/);
     expect(item).toHaveTextContent(FULL_PROCEDURE);
     // Recreate, never restart: env_file is read when the container is created.
     expect(item).not.toHaveTextContent(/restart the container/i);
@@ -1063,7 +1065,8 @@ describe('ExchangesPage: remediation', () => {
     for (const variable of VENUE_VARIABLES.bitget) {
       expect(within(lastStep).getByText(variable).tagName).toBe('CODE');
     }
-    expect(within(lastStep).getByText('docker compose up --force-recreate').tagName).toBe('CODE');
+    expect(within(lastStep).getByText(RECREATE).tagName).toBe('CODE');
+    expect(item).not.toHaveTextContent(/docker compose/);
     expect(item).not.toHaveTextContent(/steps 2 and 3/);
     expect(item).not.toHaveTextContent(/above/);
   });
