@@ -14,10 +14,11 @@ directory holds the live deployment and at most one backup::
       last-attempt.json      the latest attempt's request and outcome
       backup/                the previous deployment, and the database as it was before
                              the live one: compose.yml, current.json, and
-                             database.sqlite3 once there has been a database to back up
+                             database.sqlite3 once there has been a database to back up,
+                             with snapshot.json naming the attempt that took it
       failed/                only after a failed or interrupted deployment, replaced by
                              the next one: compose.yml, request.json, result.json,
-                             database.sqlite3
+                             database.sqlite3 and snapshot.json when it holds one
       incoming/              only while a deployment runs: the candidate being staged
 
 Every path is computed from the root and this layout at the moment it is used; a manifest
@@ -68,7 +69,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -90,6 +91,9 @@ MANIFEST_LAYOUT = 2
 # The only attempt id the attempts/ layout ever wrote. Matching it exactly is also what
 # stops a manifest's stored path from pointing anywhere outside prod/attempts/.
 LEGACY_ATTEMPT = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}")
+# Any attempt id: the legacy form, or this version's, which adds microseconds. Both start
+# with their UTC time, which attempt_time() reads.
+ATTEMPT = re.compile(r"([0-9]{8}T[0-9]{6})([0-9]{6})?Z-[0-9a-f]{12}")
 # The lock directory can move at most once (the migration), so one retry is enough;
 # the third is margin.
 LOCK_ATTEMPTS = 3
@@ -571,8 +575,14 @@ def write_live_compose_script(prod: Path, live: Live) -> None:
         return
     target = prod / "compose.sh"
     data = script.encode("utf-8")
-    if not target.is_file() or target.read_bytes() != data:
-        write_atomic(target, data, mode=0o700)
+    try:
+        if not target.is_file() or target.read_bytes() != data:
+            write_atomic(target, data, mode=0o700)
+    except OSError as error:
+        print(
+            f"compose.sh was not written for the live deployment: {describe(error)}",
+            file=sys.stderr,
+        )
 
 
 def deployment_id(manifest: Manifest) -> str | None:
@@ -581,23 +591,104 @@ def deployment_id(manifest: Manifest) -> str | None:
     return Path(str(manifest.get("attempt") or "")).name or None
 
 
+def attempt_time(attempt_id: object) -> datetime | None:
+    """When an attempt started, read from its id; None for anything that is not one."""
+    match = ATTEMPT.fullmatch(attempt_id) if isinstance(attempt_id, str) else None
+    if match is None:
+        return None
+    seconds, microseconds = match.groups()
+    started = datetime.strptime(seconds, "%Y%m%dT%H%M%S").replace(tzinfo=UTC)
+    return started.replace(microsecond=int(microseconds or 0))
+
+
+def recorded_attempt_times(prod: Path) -> list[datetime]:
+    """Every attempt time the environment directory records, wherever it records one."""
+    sources = [
+        ("current.json", "attempt"),
+        ("last-attempt.json", "attempt"),
+        ("incoming/request.json", "attempt"),
+        ("incoming/snapshot.json", "taken_by"),
+        ("failed/request.json", "attempt"),
+        ("failed/snapshot.json", "taken_by"),
+        ("backup/snapshot.json", "taken_by"),
+        ("backup.new/snapshot.json", "taken_by"),
+    ]
+    times = []
+    for name, key in sources:
+        try:
+            value = read_json(prod / name).get(key)
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(value, str):
+            value = Path(value).name  # a legacy manifest stores its attempt's directory
+        found = attempt_time(value)
+        if found is not None:
+            times.append(found)
+    return times
+
+
+def new_attempt_id(prod: Path) -> str:
+    """An id for this attempt: its UTC start to the microsecond, then 12 random hex digits.
+
+    The carry-forward decides which database copy is newer by comparing the times in
+    attempt ids, so they must never go backwards on a host. A Raspberry Pi without an RTC
+    battery can boot with its clock behind until NTP catches up, and two quick attempts
+    can land in the same clock tick. So the time is never earlier than one microsecond
+    after the latest attempt the host already records.
+    """
+    started = datetime.now(UTC)
+    latest = max(recorded_attempt_times(prod), default=None)
+    if latest is not None and started <= latest:
+        started = latest + timedelta(microseconds=1)
+    return f"{started:%Y%m%dT%H%M%S%f}Z-{uuid.uuid4().hex[:12]}"
+
+
+def snapshot_record(taken_by: str | None) -> bytes:
+    """``snapshot.json``: which attempt took the database beside it.
+
+    It travels with every database copy -- in ``incoming/``, ``failed/`` and ``backup/``
+    -- and is written before the database, so a complete directory always has it.
+    Attempt ids carry their start time and never go backwards on a host
+    (``new_attempt_id``), so comparing two says which copy is newer, whatever deployment
+    each was taken from.
+    """
+    return json_bytes({"taken_by": taken_by})
+
+
+def snapshot_taken_by(directory: Path, *, request_fallback: bool = False) -> str | None:
+    """The attempt that took the database in ``directory``, if it can be known.
+
+    ``snapshot.json`` says; failing that, and only where the directory is an attempt's own
+    (``failed/``), its ``request.json`` names the attempt, which took any snapshot it held.
+    """
+    sources = [("snapshot.json", "taken_by")]
+    if request_fallback:
+        sources.append(("request.json", "attempt"))
+    for name, key in sources:
+        try:
+            value = read_json(directory / name).get(key)
+        except (OSError, ValueError, AttributeError):
+            continue
+        if attempt_time(value) is not None:
+            return str(value)
+    return None
+
+
 def carried_snapshot(prod: Path, live: Live | None) -> Path | None:
     """``failed/database.sqlite3``, when a deployment that took no snapshot must keep it.
 
-    A failure never changes ``current.json``, so a failed (or interrupted) attempt took
-    its snapshot from the deployment still live: it is newer than the backup, and may be
-    the only copy there is. So it is carried by default. It is left behind only on
-    positive evidence that the backup already holds something newer:
+    Decided by time, not by deployment: the copy in ``failed/`` is carried unless the
+    backup's is known to be at least as new. Both record the attempt that took them
+    (``snapshot_taken_by``), and attempt ids carry times that never go backwards on a
+    host (``attempt_time``, ``new_attempt_id``). Whichever deployment
+    each came from, the newer copy is the one worth keeping. An unknown time on either
+    side carries, because a failed or interrupted attempt normally postdates the backup,
+    and with no database in the backup at all an older copy still beats none. Call this
+    only once ``settle_backups`` has run.
 
-    * the backup's ``current.json`` names the live deployment itself: a later attempt
-      snapshotted the live deployment and crashed mid-rotation, and ``settle_backups``
-      promoted its ``backup.new/``;
-    * the failed attempt's ``request.json`` says it replaced a deployment other than the
-      live one: it survived a rotation that crashed before deleting it, so it predates
-      the backup.
-
-    With no database in the backup at all, it is always carried: an older copy still
-    beats none. Call this only once ``settle_backups`` has run.
+    The ``"replaces"`` each request records is no longer consulted: a ``failed/`` that
+    survived a crashed rotation holds a snapshot older than the one that rotation put in
+    the backup, which the time rule already sees.
     """
     database = prod / "failed" / "database.sqlite3"
     if live is None or not database.is_file():
@@ -605,18 +696,9 @@ def carried_snapshot(prod: Path, live: Live | None) -> Path | None:
     backup = prod / "backup"
     if not os.path.lexists(backup / "database.sqlite3"):
         return database
-    live_id = deployment_id(live.manifest)
-    try:
-        backed_up = deployment_id(read_json(backup / "current.json"))
-    except (OSError, ValueError):
-        backed_up = None
-    if backed_up is not None and backed_up == live_id:
-        return None
-    try:
-        replaces = read_json(prod / "failed" / "request.json").get("replaces")
-    except (OSError, ValueError, AttributeError):
-        replaces = None
-    if replaces is not None and replaces != live_id:
+    failed_taken = attempt_time(snapshot_taken_by(prod / "failed", request_fallback=True))
+    backup_taken = attempt_time(snapshot_taken_by(backup))
+    if failed_taken is not None and backup_taken is not None and failed_taken <= backup_taken:
         return None
     return database
 
@@ -667,7 +749,9 @@ def swap_backup(prod: Path) -> None:
     the old one deleted, so no moment passes without a complete backup directory."""
     current, new, old = prod / "backup", prod / "backup.new", prod / "backup.old"
     if os.path.lexists(current):
-        remove_tree(old)  # An aside left by an earlier crash; backup/ supersedes it.
+        if os.path.lexists(old):
+            fsync_directory(prod)
+            remove_tree(old)  # An aside left by an earlier crash; backup/ supersedes it.
         os.rename(current, old)
     os.rename(new, current)
     fsync_directory(prod)  # The new backup's name is on disk before the old one goes.
@@ -687,14 +771,19 @@ def settle_backups(prod: Path) -> None:
     """
     current, new, old = prod / "backup", prod / "backup.new", prod / "backup.old"
     if os.path.lexists(new / "database.sqlite3"):
+        # Durable on any POSIX filesystem, not only ext4 in data=ordered mode, before the
+        # swap removes anything.
+        settle_database(prod)
         swap_backup(prod)
         return
     remove_tree(new)
     if os.path.lexists(old):
         if os.path.lexists(current):
+            fsync_directory(prod)
             remove_tree(old)
         else:
             os.rename(old, current)
+            fsync_directory(prod)
 
 
 def legacy_attempt_with_database(prod: Path) -> Path | None:
@@ -768,6 +857,7 @@ def seed_backup_from_attempts(prod: Path, backup_new: Path) -> bool:
     if compose_bytes is not None:
         write_atomic(backup_new / "compose.yml", compose_bytes)
     write_atomic(backup_new / "current.json", manifest)
+    write_atomic(backup_new / "snapshot.json", snapshot_record(source.name))
     # The database comes last, and appears whole under its name through a rename: its
     # presence is what tells settle_backups this directory is complete. Its data is on
     # disk before it takes that name.
@@ -810,6 +900,10 @@ def rotate(prod: Path, candidate: Manifest, previous: Live | None, snapshot: Pat
         if previous is not None:
             write_atomic(backup_new / "compose.yml", previous.compose_file.read_bytes())
             write_atomic(backup_new / "current.json", (prod / "current.json").read_bytes())
+        # This deployment's snapshot, or one carried from failed/: either way it says
+        # which attempt took it, and the record goes in before the database does.
+        taken_by = snapshot_taken_by(snapshot.parent, request_fallback=True)
+        write_atomic(backup_new / "snapshot.json", snapshot_record(taken_by))
         os.rename(snapshot, backup_new / "database.sqlite3")
         settle_database(prod)
     elif os.path.lexists(prod / "attempts") and not os.path.lexists(
@@ -852,6 +946,8 @@ def record_failure(prod: Path, result: Manifest, carry: Path | None = None) -> s
     database = incoming / "database.sqlite3"
     try:
         if carry is not None and not database.exists():
+            taken_by = snapshot_taken_by(carry.parent, request_fallback=True)
+            write_atomic(incoming / "snapshot.json", snapshot_record(taken_by))
             os.rename(carry, database)
             fsync_file(database)
             fsync_directory(incoming)
@@ -937,7 +1033,7 @@ def deploy_locked(
         raise DeploymentError("The OCI version label does not match the requested version")
 
     secrets = prepare_secrets_env_file(root, environment)
-    attempt = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:12]}"
+    attempt = new_attempt_id(prod)
     candidate: Manifest = {
         "layout": MANIFEST_LAYOUT,
         "environment": environment,
@@ -973,6 +1069,7 @@ def deploy_locked(
             partial = incoming / ".database.sqlite3.tmp"
             if backup(previous.manifest, previous.compose_file, secrets, partial, attempt):
                 fsync_file(partial)
+                write_atomic(incoming / "snapshot.json", snapshot_record(attempt))
                 os.replace(partial, snapshot)
                 fsync_directory(incoming)
                 candidate["backup"] = True

@@ -65,8 +65,8 @@ deployment and at most one backup:
 | `prod/secrets.env` | operator-managed credentials, mode 0600, never read by the script |
 | `prod/compose.sh` | runs docker compose against the live deployment; see below |
 | `prod/last-attempt.json` | the latest attempt's request and outcome, whether it succeeded or not |
-| `prod/backup/` | the previous deployment's `compose.yml` and `current.json` and, when there was a database to back up, `database.sqlite3`: the database as it was just before the live deployment replaced it |
-| `prod/failed/` | only after a failed or interrupted deployment: its `compose.yml`, `request.json`, `result.json` and, when there was one, the database snapshot taken before it (or carried forward from the previous `failed/`). The next failure replaces it and the next success deletes it |
+| `prod/backup/` | the previous deployment's `compose.yml` and `current.json` and, when there was a database to back up, `database.sqlite3`: the database as it was just before the live deployment replaced it, with `snapshot.json` naming the attempt that took it |
+| `prod/failed/` | only after a failed or interrupted deployment: its `compose.yml`, `request.json`, `result.json` and, when there was one, the database snapshot taken before it (or carried forward from the previous `failed/`) with its `snapshot.json`. The next failure replaces it and the next success deletes it |
 | `prod/incoming/` | only while a deployment runs: the candidate being staged |
 
 Every path is computed from this layout when it is used, and the manifests `deploy.py`
@@ -290,6 +290,7 @@ not.
 | "This workflow run is older than" | an old workflow run was re-run; push instead |
 | "The deployment host is busy" | a concurrent deployment holds the lock; it will retry |
 | "Both ... exist, so this host cannot be migrated safely" | the old and the new root are both directories, usually because the file the migration left at the old path was replaced by one; keep the directory holding the live deployment, move the other away, and put the file back (see the migration section) |
-| "The live deployment's compose file ... is missing" | `prod/compose.yml`, or the old layout's `attempts/<id>/compose.yml`, was deleted by hand; there is nothing to roll back to, so nothing was changed |
+| "The live deployment's compose file ... is missing" | `prod/compose.yml`, or the old layout's `attempts/<id>/compose.yml`, was deleted by hand; there is nothing to roll back to, so the deployment stops there. The live deployment was not touched |
+| "[Errno 17] File exists: ..." naming the previous layout's root | a workflow run from before the new layout was re-run. Its `deploy.py` still targets the old root, and the file the migration left there stops it before it runs anything, by design ([Migrating from the previous layout](#migrating-from-the-previous-layout)). Nothing was deployed; push a new commit instead |
 | "running and healthy, but recording it failed" | the new version is live, but a file under `prod/` could not be written; the next deployment repairs the files. Until then `compose.sh` may still name the previous image, so `up --force-recreate` through it would bring that image back: deploy again rather than recreating by hand |
 | Healthy container, stale behaviour | `secrets.env` changed but the container was restarted rather than recreated |
