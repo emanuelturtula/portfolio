@@ -66,6 +66,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -127,16 +128,37 @@ class Live(NamedTuple):
     compose_file: Path
 
 
+COMMAND_TIMEOUT_SECONDS = 900
+
+
+def command_name(args: list[str]) -> str:
+    """A command for a message, without its arguments, which name absolute paths."""
+    if args[:2] == ["docker", "compose"] and len(args) > 6:
+        return f"docker compose {args[6]}"
+    return " ".join(args[:3] if args[1:2] == ["image"] else args[:2])
+
+
 def run(args: list[str], *, env: dict[str, str] | None = None) -> str:
-    """Run a command and return its output. Every docker call goes through here."""
+    """Run a command and return its output. Every docker call goes through here.
+
+    Its failures are reported without the command's arguments, and docker's own output
+    is redacted: both can spell out absolute paths under the home directory.
+    """
     try:
         return subprocess.run(
-            args, env=env, check=True, text=True, capture_output=True, timeout=900
+            args, env=env, check=True, text=True, capture_output=True,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         ).stdout.strip()
     except subprocess.CalledProcessError as error:
         detail = (error.stderr or error.stdout or "No diagnostic output").strip()
         detail = "".join(c for c in detail if c.isprintable() or c == "\n")
-        raise DeploymentError(f"Command failed ({error.returncode}): {detail[-4000:]}") from error
+        raise DeploymentError(
+            f"Command failed ({error.returncode}): {redact(detail[-4000:])}"
+        ) from error
+    except subprocess.TimeoutExpired:
+        raise DeploymentError(
+            f"{command_name(args)} did not finish within {COMMAND_TIMEOUT_SECONDS} seconds"
+        ) from None
 
 
 def read_json(path: Path) -> Manifest:
@@ -208,19 +230,33 @@ def default_roots() -> tuple[Path, Path]:
 
 
 def display(path: Path) -> str:
-    """``path`` for a message, written ``~/...`` when it is under the home directory.
+    """``path`` for a message, never as an absolute path.
 
-    Messages reach the public Actions log through ssh, and the home directory names the
-    host user. That user is a repository secret GitHub masks; this does not rely on it.
+    Everything this script writes to stderr reaches the public Actions log through ssh,
+    and an absolute path under the home directory names the host user. That user is a
+    repository secret GitHub masks; this does not rely on the mask. So ``~`` stands for
+    the directory holding the deployment root (the home directory, unless ``--root``
+    says otherwise), then for the home directory itself, and a path under neither is
+    shown by its name alone.
     """
+    path = Path(path)
+    if not path.anchor:  # Relative: it names nothing outside the deployment.
+        return path.as_posix()
+    for candidate in (path, *path.parents):
+        if candidate.name in (ROOT_NAME, LEGACY_ROOT_NAME):
+            return "~/" + path.relative_to(candidate.parent).as_posix()
     try:
         return "~/" + path.relative_to(Path.home()).as_posix()
     except (ValueError, RuntimeError):
-        return str(path)
+        return ".../" + path.name
 
 
 def describe(error: OSError) -> str:
-    """An ``OSError`` for a message, with its paths written as ``display`` writes them."""
+    """An ``OSError`` for a message: its reason and its paths as ``display`` writes them.
+
+    Never ``str(error)``, which on Linux spells out both absolute paths of a failed
+    rename.
+    """
     names = [
         display(Path(os.fsdecode(name)))
         for name in (error.filename, error.filename2)
@@ -228,6 +264,43 @@ def describe(error: OSError) -> str:
     ]
     reason = error.strerror or type(error).__name__
     return f"{reason}: {' -> '.join(names)}" if names else reason
+
+
+# An absolute path up to the deployment root it leads to, on POSIX or Windows, in any
+# text: docker's own diagnostics, a traceback, an exception from a library. Not one
+# already written as ~/ by display().
+ROOT_PREFIX = re.compile(
+    r"(?<![\w~.])(?:[A-Za-z]:)?(?:[\\/][^\\/\s'\"]+)*?[\\/]"
+    rf"(?=(?:{re.escape(LEGACY_ROOT_NAME)}|{re.escape(ROOT_NAME)})(?:[\\/\s'\":,)]|$))"
+)
+
+
+def redact(text: str) -> str:
+    """``text`` with every absolute path to a deployment root, and the home directory
+    itself, written as ``~``. The last line of defence before stderr, for text this
+    script did not compose: docker's output, a traceback, a library's exception."""
+    text = ROOT_PREFIX.sub("~/", text)
+    try:
+        home = Path.home()
+    except RuntimeError:
+        return text
+    for spelling in {str(home), home.as_posix()}:
+        if len(spelling) > 1:
+            text = text.replace(spelling, "~")
+    return text
+
+
+def reason(error: BaseException) -> str:
+    """An exception's text for a message: ``describe`` for an ``OSError``, never its
+    ``str``, and redacted either way."""
+    if isinstance(error, OSError):
+        return describe(error)
+    return redact(str(error))
+
+
+def warn(message: str) -> None:
+    """Every line this script writes to stderr goes through here, redacted."""
+    print(redact(message), file=sys.stderr)
 
 
 def both_roots_exist(root: Path, legacy_root: Path) -> DeploymentError:
@@ -317,9 +390,8 @@ def settle_root(root: Path, legacy_root: Path | None) -> Path:
         os.rename(legacy_root, root)
         fsync_directory(root.parent)
         migrated = True
-        print(
-            f"Migrated the deployment root from {display(legacy_root)} to {display(root)}.",
-            file=sys.stderr,
+        warn(
+            f"Migrated the deployment root from {display(legacy_root)} to {display(root)}."
         )
     if not root.is_dir():
         raise DeploymentError(f"The deployment root {display(root)} is not a directory")
@@ -567,10 +639,9 @@ def write_live_compose_script(prod: Path, live: Live) -> None:
     try:
         script = compose_script(live.manifest, live.compose_file.relative_to(prod).as_posix())
     except (DeploymentError, KeyError, TypeError, ValueError):
-        print(
+        warn(
             "compose.sh was not written for the live deployment: its manifest does not "
-            "validate.",
-            file=sys.stderr,
+            "validate."
         )
         return
     target = prod / "compose.sh"
@@ -579,9 +650,8 @@ def write_live_compose_script(prod: Path, live: Live) -> None:
         if not target.is_file() or target.read_bytes() != data:
             write_atomic(target, data, mode=0o700)
     except OSError as error:
-        print(
-            f"compose.sh was not written for the live deployment: {describe(error)}",
-            file=sys.stderr,
+        warn(
+            f"compose.sh was not written for the live deployment: {describe(error)}"
         )
 
 
@@ -916,10 +986,9 @@ def rotate(prod: Path, candidate: Manifest, previous: Live | None, snapshot: Pat
         backup_dir / "database.sqlite3"
     ):
         if not seed_backup_from_attempts(prod, backup_new):
-            print(
+            warn(
                 "No database backup exists on this host: the previous deployment could not "
-                "be snapshotted, and the previous layout held no copy.",
-                file=sys.stderr,
+                "be snapshotted, and the previous layout held no copy."
             )
 
     # 2 and 3. The live pair: the compose file first, then the manifest.
@@ -1082,11 +1151,11 @@ def deploy_locked(
         except Exception as failure:
             evidence = record_failure(
                 prod,
-                dict(candidate, status="failed", stage="backup", error=str(failure)),
+                dict(candidate, status="failed", stage="backup", error=reason(failure)),
                 carried_snapshot(prod, previous),
             )
             raise DeploymentError(
-                f"The backup failed before the service was replaced: {failure}; "
+                f"The backup failed before the service was replaced: {reason(failure)}; "
                 f"evidence={evidence}"
             ) from failure
 
@@ -1114,7 +1183,7 @@ def deploy_locked(
         )
         verify_running(candidate, candidate_compose, secrets)
     except Exception as failure:
-        result = dict(candidate, status="failed", error=str(failure))
+        result = dict(candidate, status="failed", error=reason(failure))
         try:
             if previous is not None:
                 compose(
@@ -1135,7 +1204,7 @@ def deploy_locked(
                 result["rollback"] = "no_previous_deployment"
         except Exception as rollback_failure:
             result["rollback"] = "failed"
-            result["rollback_error"] = str(rollback_failure)
+            result["rollback_error"] = reason(rollback_failure)
         evidence = record_failure(prod, result, carry)
         raise DeploymentError(
             f"Deployment failed; rollback={result['rollback']}; evidence={evidence}"
@@ -1175,7 +1244,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = deploy(**arguments)
     except (DeploymentError, subprocess.SubprocessError, OSError, ValueError) as error:
-        print(describe(error) if isinstance(error, OSError) else str(error), file=sys.stderr)
+        warn(reason(error))
+        return 1
+    except Exception:  # noqa: BLE001 - a bug: report it, but never with an absolute path
+        warn("deploy.py stopped on an unexpected error:\n" + traceback.format_exc())
         return 1
     print(json.dumps(result, indent=2))
     return 0
