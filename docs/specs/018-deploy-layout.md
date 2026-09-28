@@ -244,6 +244,15 @@ state, over a temporary directory standing in for `$HOME`.
   `deploy.py`'s default. The owner is asked.
 - **One backup** means a problem noticed two deployments late has no pre-problem copy. This
   is the owner's decision, and it is recorded here.
+- **A crash during the candidate's `up --wait`** (up to three minutes, from a dropped SSH
+  connection, a reboot or an OOM kill) leaves the candidate running and its pre-deployment
+  snapshot in `incoming/`. The next deployment clears `incoming/`, and it cannot snapshot,
+  because the running container is not the one `current.json` names. So the backup stays one
+  generation older, and the snapshot taken just before the crashed candidate is lost. That
+  matters only if the crashed candidate's migration also damaged data. Accepted as
+  proportionate, and documented in `docs/deployment.md` (found by tester-94). The shorter
+  rotation window, from the snapshot's move into `backup.new` to the swap, is closed:
+  `settle_backups` promotes a complete `backup.new`.
 - **A crash mid-rotation** can leave `current.json` one deployment behind the running
   container. That is handled by existing behaviour, with one backup skipped, and described
   above.
