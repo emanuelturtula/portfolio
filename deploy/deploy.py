@@ -460,20 +460,38 @@ def compose_script(manifest: Manifest) -> str:
     )
 
 
+def swap_backup(prod: Path) -> None:
+    """Rename ``backup.new/`` in for ``backup/``: the old one aside, the new one in, then
+    the old one deleted, so no moment passes without a complete backup directory."""
+    current, new, old = prod / "backup", prod / "backup.new", prod / "backup.old"
+    if os.path.lexists(current):
+        remove_tree(old)  # An aside left by an earlier crash; backup/ supersedes it.
+        os.rename(current, old)
+    os.rename(new, current)
+    remove_tree(old)
+
+
 def settle_backups(prod: Path) -> None:
     """Finish or undo a backup swap an earlier deployment was interrupted in.
 
-    The swap moves ``backup/`` aside to ``backup.old/`` only once ``backup.new/`` is
-    complete, so ``backup.old/`` without ``backup/`` means it stopped halfway: the new one
-    is renamed in (or, if it is gone, the old one back). Any other ``backup.new/`` may be
-    partial and is deleted. Afterwards only ``backup/`` can exist.
+    ``backup.new/`` receives its database last, and atomically, so a ``backup.new/``
+    holding ``database.sqlite3`` is complete. It is promoted, exactly as rotation would
+    have: its database is the one from before the deployment that crashed, which is the
+    copy that matters if that deployment's migration damaged the data, and the next
+    deployment may well be unable to take a snapshot of its own. Only a ``backup.new/``
+    without a database is incomplete and discarded; then a ``backup.old/`` is renamed back
+    if ``backup/`` is missing, and deleted otherwise. Afterwards only ``backup/`` can exist.
     """
     current, new, old = prod / "backup", prod / "backup.new", prod / "backup.old"
-    if os.path.lexists(old):
-        if not os.path.lexists(current):
-            os.rename(new if os.path.lexists(new) else old, current)
-        remove_tree(old)
+    if os.path.lexists(new / "database.sqlite3"):
+        swap_backup(prod)
+        return
     remove_tree(new)
+    if os.path.lexists(old):
+        if os.path.lexists(current):
+            remove_tree(old)
+        else:
+            os.rename(old, current)
 
 
 def legacy_attempt_with_database(prod: Path) -> Path | None:
@@ -525,7 +543,11 @@ def seed_backup_from_attempts(prod: Path, backup_new: Path) -> bool:
     manifest = legacy_attempt_manifest(source)
     if manifest is not None:
         write_atomic(backup_new / "current.json", manifest)
-    shutil.copyfile(source / "database.sqlite3", backup_new / "database.sqlite3")
+    # The database comes last, and appears whole under its name through a rename: its
+    # presence is what tells settle_backups this directory is complete.
+    partial = backup_new / ".database.sqlite3.tmp"
+    shutil.copyfile(source / "database.sqlite3", partial)
+    os.replace(partial, backup_new / "database.sqlite3")
     return True
 
 
@@ -544,9 +566,11 @@ def rotate(prod: Path, candidate: Manifest, previous: Live | None, snapshot: Pat
     deleted, the newest legacy attempt holding a database becomes the backup instead.
     """
     incoming = prod / "incoming"
-    backup_dir, backup_new, backup_old = prod / "backup", prod / "backup.new", prod / "backup.old"
+    backup_dir, backup_new = prod / "backup", prod / "backup.new"
 
-    # 1. Build the new backup beside the old one.
+    # 1. Build the new backup beside the old one. The database goes in LAST, by a rename:
+    # settle_backups treats a backup.new/ holding database.sqlite3 as complete and
+    # promotes it after a crash, so nothing may follow the database into it.
     settle_backups(prod)
     if snapshot is not None:
         os.mkdir(backup_new)
@@ -570,10 +594,7 @@ def rotate(prod: Path, candidate: Manifest, previous: Live | None, snapshot: Pat
 
     # 4. Swap the backup in.
     if os.path.lexists(backup_new):
-        if os.path.lexists(backup_dir):
-            os.rename(backup_dir, backup_old)
-        os.rename(backup_new, backup_dir)
-        remove_tree(backup_old)
+        swap_backup(prod)
 
     # 5 and 6.
     write_atomic(prod / "compose.sh", compose_script(candidate).encode("utf-8"), mode=0o700)
