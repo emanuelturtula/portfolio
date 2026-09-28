@@ -3,16 +3,22 @@
 Day-two tasks on the running instance: creating the account, tuning the password hash to the
 hardware, changing the password, understanding when a session ends, pointing the application
 at the chain index it reads balances from, refreshing the prices that turn a balance into
-a value, connecting the Bitget account whose trades say what each asset cost, and keeping
-the import of those trades running.
+a value, connecting the Bitget and BingX accounts whose trades say what each asset cost, and
+keeping the import of those trades running.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
-Throughout, `<deploy-root>` is the deployment root from `docs/deployment.md`
-(`~/portfolio-app-deploy/prod`), and `<origin>` is the scheme and host the browser actually
-shows when you open the application — for example `https://portfolio.example`. Neither the
-real host name nor any credential belongs in this repository, so both stay as placeholders
-here and as real values only in the host-local `secrets.env`.
+Throughout, `<deploy-root>` is the live deployment's directory on the host,
+`~/portfolio-app/prod` (its layout is in `docs/deployment.md`), and every command below
+spells it out so it can be pasted as it is. `<origin>` is the scheme and host the browser
+actually shows when you open the application — for example `https://portfolio.example`.
+Neither the real host name nor any credential belongs in this repository, so both stay as
+placeholders here and as real values only in the host-local `secrets.env`.
+
+Every command against the running container goes through
+`~/portfolio-app/prod/compose.sh`, which each successful deployment rewrites for what it
+deployed. It passes its arguments to docker compose along with the image, port, environment
+and secrets file that compose refuses to run without, so there is nothing to export first.
 
 ## 1. Required before the first deployment carrying authentication
 
@@ -25,7 +31,7 @@ Add both variables to the host-local secrets file — the same file exchange cre
 in, at mode 0600, never through GitHub:
 
 ```bash
-$EDITOR <deploy-root>/secrets.env
+$EDITOR ~/portfolio-app/prod/secrets.env
 ```
 
 ```
@@ -46,7 +52,7 @@ exists.
 `env_file` is read at container **creation**, so after editing this file:
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml up --force-recreate app
+~/portfolio-app/prod/compose.sh up -d --force-recreate app
 ```
 
 A plain restart silently keeps the old values. That is already the last row of the
@@ -89,7 +95,7 @@ If you would rather not put the password in a file at all, leave
 container:
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio create-user --username <name>
+~/portfolio-app/prod/compose.sh exec app python -m portfolio create-user --username <name>
 ```
 
 It prompts for the password twice, with no echo, and for nothing else. The account name is
@@ -113,7 +119,7 @@ either uselessly fast or slow enough to be a denial-of-service vector against th
 endpoint, so re-measure on any host that is not that one, and after any hardware change.
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio hash-benchmark
+~/portfolio-app/prod/compose.sh exec app python -m portfolio hash-benchmark
 ```
 
 It reports the median wall time of a hash with the parameters currently configured.
@@ -179,7 +185,7 @@ question, nothing to attack. Recover by setting a new password on the existing a
 the host:
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml exec app python -m portfolio create-user --replace
+~/portfolio-app/prod/compose.sh exec app python -m portfolio create-user --replace
 ```
 
 The command asks for confirmation, then for the new password twice. It changes the password
@@ -426,8 +432,7 @@ the interval, and it prints the prices where the scheduler logs a count.
 ### Refreshing by hand
 
 ```bash
-cd <deploy-root>
-docker compose exec app python -m portfolio refresh-prices
+~/portfolio-app/prod/compose.sh exec app python -m portfolio refresh-prices
 ```
 
 It fetches every supported pair once, writes what it got, and prints one line per pair:
@@ -715,7 +720,7 @@ They go in the host-local secrets file -- the same file as section 1, at mode 06
 through GitHub, never in this repository, never in any other file:
 
 ```bash
-$EDITOR <deploy-root>/secrets.env
+$EDITOR ~/portfolio-app/prod/secrets.env
 ```
 
 ```
@@ -727,7 +732,7 @@ PORTFOLIO_BITGET_API_PASSPHRASE=<the passphrase you chose>
 Then recreate the container, because `env_file` is read at creation:
 
 ```bash
-docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml up --force-recreate app
+~/portfolio-app/prod/compose.sh up -d --force-recreate app
 ```
 
 **All three, or none.** With none set, Bitget is not configured and the provider is not built
@@ -736,6 +741,8 @@ container **refuses to start** if:
 
 - only some of the three are set -- the log names the ones that are missing;
 - any of them is set but blank;
+- any of them holds text that cannot be encoded as UTF-8 -- usually a value copied from a
+  file or a terminal in another encoding;
 - the key or the passphrase holds a character an HTTP header cannot carry: a space or tab at
   either end, a line break or another control character, or anything outside printable
   ASCII. **A trailing space pasted along with the value is the usual cause.** The secret is
@@ -785,6 +792,11 @@ own. Each attempt is one row in `exchange_sync_runs` plus one row per account in
 an update or a delete of a fill, and re-reading history the sync already holds inserts
 nothing.
 
+The signed-in `/exchanges` page shows all of this without a terminal: the account list, a
+banner for any venue whose retention window truncated its history, and the run log. The
+`curl` commands below still work, and are what a script needs, but a human recovering an
+`auth_failed` key can do the last step from the page - see step 4 below.
+
 ### The four settings
 
 | Variable | Default | What it is |
@@ -801,17 +813,18 @@ interval rule as the balance timer applies (section 11): the startup run happens
 newest exchange run, of any status, started more than one interval ago.
 
 **The first sync is a backfill.** It reads everything from the history start -- clamped to
-what the venue keeps, 90 days at Bitget -- newest first, in windows the venue accepts, one
-page at a time. Each page is committed with its checkpoint, so a restart in the middle loses
-at most the page in flight and the next run resumes where the last one stopped. Later runs
-read from where the previous plan ended, reaching five minutes back to catch a fill the
-venue recorded late.
+what the venue keeps, 90 days at Bitget and a year at BingX -- newest first, in windows the
+venue accepts, one page at a time. Each page is committed with its checkpoint, so a restart
+in the middle loses at most the page in flight and the next run resumes where the last one
+stopped. Later runs read from where the previous plan ended, reaching five minutes back to
+catch a fill the venue recorded late.
 
 ### The host clock must be synchronised
 
 The sync plans by the host's clock, and a signed venue checks it: Bitget refuses any request
-whose timestamp is more than 30 seconds from its own (venue code `40008`, reported as
-`unavailable`). Keep NTP on -- `timedatectl` should say `System clock synchronized: yes`.
+whose timestamp is more than 30 seconds from its own (venue code `40008`), and **BingX any
+more than 5 seconds from its own** (venue code `100421`), both reported as `unavailable`.
+Keep NTP on -- `timedatectl` should say `System clock synchronized: yes`.
 
 If the clock is wrong anyway:
 
@@ -820,10 +833,10 @@ If the clock is wrong anyway:
   clock (log event `exchange_sync_clock_behind_plan`), pulls it back, and the run after that
   reads everything from there. No fill is lost, but nothing is imported until the clock is
   right.
-- **Behind**: the venue refuses requests as well, beyond its 30-second window. Once corrected,
-  the sync re-reads from where the slow clock left the plan. That costs requests and inserts
-  nothing twice. Only a clock behind by more than the venue's retention (90 days at Bitget)
-  loses history, and `history_truncated` then says so.
+- **Behind**: the venue refuses requests as well, beyond its window. Once corrected, the
+  sync re-reads from where the slow clock left the plan. That costs requests and inserts
+  nothing twice. Only a clock behind by more than the venue's retention (90 days at Bitget,
+  a year at BingX) loses history, and `history_truncated` then says so.
 
 ### Reading the account list
 
@@ -847,8 +860,11 @@ the process has one, never what it is.
 | `pending_windows` | how many windows of history are planned and not yet read. Non-zero after a failure or an interruption; the next run continues from them |
 | `last_error` | the kind and detail of the latest attempt, when that attempt failed. A run that skipped the account does not replace it |
 
-`history_truncated: true` with the history start unset is the normal state at Bitget: you
-asked for everything, and Bitget keeps 90 days.
+`history_truncated: true` with the history start unset is the normal state at both venues:
+you asked for everything, and Bitget keeps 90 days. At BingX this application **assumes** a
+year. BingX's API documentation says 7 days, which it does not enforce. The only year BingX
+states is its support centre's, about exporting trade history from the website, and the same
+article says some regions and risk-controlled accounts get 30 days.
 
 ### What an account's status means
 
@@ -867,11 +883,12 @@ every fifteen minutes is how an address gets banned. **To recover:**
 3. Recreate the container -- `env_file` is read at creation, so a restart is not enough:
 
    ```bash
-   docker compose -p portfolio-app-prod -f <deploy-root>/compose.yml up --force-recreate app
+   ~/portfolio-app/prod/compose.sh up -d --force-recreate app
    ```
 
 4. Trigger a sync by hand. **A manual sync is the one that retries an `auth_failed`
-   account**:
+   account**. On the `/exchanges` page, press **Sync now**; the same page shows the result
+   once it lands. Scripting the same thing:
 
    ```bash
    curl -X POST -H 'Content-Type: application/json' -H "Origin: https://<host>" \
@@ -933,9 +950,126 @@ swept to `interrupted` at startup, at shutdown and at the start of every exchang
 interrupted run loses nothing already committed: every page is its own transaction, and the
 next run resumes each window from its last committed cursor -- at Bitget, whose cursor is a
 trade id, even when the retention edge has moved past the window's start in the meantime.
-(A venue whose cursor is a time or who has none re-reads such a window from its first page,
-which costs requests and inserts nothing twice.) **Do not run an exchange sync from a second
+(BingX's cursor is a time, so there such a window is re-read from its first page, which
+costs requests and inserts nothing twice.) **Do not run an exchange sync from a second
 process while the server is up**, for the reason section 11 gives.
+
+## 14. Connecting the BingX account
+
+The application reads your BingX **spot fills** -- every buy and sell execution -- with a
+read-only API key, exactly as it reads Bitget's (section 12). The provider landed with #14.
+Once the two variables below are set and the container recreated, the exchange timer imports
+BingX fills alongside Bitget's; section 13 covers the sync, what an account's status means,
+and how to recover when BingX refuses the key. Either venue can be configured without the
+other.
+
+### Creating a read-only key
+
+On the BingX website, under **User Center → API Management**, create a new API key:
+
+1. **Leave it read-only.** BingX creates new keys with read-only permission by default, and
+   that is exactly what this application needs: it only ever reads fills, and never places,
+   cancels or transfers anything. **Never enable trading, transfer or withdrawal.**
+2. BingX keys have no passphrase. There are two values, not three.
+3. An IP whitelist is optional, and BingX recommends one. If you set one, it must include the
+   address the host's requests reach the internet from, or every sync is refused with venue
+   code `100419`, reported as an auth error. Do not write that address into this
+   repository.
+4. Copy the **API key** and the **secret key** straight into `secrets.env`. Assume the secret
+   is shown only once.
+
+### The two variables, in `secrets.env` and nowhere else
+
+| Variable | What it is |
+|---|---|
+| `PORTFOLIO_BINGX_API_KEY` | the API key |
+| `PORTFOLIO_BINGX_API_SECRET` | the secret key |
+
+They go in the host-local secrets file -- the same file as section 1, at mode 0600, never
+through GitHub, never in this repository, never in any other file:
+
+```bash
+$EDITOR ~/portfolio-app/prod/secrets.env
+```
+
+```
+PORTFOLIO_BINGX_API_KEY=<the API key>
+PORTFOLIO_BINGX_API_SECRET=<the secret key>
+```
+
+Then recreate the container, because `env_file` is read at creation:
+
+```bash
+~/portfolio-app/prod/compose.sh up -d --force-recreate app
+```
+
+**Both, or neither.** With neither set, BingX is not configured and the provider is not built
+at all -- nothing in the process holds a credential and nothing can reach the venue. The
+container **refuses to start** if:
+
+- only one of the two is set -- the log names the one that is missing;
+- either is set but blank;
+- either holds text that cannot be encoded as UTF-8 -- usually a value copied from a file or
+  a terminal in another encoding;
+- the key holds a character an HTTP header cannot carry: a space or tab at either end, a line
+  break or another control character, or anything outside printable ASCII. **A trailing space
+  pasted along with the value is the usual cause.** The secret is not checked this way; it is
+  never sent, only used to sign.
+
+No refusal ever prints a value, only the variable's name. The credentials are never written to
+the database, never returned by any endpoint and never logged. The key travels in a request
+header and the signature in the query string of the one call that needs them, and the log
+names that call `https://open-api.bingx.com/exchange_fills` and nothing more.
+
+### What a BingX error means
+
+A BingX error carries its code, as `venue code NNNNNN`, and never the text of BingX's
+message. Every error BingX sent during testing came with HTTP status 200 and the code in the
+body, so the code is what to read. The ones worth knowing:
+
+| Venue code | Reported as | Means | What to do |
+|---|---|---|---|
+| `100421` | unavailable | **the host clock**: BingX refuses a request whose timestamp is more than **5 seconds** from its own | check the clock is synchronised -- `timedatectl` should say `System clock synchronized: yes`. Five seconds is tight: a clock NTP keeps is well inside it, and one that drifts is not. One `100421` right after a throttle or a server error is harmless: the transport resent a signed request late, and the next run signs a fresh one |
+| `100419` | auth | the request came from an address the key's IP whitelist does not include | update the whitelist, or remove it |
+| `100001`, `100412`, `100413` | auth | the secret or the key is wrong, or the key was deleted | check the two variables; create a new key if in doubt |
+| `100414`, `100441`, `100401` | auth | BingX considers the account abnormal, or wants identity verification completed | sort it out with BingX in the app or with support, then recover as in section 13 |
+| `100004` | insufficient scope | the key lacks read permission | edit the key's permissions |
+| `100410`, `109429`, HTTP `418` | rate limited | too many requests; BingX restores a throttled account after five minutes, and a `418` means requests continued after a `429` | nothing; the next run asks again |
+| `100500`, `100503` | unavailable | BingX is busy | nothing; the next run asks again |
+| `100400`, `100204`, `100404`, `100490` | invalid request | BingX refused a request this application built | read `detail` and open an issue; it will not fix itself |
+
+Three refusals come from this application rather than from BingX, and each names a field:
+
+- **`commission` "is positive"**: BingX reported a fee with the opposite sign from its
+  documentation. Refused rather than recorded as income. Report it; it needs a rule written
+  from the real fill.
+- **`symbol` "must be BASE-QUOTE"**: a fill arrived for a pair spelled in a way no BingX
+  spot pair has been. The rule is wide -- anything before the last hyphen, up to 40
+  characters, so `STRK-OLD-USDT`, `$U-USDT` and `MØTH-USDT` all pass -- and refuses only
+  whitespace, control characters and a quote that is not upper-case letters and digits.
+  Report it.
+- **"a full page of 500 fills all executed in the millisecond it was asked from"**: more than
+  500 fills share one millisecond, and the time cursor BingX pages with cannot get past them.
+  Report it. It is not expected from one person's trading.
+
+### Checking the first sync after trading a second symbol
+
+The application asks BingX for every symbol at once, without naming one. BingX documents that,
+and it held when this was tested -- but that account had traded a single symbol, so no answer
+carrying two symbols has been seen yet. If BingX ever answered for one symbol only, the other
+symbol's fills would be missing, and nothing would fail.
+
+So the first time you have traded **two different pairs** on BingX, check once:
+
+1. Trigger a sync (section 13, step 4) and wait for it to finish.
+2. Count the fills stored for BingX -- on the `/exchanges` page, or as `fills_stored` in
+   `GET /api/exchanges` -- and count the spot trades in BingX's own trade history for the
+   same period. Both count executions, not
+   orders: one order filled in several parts is several fills.
+3. If this application holds fewer, open an issue saying so -- the counts, never the trades.
+
+The same check is worth making once the account has more than 500 fills in any 30 days, the
+first time BingX pages past a single answer.
 
 ## Troubleshooting
 
@@ -984,7 +1118,12 @@ process while the server is up**, for the reason section 11 gives.
 | Prices are all flagged stale | The last refresh is over an hour old. The price is still shown; it is the age that is being reported — section 10 |
 | KAS/EUR is the only pair that ever fails | Kraken is the only key-free source for it. CoinGecko is the only fallback — section 10 |
 | A pair reports `every_source_failed` while the vendor is plainly up | A vendor can be refused for what it *sent*: a price of zero or below, a non-finite number, or one too large or too small for the column. Failover treats that like any other refusal — section 10 |
-| Container refuses to start naming a `PORTFOLIO_BITGET_*` variable | Only some of the three are set, one is blank, or the key or passphrase has a character a header cannot carry — usually a trailing space from pasting — section 12 |
+| Container refuses to start naming a `PORTFOLIO_BITGET_*` variable | Only some of the three are set, one is blank, one is not valid UTF-8, or the key or passphrase has a character a header cannot carry — usually a trailing space from pasting — section 12 |
 | A Bitget error says venue code `40008` or `40005` | The host clock is more than 30 seconds off. Check `timedatectl`. A single one right after a throttle is harmless — section 12 |
 | A Bitget error names `feeDetail.deduction` | Fees paid in BGB are not supported yet. Turn off paying fees with BGB in Bitget — section 12 |
 | Bitget errors start, or Bitget syncs stop finding trades, right after accepting something in the Bitget app | Most likely the Unified Trading Account upgrade. What a Classic call returns then is not documented. Switch the main account back to Classic — section 12 |
+| Container refuses to start naming a `PORTFOLIO_BINGX_*` variable | Only one of the two is set, one is blank, one is not valid UTF-8, or the key has a character a header cannot carry — usually a trailing space from pasting — section 14 |
+| A BingX error says venue code `100421` | The host clock is more than 5 seconds off. Check `timedatectl`. A single one right after a throttle is harmless — section 14 |
+| A BingX error says venue code `100419` | The key has an IP whitelist that does not include the host's address — section 14 |
+| BingX holds fewer fills than BingX's own trade history shows | The case the application cannot detect by itself: report it with the two counts — section 14 |
+| BingX holds more fills than its own trade history, around the time BingX renamed a pair (to a name like `XYZ-OLD-USDT`) | A fill read under both names is stored twice, because its id includes the pair's name. Report it with the two counts and the date; do not edit the database — section 14 |

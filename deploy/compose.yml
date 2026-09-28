@@ -1,6 +1,11 @@
 # Runtime manifest for the Raspberry Pi. Uploaded by the delivery pipeline for each
-# deployment; nothing persistent lives on the host except the data volume and the
-# deployment state under the deploy root.
+# deployment, which stages it in ~/portfolio-app/prod/incoming/ and, once the container is
+# healthy, keeps it as ~/portfolio-app/prod/compose.yml. Nothing else persists on the host
+# except the data volume and that deployment state.
+#
+# Every PORTFOLIO_* variable below is set by deploy.py, or by the compose.sh it writes
+# beside the live copy. Run compose on the host through that script (docs/operations.md),
+# not against this file directly, or compose refuses for want of those variables.
 #
 # The compose project name (portfolio-app-prod) is chosen by deploy.py and deliberately
 # differs from the legacy `portfolio-prod` project, so the old application keeps running
@@ -16,9 +21,10 @@ services:
       PORTFOLIO_ENVIRONMENT: ${PORTFOLIO_ENVIRONMENT:?An environment name is required}
       PORTFOLIO_DATABASE_URL: sqlite+aiosqlite:////app/data/portfolio.db
     # Application secrets (exchange API credentials, price provider keys) live in a
-    # host-local file that deploy.py guarantees exists at mode 0600. They are written once
-    # over SSH by the operator and never pass through GitHub Actions. The /dev/null default
-    # keeps compose valid before that file has any content.
+    # host-local file, ~/portfolio-app/prod/secrets.env, that deploy.py guarantees exists at
+    # mode 0600. They are written once over SSH by the operator and never pass through
+    # GitHub Actions. The /dev/null default keeps compose valid before that file has any
+    # content.
     #
     # Two authentication variables live in that same file rather than here, because one is
     # a host name and the other is a credential, and neither may enter the repository:
