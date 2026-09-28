@@ -89,6 +89,15 @@ class ConflictingEventError(ValueError):
     **The message names the kind and nothing else**: the source and the external id are on
     the exception as attributes for a caller that needs them, and are kept out of the text,
     which is what ends up in a log. An external id is a trade number.
+
+    **It pickles and copies**, which an exception with a constructor of its own does not do
+    by default: `BaseException` rebuilds itself by calling the class with `self.args`, and
+    `args` here holds the one message, not the three arguments `__init__` takes, so a round
+    trip through `pickle` or `copy` raised `TypeError`. That matters as soon as the error
+    crosses a process or thread boundary -- a worker pool, a `concurrent.futures` result --
+    where the caller would receive that `TypeError` instead of this. `__reduce__` rebuilds it
+    from the identity instead. The message stays the only thing in `args`, so putting the
+    identity in the pickle does not put it in the text.
     """
 
     def __init__(self, kind: str, source: str, external_id: str) -> None:
@@ -99,6 +108,17 @@ class ConflictingEventError(ValueError):
         self.kind = kind
         self.source = source
         self.external_id = external_id
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[ConflictingEventError], tuple[str, str, str], dict[str, object]]:
+        """Rebuild from the identity, and restore anything else set on the instance.
+
+        The third element is the instance's `__dict__`, which `BaseException.__setstate__`
+        applies after construction, so an `add_note` survives the round trip as it does for
+        any other exception.
+        """
+        return (type(self), (self.kind, self.source, self.external_id), dict(self.__dict__))
 
 
 def replay(
