@@ -121,6 +121,15 @@ rename of the root makes every one of them wrong. So:
       success supersedes a failure's evidence. On a migrated host, this is the step that
       removes the ten old database copies.
 
+**A migrating deployment that took no snapshot** (the running container unhealthy, not the one
+`current.json` names, or without a database) must not delete the only copies. Before
+`attempts/` is removed, `backup/` is seeded from the newest legacy attempt that has a
+`database.sqlite3`: that database, that attempt's `compose.yml`, and its manifest (`result.json`
+when it records a healthy deployment, else `request.json`), written as `backup/current.json`. If
+no legacy attempt has a database, `attempts/` goes anyway, and one line on stderr says no
+backup exists. On a new-layout host, a deployment without a snapshot leaves `backup/` as it
+was. (Found by tester-94 reading the implementation.)
+
 **After a successful deployment exactly one database backup exists on the host**, in
 `prod/backup/`. During a failed deployment's aftermath there can be two: the backup, and the
 failure's own snapshot in `failed/`. The failure's snapshot is the pre-deployment database,
