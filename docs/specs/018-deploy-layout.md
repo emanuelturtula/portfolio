@@ -219,7 +219,7 @@ state, over a temporary directory standing in for `$HOME`.
 | 4 | `compose.sh` | its exact text for a fixed digest; mode 0700; it contains no `secrets.env` content (the file is filled with a sentinel); running it with a fake `docker` on `PATH` receives the project name, the file, the four variables and the arguments as given (`up -d --force-recreate app`, `ps`, `exec app python -m portfolio create-user --username x`) |
 | 5 | docs | `tests/deploy/` or a doc test: no `-f <deploy-root>/compose.yml` and no `portfolio-app-deploy` left in `docs/`, except in the migration paragraph; every command names `compose.sh` |
 | 6 | unchanged guards | the existing validate, rerun-order tests pass unchanged; a digest mismatch after `up` still rolls back |
-| — | atomic writes | a failure injected between each rotation step leaves every JSON file parseable, and `compose.yml` / `current.json` a matching pair or the previous pair |
+| — | atomic writes | a failure injected between each rotation step leaves every JSON file parseable. The order holds: `current.json` never runs ahead of `compose.yml`; `backup/`, `compose.sh`, `last-attempt.json` and the removal of `attempts/` come only after `current.json`. The next deployment recovers. (A crash between steps 2 and 3 leaves the new `compose.yml` beside the previous manifest; that is the order-consistent state, not a torn pair.) |
 
 `test_deploy.py`'s pruning tests go, with `prune_attempts`.
 
