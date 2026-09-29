@@ -302,3 +302,5 @@ is regenerated, because the drift job checks it.
       silently reverse the documented same-instant order.
     - A test shows the recompute finishes before `http.response.start`, which a background
       task would not.
+  - *After the fix:* the bound makes an id of zero or below a 422 as well, since no id can
+    be one. A 404 remains the answer for any id in range that the owner does not have.
