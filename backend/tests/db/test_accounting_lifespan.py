@@ -772,3 +772,73 @@ def test_the_lock_and_the_status_exist_without_the_lifespan() -> None:
 
     assert isinstance(app.state.accounting_lock, asyncio.Lock)
     assert app.state.accounting_status is None
+
+
+# --------------------------------------------------------------------------------------
+# #18: the trigger published for a request, `app.state.accounting_recompute`
+# --------------------------------------------------------------------------------------
+
+
+def test_the_published_trigger_exists_without_the_lifespan() -> None:
+    """Installed by `create_app` beside the lock, so the adjustment dependency always finds it."""
+    app = create_app()
+
+    assert callable(app.state.accounting_recompute)
+    assert create_app().state.accounting_recompute is not app.state.accounting_recompute, (
+        "each application gets a trigger bound to itself"
+    )
+
+
+async def test_the_published_trigger_is_the_real_one_for_its_application(
+    accounting_database: Path,
+) -> None:
+    """It recomputes, records to `accounting_status` and logs the reason it was given."""
+    user_id = await plant_owner_with_fills(accounting_database)
+
+    async with settled_app(accounting_database) as app:
+        async with own_factory(accounting_database) as factory, factory() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO manual_adjustments (user_id, asset, quantity, unit_cost, "
+                    "occurred_at, note, created_at, updated_at) VALUES (:user, 'KAS', "
+                    "'5.000000000000000000', NULL, '2026-03-01 08:00:00.000000', 'Opening', "
+                    "'2026-09-29 10:00:00.000000', '2026-09-29 10:00:00.000000')"
+                ),
+                {"user": user_id},
+            )
+            await session.commit()
+        with capture_logs() as captured:
+            returned = await app.state.accounting_recompute(RecomputeReason.ADJUSTMENT)
+        recorded = status_of(app)
+
+    assert isinstance(returned, AccountingStatus)
+    assert recorded is returned
+    assert (returned.outcome, returned.error) == (RecomputeOutcome.WRITTEN, None)
+    (finished,) = events_named(captured, "accounting_recompute_finished")
+    assert finished["reason"] == "adjustment"
+    assert finished["event_count"] == 4, "three fills and the adjustment"
+
+
+async def test_the_published_trigger_waits_for_the_same_lock(
+    accounting_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request's recompute is serialised with a sync's: one lock, not one each."""
+    await plant_owner_with_fills(accounting_database)
+
+    async with settled_app(accounting_database) as app:
+        calls = RecomputeCalls(monkeypatch)
+        lock: asyncio.Lock = app.state.accounting_lock
+        await lock.acquire()
+        try:
+            pending = asyncio.create_task(
+                app.state.accounting_recompute(RecomputeReason.ADJUSTMENT)
+            )
+            await asyncio.sleep(0.1)
+            assert calls.users == [], "the recompute started while the lock was held"
+            assert not pending.done()
+        finally:
+            lock.release()
+        status = await asyncio.wait_for(pending, timeout=BOUND)
+
+    assert len(calls.users) == 1
+    assert status.outcome is RecomputeOutcome.UNCHANGED

@@ -144,6 +144,15 @@ EXPECTED_NAMES = {
         "ck_accounting_warnings_kind",
         "fk_accounting_warnings_snapshot_id_accounting_snapshots",
     },
+    # #18. Named here, in the metadata, even though SQLite's DDL drops the primary key's
+    # name: `AUTOINCREMENT` is only legal on the inline `INTEGER PRIMARY KEY`, which carries
+    # no `CONSTRAINT` clause. `tests/db/test_migrations.py` pins what is on disk.
+    "manual_adjustments": {
+        "pk_manual_adjustments",
+        "fk_manual_adjustments_user_id_users",
+        "ck_manual_adjustments_note_not_blank",
+        "ix_manual_adjustments_user_id",
+    },
 }
 
 
