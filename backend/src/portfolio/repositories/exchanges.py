@@ -29,6 +29,13 @@ fill on an accounting field is a collision and raises `FillConflictError`. The d
 itself refuses `UPDATE` and `DELETE` of a fill (two triggers, `0007_exchange_sync`), so there
 is no method here that could do either.
 
+## The accounting reads the whole log, and never `raw_payload`
+
+`list_fills_for_accounting` (#19) returns every fill of every account an owner has, as
+`AccountingFillRecord`s, from a statement that names its columns. `raw_payload` is not one of
+them: it is the venue's own object, kept for forensics, and a column never loaded is a column
+that cannot reach a log or a snapshot.
+
 ## This module cannot import `NormalizedFill`
 
 `repositories` and `providers` are siblings in the layers contract and may not import each
@@ -40,7 +47,7 @@ one call site, in `services/exchange_sync.py`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -53,11 +60,13 @@ if TYPE_CHECKING:
     from datetime import datetime
     from decimal import Decimal
 
+    from sqlalchemy import Select
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from portfolio.domain.exchanges import FillSide
 
 __all__ = [
+    "AccountingFillRecord",
     "ExchangeAccountRepository",
     "ExchangeAccountState",
     "ExchangeFillRepository",
@@ -66,6 +75,7 @@ __all__ = [
     "FillInsertResult",
     "FillRecord",
     "SyncWindowRow",
+    "select_fills_for_accounting",
 ]
 
 _COMPARED_FIELDS: Final = (
@@ -569,3 +579,106 @@ class ExchangeFillRepository:
             .where(ExchangeFill.exchange_account_id == account_id)
         )
         return total or 0
+
+    async def list_fills_for_accounting(self, user_id: int) -> list[AccountingFillRecord]:
+        """Every fill of every exchange account `user_id` owns, as plain records, by fill id.
+
+        The whole history, every time: the accounting engine replays from the first event, and
+        a recompute that read part of the log would compute a different, wrong position. For a
+        personal history that is thousands of rows, which is not a performance question.
+
+        **`raw_payload` is never loaded.** The statement names its columns, and
+        `select_fills_for_accounting` is public so that a test can compile it and see. The
+        venue's own object is forensic data; nothing the accounting needs is in it that is not
+        already a column, and a column not loaded cannot reach a log.
+
+        **Nothing is compared or ordered in SQL but integers**: the owner by `user_id` and the
+        order by `ExchangeFill.id`. The engine sorts by its own key, in Python, anyway.
+        """
+        result = await self._session.execute(select_fills_for_accounting(user_id))
+        return [
+            AccountingFillRecord(
+                id=row.id,
+                exchange_account_id=row.exchange_account_id,
+                exchange_key=ExchangeKey(row.exchange_key),
+                external_trade_id=row.external_trade_id,
+                external_order_id=row.external_order_id,
+                symbol=row.symbol,
+                base_asset=row.base_asset,
+                quote_asset=row.quote_asset,
+                side=row.side,
+                quantity=row.quantity,
+                price=row.price,
+                quote_quantity=row.quote_quantity,
+                quote_quantity_derived=row.quote_quantity_derived,
+                fee_amount=row.fee_amount,
+                fee_asset=row.fee_asset,
+                executed_at=row.executed_at,
+                ingested_at=row.ingested_at,
+            )
+            for row in result
+        ]
+
+
+@dataclass(frozen=True, slots=True)
+class AccountingFillRecord:
+    """One stored fill as the accounting reads it: every column but `raw_payload`, plus the venue.
+
+    A frozen record rather than the ORM row, for the reason `ExchangeAccountState` is one, and
+    for a second reason of its own: the accounting service hands these to a worker thread,
+    where an ORM row attached to an async session must not travel.
+
+    **`side` is the column's text, unconverted.** A `CHECK` keeps it to `buy` or `sell`, but
+    turning it into a `FillSide` is part of turning the record into a `Trade`, which is where a
+    row that does not convert is reported with its identity (`UnconvertibleFillError`).
+    """
+
+    id: int
+    exchange_account_id: int
+    exchange_key: ExchangeKey
+    external_trade_id: str
+    external_order_id: str | None
+    symbol: str
+    base_asset: str
+    quote_asset: str
+    side: str
+    quantity: Decimal
+    price: Decimal
+    quote_quantity: Decimal
+    quote_quantity_derived: bool
+    fee_amount: Decimal
+    fee_asset: str | None
+    executed_at: datetime
+    ingested_at: datetime
+
+
+def select_fills_for_accounting(user_id: int) -> Select[*tuple[Any, ...]]:
+    """The statement `list_fills_for_accounting` runs, with every column it loads named.
+
+    Every column of `exchange_fills` except `raw_payload`, and the account's `exchange_key`.
+    The join is on the account, so a fill of another owner's account is never read.
+    """
+    return (
+        select(
+            ExchangeFill.id,
+            ExchangeFill.exchange_account_id,
+            ExchangeAccount.exchange_key,
+            ExchangeFill.external_trade_id,
+            ExchangeFill.external_order_id,
+            ExchangeFill.symbol,
+            ExchangeFill.base_asset,
+            ExchangeFill.quote_asset,
+            ExchangeFill.side,
+            ExchangeFill.quantity,
+            ExchangeFill.price,
+            ExchangeFill.quote_quantity,
+            ExchangeFill.quote_quantity_derived,
+            ExchangeFill.fee_amount,
+            ExchangeFill.fee_asset,
+            ExchangeFill.executed_at,
+            ExchangeFill.ingested_at,
+        )
+        .join(ExchangeAccount, ExchangeAccount.id == ExchangeFill.exchange_account_id)
+        .where(ExchangeAccount.user_id == user_id)
+        .order_by(ExchangeFill.id)
+    )
