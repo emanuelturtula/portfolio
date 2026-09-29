@@ -95,7 +95,7 @@ describe('the market value sentences', () => {
 });
 
 describe('isHeld', () => {
-  it('calls a fully sold position not held, as the wire spells it', () => {
+  it('calls a position with nothing left not held, as the wire spells it', () => {
     // The wire sends "0.000000000000000000", which is not the string "0".
     expect(isHeld(xrpClosed())).toBe(false);
     expect(isHeld(xrpClosed({ quantity: '0' }))).toBe(false);
@@ -128,15 +128,15 @@ describe('groupExclusions', () => {
 });
 
 describe('describeClosedPositions', () => {
-  it('names one fully sold asset in the singular', () => {
+  it('names one asset no longer held in the singular', () => {
     expect(describeClosedPositions(['XRP'])).toBe(
-      '1 fully sold asset (XRP) is not listed; its realized P&L is in the total.',
+      '1 asset no longer held (XRP) is not listed; its realized P&L is in the total.',
     );
   });
 
   it('names several in the plural, in the order given', () => {
     expect(describeClosedPositions(['BTC', 'ETH'])).toBe(
-      '2 fully sold assets (BTC, ETH) are not listed; their realized P&L is in the total.',
+      '2 assets no longer held (BTC, ETH) are not listed; their realized P&L is in the total.',
     );
   });
 });

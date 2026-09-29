@@ -265,7 +265,7 @@ describe('InvestedSection: the table (criteria 1 and 3)', () => {
     expect(
       Array.from(table.querySelectorAll('thead th')).map((header) => header.textContent.trim()),
     ).toEqual(COLUMNS);
-    // XRP is fully sold: not a row.
+    // XRP is no longer held: not a row.
     expect(await rowSymbols()).toEqual(['BTC', 'ETH', 'KAS', 'SOL']);
   });
 
@@ -661,7 +661,7 @@ describe('InvestedSection: flags and exclusions (criteria 5 and 8)', () => {
   });
 
   it('explains each flag in the table once, alphabetically, and none that is only on a sold asset', async () => {
-    // XRP, fully sold and not a row, carries history_incomplete here; ETH carries it too, so
+    // XRP, no longer held and not a row, carries history_incomplete here; ETH carries it too, so
     // it is in the legend once. A flag on no held row would explain a badge nobody can see.
     const response = investedPortfolio({
       positions: [
@@ -715,19 +715,19 @@ describe('InvestedSection: a stale price (criterion 6)', () => {
 });
 
 describe('InvestedSection: closed positions', () => {
-  it('lists a fully sold asset in one line, not as a row', async () => {
+  it('lists an asset no longer held in one line, not as a row', async () => {
     openDashboard();
 
     const region = await loadedRegion();
     expect(await rowSymbols()).not.toContain('XRP');
     expect(
       within(region).getByText(
-        '1 fully sold asset (XRP) is not listed; its realized P&L is in the total.',
+        '1 asset no longer held (XRP) is not listed; its realized P&L is in the total.',
       ),
     ).toBeInTheDocument();
   });
 
-  it('lists several fully sold assets in the plural', async () => {
+  it('lists several assets no longer held in the plural', async () => {
     // Realized: 7500 (BTC) - 3.25 (DOGE) + 125.5 (XRP) = 7622.25.
     openDashboard({
       positions: positionsResponse({
@@ -749,7 +749,7 @@ describe('InvestedSection: closed positions', () => {
     expect(await rowSymbols()).toEqual(['BTC']);
     expect(
       within(await loadedRegion()).getByText(
-        '2 fully sold assets (DOGE, XRP) are not listed; their realized P&L is in the total.',
+        '2 assets no longer held (DOGE, XRP) are not listed; their realized P&L is in the total.',
       ),
     ).toBeInTheDocument();
   });
@@ -765,14 +765,14 @@ describe('InvestedSection: closed positions', () => {
     const region = await loadedRegion();
     expect(await within(region).findByText('Nothing is held right now.')).toBeInTheDocument();
     expect(within(region).queryByRole('table')).not.toBeInTheDocument();
-    expect(within(region).getByText(/1 fully sold asset \(XRP\)/)).toBeInTheDocument();
+    expect(within(region).getByText(/1 asset no longer held \(XRP\)/)).toBeInTheDocument();
   });
 
   it('says nothing about sold assets when there are none', async () => {
     openDashboard({ positions: breakEvenPortfolio() });
 
     await positionsTable();
-    expect(within(await loadedRegion()).queryByText(/fully sold/)).not.toBeInTheDocument();
+    expect(within(await loadedRegion()).queryByText(/no longer held/)).not.toBeInTheDocument();
   });
 });
 
@@ -878,7 +878,7 @@ describe('InvestedSection: history warnings', () => {
     const [shortSale, fee] = within(details).getAllByRole('listitem');
     expect(shortSale?.querySelector('time')?.getAttribute('datetime')).toBe(WARNING_OCCURRED_AT);
     expect(shortSale).toHaveTextContent(
-      /on Bitget: A sale of ETH exceeded the imported history by 0\.25 ETH\. A buy or a deposit is missing\.$/,
+      /on Bitget: A sale of, or a fee paid in, ETH exceeded the imported history by 0\.25 ETH\. A buy or a deposit is missing\.$/,
     );
     expect(dataValues(shortSale ?? details)).toEqual(['0.250000000000000000']);
     expect(fee).toHaveTextContent(
@@ -1051,6 +1051,44 @@ describe('InvestedSection: empty states (criterion 7)', () => {
     expect(within(region).queryByRole('heading', { name: 'No trades imported yet' })).toBeNull();
     expect(within(region).queryByRole('heading', { name: 'The exchange sync failed' })).toBeNull();
   });
+
+  it.each<[string, PositionsResponse, string]>([
+    ['with positions', investedPortfolio(), 'BTC'],
+    ['with none', emptySnapshot(), 'No positions'],
+  ])(
+    'treats an exchange list kept across a failed poll as unknown, %s (R5)',
+    async (_label, positions, landmark) => {
+      // The list said Bitget's sync failed; then a poll of the list failed. The stale list is
+      // no longer trusted either way: neither its failure nor its "no trades" is claimed.
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      vi.setSystemTime(new Date(NOW));
+      const { exchanges } = openDashboard({
+        positions,
+        exchanges: [erroredExchange('unavailable')],
+      });
+      const region = await loadedRegion();
+      expect(await within(region).findByRole('alert')).toHaveTextContent(
+        /Bitget may be missing|trades from Bitget/,
+      );
+
+      exchanges.fail('list', () => problem(503, 'Service Unavailable', 'Try again shortly.'));
+      act(() => {
+        vi.advanceTimersByTime(60_000);
+      });
+
+      await waitFor(() => {
+        expect(within(region).getByRole('alert')).toHaveTextContent(
+          'Exchange status is unavailable: Try again shortly.',
+        );
+      });
+      // Neither sentence that names the venue's failed sync is left on screen.
+      expect(region).not.toHaveTextContent(/may miss recent trades|may be missing/);
+      expect(
+        within(region).queryByRole('heading', { name: 'The exchange sync failed' }),
+      ).toBeNull();
+      expect(within(region).getAllByText(landmark).length).toBeGreaterThan(0);
+    },
+  );
 
   it('falls back to "not computed yet" when there is no snapshot and no exchange status', async () => {
     openDashboard({
