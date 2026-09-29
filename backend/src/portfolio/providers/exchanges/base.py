@@ -338,13 +338,14 @@ class NormalizedFill:
       `UtcDateTime` column nor an accounting `EventKey` can hold. The value is kept as
       given; only whether it converts is checked;
     * a `quote_quantity_derived` that is not exactly a `bool`, or a blank `raw_payload`;
-    * **a fill the accounting engine cannot replay** (spec 020), whatever its fields: a
-      `base_asset` equal to the `quote_asset`, a fee in the asset received that consumes
-      everything received, or a rebate in the asset given that is at least everything
-      given. `trade_shape_problem` decides all three, the same function `Trade` refuses
-      them with, so the two cannot drift apart. They are refused here because the fill log
-      is append-only: a row once stored is a row every recompute after it must build a
-      `Trade` from, and one that cannot be built stops every position being computed.
+    * **a fill the accounting engine cannot replay** (spec 020), even when every field
+      passes its own rule: a `base_asset` equal to the `quote_asset`, a fee in the asset
+      received that consumes everything received, or a rebate in the asset given that is at
+      least everything given. `trade_shape_problem` decides all three, the same function
+      `Trade` refuses them with, so the two cannot drift apart. They are refused here
+      because the fill log is append-only: a row once stored is a row every recompute after
+      it must build a `Trade` from, and one that cannot be built stops every position being
+      computed.
 
     **No message quotes an amount or a trade id**: a fill quantity is the owner's holdings.
     Each names the field and the rule.
