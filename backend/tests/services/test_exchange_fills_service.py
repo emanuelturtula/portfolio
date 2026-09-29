@@ -29,6 +29,7 @@ from decimal import Decimal
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Final
 
+import anyio
 import pytest
 from sqlalchemy import event
 
@@ -735,22 +736,32 @@ async def test_the_page_built_in_the_thread_equals_the_one_built_from_the_record
     assert numbers(page, ids) == [1004, 1003]
 
 
+@pytest.mark.parametrize("cancelled_by", ["an anyio cancel scope", "Task.cancel"])
 async def test_a_cancelled_request_stops_waiting_while_the_thread_still_runs(
     factory: async_sessionmaker[AsyncSession],
     book: tuple[int, int, dict[int, int]],
     monkeypatch: pytest.MonkeyPatch,
+    cancelled_by: str,
 ) -> None:
     """Cancellation propagates at once: the caller is not held until the thread finishes.
 
     The thread is held on an event the test controls; the request is cancelled while it is
-    held, and must raise its cancellation within `CANCEL_BOUND` seconds, with the thread still
-    held. The thread holds no session, so letting it finish afterwards is harmless.
+    held, and must give up within `CANCEL_BOUND` seconds, with the thread still held. The
+    thread holds no session, so letting it finish afterwards is harmless.
+
+    **Both ways a request is cancelled are driven.** An anyio cancel scope is how the
+    application's own stack cancels -- Starlette's `BaseHTTPMiddleware`, which the session
+    check is, runs the handler in an anyio task group -- and it is the one `abandon_on_cancel`
+    decides: without it the worker thread's scope is shielded and the request waits for the
+    thread. A bare `Task.cancel()` is delivered at the await either way; it is here so that
+    neither path can regress unseen.
     """
     owner, _intruder, _ids = book
     entered = threading.Event()
     release = threading.Event()
     finished = threading.Event()
     build_page = exchanges_service._fills_page
+    scopes: list[anyio.CancelScope] = []
 
     def held_page(*arguments: Any) -> FillsPage:
         entered.set()
@@ -760,16 +771,36 @@ async def test_a_cancelled_request_stops_waiting_while_the_thread_still_runs(
         finally:
             finished.set()
 
+    async def request_in_a_scope() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await list_fills(factory, owner)
+
     monkeypatch.setattr(exchanges_service, "_fills_page", held_page)
-    request = asyncio.create_task(list_fills(factory, owner))
+    by_scope = cancelled_by == "an anyio cancel scope"
+    request = asyncio.create_task(request_in_a_scope() if by_scope else list_fills(factory, owner))
     try:
         await asyncio.wait_for(until(entered.is_set), timeout=CANCEL_BOUND)
-        request.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(request, timeout=CANCEL_BOUND)
+        if by_scope:
+            scopes[0].cancel()
+        else:
+            request.cancel()
+        # `asyncio.wait`, not `wait_for`: on a timeout `wait_for` cancels the request itself,
+        # and a request cancelled twice over can then finish inside the bound by accident.
+        done, _pending = await asyncio.wait({request}, timeout=CANCEL_BOUND)
+        assert request in done, "the request was still waiting for the thread"
         assert not finished.is_set(), "the cancellation waited for the thread"
+        if by_scope:
+            assert request.result() is None
+            assert scopes[0].cancelled_caught, "the scope's cancellation reached the request"
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                request.result()
     finally:
         release.set()
+        if not request.done():
+            request.cancel()
+            await asyncio.wait({request}, timeout=HELD_THREAD_SECONDS)
     await asyncio.wait_for(until(finished.is_set), timeout=HELD_THREAD_SECONDS)
 
 
