@@ -25,7 +25,7 @@ from fractions import Fraction
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 
 from portfolio.domain.money import (
@@ -1057,3 +1057,229 @@ def test_divide_computes_the_widest_quotients_at_other_scales(
     assert abs(expected) < Fraction(10) ** (MONEY_PRECISION - scale)
 
     assert Fraction(divide(Decimal(dividend), Decimal(divisor), scale)) == expected
+
+
+# --------------------------------------------------------------------------------------
+# Spec 024, R1: `add` and `subtract` equal the integer algorithm they replaced, bit for bit
+# --------------------------------------------------------------------------------------
+#
+# #93 moved `_exact_sum` from summing aligned integer coefficients to one call on an explicit
+# maximum-precision context that traps any rounding. The answers must not change -- not the
+# value, and not the *spelling*: the exponent and the sign of a zero are part of what `add`
+# promises, and `NumericText`, the wire and every `as_tuple()` downstream see them. So the
+# replaced algorithm is kept here, verbatim from `main` before #93, as the oracle, and the
+# property compares the two on `as_tuple()`.
+
+
+def oracle_exact_sum(left: Decimal, right: Decimal) -> Decimal:
+    """`money._exact_sum` as it was before #93: aligned integer coefficients, summed exactly."""
+    left_sign, left_digits, left_exponent = left.as_tuple()
+    right_sign, right_digits, right_exponent = right.as_tuple()
+    exponent = min(int(left_exponent), int(right_exponent))
+    left_value = oracle_scaled_coefficient(left_digits, int(left_exponent) - exponent)
+    right_value = oracle_scaled_coefficient(right_digits, int(right_exponent) - exponent)
+    total = (-left_value if left_sign else left_value) + (
+        -right_value if right_sign else right_value
+    )
+    if total == 0:
+        return Decimal((left_sign & right_sign, (0,), exponent))
+    return Decimal((int(total < 0), Decimal(abs(total)).as_tuple().digits, exponent))
+
+
+def oracle_scaled_coefficient(digits: tuple[int, ...], shift: int) -> int:
+    """`money._scaled_coefficient` as it was: the integer `digits` spell, times 10**shift."""
+    return int(Decimal((0, digits, shift)))
+
+
+def digits_of(number: int) -> tuple[int, ...]:
+    """The decimal digits of a non-negative integer, with no `str` round trip.
+
+    `Decimal(int)` converts the binary representation directly, so a coefficient past the
+    interpreter's 4300-digit `str` limit is built as easily as a short one.
+    """
+    return Decimal(number).as_tuple().digits
+
+
+EXPONENTS: Final = st.integers(-60, 60)
+#: Up to 61 digits: past every precision either context has ever been set to but the maximum.
+COEFFICIENTS: Final = st.integers(0, 10**61 - 1)
+
+
+@st.composite
+def long_coefficients(draw: st.DrawFn) -> tuple[int, ...]:
+    """A coefficient of 31 to 5,060 digits: a head, a run of zeros of drawn length, a tail."""
+    head = draw(st.integers(1, 10**30 - 1))
+    # Two bands rather than one range: Hypothesis favours small integers, and the band past
+    # the interpreter's 4300-digit `str` limit is the one the old algorithm was careful about.
+    run = draw(st.one_of(st.integers(0, 200), st.integers(4_300, 5_000)))
+    tail = digits_of(draw(st.integers(0, 10**30 - 1)))
+    padded_tail = (0,) * (30 - len(tail)) + tail
+    return (*digits_of(head), *((0,) * run), *padded_tail)
+
+
+@st.composite
+def amounts(draw: st.DrawFn) -> Decimal:
+    """Any finite `Decimal`: a signed zero, an ordinary one, or one with a very long coefficient."""
+    sign = draw(st.sampled_from((0, 1)))
+    exponent = draw(EXPONENTS)
+    shape = draw(st.sampled_from(("zero", "ordinary", "ordinary", "ordinary", "long")))
+    if shape == "zero":
+        return Decimal((sign, (0,), exponent))
+    if shape == "long":
+        return Decimal((sign, draw(long_coefficients()), exponent))
+    return Decimal((sign, digits_of(draw(COEFFICIENTS)), exponent))
+
+
+RELATIONS: Final = ("independent", "independent", "equal", "opposite", "rescaled")
+
+
+@st.composite
+def operand_pairs(draw: st.DrawFn) -> tuple[Decimal, Decimal]:
+    """Two amounts, often related: equal, opposite, or the same value at another exponent.
+
+    Independent draws almost never cancel, and a cancellation is where the sign and the
+    exponent of a zero result are decided -- the one place the two algorithms could differ
+    while agreeing on every value.
+    """
+    left = draw(amounts())
+    relation = draw(st.sampled_from(RELATIONS))
+    if relation == "equal":
+        return left, left
+    if relation == "opposite":
+        return left, left.copy_negate()
+    if relation == "rescaled":
+        sign, digits, exponent = left.as_tuple()
+        extra = draw(st.integers(1, 20))
+        return left, Decimal((sign, (*digits, *((0,) * extra)), int(exponent) - extra))
+    return left, draw(amounts())
+
+
+EQUIVALENCE: Final = settings(
+    max_examples=500, deadline=None, suppress_health_check=[HealthCheck.too_slow]
+)
+
+#: Gaps far past anything the random exponents reach, and coefficients past the `str` limit.
+#: Each pair is run through one operation only: the oracle's integer conversion is quadratic,
+#: about a second at a gap of two hundred thousand places, and the gate has a budget.
+EXTREME_CASES: Final = (
+    ("add", Decimal("1E+100000"), Decimal("1E-100000")),
+    ("subtract", Decimal("-1E+100000"), Decimal("1E-100000")),
+    ("add", Decimal("1E-30000"), Decimal("-1E+30000")),
+    ("subtract", Decimal("1E+30000"), Decimal("-1E-30000")),
+    ("add", Decimal("1E+100000"), Decimal("-1E+100000")),
+    ("subtract", Decimal("-0E+100000"), Decimal("0E-100000")),
+    ("add", Decimal((0, digits_of(10**5001 - 1), -18)), Decimal((1, (1,), -20000))),
+    (
+        "subtract",
+        Decimal((1, digits_of(10**5001 - 1), 0)),
+        Decimal((0, digits_of(10**5000 + 7), 3)),
+    ),
+)
+
+
+@EQUIVALENCE
+@given(pair=operand_pairs())
+@example(pair=(Decimal("0"), Decimal("-0")))
+@example(pair=(Decimal("-0"), Decimal("-0")))
+@example(pair=(Decimal("-0.00"), Decimal("0E+5")))
+@example(pair=(Decimal("1"), Decimal("-1")))
+@example(pair=(Decimal("-1.50"), Decimal("1.5")))
+@example(pair=(Decimal("12345678901234567890.123456789012345678"), Decimal("1E-18")))
+def test_add_equals_the_integer_algorithm_it_replaced(pair: tuple[Decimal, Decimal]) -> None:
+    """Value, exponent and the sign of a zero: `as_tuple()` is compared, not `==`."""
+    left, right = pair
+
+    assert add(left, right).as_tuple() == oracle_exact_sum(left, right).as_tuple()
+
+
+@EQUIVALENCE
+@given(pair=operand_pairs())
+@example(pair=(Decimal("0"), Decimal("0")))
+@example(pair=(Decimal("-0"), Decimal("0")))
+@example(pair=(Decimal("0"), Decimal("-0")))
+@example(pair=(Decimal("7.1"), Decimal("7.100")))
+@example(pair=(Decimal("-2.5"), Decimal("-2.5")))
+def test_subtract_equals_the_integer_algorithm_it_replaced(pair: tuple[Decimal, Decimal]) -> None:
+    left, right = pair
+
+    expected = oracle_exact_sum(left, right.copy_negate())
+
+    assert subtract(left, right).as_tuple() == expected.as_tuple()
+
+
+@pytest.mark.parametrize(("operation", "left", "right"), EXTREME_CASES)
+def test_add_and_subtract_equal_the_old_algorithm_at_extreme_gaps(
+    operation: str, left: Decimal, right: Decimal
+) -> None:
+    """Two hundred thousand places apart, and 5,001-digit coefficients: still identical."""
+    if operation == "add":
+        assert add(left, right).as_tuple() == oracle_exact_sum(left, right).as_tuple()
+    else:
+        expected = oracle_exact_sum(left, right.copy_negate())
+        assert subtract(left, right).as_tuple() == expected.as_tuple()
+
+
+@EQUIVALENCE
+@given(pair=operand_pairs())
+def test_add_and_subtract_ignore_a_hostile_ambient_context(pair: tuple[Decimal, Decimal]) -> None:
+    """Six digits, rounding toward floor, inexact results trapped: the same answers.
+
+    `ROUND_FLOOR` is the one mode under which `1 + -1` is `-0`, so a sum that leaked into the
+    ambient context would show it in the sign of a zero as well as in rounded digits.
+    """
+    left, right = pair
+    expected_sum = oracle_exact_sum(left, right).as_tuple()
+    expected_difference = oracle_exact_sum(left, right.copy_negate()).as_tuple()
+
+    with decimal.localcontext() as context:
+        context.prec = 6
+        context.rounding = decimal.ROUND_FLOOR
+        context.traps[decimal.Inexact] = True
+        context.traps[decimal.Rounded] = True
+        total = add(left, right).as_tuple()
+        difference = subtract(left, right).as_tuple()
+
+    assert (total, difference) == (expected_sum, expected_difference)
+
+
+def test_the_equivalence_strategy_reaches_what_it_claims() -> None:
+    """Zeros of both signs, cancellations, exponents at both ends, and very long coefficients."""
+    seen: dict[str, bool] = dict.fromkeys(
+        ("negative zero", "cancellation", "exponent -60", "exponent 60", "over 4300 digits"),
+        False,
+    )
+
+    @settings(
+        max_examples=1_000,
+        deadline=None,
+        derandomize=True,
+        suppress_health_check=[HealthCheck.too_slow],
+    )
+    @given(pair=operand_pairs())
+    def observe(pair: tuple[Decimal, Decimal]) -> None:
+        left, right = pair
+        for value in pair:
+            sign, digits, exponent = value.as_tuple()
+            seen["negative zero"] |= value.is_zero() and bool(sign)
+            seen["exponent -60"] |= exponent == -60
+            seen["exponent 60"] |= exponent == 60
+            seen["over 4300 digits"] |= len(digits) > 4300
+        seen["cancellation"] |= not left.is_zero() and oracle_exact_sum(left, right).is_zero()
+
+    observe()
+
+    assert seen == dict.fromkeys(seen, True), seen
+
+
+def test_a_sum_past_the_largest_exponent_is_an_overflow() -> None:
+    """Documented in `add`: at the edge of `Decimal`'s own range the new version overflows.
+
+    The integer version raised `decimal.InvalidOperation` here; no amount this application
+    stores comes within a quintillion places of it. Pinned so the difference stays a decision.
+    """
+    largest = Decimal((0, (9,), decimal.MAX_EMAX))
+
+    with pytest.raises(decimal.Overflow):
+        add(largest, largest)
+    with pytest.raises(decimal.Overflow):
+        subtract(largest, largest.copy_negate())
