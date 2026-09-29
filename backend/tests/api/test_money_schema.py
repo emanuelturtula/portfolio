@@ -402,6 +402,10 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         # Positions, cost and returns (#19): the owner's holdings and what they are worth,
         # every amount a string.
         "/api/accounting/positions",
+        # Manual adjustments (#18): opening balances and off-exchange acquisitions. Amounts
+        # are strings both ways, and a JSON number is refused on the way in.
+        "/api/accounting/adjustments",
+        "/api/accounting/adjustments/{adjustment_id}",
     }
 
 

@@ -4,6 +4,76 @@
  */
 
 export interface paths {
+    "/api/accounting/adjustments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the manual adjustments: opening balances and off-exchange acquisitions
+         * @description Return the caller's adjustments, by `occurred_at` and then id: the order they replay in.
+         */
+        get: operations["listAdjustments"];
+        put?: never;
+        /**
+         * Record coins the imported history does not show
+         * @description Record an inflow: `quantity` of `asset` acquired at `occurred_at`, at `unit_cost` or unknown.
+         *
+         *     For an opening balance -- coins bought before the exchange history begins -- **date it
+         *     before the first sale it has to cover.** An adjustment replays among the fills by
+         *     `occurred_at`, and one at the same instant as a fill replays after it.
+         *
+         *     Omit `unit_cost`, or send `null`, when the cost is not known: the quantity counts, the cost
+         *     does not, and the asset shows `unknown_basis`. A sale of those units then realizes no profit
+         *     and its proceeds go to `unmatched_proceeds`. Anything the accounting engine could not replay
+         *     is refused here with a 422, and nothing is stored. The positions are recomputed before this
+         *     answers.
+         */
+        post: operations["createAdjustment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/accounting/adjustments/{adjustment_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Replace a manual adjustment's five fields
+         * @description Replace every editable field, `unit_cost` included: `null` makes the cost unknown.
+         *
+         *     `PUT` rather than `PATCH`, because `unit_cost: null` is a value, and a partial update could
+         *     not tell it from a field that was not sent. The body is validated before the id is looked
+         *     up. Another owner's id and a missing one are the same 404. The positions are recomputed
+         *     before this answers.
+         */
+        put: operations["replaceAdjustment"];
+        post?: never;
+        /**
+         * Delete a manual adjustment
+         * @description Delete the adjustment; its id is never reused. The positions are recomputed first.
+         *
+         *     A repeat is a 404, as are another owner's id and a missing one.
+         *
+         *     **`/api/docs` cannot send this one.** Every write must carry `Content-Type:
+         *     application/json`, and Swagger UI sends no content type for a request without a body, so
+         *     the request is refused with a 403 before it gets here. `docs/operations.md`, section 15,
+         *     gives the one line to run in the browser console instead.
+         */
+        delete: operations["deleteAdjustment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/accounting/positions": {
         parameters: {
             query?: never;
@@ -540,6 +610,122 @@ export interface components {
             quantity: string;
             /** Source */
             source: string;
+        };
+        /**
+         * AdjustmentCreateRequest
+         * @description A new adjustment. `unit_cost` may be omitted, which records an unknown cost.
+         */
+        AdjustmentCreateRequest: {
+            /**
+             * Asset
+             * @description The symbol exactly as the exchanges spell it: 1 to 20 upper-case letters or digits, such as `BTC`. A lower-case symbol is refused rather than corrected, and so are the cash assets USDC and USDT.
+             */
+            asset: string;
+            /**
+             * Note
+             * @description Why, in your words. Required, not blank, at most 500 characters, and stored as given.
+             */
+            note: string;
+            /**
+             * Occurred At
+             * Format: date-time
+             * @description When the coins were acquired: an ISO 8601 datetime with an offset, not later than now. It places the adjustment among the exchange fills, and an adjustment at the same instant as a fill replays after it -- so date an opening balance **before** the first sale it covers.
+             */
+            occurred_at: string;
+            /**
+             * Quantity
+             * @description How much was acquired, above zero, as a JSON string. At most 18 decimal places and 20 digits before the point.
+             * @example 1234.56789012
+             */
+            quantity: string;
+            /**
+             * Unit Cost
+             * @description USD per unit, zero or more, as a JSON string, or `null`. **`null` is an unknown cost, not zero**: the quantity then counts toward the position but not toward its cost, and the asset shows the `unknown_basis` flag and the quantity in `unknown_basis_quantity` on `GET /api/accounting/positions`. Zero is a known cost of nothing. At most 18 decimal places, and unit cost times quantity must have at most 20 digits before the point.
+             */
+            unit_cost?: string | null;
+        };
+        /**
+         * AdjustmentListResponse
+         * @description The owner's adjustments, by `occurred_at` and then id, wrapped in an object.
+         *
+         *     An object rather than a bare array, for the reason `WalletListResponse` gives.
+         */
+        AdjustmentListResponse: {
+            /** Adjustments */
+            adjustments: components["schemas"]["AdjustmentResponse"][];
+        };
+        /**
+         * AdjustmentReplaceRequest
+         * @description A full replacement of an adjustment's five fields.
+         *
+         *     `unit_cost` is **required** and may be `null`: a replacement states the cost, known or
+         *     unknown, rather than leaving it to be guessed from an omission.
+         */
+        AdjustmentReplaceRequest: {
+            /**
+             * Asset
+             * @description The symbol exactly as the exchanges spell it: 1 to 20 upper-case letters or digits, such as `BTC`. A lower-case symbol is refused rather than corrected, and so are the cash assets USDC and USDT.
+             */
+            asset: string;
+            /**
+             * Note
+             * @description Why, in your words. Required, not blank, at most 500 characters, and stored as given.
+             */
+            note: string;
+            /**
+             * Occurred At
+             * Format: date-time
+             * @description When the coins were acquired: an ISO 8601 datetime with an offset, not later than now. It places the adjustment among the exchange fills, and an adjustment at the same instant as a fill replays after it -- so date an opening balance **before** the first sale it covers.
+             */
+            occurred_at: string;
+            /**
+             * Quantity
+             * @description How much was acquired, above zero, as a JSON string. At most 18 decimal places and 20 digits before the point.
+             * @example 1234.56789012
+             */
+            quantity: string;
+            /**
+             * Unit Cost
+             * @description USD per unit, zero or more, as a JSON string, or `null`. **`null` is an unknown cost, not zero**: the quantity then counts toward the position but not toward its cost, and the asset shows the `unknown_basis` flag and the quantity in `unknown_basis_quantity` on `GET /api/accounting/positions`. Zero is a known cost of nothing. At most 18 decimal places, and unit cost times quantity must have at most 20 digits before the point.
+             */
+            unit_cost: string | null;
+        };
+        /**
+         * AdjustmentResponse
+         * @description One adjustment, as stored: amounts as strings at their stored scale, instants in UTC.
+         */
+        AdjustmentResponse: {
+            /** Asset */
+            asset: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Id */
+            id: number;
+            /** Note */
+            note: string;
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
+            /**
+             * Quantity
+             * @example 1234.56789012
+             */
+            quantity: string;
+            /**
+             * Unit Cost
+             * @description USD per unit. `null` is an unknown cost, not zero: the asset shows `unknown_basis` on `GET /api/accounting/positions`.
+             */
+            unit_cost: string | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
         };
         /**
          * ChainKey
@@ -1323,6 +1509,125 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    listAdjustments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdjustmentListResponse"];
+                };
+            };
+        };
+    };
+    createAdjustment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdjustmentCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdjustmentResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    replaceAdjustment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The adjustment's id, as a create returned it. */
+                adjustment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdjustmentReplaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdjustmentResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    deleteAdjustment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The adjustment's id, as a create returned it. */
+                adjustment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     readAccountingPositions: {
         parameters: {
             query?: never;

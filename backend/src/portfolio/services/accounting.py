@@ -1,7 +1,8 @@
-"""The cost-basis snapshot: recomputed from the stored fills, kept, and served valued (#19).
+"""The cost-basis snapshot: recomputed from the stored events, kept, and served valued (#19).
 
-Two jobs, one class. `recompute` loads an owner's fills, turns each into a `Trade`, runs
-`domain.accounting.replay`, and replaces the stored snapshot when the answer changed.
+Two jobs, one class. `recompute` loads an owner's fills and manual adjustments, turns each into
+the engine's event -- a `Trade`, or an `Adjustment` (#18) -- runs `domain.accounting.replay`
+over **one** list of both, and replaces the stored snapshot when the answer changed.
 `positions` reads the stored snapshot back and values it at the cached prices.
 
 **No provider here, and none reachable.** A router imports this module, so it imports
@@ -12,10 +13,12 @@ table the sync wrote, and the prices from the cache the refresh wrote.
 
 ## Recompute: skip when nothing changed, replace whole when something did
 
-1. The fills are loaded as plain records -- never `raw_payload` -- and handed to a **worker
-   thread**, where each becomes a `Trade` and `replay` runs. Both are CPU-bound and pure, and
-   on the Pi a long history run on the event loop would stall every request for as long as it
-   took (spec 021, *Rulings*).
+1. The fills and the adjustments are loaded as plain records -- never `raw_payload`, never
+   an adjustment's note -- and handed to a **worker thread**, where each becomes its event and
+   `replay` runs. Both are CPU-bound and pure, and on the Pi a long history run on the event
+   loop would stall every request for as long as it took (spec 021, *Rulings*). The engine
+   orders the events by its own key, so an adjustment lands among the fills by `occurred_at`,
+   and after a fill at the same instant (spec 023, *The event*).
 2. If the stored header's `input_fingerprint` equals the new one, nothing is written and the
    outcome is `UNCHANGED`: `computed_at` does not move. `ENGINE_VERSION` is in the
    fingerprint, so an engine upgrade always writes.
@@ -31,6 +34,12 @@ skipped fill is a position that is wrong with nothing to say so, which is the
 confident-wrong-number failure the engine exists to avoid (spec 020, *For #19*). It raises
 `UnconvertibleFillError`, which carries the row's identity as attributes and never in its
 message, and the snapshot already stored stays.
+
+A stored adjustment is held to the same rule, with `UnconvertibleAdjustmentError`. It is as
+unreachable: `services/adjustments.py` validates an adjustment by building the very
+`Adjustment` this module builds, so nothing is stored that `adjustment_of` refuses (spec 023).
+`adjustment_of` lives here, beside `trade_of`, because both are the one mapping from a stored
+row to an event; `services/adjustments.py` re-exports it.
 
 ## Reading: one snapshot, never two
 
@@ -71,6 +80,7 @@ from anyio import to_thread
 from portfolio.domain.accounting import (
     METHOD,
     VALUE_SCALE,
+    Adjustment,
     EventKey,
     Trade,
     Transfer,
@@ -87,6 +97,7 @@ from portfolio.repositories.accounting import (
     AccountingWarningKind,
     SnapshotWarning,
 )
+from portfolio.repositories.adjustments import ManualAdjustmentRepository
 from portfolio.repositories.exchanges import ExchangeFillRepository
 from portfolio.services.prices import Price, PriceUnavailable, build_price_service
 
@@ -103,11 +114,13 @@ if TYPE_CHECKING:
     )
     from portfolio.domain.accounting.events import AccountingEvent
     from portfolio.repositories.accounting import SnapshotHeader
+    from portfolio.repositories.adjustments import AdjustmentRecord
     from portfolio.repositories.exchanges import AccountingFillRecord
     from portfolio.services.prices import PriceLookup, PriceService
 
 __all__ = [
     "ACCOUNTING_QUOTE_CURRENCY",
+    "ADJUSTMENT_SOURCE",
     "PRICED_ASSETS",
     "SNAPSHOT_READ_ATTEMPTS",
     "AccountingService",
@@ -120,8 +133,11 @@ __all__ = [
     "RecomputeReport",
     "SnapshotReadError",
     "SnapshotWarning",
+    "UnconvertibleAdjustmentError",
     "UnconvertibleFillError",
+    "adjustment_of",
     "build_accounting_service",
+    "external_id_of",
     "lot_kinds_of",
     "trade_of",
     "utc_now",
@@ -153,6 +169,17 @@ three is a margin, not a measurement. See `SnapshotReadError` for what happens p
 _NOTHING: Final = Decimal((0, (0,), -VALUE_SCALE))
 """Zero at the scale every figure is carried at: the unallocated costs of no snapshot."""
 
+ADJUSTMENT_SOURCE: Final = "manual"
+"""The `EventKey.source` of every manual adjustment (spec 023, *The event*).
+
+The source `lot_kinds_of` already expects for an adjustment, and one that sorts after every
+venue key -- `bingx`, `bitget` -- so an adjustment at the same instant as a fill replays after it.
+An owner recording an opening balance dates it before the first sale it has to cover.
+"""
+
+_EXTERNAL_ID_DIGITS: Final = 20
+"""How wide `external_id_of` pads an id: enough for any SQLite `INTEGER` primary key."""
+
 
 def utc_now() -> datetime:
     """The clock, in one place, so a test can replace it with a value it chose."""
@@ -177,6 +204,8 @@ class RecomputeReason(StrEnum):
 
     STARTUP = "startup"
     EXCHANGE_SYNC = "exchange_sync"
+    ADJUSTMENT = "adjustment"
+    """An owner created, replaced or deleted a manual adjustment (#18)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +263,38 @@ class UnconvertibleFillError(ValueError):
             (self.exchange_account_id, self.external_trade_id),
             dict(self.__dict__),
         )
+
+
+class UnconvertibleAdjustmentError(ValueError):
+    """A stored manual adjustment does not convert to an `Adjustment`, so the recompute stopped.
+
+    `UnconvertibleFillError`'s counterpart, built to the same rules (spec 023, *Loading and
+    recompute*):
+
+    * **The message identifies nothing.** `adjustment_id` is an attribute, for whoever needs to
+      find the row. The refusal that caused it -- naming the field and the rule, never a value
+      -- is its `__cause__`.
+    * **It pickles and copies**, rebuilding itself from the id, because the recompute raises it
+      inside a worker thread.
+
+    **Unreachable in practice**: the service validates an adjustment by building this same
+    `Adjustment` before anything is stored. It exists so that a row written some other way --
+    by hand on the Pi, say -- fails the recompute loudly instead of being skipped.
+    """
+
+    def __init__(self, adjustment_id: int) -> None:
+        """Record which row it was, as an attribute only."""
+        super().__init__(
+            "a stored manual adjustment does not convert to an adjustment the accounting "
+            "engine can replay"
+        )
+        self.adjustment_id = adjustment_id
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[UnconvertibleAdjustmentError], tuple[int], dict[str, object]]:
+        """Rebuild from the row's id, and restore anything else set on the instance."""
+        return (type(self), (self.adjustment_id,), dict(self.__dict__))
 
 
 class SnapshotReadError(RuntimeError):
@@ -343,6 +404,44 @@ def trade_of(record: AccountingFillRecord) -> Trade:
         raise UnconvertibleFillError(record.exchange_account_id, record.external_trade_id) from exc
 
 
+def external_id_of(adjustment_id: int) -> str:
+    """An adjustment's `EventKey.external_id`: its id, zero-padded to twenty digits.
+
+    `external_id` compares as text in the replay order, and `"10"` sorts before `"9"`. Padded,
+    the text order is the numeric order, so two adjustments at one instant replay in the order
+    they were entered -- and `AUTOINCREMENT` means that order is never reshuffled by a reused
+    id. Twenty digits hold any id SQLite can assign.
+    """
+    return f"{adjustment_id:0{_EXTERNAL_ID_DIGITS}d}"
+
+
+def adjustment_of(record: AdjustmentRecord) -> Adjustment:
+    """One stored adjustment as the engine's `Adjustment`, keyed as a manual event.
+
+    `EventKey(occurred_at, source=ADJUSTMENT_SOURCE, external_id=external_id_of(id))`, and
+    `asset`, `quantity` and `unit_cost` copied as they are stored. **The same constructors the
+    service validates an entry with**, so the rule a row is held to here is the rule it was
+    accepted under (spec 023, *Validation*).
+
+    Raises:
+        UnconvertibleAdjustmentError: the row breaks a rule `Adjustment` or `EventKey`
+            enforces, which only a row written around the service can.
+    """
+    try:
+        return Adjustment(
+            key=EventKey(
+                occurred_at=record.occurred_at,
+                source=ADJUSTMENT_SOURCE,
+                external_id=external_id_of(record.id),
+            ),
+            asset=record.asset,
+            quantity=record.quantity,
+            unit_cost=record.unit_cost,
+        )
+    except (TypeError, ValueError) as exc:
+        raise UnconvertibleAdjustmentError(record.id) from exc
+
+
 def lot_kinds_of(events: Iterable[AccountingEvent]) -> dict[EventKey, str]:
     """The kind of the event behind each key a lot can carry (spec 021, R2 and R8).
 
@@ -375,14 +474,20 @@ def lot_kinds_of(events: Iterable[AccountingEvent]) -> dict[EventKey, str]:
     return kinds
 
 
-def _replay_fills(records: Sequence[AccountingFillRecord]) -> _Replayed:
+def _replay_events(
+    fills: Sequence[AccountingFillRecord],
+    adjustments: Sequence[AdjustmentRecord],
+) -> _Replayed:
     """Convert and replay, in the worker thread. Pure: no session, no clock, no I/O.
 
-    **The one place the owner's events are assembled.** #18 adds a second source -- the
-    adjustments -- to the list built here and to the loader that feeds it, not a second
-    pipeline.
+    **The one place the owner's events are assembled**, from both sources, into one list. The
+    order they are listed in does not matter: `replay` sorts by `(occurred_at, source,
+    external_id, kind)` and the fingerprint is taken over that order, so the same stored rows
+    give the same fingerprint however they were read. A row of either kind that does not
+    convert raises before anything is replayed.
     """
-    events = [trade_of(record) for record in records]
+    events: list[AccountingEvent] = [trade_of(record) for record in fills]
+    events.extend(adjustment_of(record) for record in adjustments)
     return _Replayed(result=replay(events), lot_kinds=lot_kinds_of(events))
 
 
@@ -399,18 +504,20 @@ class AccountingService:
         *,
         session: AsyncSession,
         fills: ExchangeFillRepository,
+        adjustments: ManualAdjustmentRepository,
         snapshots: AccountingSnapshotRepository,
         prices: PriceService,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._session = session
         self._fills = fills
+        self._adjustments = adjustments
         self._snapshots = snapshots
         self._prices = prices
         self._clock = clock
 
     async def recompute(self, user_id: int) -> RecomputeReport:
-        """Replay the owner's fills, and replace the stored snapshot if the answer changed.
+        """Replay the owner's fills and adjustments, and replace the snapshot if the answer changed.
 
         See the module docstring for the three steps. The worker thread is abandoned rather
         than waited for when the caller is cancelled: it touches no session, so shutdown does
@@ -422,14 +529,19 @@ class AccountingService:
 
         Raises:
             UnconvertibleFillError: a stored fill does not convert. Nothing is written.
+            UnconvertibleAdjustmentError: a stored adjustment does not convert. Nothing is
+                written.
             ConflictingEventError: two events share an identity and differ -- unreachable from
-                stored rows, whose unique constraints forbid it.
+                stored rows, whose unique constraints and primary keys forbid it.
             decimal.InvalidOperation: replay left the engine's range (spec 019, *Risks*).
             Anything the write raises, including a figure `NumericText(18)` refuses; the
                 transaction is rolled back first, so the previous snapshot stays.
         """
-        records = await self._fills.list_fills_for_accounting(user_id)
-        replayed = await to_thread.run_sync(_replay_fills, records, abandon_on_cancel=True)
+        fills = await self._fills.list_fills_for_accounting(user_id)
+        adjustments = await self._adjustments.list_adjustments_for_accounting(user_id)
+        replayed = await to_thread.run_sync(
+            _replay_events, fills, adjustments, abandon_on_cancel=True
+        )
         result = replayed.result
         stored = await self._snapshots.get_header(user_id, result.method)
         if stored is not None and stored.input_fingerprint == result.input_fingerprint:
@@ -531,6 +643,7 @@ def build_accounting_service(
     return AccountingService(
         session=session,
         fills=ExchangeFillRepository(session),
+        adjustments=ManualAdjustmentRepository(session),
         snapshots=AccountingSnapshotRepository(session),
         prices=build_price_service(session, clock=clock),
         clock=clock,

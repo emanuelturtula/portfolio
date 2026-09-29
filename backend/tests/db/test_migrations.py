@@ -92,6 +92,9 @@ APPLICATION_TABLES = frozenset(
         "accounting_positions",
         "accounting_lots",
         "accounting_warnings",
+        # #18. The owner's manual adjustments: opening balances and off-exchange
+        # acquisitions. Owner data, not derived, so it is not one of #19's tables.
+        "manual_adjustments",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -137,6 +140,10 @@ EXCHANGE_SYNC_TABLES = frozenset(
 ACCOUNTING_TABLES = frozenset(
     {"accounting_snapshots", "accounting_positions", "accounting_lots", "accounting_warnings"}
 )
+
+#: #18's one. Its revision sits on top of #19's, so every single-step reversal below
+#: `0009_manual_adjustments` takes it down as well, and each test subtracts it.
+ADJUSTMENT_TABLES = frozenset({"manual_adjustments"})
 
 EXPECTED_SEED_ROWS = [
     ("BTC", "Bitcoin", 8, "crypto"),
@@ -253,6 +260,21 @@ EXPECTED_CONSTRAINT_NAMES = {
         "uq_accounting_warnings_snapshot_seq",
         "ck_accounting_warnings_kind",
         "fk_accounting_warnings_snapshot_id_accounting_snapshots",
+    },
+    # #18. One CHECK, the note's, compared with its model constant and exercised with real
+    # inserts in `tests/db/test_adjustments_migration.py`. No CHECK on a money column.
+    #
+    # **The primary key is the one anonymous constraint in the schema, and it has to be.**
+    # `AUTOINCREMENT` is only legal on SQLite's inline `INTEGER PRIMARY KEY`, and SQLAlchemy
+    # renders `sqlite_autoincrement=True` as `id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT`
+    # with no `CONSTRAINT` clause, so the `pk_manual_adjustments` the migration passes is
+    # dropped. The rebuild hazard this map guards against is therefore a different one here:
+    # a batch migration must pass `sqlite_autoincrement` again, or it silently loses
+    # `AUTOINCREMENT`, which `test_adjustments_migration.py` pins by behaviour.
+    "manual_adjustments": {
+        None,
+        "ck_manual_adjustments_note_not_blank",
+        "fk_manual_adjustments_user_id_users",
     },
 }
 
@@ -438,6 +460,7 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
         - EXCHANGE_TABLES
         - EXCHANGE_SYNC_TABLES
         - ACCOUNTING_TABLES
+        - ADJUSTMENT_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -473,6 +496,7 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
         - EXCHANGE_TABLES
         - EXCHANGE_SYNC_TABLES
         - ACCOUNTING_TABLES
+        - ADJUSTMENT_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -538,7 +562,11 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
     command.downgrade(build_alembic_config(database_url), BALANCES_REVISION)
 
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - EXCHANGE_TABLES - EXCHANGE_SYNC_TABLES - ACCOUNTING_TABLES
+        APPLICATION_TABLES
+        - EXCHANGE_TABLES
+        - EXCHANGE_SYNC_TABLES
+        - ACCOUNTING_TABLES
+        - ADJUSTMENT_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:

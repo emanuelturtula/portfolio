@@ -1074,11 +1074,12 @@ first time BingX pages past a single answer.
 
 ## 15. The cost-basis snapshot: recomputing it, and reading it
 
-The stored fills are replayed into one position per asset -- quantity, cost basis, average
-cost, realized P&L -- by the engine `docs/accounting.md` describes, and the result is kept as a
-**snapshot** in four tables (`accounting_snapshots` and its positions, lots and warnings).
-`GET /api/accounting/positions` serves that snapshot, valued at the cached USD prices. The
-contract is spec `docs/specs/021-position-snapshots.md`.
+The stored fills, and the manual adjustments the owner has entered, are replayed into one
+position per asset -- quantity, cost basis, average cost, realized P&L -- by the engine
+`docs/accounting.md` describes, and the result is kept as a **snapshot** in four tables
+(`accounting_snapshots` and its positions, lots and warnings). `GET /api/accounting/positions`
+serves that snapshot, valued at the cached USD prices. The contracts are specs
+`docs/specs/021-position-snapshots.md` and `docs/specs/023-manual-adjustments.md`.
 
 ### When it is recomputed
 
@@ -1091,11 +1092,14 @@ contract is spec `docs/specs/021-position-snapshots.md`.
   that a transient failure is retried at the next sync (every fifteen minutes by default)
   rather than at the next stored fill or restart. Otherwise a run that stored nothing leaves
   the snapshot alone.
-- **Never on a request.** The endpoint reads what is stored.
+- **After every change to a manual adjustment**, inside the request that made it: a `POST`,
+  `PUT` or `DELETE` under `/api/accounting/adjustments` answers only once the snapshot is
+  current. The change is committed first, so a recompute that fails does not undo it.
+- **Never on a read.** `GET /api/accounting/positions` reads what is stored.
 
 Two recomputes never overlap: a second one waits for the first. A recompute whose input has
-not changed -- the same fills, the same engine version -- writes nothing, and the snapshot's
-`computed_at` stays where it was.
+not changed -- the same fills and adjustments, the same engine version -- writes nothing, and
+the snapshot's `computed_at` stays where it was.
 
 ### The two log lines
 
@@ -1105,8 +1109,8 @@ not changed -- the same fills, the same engine version -- writes nothing, and th
 
 | Event | Fields | Meaning |
 |---|---|---|
-| `accounting_recompute_finished` | `reason`, `duration_ms`, `event_count`, `outcome` | `reason` is `startup` or `exchange_sync`. `outcome` is `written` (the snapshot was replaced) or `unchanged` (the input was the same, nothing was written). `event_count` is the number of fills replayed. |
-| `accounting_recompute_failed` | `reason`, `duration_ms`, `error` | The recompute raised. `error` is the exception's **class name only** -- never its message and never a traceback. The database engine already hides the values a failed statement was binding, but a message is free text that nothing promises to keep clear of a trade id or an amount, and the class name is enough to act on. |
+| `accounting_recompute_finished` | `reason`, `duration_ms`, `event_count`, `outcome` | `reason` is `startup`, `exchange_sync` or `adjustment`. `outcome` is `written` (the snapshot was replaced) or `unchanged` (the input was the same, nothing was written). `event_count` is the number of fills and adjustments replayed. |
+| `accounting_recompute_failed` | `reason`, `duration_ms`, `error`, and `adjustment_id` when `error` is `UnconvertibleAdjustmentError` | The recompute raised. `error` is the exception's **class name only** -- never its message and never a traceback. The database engine already hides the values a failed statement was binding, but a message is free text that nothing promises to keep clear of a trade id or an amount, and the class name is enough to act on. `adjustment_id` names the manual adjustment to correct; an adjustment id is logged on every change to one anyway. A fill's identity is never logged. |
 
 **The startup run's `duration_ms` on the Pi is the measurement for spec 021's criterion 8**
 (under two seconds). It is the replay of the whole history on the real hardware.
@@ -1114,8 +1118,9 @@ not changed -- the same fills, the same engine version -- writes nothing, and th
 ### What a failed recompute means
 
 **The previous snapshot stays exactly as it was, and is still served.** A recompute replaces
-the snapshot in one transaction, and a failure rolls it back. The sync that triggered it is
-not affected: its run and its fills are recorded as usual.
+the snapshot in one transaction, and a failure rolls it back. Whatever triggered it is not
+affected: a sync's run and fills are recorded as usual, and a manual adjustment stays saved and
+the request that changed it still succeeds.
 
 The endpoint says so. `last_recompute` carries the last attempt since the process started:
 
@@ -1130,16 +1135,55 @@ curl -s -b "$COOKIE" https://<host>/api/accounting/positions | jq '.computed_at,
 | `error` | What it means | What to do |
 |---|---|---|
 | `UnconvertibleFillError` | A stored fill has a shape the engine cannot account for: a pair whose base and quote are the same asset, a fee that consumes everything received, or a rebate larger than everything given. Ingestion has refused these since #99, so this is a row written before that, or by hand. | Do not edit the database: `exchange_fills` is append-only, and the recompute will keep failing until the row is dealt with. Report it with the venue and the date. The error names neither the account nor the trade on purpose, so that trade ids stay out of the log. |
+| `UnconvertibleAdjustmentError` | A stored manual adjustment breaks a rule the engine enforces: a quantity not above zero, a negative cost, more than 18 decimal places, a cost times a quantity too large to represent, a blank asset, or a date that cannot be expressed in UTC. The API refuses all of these when an adjustment is entered, so this is a row written some other way, such as by hand on the Pi. | The `accounting_recompute_failed` log line names it: its `adjustment_id` field. Correct that adjustment with a `PUT`, or delete it, under `/api/accounting/adjustments`; either recomputes at once. "Recording an opening balance" below says how to delete one. |
 | `OperationalError` | SQLite refused the statement, most likely "database is locked": another write held the lock past the five-second busy timeout. Transient. | Nothing. It is retried at the next exchange sync, even one that stores nothing, and at the next restart. If it persists across several syncs, report it. |
 | `StatementError` | The write was refused. The likeliest cause is a figure of 10²⁰ or more, which no column can hold and no real history reaches. | Report it. |
 | `InvalidOperation` | Replay left the engine's range (spec 019, *Risks*). | Report it. |
 | anything else | A defect of ours. | Report it with the class name and the time. |
 
 **Every failed recompute is retried**: at the next exchange sync, whether or not that sync
-stored a fill, and at the next restart. A transient failure such as `OperationalError` clears
-itself that way. A failure caused by the data -- `UnconvertibleFillError`, `StatementError`,
-`InvalidOperation` -- does not, because the same fills fail the same way every time; the retry
+stored a fill, at the next change to a manual adjustment, and at the next restart. A transient
+failure such as `OperationalError` clears itself that way. A failure caused by the data --
+`UnconvertibleFillError`, `UnconvertibleAdjustmentError`, `StatementError`,
+`InvalidOperation` -- does not, because the same rows fail the same way every time; the retry
 costs one replay per sync and changes nothing until the cause is dealt with.
+
+### Recording an opening balance, or any acquisition the history does not show
+
+A `negative_inventory` warning, and the `history_incomplete` flag on an asset, mean a sale
+larger than everything the imported history holds -- usually coins bought before the venue's
+retention window. The fix is a **manual adjustment**: an inflow of the asset, at its cost or at
+an unknown cost, dated **before the first sale it has to cover**. `docs/accounting.md`,
+"Recording what the history does not show", explains the rules and works an example.
+
+The endpoints are under `/api/accounting/adjustments` and need a session, like every other:
+
+| Method | Path | Does |
+|---|---|---|
+| `GET` | `/api/accounting/adjustments` | Lists them, in the order they replay. |
+| `POST` | `/api/accounting/adjustments` | Records one. `201`. |
+| `PUT` | `/api/accounting/adjustments/{id}` | Replaces all five fields, `unit_cost` included: `null` is an unknown cost. |
+| `DELETE` | `/api/accounting/adjustments/{id}` | Deletes one. `204`. |
+
+**`/api/docs` works for the first three while signed in** (section 6), **not for the delete.**
+Every write must carry `Content-Type: application/json`, and Swagger UI sends no content type
+for a request without a body, so a delete from there is refused with a 403 before it reaches
+the endpoint. Delete from the browser console instead, on a page of the signed-in
+application, with the adjustment's id in place of `<id>`:
+
+```js
+await fetch('/api/accounting/adjustments/<id>', {method: 'DELETE', headers: {'Content-Type': 'application/json'}})
+```
+
+The browser adds the `Origin` header and the session cookie itself; the promise resolves to a
+response whose `status` is `204` when the adjustment is gone, and `404` when no adjustment of
+yours has that id.
+
+Every amount is a JSON string: a JSON number is refused. Each change answers after the
+snapshot is recomputed, so `GET /api/accounting/positions` shows it straight away; if that
+recompute fails, the change is still saved and `last_recompute` says `failed`. The log records
+`adjustment_created`, `adjustment_updated` and `adjustment_deleted` with the adjustment's id
+**and nothing else**: never the asset, an amount, a date or the note.
 
 ### Reading the positions
 
@@ -1218,3 +1262,7 @@ what is left, so their percentage is the return on exactly the money in the tota
 | `last_recompute.outcome` is `failed` | The previous snapshot is still the one served. Read `error` — section 15 |
 | New trades are imported but the positions do not change | Check `last_recompute`: a failed recompute keeps the old snapshot. If it says `unchanged`, the fills replayed were exactly the ones the snapshot was already computed from — section 15 |
 | An asset shows `market_value: null` with `unsupported_pair` | Only chain assets (BTC, KAS) are priced. It is left out of the totals and named in `totals.excluded` — section 15 |
+| A `negative_inventory` warning, and `history_incomplete` on an asset | A sale larger than the imported history holds. Record the missing coins as a manual adjustment dated before that sale — section 15 |
+| An opening balance was entered and the warning is still there | The adjustment is dated at or after the sale. At the same instant, a fill replays first. Date it earlier with a `PUT` — section 15 |
+| Deleting an adjustment from `/api/docs` returns 403 | Swagger UI sends no content type for a request without a body, and every write needs `application/json`. Delete it from the browser console instead — section 15 |
+| Creating an adjustment returns 422 naming `asset` | The symbol must be the venue's own spelling, upper case, such as `BTC`, and not USDC or USDT — section 15 |

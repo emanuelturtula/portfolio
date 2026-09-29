@@ -166,6 +166,14 @@ _ACCOUNTING_WARNING_KIND_CHECK: Final = "kind IN ('negative_inventory', 'unattri
 # test as the constant above.
 _ACCOUNTING_LOT_KIND_CHECK: Final = "kind IN ('adjustment', 'trade')"
 
+# Every manual adjustment says why it exists (#18). The service refuses a blank note before
+# anything is written; this refuses one again for a writer that bypasses it. SQLite's `trim()`
+# removes spaces only, so the service's test -- Python's `str.strip()`, which removes every
+# kind of whitespace -- is the stricter of the two, and nothing it accepts is refused here.
+# The same duplication hazard as every constant above -- repeated verbatim in
+# `0009_manual_adjustments` -- and the same reflection test.
+_MANUAL_ADJUSTMENT_NOTE_CHECK: Final = "trim(note) <> ''"
+
 PRICE_SCALE: Final = 12
 """Decimal places `prices.amount` rounds to and stores. Public, because a test pins it.
 
@@ -1015,6 +1023,69 @@ class AccountingWarning(Base):
     asset: Mapped[str] = mapped_column(Text, nullable=False)
     quantity: Mapped[Decimal] = mapped_column(NumericText(ACCOUNTING_SCALE), nullable=False)
     charged_to: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+ADJUSTMENT_SCALE: Final = 18
+"""Decimal places `manual_adjustments.quantity` and `unit_cost` round to and store.
+
+**It rounds nothing**, for the reason `ACCOUNTING_SCALE` gives: the service refuses an amount
+with more than `AMOUNT_SCALE` fractional digits -- eighteen -- before it reaches the column, by
+building the engine's `Adjustment` from it. So a stored amount is the amount the owner entered,
+and the event the recompute builds from it is the event that was validated.
+"""
+
+
+class ManualAdjustment(Base):
+    """An inflow the owner records by hand: an opening balance, or an off-exchange purchase (#18).
+
+    **Source data, not derived data.** Unlike the `accounting_*` tables, a recompute cannot
+    rebuild a row of this one: the owner typed it. It cascades from `users` all the same,
+    because it is the owner's data exactly as a wallet is, and nothing outlives its owner.
+
+    **`AUTOINCREMENT`, so an id is never reused.** The id is the event's identity in the replay
+    -- `EventKey(occurred_at, "manual", f"{id:020d}")` -- and SQLite's default rowid reuses the
+    largest id after it is deleted. A reused id would give a new adjustment an old one's
+    identity, and its place among the adjustments entered at the same instant. **An Alembic
+    batch rebuild of this table drops the keyword** unless it passes
+    `table_kwargs={"sqlite_autoincrement": True}`; see `0009_manual_adjustments`.
+
+    **`unit_cost` is nullable, and `NULL` is unknown, never zero.** An adjustment without a cost
+    is held at unknown basis, out of the average and out of the realized P&L; a zero is accepted
+    and means a known cost of nothing (spec 019, *Adjustment*).
+
+    **Amounts carry no `CHECK`**, for the reason `ExchangeFill` gives: a sign check on a `TEXT`
+    column is a comparison SQLite makes by numeric affinity. The service enforces signs, scale
+    and range by building the engine's `Adjustment`, which is the one definition of them. For
+    the same reason nothing orders by `occurred_at` or by an amount in SQL: the service orders
+    the list in Python.
+
+    `note` is free text in the owner's words and **never reaches a log**; `created_at` and
+    `updated_at` are our clock, and `occurred_at` is the owner's claim about when the coins were
+    acquired, which is what places the adjustment among the fills.
+    """
+
+    __tablename__ = "manual_adjustments"
+    __table_args__ = (
+        # Named, because a batch rebuild cannot re-create an anonymous CHECK.
+        CheckConstraint(_MANUAL_ADJUSTMENT_NOTE_CHECK, name="note_not_blank"),
+        {"sqlite_autoincrement": True},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # `ix_manual_adjustments_user_id` by the naming convention: every read is one owner's.
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    asset: Mapped[str] = mapped_column(Text, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(NumericText(ADJUSTMENT_SCALE), nullable=False)
+    unit_cost: Mapped[Decimal | None] = mapped_column(NumericText(ADJUSTMENT_SCALE), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 # Re-exported so that anything needing the schema -- Alembic's `env.py`, the drift check --
