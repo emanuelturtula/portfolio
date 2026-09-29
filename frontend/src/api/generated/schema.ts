@@ -281,6 +281,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/exchanges/fills": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The owner's imported fills, filtered by exchange and date, with their totals
+         * @description Return one page of fills, newest first, and the totals over every fill that matched.
+         *
+         *     **The totals cover the whole filtered set, not the page**, so they are the same whatever
+         *     `limit` and `offset` are, and a client never sums a page. Every amount is a JSON string.
+         *     Only a USDT-quoted fill has a USDT value; any other quote is totalled in its own asset
+         *     under `not_valued_in_usdt` and never converted. Totals cover only what has been imported:
+         *     `GET /api/exchanges` says when that history is partial.
+         *
+         *     A naive `from` or `to`, one that is not ISO 8601, or `from` not before `to` is a 422, as
+         *     is an unknown `exchange`. Reads the database; calls no venue.
+         */
+        get: operations["listExchangeFills"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/exchanges/runs": {
         parameters: {
             query?: never;
@@ -804,6 +833,243 @@ export interface components {
             windows_completed: number;
         };
         /**
+         * ExchangeFillAssetTotalsResponse
+         * @description One base asset: quantities over all its fills, USDT over its USDT-quoted ones.
+         */
+        ExchangeFillAssetTotalsResponse: {
+            /** Asset */
+            asset: string;
+            /**
+             * Bought
+             * @description Quantity bought, in the asset, over every quote.
+             * @example 1234.56789012
+             */
+            bought: string;
+            /** Fill Count */
+            fill_count: number;
+            /**
+             * Net
+             * @description `bought - sold`, in the asset. Buys minus sells: positive is net buying. May be negative over a filtered range, and is never clamped to zero.
+             * @example 1234.56789012
+             */
+            net: string;
+            /**
+             * Sold
+             * @description Quantity sold, in the asset, over every quote.
+             * @example 1234.56789012
+             */
+            sold: string;
+            /**
+             * Usdt Net
+             * @description `usdt_spent - usdt_received`. Buys minus sells: positive is net buying. May be negative over a filtered range, and is never clamped to zero.
+             * @example 1234.56789012
+             */
+            usdt_net: string;
+            /**
+             * Usdt Received
+             * @description USDT received from its USDT-quoted sells.
+             * @example 1234.56789012
+             */
+            usdt_received: string;
+            /**
+             * Usdt Spent
+             * @description USDT spent on its USDT-quoted buys.
+             * @example 1234.56789012
+             */
+            usdt_spent: string;
+            /**
+             * Usdt Unvalued Fill Count
+             * @description How many of its fills are quoted in something other than USDT, and so are left out of its USDT figures.
+             */
+            usdt_unvalued_fill_count: number;
+        };
+        /**
+         * ExchangeFillFeeTotalResponse
+         * @description The fees paid in one asset, summed with their sign and never converted.
+         */
+        ExchangeFillFeeTotalResponse: {
+            /**
+             * Amount
+             * @description Signed: positive is fees paid, negative is rebates. Listed even when it sums to zero, if a fill carried a fee in this asset.
+             * @example 1234.56789012
+             */
+            amount: string;
+            /** Asset */
+            asset: string;
+        };
+        /**
+         * ExchangeFillListResponse
+         * @description One page of the filtered fills, newest first, and the totals over all of them.
+         *
+         *     `total_count` is how many fills matched the filters, which `totals.fill_count` repeats;
+         *     `fills` holds at most `limit` of them, from `offset`.
+         */
+        ExchangeFillListResponse: {
+            /** Fills */
+            fills: components["schemas"]["ExchangeFillResponse"][];
+            /** Total Count */
+            total_count: number;
+            totals: components["schemas"]["ExchangeFillTotalsResponse"];
+        };
+        /**
+         * ExchangeFillNotValuedInUsdtResponse
+         * @description The fills quoted in anything but USDT: how many, and their sums per quote asset.
+         */
+        ExchangeFillNotValuedInUsdtResponse: {
+            /**
+             * By Quote Asset
+             * @description Sorted by quote asset.
+             */
+            by_quote_asset: components["schemas"]["ExchangeFillQuoteAssetTotalsResponse"][];
+            /** Fill Count */
+            fill_count: number;
+        };
+        /**
+         * ExchangeFillQuoteAssetTotalsResponse
+         * @description One quote asset other than USDT, summed in itself. Never converted.
+         */
+        ExchangeFillQuoteAssetTotalsResponse: {
+            /** Fill Count */
+            fill_count: number;
+            /**
+             * Net
+             * @description `spent - received`, in `quote_asset`. Buys minus sells: positive is net buying. May be negative over a filtered range, and is never clamped to zero.
+             * @example 1234.56789012
+             */
+            net: string;
+            /** Quote Asset */
+            quote_asset: string;
+            /**
+             * Received
+             * @description The quote received on sells, in `quote_asset`.
+             * @example 1234.56789012
+             */
+            received: string;
+            /**
+             * Spent
+             * @description The quote paid on buys, in `quote_asset`.
+             * @example 1234.56789012
+             */
+            spent: string;
+        };
+        /**
+         * ExchangeFillResponse
+         * @description One stored fill, as the venue reported it. Never its trade id, never its raw payload.
+         */
+        ExchangeFillResponse: {
+            /** Base Asset */
+            base_asset: string;
+            exchange_key: components["schemas"]["ExchangeKey"];
+            /**
+             * Executed At
+             * Format: date-time
+             * @description When the venue executed it, in UTC.
+             */
+            executed_at: string;
+            /**
+             * Fee Amount
+             * @description In `fee_asset`, signed: positive is a fee paid, negative a rebate.
+             * @example 1234.56789012
+             */
+            fee_amount: string;
+            /**
+             * Fee Asset
+             * @description `null` only when the fee is zero.
+             */
+            fee_asset: string | null;
+            /**
+             * Id
+             * @description Our row id: a stable key, not the venue's trade id.
+             */
+            id: number;
+            /**
+             * Order Id
+             * @description The venue's order id, to find the trade at the venue; `null` when it sent none. Several fills may share one.
+             */
+            order_id: string | null;
+            /**
+             * Price
+             * @description Quote asset per unit of the base asset.
+             * @example 1234.56789012
+             */
+            price: string;
+            /**
+             * Quantity
+             * @description In the base asset.
+             * @example 1234.56789012
+             */
+            quantity: string;
+            /** Quote Asset */
+            quote_asset: string;
+            /**
+             * Quote Quantity
+             * @description In the quote asset, as stored: never recomputed as quantity times price.
+             * @example 1234.56789012
+             */
+            quote_quantity: string;
+            /**
+             * Quote Quantity Derived
+             * @description Whether `quote_quantity` was derived because the venue did not send it.
+             */
+            quote_quantity_derived: boolean;
+            /** @description Which way the base asset moved, for the owner. */
+            side: components["schemas"]["FillSide"];
+            /**
+             * Symbol
+             * @description The pair as the venue spells it, such as `BTCUSDT`.
+             */
+            symbol: string;
+            /**
+             * Usdt Value
+             * @description `quote_quantity` when `quote_asset` is `USDT`, else `null`: another quote is never converted.
+             */
+            usdt_value: string | null;
+        };
+        /**
+         * ExchangeFillTotalsResponse
+         * @description What the whole filtered set adds up to, whatever page was asked for.
+         */
+        ExchangeFillTotalsResponse: {
+            /**
+             * By Asset
+             * @description Sorted by asset.
+             */
+            by_asset: components["schemas"]["ExchangeFillAssetTotalsResponse"][];
+            /**
+             * Fees
+             * @description Sorted by asset.
+             */
+            fees: components["schemas"]["ExchangeFillFeeTotalResponse"][];
+            /** Fill Count */
+            fill_count: number;
+            not_valued_in_usdt: components["schemas"]["ExchangeFillNotValuedInUsdtResponse"];
+            usdt: components["schemas"]["ExchangeFillUsdtTotalsResponse"];
+        };
+        /**
+         * ExchangeFillUsdtTotalsResponse
+         * @description USDT across every asset, over the USDT-quoted fills.
+         */
+        ExchangeFillUsdtTotalsResponse: {
+            /**
+             * Net
+             * @description `spent - received`. Buys minus sells: positive is net buying. May be negative over a filtered range, and is never clamped to zero.
+             * @example 1234.56789012
+             */
+            net: string;
+            /**
+             * Received
+             * @description USDT received from sells.
+             * @example 1234.56789012
+             */
+            received: string;
+            /**
+             * Spent
+             * @description USDT spent on buys.
+             * @example 1234.56789012
+             */
+            spent: string;
+        };
+        /**
          * ExchangeKey
          * @description Every venue spot fills can be imported from.
          *
@@ -978,6 +1244,18 @@ export interface components {
             asset: string;
             reason: components["schemas"]["ExclusionReason"];
         };
+        /**
+         * FillSide
+         * @description Whether a fill bought or sold the base asset.
+         *
+         *     Always from the owner's side of the trade, and always about the **base** asset: a
+         *     `BUY` of `BTCUSDT` spent USDT and received BTC. A venue that reports the side of the
+         *     taker, or reports it about the quote asset, must translate before building a
+         *     `NormalizedFill` -- a fill recorded the wrong way round is a cost basis with the sign
+         *     flipped, and nothing downstream can tell.
+         * @enum {string}
+         */
+        FillSide: "buy" | "sell";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -1848,6 +2126,46 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExchangeListResponse"];
+                };
+            };
+        };
+    };
+    listExchangeFills: {
+        parameters: {
+            query?: {
+                /** @description A venue to include. Repeat it for several; omit it for every venue. A venue repeated counts once. */
+                exchange?: components["schemas"]["ExchangeKey"][] | null;
+                /** @description Inclusive start: an ISO 8601 datetime with a timezone offset. A naive datetime is refused rather than assumed to be UTC. */
+                from?: string | null;
+                /** @description Exclusive end: an ISO 8601 datetime with a timezone offset, later than `from`. A fill exactly on it belongs to the next range. */
+                to?: string | null;
+                /** @description How many fills to return, newest first. */
+                limit?: number;
+                /** @description How many matching fills to skip. Past the end is an empty page with the same totals. */
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExchangeFillListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

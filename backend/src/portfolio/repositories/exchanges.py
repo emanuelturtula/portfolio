@@ -36,6 +36,15 @@ is no method here that could do either.
 them: it is the venue's own object, kept for forensics, and a column never loaded is a column
 that cannot reach a log or a snapshot.
 
+## The transactions view reads the owner's fills, and never `raw_payload` or the trade id
+
+`list_fills_for_view` (#93) returns every fill of the owner's accounts on the selected venues,
+as `FillViewRecord`s, from `select_fills_for_view`, which names its columns: the ones the view
+shows and totals, and **neither `raw_payload` nor `external_trade_id`**. The trade id is never
+served, and a column never loaded cannot be served by mistake. The venues are filtered in SQL
+-- an integer and an enum column -- and nothing else is: the view's date range and its order are
+applied by the service, in Python, for the reason given above.
+
 ## This module cannot import `NormalizedFill`
 
 `repositories` and `providers` are siblings in the layers contract and may not import each
@@ -53,17 +62,15 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from portfolio.db.models import ExchangeAccount, ExchangeFill, ExchangeSyncWindow
-from portfolio.domain.exchanges import AccountSyncStatus, ExchangeKey
+from portfolio.domain.exchanges import AccountSyncStatus, ExchangeKey, FillSide
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
     from datetime import datetime
     from decimal import Decimal
 
     from sqlalchemy import Select
     from sqlalchemy.ext.asyncio import AsyncSession
-
-    from portfolio.domain.exchanges import FillSide
 
 __all__ = [
     "AccountingFillRecord",
@@ -74,8 +81,10 @@ __all__ = [
     "FillConflictError",
     "FillInsertResult",
     "FillRecord",
+    "FillViewRecord",
     "SyncWindowRow",
     "select_fills_for_accounting",
+    "select_fills_for_view",
 ]
 
 _COMPARED_FIELDS: Final = (
@@ -619,6 +628,41 @@ class ExchangeFillRepository:
             for row in result
         ]
 
+    async def list_fills_for_view(
+        self, user_id: int, exchanges: Collection[ExchangeKey] | None
+    ) -> Sequence[FillViewRecord]:
+        """Every fill of `user_id`'s accounts on `exchanges`, as plain records, by fill id.
+
+        `exchanges` is `None` for every venue; a collection selects those venues, and an empty
+        one selects none. **The venue is the only filter here**: the service applies the date
+        range and the order in Python, because `executed_at` is text in SQLite (see the module
+        docstring), and so it reads the owner's whole history on those venues. For a personal
+        history that is thousands of rows; spec 024 records what 50,000 cost.
+
+        **Neither `raw_payload` nor `external_trade_id` is loaded**: the statement names its
+        columns, and `select_fills_for_view` is public so that a test can compile it and see.
+        """
+        result = await self._session.execute(select_fills_for_view(user_id, exchanges))
+        return [
+            FillViewRecord(
+                id=row.id,
+                exchange_key=ExchangeKey(row.exchange_key),
+                external_order_id=row.external_order_id,
+                symbol=row.symbol,
+                base_asset=row.base_asset,
+                quote_asset=row.quote_asset,
+                side=FillSide(row.side),
+                quantity=row.quantity,
+                price=row.price,
+                quote_quantity=row.quote_quantity,
+                quote_quantity_derived=row.quote_quantity_derived,
+                fee_amount=row.fee_amount,
+                fee_asset=row.fee_asset,
+                executed_at=row.executed_at,
+            )
+            for row in result
+        ]
+
 
 @dataclass(frozen=True, slots=True)
 class AccountingFillRecord:
@@ -682,3 +726,67 @@ def select_fills_for_accounting(user_id: int) -> Select[*tuple[Any, ...]]:
         .where(ExchangeAccount.user_id == user_id)
         .order_by(ExchangeFill.id)
     )
+
+
+@dataclass(frozen=True, slots=True)
+class FillViewRecord:
+    """One stored fill as the transactions view reads it: what it shows and what it totals.
+
+    Every column but `raw_payload`, `external_trade_id`, `exchange_account_id` and
+    `ingested_at`, plus the account's venue. `side` is a `FillSide` here, unlike
+    `AccountingFillRecord`'s: `ck_exchange_fills_side` admits nothing else, and the view has no
+    per-row error to report a stray value with.
+    """
+
+    id: int
+    exchange_key: ExchangeKey
+    external_order_id: str | None
+    symbol: str
+    base_asset: str
+    quote_asset: str
+    side: FillSide
+    quantity: Decimal
+    price: Decimal
+    quote_quantity: Decimal
+    quote_quantity_derived: bool
+    fee_amount: Decimal
+    fee_asset: str | None
+    executed_at: datetime
+
+
+def select_fills_for_view(
+    user_id: int, exchanges: Collection[ExchangeKey] | None
+) -> Select[*tuple[Any, ...]]:
+    """The statement `list_fills_for_view` runs, with every column it loads named.
+
+    Joined on the account, so a fill of another owner's account is never read. The venues are
+    an `IN` on `exchange_accounts.exchange_key`, sorted so the statement is the same for the
+    same set; `None` leaves the clause out. Ordered by `ExchangeFill.id`, an integer, so the
+    read is deterministic; the view's own order is the service's.
+    """
+    statement = (
+        select(
+            ExchangeFill.id,
+            ExchangeAccount.exchange_key,
+            ExchangeFill.external_order_id,
+            ExchangeFill.symbol,
+            ExchangeFill.base_asset,
+            ExchangeFill.quote_asset,
+            ExchangeFill.side,
+            ExchangeFill.quantity,
+            ExchangeFill.price,
+            ExchangeFill.quote_quantity,
+            ExchangeFill.quote_quantity_derived,
+            ExchangeFill.fee_amount,
+            ExchangeFill.fee_asset,
+            ExchangeFill.executed_at,
+        )
+        .join(ExchangeAccount, ExchangeAccount.id == ExchangeFill.exchange_account_id)
+        .where(ExchangeAccount.user_id == user_id)
+        .order_by(ExchangeFill.id)
+    )
+    if exchanges is not None:
+        statement = statement.where(
+            ExchangeAccount.exchange_key.in_(sorted({ExchangeKey(key) for key in exchanges}))
+        )
+    return statement
