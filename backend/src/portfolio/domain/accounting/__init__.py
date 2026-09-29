@@ -9,6 +9,10 @@ contract is spec 019; the method and its caveats are in `docs/accounting.md` and
 context: the `domain-is-pure` import contract forbids the modules that could do any of it,
 and an AST test forbids the clock calls an import contract cannot see. The same events and
 configuration always give the same result, and the same `input_fingerprint`.
+
+`value_position` and `value_portfolio` (#19) combine a position with a current price. They
+are here rather than in the service that looks the price up so that the arithmetic is held to
+the engine's exactness rules and its coverage floor; see `valuation`.
 """
 
 from portfolio.domain.accounting.constants import (
@@ -28,6 +32,7 @@ from portfolio.domain.accounting.events import (
     Transfer,
     trade_shape_problem,
 )
+from portfolio.domain.accounting.fingerprint import event_kind
 from portfolio.domain.accounting.replay import ConflictingEventError, replay
 from portfolio.domain.accounting.results import (
     AccountingResult,
@@ -37,6 +42,16 @@ from portfolio.domain.accounting.results import (
     PositionFlag,
     UnattributedFee,
 )
+from portfolio.domain.accounting.valuation import (
+    RETURN_PCT_SCALE,
+    VALUE_SCALE,
+    Exclusion,
+    ExclusionReason,
+    PortfolioTotals,
+    PositionValue,
+    value_portfolio,
+    value_position,
+)
 
 __all__ = [
     "AVERAGE_COST_SCALE",
@@ -45,19 +60,28 @@ __all__ = [
     "ENGINE_VERSION",
     "METHOD",
     "QUANTITY_SCALE",
+    "RETURN_PCT_SCALE",
+    "VALUE_SCALE",
     "AccountingConfig",
     "AccountingResult",
     "Adjustment",
     "ConflictingEventError",
     "EventKey",
+    "Exclusion",
+    "ExclusionReason",
     "Lot",
     "NegativeInventory",
+    "PortfolioTotals",
     "Position",
     "PositionFlag",
+    "PositionValue",
     "Trade",
     "TradeShapeProblem",
     "Transfer",
     "UnattributedFee",
+    "event_kind",
     "replay",
     "trade_shape_problem",
+    "value_portfolio",
+    "value_position",
 ]
