@@ -20,6 +20,7 @@ wrong `source` or `external_id` would change.
 from __future__ import annotations
 
 import copy
+import gc
 import pickle
 import sys
 import threading
@@ -1048,6 +1049,14 @@ async def test_a_retried_read_does_not_serve_rows_remembered_from_the_first_atte
     22500 unmatched and a shortfall of 1.5. B's position and warning rows reuse A's ids, so a
     retry that handed back the objects the first attempt loaded would serve A's figures under
     B's header -- the case `populate_existing` is there for, on both lists.
+
+    **The cyclic garbage collector is paused for the read**, and that is what makes this test
+    deterministic. The first attempt's ORM rows sit in reference cycles, so whether they are
+    still in the session's weak identity map when the retry runs depends on whether a
+    collection happened in between. Measured on the mutation lab: with `populate_existing`
+    removed, the test passed while a collection happened to run and served
+    `(2, 0, 30000, 1.5)` -- one snapshot's header over the other's rows -- once it could not.
+    Production does not get to choose, so the test does not either.
     """
     async with factory() as session:
         user_id = await plant_owner(session)
@@ -1100,8 +1109,12 @@ async def test_a_retried_read_does_not_serve_rows_remembered_from_the_first_atte
 
     monkeypatch.setattr(AccountingSnapshotRepository, "list_warnings", recompute_after_both_lists)
 
-    async with factory() as session:
-        view = await build_accounting_service(session, clock=clock).positions(user_id)
+    gc.disable()
+    try:
+        async with factory() as session:
+            view = await build_accounting_service(session, clock=clock).positions(user_id)
+    finally:
+        gc.enable()
 
     assert not armed[0], "the hook ran: a recompute really committed mid-read"
     (btc,) = [entry.value.position for entry in view.positions]
