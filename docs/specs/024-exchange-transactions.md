@@ -331,3 +331,29 @@ These are the issue's criteria, all of them, backend and frontend, plus:
   - **A DST bug was caught by the tester and fixed.** On a day whose local midnight does not
     exist (Santiago, 6 Sep 2026), the next-day boundary came out an hour late. It is now
     built from calendar fields.
+- **R3. Measured budget, and the backend's interpretations (developer), accepted.**
+  - **Timings.** Development machine, synthetic fills, and the no-filter worst case, in
+    which every fill is loaded, sorted and totalled. Each figure is the median of 5 after a
+    warm-up.
+
+    | Fills | Without coverage | With coverage | As first built (no coverage) |
+    |---|---|---|---|
+    | 5,000 | 0.040 s | 0.158 s | 0.103 s |
+    | 20,000 | 0.199 s | 0.666 s | 0.446 s |
+    | 50,000 | 0.460 s | 1.631 s | 1.08 s |
+
+    At 20,000 fills that is about 0.8 s on the Pi, within the 1 s budget. The guard test
+    bounds the 20,000 case at 2.0 s with coverage, which is 3 × 0.666 s.
+  - **The view reads fewer columns than the spec allowed.** `external_trade_id`,
+    `exchange_account_id` and `ingested_at` are left out along with `raw_payload`. A trade
+    id that is never loaded cannot be served by mistake.
+  - **The new `money.add` has two edges.** A sum past `MAX_EMAX` raises `decimal.Overflow`,
+    and an exponent gap near 10^18 places raises `MemoryError`. The old algorithm raised
+    `InvalidOperation` for both. No stored or derived amount comes near either edge. Both
+    are documented under *Raises*, and a test pins the `Overflow` case.
+  - **Zero totals are sent at 18 places** (`"0.000000000000000000"`), the stored scale. That
+    needed `TOTALS_SCALE` in `domain/fill_totals.py`. It is not imported from
+    `domain.accounting`, so that the engine can reuse these totals later without an import
+    cycle.
+  - **A fee asset is listed whenever a matching fill carries one,** even when its amount or
+    its sum is zero. A fill with no fee asset adds nothing.
