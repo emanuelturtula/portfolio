@@ -32,6 +32,17 @@ export const EXCHANGE_KEYS: readonly ExchangeKey[] = Object.keys(EXCHANGES).filt
   (key): key is ExchangeKey => Object.hasOwn(EXCHANGES, key),
 );
 
+/**
+ * The first and last day a filter accepts. Both are what the date inputs' `min` and `max`
+ * say, and both keep the instants the API is sent inside what it can read: a `from` at
+ * year 0001 is, east of Greenwich, an instant in year 0, and a `to` of 31 December 9999 has
+ * its next midnight in year 10000. Neither can be parsed as a datetime by the backend, and
+ * the owner would see "Could not load transactions" for a range no fill can be in. Every
+ * day up to `MAX_DAY` has a next day that fits.
+ */
+export const MIN_DAY = '1970-01-01';
+export const MAX_DAY = '9999-12-30';
+
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const PAGE_PATTERN = /^[1-9]\d{0,5}$/;
 const DIGITS = '0123456789';
@@ -61,8 +72,16 @@ function isCalendarDay(value: string): boolean {
   return DAY_PATTERN.test(value) && formatDay(startOfDay(value)) === value;
 }
 
+/**
+ * Whether `day` is a real calendar day between {@link MIN_DAY} and {@link MAX_DAY}, and so
+ * one a filter may hold and the API may be asked about. `YYYY-MM-DD` orders as text.
+ */
+export function isSelectableDay(day: string): boolean {
+  return isCalendarDay(day) && day >= MIN_DAY && day <= MAX_DAY;
+}
+
 function dayOrNull(value: string | null): string | null {
-  return value !== null && isCalendarDay(value) ? value : null;
+  return value !== null && isSelectableDay(value) ? value : null;
 }
 
 /**
@@ -83,7 +102,8 @@ function pageOrFirst(value: string | null): number {
  *
  * - an unknown exchange is dropped, a repeated one counts once, and the rest come out in the
  *   order of {@link EXCHANGE_KEYS}, so two URLs that mean the same thing share one query key;
- * - a day that is not a real `YYYY-MM-DD` day is dropped;
+ * - a day that is not a real `YYYY-MM-DD` day between {@link MIN_DAY} and {@link MAX_DAY} is
+ *   dropped;
  * - a page that is not a positive integer is the first.
  *
  * An inverted range (`to` before `from`) is *kept*: the form shows it and refuses to send it

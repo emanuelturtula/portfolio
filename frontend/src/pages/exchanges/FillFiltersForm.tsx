@@ -1,13 +1,14 @@
 import { EXCHANGES } from '@/lib/exchanges';
 import {
-  dayFromInput,
   displayTimeZone,
   EXCHANGE_KEYS,
   hasActiveFilters,
   toggleExchange,
+  writeFillFilters,
   type FillFilters,
 } from '@/lib/fillFilters';
 import { INVERTED_RANGE_MESSAGE } from '@/lib/fills';
+import { DayInput } from '@/pages/exchanges/DayInput';
 
 interface FillFiltersFormProps {
   readonly filters: FillFilters;
@@ -18,9 +19,11 @@ interface FillFiltersFormProps {
 }
 
 /**
- * The exchange checkboxes and the two day pickers. There is no Apply button: every control is
- * driven by the URL's filters and writes back to it, so the URL is the single source of truth
- * and back/forward restore exactly what the form shows.
+ * The exchange checkboxes and the two day pickers. There is no Apply button: every control
+ * writes to the URL's filters and shows them, so the URL is the single source of truth and
+ * back/forward restore exactly what the form shows. The day pickers keep a draft of what is
+ * being typed until it is a day the filters may hold (see `DayInput`), and are told to drop
+ * it whenever the filters change under them - `syncKey` is the filters, as the URL writes them.
  *
  * The venue choices are every `ExchangeKey`, not the ones the exchange list happens to hold,
  * so the form does not depend on that request. None checked is every exchange.
@@ -32,6 +35,7 @@ interface FillFiltersFormProps {
  */
 export function FillFiltersForm({ filters, inverted, onChange, onClear }: FillFiltersFormProps) {
   const active = hasActiveFilters(filters);
+  const syncKey = writeFillFilters(filters, 1).toString();
 
   return (
     <div className="fill-filters" role="group" aria-label="Transaction filters">
@@ -52,31 +56,28 @@ export function FillFiltersForm({ filters, inverted, onChange, onClear }: FillFi
         <p className="hint">Leave all unchecked to include every exchange.</p>
       </fieldset>
 
-      <div className="field">
-        <label htmlFor="fills-from">From</label>
-        <input
-          id="fills-from"
-          type="date"
-          value={filters.fromDay ?? ''}
-          aria-describedby="fills-timezone"
-          onChange={(event) => {
-            onChange({ ...filters, fromDay: dayFromInput(event.target.value) });
-          }}
-        />
-      </div>
-      <div className="field">
-        <label htmlFor="fills-to">To</label>
-        <input
-          id="fills-to"
-          type="date"
-          value={filters.toDay ?? ''}
-          aria-describedby="fills-timezone"
-          aria-invalid={inverted}
-          onChange={(event) => {
-            onChange({ ...filters, toDay: dayFromInput(event.target.value) });
-          }}
-        />
-      </div>
+      <DayInput
+        id="fills-from"
+        label="From"
+        day={filters.fromDay}
+        syncKey={syncKey}
+        describedBy="fills-timezone"
+        invalid={false}
+        onDay={(fromDay) => {
+          onChange({ ...filters, fromDay });
+        }}
+      />
+      <DayInput
+        id="fills-to"
+        label="To"
+        day={filters.toDay}
+        syncKey={syncKey}
+        describedBy="fills-timezone"
+        invalid={inverted}
+        onDay={(toDay) => {
+          onChange({ ...filters, toDay });
+        }}
+      />
 
       <button
         type="button"

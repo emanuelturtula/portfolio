@@ -627,3 +627,8 @@ p.state-error[role='alert'] {
 .data-table--sticky tbody th {
   min-width: 5.5rem;
 }
+
+/* A day typed outside `min`..`max` stays in the field but is never sent: the border says so. */
+.fill-filters .field input:invalid {
+  border-color: var(--color-error);
+}

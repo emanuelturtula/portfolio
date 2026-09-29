@@ -27,7 +27,7 @@ interface SyncHistoryDisclosureProps {
  *   that finds a new failure does not reopen a log they closed.
  *
  * The `<details>` is controlled: the summary's click is taken over (`preventDefault`) and
- * writes the state, and React writes `open` back. The native `toggle` event is deliberately
+ * writes the state, from the element's own `open`, and the element itself. The native `toggle` event is deliberately
  * not used, because it also fires when `open` changes for any other reason, and a log that
  * opened itself because a run failed would be recorded as the owner's own choice.
  *
@@ -57,8 +57,17 @@ export function SyncHistoryDisclosure({ runs, exchanges }: SyncHistoryDisclosure
           <details open={open}>
             <summary
               onClick={(event) => {
+                // Take over the native toggle, and read the element's own state to do it: the
+                // browser can open a <details> without React (find-in-page does), and `open`
+                // here is only what React last rendered. Working from that would "toggle" to
+                // the state the element is already in, and the click would seem to do nothing.
+                // The element is written to directly as well as the state, because React does
+                // not touch an attribute whose rendered value has not changed.
                 event.preventDefault();
-                setOwnerChoice(!open);
+                const details = event.currentTarget.parentElement as HTMLDetailsElement;
+                const next = !details.open;
+                details.open = next;
+                setOwnerChoice(next);
               }}
             >
               Latest run: {RUN_STATUS_LABELS[newest.status]}, started{' '}

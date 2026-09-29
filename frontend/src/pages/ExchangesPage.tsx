@@ -3,6 +3,7 @@ import { useQueryClient } from '@tanstack/react-query';
 
 import { describeApiError } from '@/api/client';
 import {
+  exchangeFillsQueryKey,
   exchangeRunsQueryKey,
   useExchanges,
   useExchangeRuns,
@@ -88,6 +89,44 @@ export function ExchangesPage() {
     }
     previousAnySyncingRef.current = anySyncing;
   }, [anySyncing, newestRun, queryClient]);
+
+  /**
+   * Spec 024, R5/S1: the transactions are refreshed when the stored fills change, not only when
+   * this page's own sync settles. A *scheduled* sync can recover a failing venue and store
+   * fills: the next list poll clears the failing alert and the completeness sentence, and
+   * without this the table and its totals would keep the old count with no warning at all.
+   *
+   * The signal is the list's per-venue `fills_stored`, which the list already polls, so this
+   * adds no request of its own. It is compared only while no venue is `syncing`: during a
+   * backfill every committed page raises the count, and refreshing the whole fills view and
+   * its totals at each 5 s poll for minutes would be polling by another name. The list shows
+   * `pending_windows` and the completeness notice says the import is unfinished meanwhile, so
+   * the owner is not misled while it runs. The baseline is not advanced during that time, so
+   * the first settled reading after the run still differs from the one before it, and a run
+   * that starts and ends between two slow polls is seen the same way.
+   *
+   * The first reading is only recorded: the fills query has just been asked for it. After a
+   * manual sync the fills are invalidated twice (by the mutation, then here), which is one
+   * spare request.
+   */
+  const fillsSignature = exchanges.data
+    ?.map((exchange) => `${exchange.exchange_key}:${String(exchange.fills_stored)}`)
+    .join(',');
+  const fillsBaselineRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const baseline = fillsBaselineRef.current;
+    if (baseline === undefined) {
+      fillsBaselineRef.current = fillsSignature;
+      return;
+    }
+    if (anySyncing) {
+      return;
+    }
+    fillsBaselineRef.current = fillsSignature;
+    if (fillsSignature !== baseline) {
+      void queryClient.invalidateQueries({ queryKey: exchangeFillsQueryKey });
+    }
+  }, [anySyncing, fillsSignature, queryClient]);
 
   /**
    * What the run log showed at the moment Sync now was last pressed: the newest run's id,

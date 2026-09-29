@@ -13,6 +13,21 @@ import {
 } from '@/lib/fills';
 import { money } from '@/lib/money';
 
+/**
+ * "(derived)" after a value that rests on a quote value the venue did not send. It goes on the
+ * quote value and, for a USDT-quoted fill, on the USDT value too: that one is the same number
+ * (`usdt_value` is the stored `quote_quantity`), and the figure the totals add up is the one
+ * whose provenance the owner most needs to see.
+ */
+function DerivedMarker() {
+  return (
+    <>
+      {' '}
+      <span className="derived">{DERIVED_MARKER}</span>
+    </>
+  );
+}
+
 interface FillRowProps {
   readonly fill: ExchangeFill;
 }
@@ -24,8 +39,8 @@ interface FillRowProps {
  * - **The side is a word.** "Buy" or "Sell", never a colour on its own.
  * - **Amounts carry their asset in the cell**, because the quote asset differs from row to
  *   row: a header cannot name a unit that changes.
- * - **A quote value the venue did not send** is marked "(derived)" and explained under the
- *   table.
+ * - **A quote value the venue did not send** is marked "(derived)" - on the USDT value as
+ *   well, when there is one - and explained under the table.
  * - **A fill quoted in something other than USDT has no USDT value.** The cell says so rather
  *   than showing a dash or a zero, since a zero would read as "worth nothing".
  * - **A zero fee has no fee asset**, and reads "None".
@@ -50,18 +65,16 @@ function FillRow({ fill }: FillRowProps) {
       </td>
       <td className="num">
         <Money value={money(fill.quote_quantity)} options={UNIT_PRICE_FORMAT} /> {fill.quote_asset}
-        {fill.quote_quantity_derived && (
-          <>
-            {' '}
-            <span className="derived">{DERIVED_MARKER}</span>
-          </>
-        )}
+        {fill.quote_quantity_derived && <DerivedMarker />}
       </td>
       <td className="num">
         {fill.usdt_value === null ? (
           NOT_IN_USDT
         ) : (
-          <Money value={money(fill.usdt_value)} options={UNIT_PRICE_FORMAT} />
+          <>
+            <Money value={money(fill.usdt_value)} options={UNIT_PRICE_FORMAT} />
+            {fill.quote_quantity_derived && <DerivedMarker />}
+          </>
         )}
       </td>
       <td className="num">
