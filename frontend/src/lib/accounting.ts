@@ -62,8 +62,9 @@ export const FLAG_BADGES: Record<PositionFlag, string> = {
  */
 export const FLAG_EXPLANATIONS: Record<PositionFlag, string> = {
   history_incomplete:
-    'A sale was larger than everything the imported history held, so a buy or a deposit is ' +
-    'missing. The realized P&L of that sale is unreliable, and this marker stays.',
+    'A sale, or a fee paid in this asset, was larger than everything the imported history ' +
+    'held, so a buy or a deposit is missing. The realized P&L of that disposal is ' +
+    'unreliable, and this marker stays.',
   unattributed_fee:
     "A fee on this asset's trades was paid in another asset whose cost is unknown, so this " +
     "asset's figures leave that fee out.",
@@ -100,7 +101,7 @@ export const MARKET_VALUE_UNAVAILABLE_MESSAGES: Record<
 
 /**
  * Whether the position holds anything. Compared as a decimal, never as a string: the wire
- * sends a fully sold position's quantity as `"0.000000000000000000"`, which is not `"0"`.
+ * sends a position with nothing left as `"0.000000000000000000"`, which is not `"0"`.
  */
 export function isHeld(position: Position): boolean {
   return !isZeroMoney(money(position.quantity));
@@ -126,14 +127,17 @@ const ONE_CLOSED = { noun: 'asset', verb: 'is', possessive: 'its' };
 const MANY_CLOSED = { noun: 'assets', verb: 'are', possessive: 'their' };
 
 /**
- * The one line that stands for every fully sold asset the table leaves out, e.g. "2 fully
- * sold assets (BTC, ETH) are not listed; their realized P&L is in the total."
+ * The one line that stands for every asset no longer held that the table leaves out, e.g.
+ * "2 assets no longer held (BTC, ETH) are not listed; their realized P&L is in the total."
+ *
+ * "No longer held", not "fully sold": a fee paid in an asset the history never held leaves a
+ * position at zero without a sale ever having happened.
  */
 export function describeClosedPositions(symbols: readonly string[]): string {
   const { noun, verb, possessive } = symbols.length === 1 ? ONE_CLOSED : MANY_CLOSED;
 
   return (
-    `${String(symbols.length)} fully sold ${noun} (${symbols.join(', ')}) ` +
+    `${String(symbols.length)} ${noun} no longer held (${symbols.join(', ')}) ` +
     `${verb} not listed; ${possessive} realized P&L is in the total.`
   );
 }

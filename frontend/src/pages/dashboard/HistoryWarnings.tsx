@@ -18,8 +18,8 @@ function WarningSentence({ warning }: { readonly warning: AccountingWarning }): 
     case 'negative_inventory':
       return (
         <>
-          A sale of {warning.asset} exceeded the imported history by {quantity} {warning.asset}. A
-          buy or a deposit is missing.
+          A sale of, or a fee paid in, {warning.asset} exceeded the imported history by {quantity}{' '}
+          {warning.asset}. A buy or a deposit is missing.
         </>
       );
     case 'unattributed_fee':

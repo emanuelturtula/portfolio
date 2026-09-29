@@ -37,8 +37,12 @@ body {
   padding: 0 1.5rem 3rem;
 }
 
+/* `flex-wrap`: on a 375 px phone the title, the nav and the account do not fit on one row,
+   and a row that cannot wrap widens the whole page (spec 022, criterion 10). At desktop
+   widths everything still fits on one row and nothing changes. */
 .app-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
@@ -60,6 +64,7 @@ body {
 
 .account-controls {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
 }
@@ -154,6 +159,7 @@ button[aria-disabled='true'] {
 
 nav[aria-label='Main'] {
   display: flex;
+  flex-wrap: wrap;
   gap: 1rem;
 }
 
