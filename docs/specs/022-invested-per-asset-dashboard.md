@@ -396,3 +396,15 @@ None.
       `value_out_of_range` as well.
   - **Kept as they are.** Two "Try again" buttons when both sections fail. Each sits under
     its own titled alert.
+- **R9. Delta review of R8 (reviewer). Nothing must be fixed; three small edits:**
+  - **The unallocated line says "or", not "and".** It reads "from stablecoin conversions or
+    from swaps into units with no known cost". The page cannot tell which one applied.
+  - **Row 3 on the known-list path also requires `computed_at === null || event_count === 0`.**
+    A list whose poll lags a stablecoin-only sync must not claim "No trades imported yet"
+    over a snapshot that replayed trades. That case falls through to `no_positions`.
+  - **The stale-price check reads `price?.stale` before the exclusion check.** The logic is
+    the same, and the null-price path is then reached by an unpriced, excluded row, which is
+    a writable shape (R1).
+  - **The N5 trade-off stands.** While the exchanges list has not answered and the
+    positions are empty, a failed positions refresh shows no alert. It needs a hung first
+    `/api/exchanges` request, and the section shows no figures meanwhile.
