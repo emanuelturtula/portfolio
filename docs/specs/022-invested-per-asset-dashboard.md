@@ -313,3 +313,17 @@ None.
 
   The rule for the rest of the issue is the same: never keep a branch only a contradictory
   fixture can reach, and never invent a value to fill it.
+- **R2. Empty rows 1 and 2 are failures, rendered as `ErrorState` with `role="alert"` (developer).**
+  Every time inside an alert is an `AbsoluteTime`, never a `RelativeTime`: a ticking phrase
+  inside a live region re-announces. This settles the conflict between row 1's "`RelativeTime`
+  of `last_recompute.at`" and the accessibility rule, in the rule's favour. The status line and
+  the stale-price age are not live regions, so they keep `RelativeTime`.
+- **R3. Row 2 does not claim that no trades were imported (developer).** A venue can hold
+  fills, all between stablecoins, and still have a failed last sync. The row says that
+  venue's trades may be missing because its last sync failed.
+- **R4. Exclusions are grouped by reason, one line per reason, each listing its assets
+  (developer).** Most positions are unpriced (see Risks), so one line per asset would be a
+  long repetition of one sentence.
+- **R5. "Exchange status is unavailable" shows whenever the exchanges query is in error,** in
+  the empty and the non-empty case. A list kept across a failed poll is treated as unknown, as
+  `ValueSection` treats its runs.
