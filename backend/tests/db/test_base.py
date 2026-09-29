@@ -120,6 +120,30 @@ EXPECTED_NAMES = {
         "fk_exchange_sync_run_accounts_exchange_sync_run_id_exchange_sync_runs",
         "fk_exchange_sync_run_accounts_exchange_account_id_exchange_accounts",
     },
+    # #19. One current snapshot per owner and method, and its children, each keyed by the
+    # unique constraint its read and the cascade use; no index beside them (spec 021, R3).
+    "accounting_snapshots": {
+        "pk_accounting_snapshots",
+        "uq_accounting_snapshots_user_method",
+        "fk_accounting_snapshots_user_id_users",
+    },
+    "accounting_positions": {
+        "pk_accounting_positions",
+        "uq_accounting_positions_snapshot_asset",
+        "fk_accounting_positions_snapshot_id_accounting_snapshots",
+    },
+    "accounting_lots": {
+        "pk_accounting_lots",
+        "uq_accounting_lots_snapshot_seq",
+        "ck_accounting_lots_kind",
+        "fk_accounting_lots_snapshot_id_accounting_snapshots",
+    },
+    "accounting_warnings": {
+        "pk_accounting_warnings",
+        "uq_accounting_warnings_snapshot_seq",
+        "ck_accounting_warnings_kind",
+        "fk_accounting_warnings_snapshot_id_accounting_snapshots",
+    },
 }
 
 

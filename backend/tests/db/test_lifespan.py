@@ -21,12 +21,18 @@ from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 from anyio import Path as AsyncPath
+from anyio import to_thread
 from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
 from portfolio.config import get_settings
-from portfolio.db.engine import create_database_engine, create_session_factory
+from portfolio.db.alembic_config import upgrade_to_head
+from portfolio.db.engine import (
+    create_database_engine,
+    create_session_factory,
+    ensure_database_directory,
+)
 from portfolio.db.models import Asset
 from portfolio.domain.chains import ChainKey
 from portfolio.domain.exchanges import ExchangeKey
@@ -189,15 +195,22 @@ def scheduled_lifespan(
 
 
 async def bring_the_schema_up(database: Path) -> None:
-    """Run one lifespan for its migration and nothing else, then let it go.
+    """Migrate the file to head, and nothing else: no lifespan, so no timer and no task.
 
-    The schema does not exist until a lifespan has run, so a test that needs a row in place
-    *before* the lifespan it is measuring has to bring the file up first. This entry has the
-    schedule off, which is the shared default, so it reads nothing and costs nothing.
+    The schema does not exist until something has migrated it, so a test that needs a row in
+    place *before* the lifespan it is measuring has to bring the file up first.
+
+    **It used to run a whole lifespan, and that was a race.** Several tests switch a timer on
+    before they plant their rows, so the bring-up lifespan started that timer too; whether its
+    startup tick wrote a run before the bring-up shut down decided whether the lifespan under
+    test then saw "a recent attempt" and skipped its own startup sync. #19's shutdown -- which
+    first cancels the startup recompute and waits for it -- gives the tick those few loop
+    iterations: `test_a_failing_price_refresh_does_not_stop_the_balance_sync` went from 0 of
+    15 failures to 4 of 15. Migrating directly, the way the lifespan does, has no tick to race.
     """
-    app = create_app()
-    async with app.router.lifespan_context(app):
-        pass
+    url = f"sqlite+aiosqlite:///{database.as_posix()}"
+    ensure_database_directory(url)
+    await to_thread.run_sync(upgrade_to_head, url)
     assert await AsyncPath(database).is_file()
 
 
