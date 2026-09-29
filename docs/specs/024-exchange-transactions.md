@@ -372,3 +372,31 @@ These are the issue's criteria, all of them, backend and frontend, plus:
     - Paging shows "Showing 1 to 50 of 76".
     - The failing-venue alert and both completeness sentences render.
   - **Nothing needed fixing.**
+- **R5. Review findings (reviewer, before the pull request).** The baseline gate passed at
+  `6c0fc45` before these changes. Nothing had to be fixed. These were taken:
+  - **S1. The fills must follow a scheduled sync.** Only the manual sync's mutation
+    invalidated them. A scheduled run that stored fills cleared the failing alert and the
+    completeness sentence on the next list poll, and left the table and totals stale, with
+    nothing warning. That is a partial history read as complete.
+    - The fills query is now invalidated when the list's per-venue `fills_stored` signature
+      changes.
+    - This is skipped while any venue is `syncing`, and fires once syncing stops. A backfill
+      raises `fills_stored` at every page, and refetching every 5 s would be polling by
+      another name. Meanwhile, `pending_windows` and the completeness notice already say the
+      import is unfinished.
+  - **S2. The timing guard was worded beyond what it catches.** Reverting R1 costs only about
+    2×, well inside its 2.0 s bound. Its docstring now says it catches order-of-magnitude
+    regressions. A separate, machine-independent guard protects R1's speed: `money.add`
+    against plain `Decimal` addition in the same process, with a lab mutant that restores the
+    old algorithm to prove it fails.
+  - **N1.** The `domain/fill_totals.py` docstring now describes the trapped-context `add`.
+  - **N2.** A derived quote carries the "(derived)" marker on its USDT value as well.
+  - **N3. The CPU work runs in a worker thread,** as the recompute's does: decoding,
+    filtering, sorting, totals and the page slice. The SQL read and the column conversion
+    stay on the loop.
+  - **N4. Day inputs are bounded to 1970-01-01 through 9999-12-30.** Each input keeps a local
+    draft, so digits typed through an intermediate year are neither lost nor sent. Only an
+    empty or in-range day reaches the URL, and `readFillFilters` ignores one outside the
+    range.
+  - **N5.** The Sync history toggle follows the element's real `open` state, so a disclosure
+    the browser opened itself (find in page) closes on the next click.
