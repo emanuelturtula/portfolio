@@ -215,40 +215,24 @@ async def get_accounting_service(request: Request) -> AsyncIterator[AccountingSe
         yield build_accounting_service(session)
 
 
-def accounting_recompute_of(
-    app: FastAPI,
-) -> Callable[[RecomputeReason], Awaitable[AccountingStatus]]:
-    """The recompute trigger `create_app` published, bound to its application.
-
-    `run_accounting_recompute` lives in `main.py`, which nothing under `api` may import -- it
-    imports every router. So `install_accounting_runtime` publishes it on the application state,
-    and this reads it back: the one place a request reaches the trigger (spec 023, *Triggering
-    the recompute from a request*).
-
-    Raises:
-        RuntimeError: nothing callable is installed -- an application not built by
-            `create_app`. A clear failure is better than an `AttributeError` mid-request.
-    """
-    recompute = getattr(app.state, "accounting_recompute", None)
-    if not callable(recompute):
-        message = (
-            "No accounting recompute is installed: the application was not built by "
-            "`portfolio.main.create_app`, whose `install_accounting_runtime` publishes it."
-        )
-        raise RuntimeError(message)
-    installed: Callable[[RecomputeReason], Awaitable[AccountingStatus]] = recompute
-    return installed
-
-
 async def get_adjustment_service(request: Request) -> AsyncIterator[AdjustmentService]:
     """Open a session for this request and hand the router the adjustment service.
 
     The service is built with an `after_change` that awaits the recompute trigger with
     `RecomputeReason.ADJUSTMENT`. The service commits its own write on this session first, so
     the recompute -- which opens a session of its own and takes the recompute lock -- never
-    waits on this request's write. The trigger is read per request, so a test can replace it.
+    waits on this request's write.
+
+    **The trigger is read from `app.state.accounting_recompute`**, because
+    `run_accounting_recompute` lives in `main.py`, which nothing under `api` may import -- it
+    imports every router (spec 023, *Triggering the recompute from a request*).
+    `install_accounting_runtime` publishes it from `create_app`, so every application that
+    serves a request has one, and it is read directly, as `db_sessionmaker` is. It is read per
+    request, so a test can replace it.
     """
-    recompute = accounting_recompute_of(request.app)
+    recompute: Callable[[RecomputeReason], Awaitable[AccountingStatus]] = (
+        request.app.state.accounting_recompute
+    )
 
     async def after_change() -> AccountingStatus:
         return await recompute(RecomputeReason.ADJUSTMENT)
