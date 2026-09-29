@@ -50,6 +50,7 @@ from portfolio.repositories.exchange_sync_runs import (
     ExchangeSyncRunSummary,
 )
 from portfolio.repositories.sync_runs import SyncRunStatus, SyncTrigger
+from portfolio.repositories.users import UserRepository
 from portfolio.services.accounting import (
     AccountingService,
     AccountingStatus,
@@ -678,6 +679,33 @@ async def test_the_trigger_never_raises(
         returned = await run_accounting_recompute(app, RecomputeReason.STARTUP)
 
     assert (returned.outcome, returned.error) == (RecomputeOutcome.FAILED, "LookupError")
+
+
+async def test_a_failure_before_any_owner_is_recomputed_is_an_outcome_too(
+    accounting_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Listing the owners fails -- the database locked, say: still `failed`, never a raise.
+
+    The per-owner `try` cannot catch this one, because no owner has been reached yet; the
+    trigger's outer `try` is what keeps "never raises" true, and nothing else exercises it.
+    """
+    await plant_owner_with_fills(accounting_database)
+
+    async def locked(repository: object) -> list[object]:
+        del repository
+        raise RuntimeError(LEAKY_MESSAGE)
+
+    async with settled_app(accounting_database) as app:
+        monkeypatch.setattr(UserRepository, "list_all", locked)
+        with capture_logs() as captured:
+            returned = await run_accounting_recompute(app, RecomputeReason.EXCHANGE_SYNC)
+        recorded = status_of(app)
+
+    assert (returned.outcome, returned.error) == (RecomputeOutcome.FAILED, "RuntimeError")
+    assert recorded is returned
+    (failed,) = events_named(captured, "accounting_recompute_failed")
+    assert failed["error"] == "RuntimeError"
+    assert LEAKY_MESSAGE not in repr(captured)
 
 
 async def test_concurrent_triggers_are_serialised_by_the_lock(
