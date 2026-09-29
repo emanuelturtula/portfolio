@@ -267,6 +267,8 @@ is regenerated, because the drift job checks it.
   service's own constants (`NOTE_MAX_LENGTH`, the asset pattern). The service remains the
   only validator. This keeps its field-specific messages, and gives #111's form limits it can
   read.
+  openapi-typescript does not carry `pattern` or `maxLength` into `schema.ts`, so #111
+  reads them from `/api/openapi.json` or mirrors the constants.
 - **R7. No guard for a trigger that is always installed (tester).** `create_app` installs
   `app.state.accounting_recompute` through `install_accounting_runtime`, whether or not the
   lifespan runs. A `RuntimeError` for its absence could only be reached by a test that
