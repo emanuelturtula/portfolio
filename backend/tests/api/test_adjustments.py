@@ -621,6 +621,11 @@ REFUSED: Final[tuple[tuple[str, dict[str, Any], str, str | None, tuple[str, ...]
         (),
     ),
     ("missing note", body(omit=("note",)), "note", None, ()),
+    # Neither a string nor a number: passed on by the ISO parser, refused by Pydantic's own
+    # datetime validation, and never read as anything.
+    ("null occurred_at", body(occurred_at=None), "occurred_at", None, ()),
+    ("object occurred_at", body(occurred_at={"year": 2026}), "occurred_at", None, ()),
+    ("missing occurred_at", body(omit=("occurred_at",)), "occurred_at", None, ()),
     ("null note", body(note=None), "note", None, ()),
     ("missing quantity", body(omit=("quantity",)), "quantity", None, ()),
     ("null quantity", body(quantity=None), "quantity", None, ()),
