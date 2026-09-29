@@ -31,6 +31,8 @@ Where the spec's first draft was silent, this oracle surfaced the question and t
 * **R5** `Lot.quantity` is the whole quantity acquired, known and unknown together.
 * **R6** `A` in I8 counts adjustments of non-cash assets only.
 * **R8** A zero fee creates no leg and touches no position, whatever asset it names.
+* **R11** A swap splits its fee as a sale does: the known share, `fee x known_out / given`,
+  joins the received cost, and the complement goes to `unallocated_costs`.
 
 Not computed: the input fingerprint. The spec fixes what it covers but not the JSON key
 names, so there is nothing independent to compute it from. `test_fingerprint.py` tests its
@@ -416,15 +418,21 @@ class _Book:
             pool.realized += proceeds_known - basis_out
             pool.unmatched += proceeds - proceeds_known
         else:
-            value = basis_out + fee_value
             known_in = received if uncovered == 0 else divide(received * known_out, given)
             unknown_in = received - known_in
             if known_in > 0:
-                self.acquire(received_asset, known_in, value, unknown_in)
-                self.lot(received_asset, key, received, value, unknown_in)
+                # R11: the fee splits as a sale's proceeds do. The known share joins the
+                # received cost; the rest belongs to units of unknown cost, so it is known
+                # value with no known quantity to attach to.
+                fee_known = fee_value if uncovered == 0 else divide(fee_value * known_out, given)
+                cost = basis_out + fee_known
+                self.acquire(received_asset, known_in, cost, unknown_in)
+                self.lot(received_asset, key, received, cost, unknown_in)
+                self.unallocated += fee_value - fee_known
             else:
+                # The limit of the same rule: nothing known arrives, so all of it is unallocated.
                 self.acquire(received_asset, ZERO, ZERO, received)
-                self.unallocated += value
+                self.unallocated += basis_out + fee_value
                 self.lot(received_asset, key, received, ZERO, received)
 
     def result(self, event_count: int) -> Result:

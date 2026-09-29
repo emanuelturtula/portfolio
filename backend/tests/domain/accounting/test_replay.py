@@ -1138,3 +1138,161 @@ def test_a_swap_at_a_tie_receives_exactly_what_was_received() -> None:
     assert found.quantity == Decimal("3.000000000000000001")
     assert found.unknown_basis_quantity == Decimal("1.500000000000000001")
     assert found.cost_basis == Decimal("100")
+
+
+# --------------------------------------------------------------------------------------
+# R11: a swap splits its fee the way a sale does
+# --------------------------------------------------------------------------------------
+
+
+def test_r11_a_swap_fee_splits_by_the_known_share() -> None:
+    """KAS: 1 known at 100 and 3 unknown. 2 KAS go for 10 BTC with an 8 USDT fee.
+
+    The known share is 2 x 1 / 4 = 0.5 KAS, carrying 50 of basis, and 0.5 / 2 of the trade:
+    known_in = 10 x 0.5 / 2 = 2.5 BTC, and fee_known = 8 x 0.5 / 2 = 2. So BTC costs
+    50 + 2 = 52 for 2.5 known units (20.8 each), and the other 6 of the fee belongs to the
+    7.5 BTC of unknown cost: `unallocated_costs`. Before R11 the whole 8 went to BTC (58).
+    """
+    result = run(
+        adjust(key(9, "m1", "manual"), "KAS", "3", None),
+        buy(key(10, "e1"), "KAS", "USDT", "1", "100"),
+        sell(key(11, "e2"), "KAS", "BTC", "2", "10", "8", "USDT"),
+    )
+
+    expect(
+        result,
+        "BTC",
+        quantity="10",
+        unknown="7.5",
+        cost_basis="52",
+        average="20.8",
+        flags=UNKNOWN,
+    )
+    assert result.unallocated_costs == Decimal("6")
+    lot = result.lots[-1]
+    assert (lot.asset, lot.cost_basis, lot.unknown_basis_quantity) == (
+        "BTC",
+        Decimal("52"),
+        Decimal("7.5"),
+    )
+
+
+def test_r11_a_sliver_of_known_cost_no_longer_inflates_the_average() -> None:
+    """1 KAS known at 1, 999,999 unknown; all 1,000,000 swapped for 1 BTC with a 10 USDT fee.
+
+    known_in = 1 x 1 / 1,000,000 = 0.000001 BTC. Its cost is the carried 1 plus its share of
+    the fee, 10 x 1 / 1,000,000 = 0.00001, so the average is 1,000,010: the known units'
+    carried cost per BTC (1,000,000) plus the fee per BTC of the whole trade (10). Before
+    R11 the whole fee sat on the sliver: 11 / 0.000001 = 11,000,000.
+    """
+    result = run(
+        adjust(key(9, "m1", "manual"), "KAS", "999999", None),
+        buy(key(10, "e1"), "KAS", "USDT", "1", "1"),
+        sell(key(11, "e2"), "KAS", "BTC", "1000000", "1", "10", "USDT"),
+    )
+
+    found = position(result, "BTC")
+    assert found.known_quantity == Decimal("0.000001")
+    assert found.cost_basis == Decimal("1.00001")
+    assert found.average_cost == Decimal("1000010")
+    assert result.unallocated_costs == Decimal("9.99999")
+
+
+def test_r11_a_fully_known_swap_keeps_the_whole_fee() -> None:
+    """`uncovered == 0` is unchanged: all of the fee joins the received cost."""
+    result = run(
+        buy(key(10, "e1"), "BTC", "USDT", "1", "30000"),
+        buy(key(11, "e2"), "KAS", "BTC", "100000", "0.5", "15", "USDT"),
+    )
+
+    expect(result, "KAS", quantity="100000", cost_basis="15015")
+    assert result.unallocated_costs == 0
+
+
+def test_r11_a_swap_splits_a_cash_rebate_too() -> None:
+    """The fee's value is signed. The same trade as the first R11 test with a rebate of 8:
+    BTC's cost is 50 - 2 = 48, and -6 goes to `unallocated_costs`."""
+    result = run(
+        adjust(key(9, "m1", "manual"), "KAS", "3", None),
+        buy(key(10, "e1"), "KAS", "USDT", "1", "100"),
+        sell(key(11, "e2"), "KAS", "BTC", "2", "10", "-8", "USDT"),
+    )
+
+    expect(result, "BTC", quantity="10", unknown="7.5", cost_basis="48", flags=UNKNOWN)
+    assert result.unallocated_costs == Decimal("-6")
+
+
+def test_r11_a_swap_splits_a_carried_non_cash_fee() -> None:
+    """A BGB fee is worth its carried cost, 4 BGB at 1.5 = 6, and that 6 splits the same way:
+    1.5 to BTC, 4.5 unallocated, as 0.5 of 2 KAS given had a known cost."""
+    result = run(
+        buy(key(8, "e0"), "BGB", "USDT", "10", "15"),
+        adjust(key(9, "m1", "manual"), "KAS", "3", None),
+        buy(key(10, "e1"), "KAS", "USDT", "1", "100"),
+        sell(key(11, "e2"), "KAS", "BTC", "2", "10", "4", "BGB"),
+    )
+
+    expect(result, "BTC", quantity="10", unknown="7.5", cost_basis="51.5", flags=UNKNOWN)
+    expect(result, "BGB", quantity="6", cost_basis="9", average="1.5")
+    assert result.unallocated_costs == Decimal("4.5")
+
+
+#: The same swap with less and less of the given KAS at a known cost: 1 known at 1 USDT,
+#: `unknown` of unknown cost, all of it swapped for 1 BTC with a 10 USDT fee. The last row
+#: rounds known_in to zero -- the limit path.
+CONTINUITY: Final = [
+    ("9", "1", "0.1"),
+    ("99", "0.1", "0.01"),
+    ("9999", "0.001", "0.0001"),
+    ("999999999999999999", "0.00000000000000001", "0.000000000000000001"),
+    ("10000000000000000000", "0", "0"),
+]
+
+
+def test_r11_the_fee_share_shrinks_continuously_to_the_known_in_zero_limit() -> None:
+    """Continuity toward `known_in == 0`, which is now the limit of the rule, not a cliff.
+
+    In every row, BTC's cost plus `unallocated_costs` is exactly the carried 1 plus the
+    fee of 10 -- the value is counted once, wherever it lands. The fee's share of BTC's cost
+    is 10 x known_in, shrinking with the known part until the limit row, where nothing
+    known arrives and all 11 is unallocated. The fee per known BTC stays 10 throughout,
+    where before R11 it was 10 / known_in: 100, 1,000, 100,000, 1E19, then nothing.
+    """
+    shares: list[Decimal] = []
+    for unknown, fee_share, known_in in CONTINUITY:
+        given = str(Decimal(unknown) + 1)
+        result = run(
+            adjust(key(9, "m1", "manual"), "KAS", unknown, None),
+            buy(key(10, "e1"), "KAS", "USDT", "1", "1"),
+            sell(key(11, "e2"), "KAS", "BTC", given, "1", "10", "USDT"),
+        )
+        found = position(result, "BTC")
+        assert found.cost_basis + result.unallocated_costs == Decimal("11"), unknown
+        assert found.known_quantity == Decimal(known_in), unknown
+        if Decimal(known_in) == 0:
+            assert found.cost_basis == 0
+            assert result.unallocated_costs == Decimal("11")
+            shares.append(Decimal(0))
+            continue
+        share = found.cost_basis - 1
+        assert share == Decimal(fee_share), unknown
+        assert share == 10 * found.known_quantity, unknown
+        shares.append(share)
+
+    assert shares == sorted(shares, reverse=True)
+    assert shares[-1] == 0
+
+
+def test_r11_an_unattributed_fee_on_a_partly_unknown_swap_is_still_reported() -> None:
+    """An uncovered fee has no known value to split; the warning and flag are unchanged."""
+    result = run(
+        adjust(key(9, "m1", "manual"), "KAS", "3", None),
+        buy(key(10, "e1"), "KAS", "USDT", "1", "100"),
+        sell(key(11, "e2"), "KAS", "BTC", "2", "10", "4", "BGB"),
+    )
+
+    expect(
+        result, "BTC", quantity="10", unknown="7.5", cost_basis="50", flags=UNKNOWN | UNATTRIBUTED
+    )
+    assert result.warnings[-1] == UnattributedFee(key(11, "e2"), "BGB", Decimal("4"), "BTC")
+    assert result.unallocated_costs == 0
