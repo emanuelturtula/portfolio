@@ -52,11 +52,11 @@ from tests.adjustments_harness import (
     iso,
     plant_adjustment,
 )
-from tests.auth.conftest import BASE_URL, JSON_HEADERS
+from tests.auth.conftest import BASE_URL, JSON_HEADERS, sign_in
 from tests.exchange_sync_harness import make_fill
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable, MutableMapping, Sequence
 
     from fastapi import FastAPI
     from httpx import Response
@@ -151,13 +151,16 @@ class RecordingRecompute:
         self.error = error
         self.reasons: list[RecomputeReason] = []
         self.committed: list[list[dict[str, Any]]] = []
+        self.finished = 0
 
     async def __call__(self, reason: RecomputeReason) -> AccountingStatus:
         self.reasons.append(reason)
         self.committed.append(await rows(self.app.state.db_sessionmaker, ADJUSTMENTS_SQL))
         if self.error is not None:
             raise self.error
-        return await self.real(reason)
+        status = await self.real(reason)
+        self.finished += 1
+        return status
 
 
 def recording(app: FastAPI, *, error: Exception | None = None) -> RecordingRecompute:
@@ -920,3 +923,177 @@ def test_the_schema_publishes_the_services_limits(app: FastAPI) -> None:
         properties = schemas[name]["properties"]
         assert properties["asset"]["pattern"] == ASSET_SYMBOL_PATTERN == "^[A-Z0-9]{1,20}$", name
         assert properties["note"]["maxLength"] == NOTE_MAX_LENGTH == 500, name
+
+
+# --------------------------------------------------------------------------------------
+# Criterion 5, at the protocol: the recompute is over before the response begins
+# --------------------------------------------------------------------------------------
+
+
+async def test_the_recompute_has_finished_before_the_response_starts(
+    api_app: FastAPI,
+) -> None:
+    """Not merely inside the ASGI call: a Starlette `BackgroundTask` also runs inside it.
+
+    A background task runs after `http.response.start` and the body have been sent, so a
+    client could read the positions before it ran. This wraps the application's `send` and
+    records, at the moment each change's response starts, how many recomputes had already
+    **finished**. Each must be one more than before.
+    """
+    await settled(api_app)
+    recorder = recording(api_app)
+    starts: list[tuple[str, int]] = []
+
+    async def spied(
+        scope: MutableMapping[str, Any],
+        receive: Callable[[], Awaitable[MutableMapping[str, Any]]],
+        send: Callable[[MutableMapping[str, Any]], Awaitable[None]],
+    ) -> None:
+        async def watched(message: MutableMapping[str, Any]) -> None:
+            if message["type"] == "http.response.start" and scope["path"].startswith(
+                ADJUSTMENTS_PATH
+            ):
+                starts.append((str(scope["method"]), recorder.finished))
+            await send(message)
+
+        await api_app(scope, receive, watched)
+
+    async with AsyncClient(transport=ASGITransport(app=spied), base_url=BASE_URL) as client:
+        await sign_in(client)
+        created = await post_ok(client, body(quantity="1"))
+        replaced = await put(client, created["id"], body(quantity="2"))
+        deleted = await remove(client, created["id"])
+
+    assert (replaced.status_code, deleted.status_code) == (200, 204)
+    assert starts == [("POST", 1), ("PUT", 2), ("DELETE", 3)]
+    assert recorder.reasons == [RecomputeReason.ADJUSTMENT] * 3
+
+
+# --------------------------------------------------------------------------------------
+# Spec 023, R8: an instant is ISO 8601, never Unix time; an id is within 64 bits
+# --------------------------------------------------------------------------------------
+
+FORMAT_REFUSAL: Final = (
+    "Value error, occurred_at must be an ISO 8601 datetime with a timezone, such as "
+    "2026-01-01T00:00:00Z"
+)
+NAIVE_REFUSAL: Final = "occurred_at must be a timezone-aware datetime"
+
+
+@pytest.mark.parametrize(
+    ("spelled", "msg"),
+    [
+        ("1767225600", FORMAT_REFUSAL),
+        ("1767225600.5", FORMAT_REFUSAL),
+        (" 2026-01-01T00:00:00Z", FORMAT_REFUSAL),
+        ("next tuesday", FORMAT_REFUSAL),
+        ("20260101", NAIVE_REFUSAL),
+        ("2026-01-01", NAIVE_REFUSAL),
+    ],
+    ids=["unix seconds", "unix fractional", "leading space", "prose", "basic date", "date"],
+)
+async def test_an_instant_that_is_not_an_aware_iso_datetime_is_refused(
+    api_app: FastAPI,
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+    spelled: str,
+    msg: str,
+) -> None:
+    """R8's must-fix: Pydantic's lax parser read a string of digits as Unix time.
+
+    `"1767225600"` was stored as 2026-01-01, and `"20260101"` -- ISO 8601's basic date -- as
+    1970-08-23, before the whole history. Now a string that is not ISO 8601 is a fixed
+    refusal, and one that parses to a naive instant meets the service's aware rule. Neither
+    quotes what was sent.
+    """
+    await settled(api_app)
+    recorder = recording(api_app)
+
+    response = await post(signed_in_api_client, body(occurred_at=spelled))
+
+    assert response.status_code == 422, response.text
+    assert response.json()["errors"] == [
+        {"loc": ["body", "occurred_at"], "msg": msg, "type": "value_error"}
+    ]
+    if spelled.strip() not in msg:
+        assert spelled.strip() not in response.text, "the refusal quoted what was sent"
+    assert await rows(api_sessionmaker, ADJUSTMENTS_SQL) == []
+    assert recorder.reasons == []
+
+
+@pytest.mark.parametrize(
+    "spelled",
+    ["2026-01-01T00:00:00Z", "2026-01-01T02:00:00+02:00", "20260101T000000Z"],
+    ids=["extended Z", "extended offset", "basic Z"],
+)
+async def test_an_aware_iso_instant_is_accepted_in_either_iso_format(
+    api_app: FastAPI, signed_in_api_client: AsyncClient, spelled: str
+) -> None:
+    """The control: every spelling of 2026-01-01T00:00Z is the same stored instant."""
+    await settled(api_app)
+
+    created = await post_ok(signed_in_api_client, body(occurred_at=spelled))
+
+    assert datetime.fromisoformat(created["occurred_at"]) == datetime(2026, 1, 1, tzinfo=UTC)
+
+
+LARGEST_ID: Final = 2**63 - 1
+
+
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
+@pytest.mark.parametrize(
+    ("adjustment_id", "bound"),
+    [
+        (2**63, "less than or equal to 9223372036854775807"),
+        (10**20, "less than or equal to 9223372036854775807"),
+        (0, "greater than or equal to 1"),
+        (-1, "greater than or equal to 1"),
+    ],
+    ids=["two to the 63", "ten to the 20", "zero", "negative"],
+)
+async def test_an_id_outside_sqlites_range_is_a_422_not_a_500(
+    api_app: FastAPI,
+    signed_in_api_client: AsyncClient,
+    api_sessionmaker: async_sessionmaker[AsyncSession],
+    method: str,
+    adjustment_id: int,
+    bound: str,
+) -> None:
+    """R8: an id past 64 bits made SQLite raise, a 500. Now the path refuses it, and says why.
+
+    The refusal quotes the bound, never the id that was sent. Zero and negative ids are
+    outside the range an `AUTOINCREMENT` table assigns, and are refused the same way.
+    """
+    await settled(api_app)
+    created = await post_ok(signed_in_api_client, body())
+    before = await rows(api_sessionmaker, ADJUSTMENTS_SQL)
+    recorder = recording(api_app)
+
+    response = await signed_in_api_client.request(
+        method, f"{ADJUSTMENTS_PATH}/{adjustment_id}", json=body(), headers=JSON_HEADERS
+    )
+
+    assert response.status_code == 422, response.text
+    (error,) = response.json()["errors"]
+    assert error["loc"] == ["path", "adjustment_id"]
+    assert error["msg"] == f"Input should be {bound}"
+    if abs(adjustment_id) > 1:
+        assert str(adjustment_id) not in response.json()["errors"][0]["msg"]
+    assert await rows(api_sessionmaker, ADJUSTMENTS_SQL) == before
+    assert recorder.reasons == []
+    assert created["id"] >= 1
+
+
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
+async def test_the_largest_id_sqlite_can_assign_is_looked_up(
+    api_app: FastAPI, signed_in_api_client: AsyncClient, method: str
+) -> None:
+    """The bound is inclusive: 2**63 - 1 is a real id nobody holds, so it is a 404."""
+    await settled(api_app)
+
+    response = await signed_in_api_client.request(
+        method, f"{ADJUSTMENTS_PATH}/{LARGEST_ID}", json=body(), headers=JSON_HEADERS
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == NOT_FOUND_DETAIL

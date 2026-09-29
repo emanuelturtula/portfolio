@@ -66,6 +66,7 @@ from tests.accounting_harness import (
     plant_unconvertible_fill,
     rows,
 )
+from tests.adjustments_harness import plant_adjustment
 from tests.exchange_sync_harness import make_fill
 from tests.offline_http import use_an_offline_http_client
 
@@ -842,3 +843,69 @@ async def test_the_published_trigger_waits_for_the_same_lock(
 
     assert len(calls.users) == 1
     assert status.outcome is RecomputeOutcome.UNCHANGED
+
+
+#: A distinctive id, note and asset for the failed-recompute log line below.
+BAD_ADJUSTMENT_ID: Final = 604_217
+BAD_ADJUSTMENT_NOTE: Final = "note-sentinel-" + "Hd5" * 5
+BAD_ADJUSTMENT_ASSET: Final = "QW" + "ZX" * 3
+
+
+async def test_a_recompute_stopped_by_an_adjustment_logs_which_one(
+    accounting_database: Path,
+) -> None:
+    """The operator can find the row: `adjustment_id` is on the failure line, and nothing else.
+
+    The row is one the service refuses -- a zero quantity -- written by SQL, as a hand-edited
+    database would hold it. The failure names the class and the id; never the asset, the
+    note, or the message.
+    """
+    user_id = await plant_owner_with_fills(accounting_database)
+    async with own_factory(accounting_database) as factory, factory() as session:
+        await plant_adjustment(
+            session,
+            user_id,
+            adjustment_id=BAD_ADJUSTMENT_ID,
+            asset=BAD_ADJUSTMENT_ASSET,
+            raw_quantity="0.000000000000000000",
+            occurred_at=at(0),
+            note=BAD_ADJUSTMENT_NOTE,
+        )
+
+    async with settled_app(accounting_database) as app:
+        with capture_logs() as captured:
+            status = await run_accounting_recompute(app, RecomputeReason.ADJUSTMENT)
+
+    assert (status.outcome, status.error) == (
+        RecomputeOutcome.FAILED,
+        "UnconvertibleAdjustmentError",
+    )
+    (failed,) = events_named(captured, "accounting_recompute_failed")
+    assert failed["adjustment_id"] == BAD_ADJUSTMENT_ID
+    assert (failed["reason"], failed["error"]) == ("adjustment", "UnconvertibleAdjustmentError")
+    rendered = repr(captured)
+    assert BAD_ADJUSTMENT_NOTE not in rendered
+    assert BAD_ADJUSTMENT_ASSET not in rendered
+
+
+async def test_a_recompute_stopped_by_anything_else_names_no_adjustment(
+    accounting_database: Path,
+) -> None:
+    """The companion: a fill that does not convert is not an adjustment, and says no id."""
+    user_id = await plant_owner_with_fills(accounting_database)
+    async with own_factory(accounting_database) as factory, factory() as session:
+        account = await session.scalar(
+            text("SELECT id FROM exchange_accounts WHERE user_id = :user"), {"user": user_id}
+        )
+        await plant_unconvertible_fill(
+            session, int(account), trade_id=LEAKY_TRADE_ID, shape="same_asset"
+        )
+
+    async with settled_app(accounting_database) as app:
+        with capture_logs() as captured:
+            status = await run_accounting_recompute(app, RecomputeReason.EXCHANGE_SYNC)
+
+    assert status.error == "UnconvertibleFillError"
+    (failed,) = events_named(captured, "accounting_recompute_failed")
+    assert "adjustment_id" not in failed
+    assert LEAKY_TRADE_ID not in repr(captured)

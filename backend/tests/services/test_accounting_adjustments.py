@@ -44,6 +44,7 @@ from portfolio.domain.accounting import (
 )
 from portfolio.domain.exchanges import ExchangeKey, FillSide
 from portfolio.services.accounting import (
+    ADJUSTMENT_SOURCE,
     RecomputeOutcome,
     RecomputeReason,
     UnconvertibleAdjustmentError,
@@ -628,6 +629,20 @@ async def test_the_recompute_reads_only_the_owners_adjustments(
     assert (mine.event_count, theirs.event_count) == (2, 2)
     positions = (await snapshot_tables(factory))["positions"]
     assert sorted(row["asset"] for row in positions) == ["BTC", "KAS"]
+
+
+def test_every_venue_key_sorts_before_the_manual_source() -> None:
+    """The same-instant order spec 023 documents depends on it, so it is held here.
+
+    An adjustment at the same instant as a fill replays after the fill because `"manual"`
+    sorts after every venue key. A venue added later whose key sorts after it -- `okx`, or
+    `mexc`, since `"ma" < "me"` -- would silently put the owner's opening balance before that
+    venue's sale at the same instant, the reverse of what the API documentation tells the
+    owner. Adding such a venue then has to be a decision, made with this test in view.
+    """
+    assert list(ExchangeKey), "the control: there are venues to compare"
+    assert all(key.value < ADJUSTMENT_SOURCE for key in ExchangeKey)
+    assert ADJUSTMENT_SOURCE == "manual"
 
 
 def test_the_recompute_reason_for_an_adjustment() -> None:
