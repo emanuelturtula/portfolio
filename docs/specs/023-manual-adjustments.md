@@ -304,3 +304,10 @@ is regenerated, because the drift job checks it.
       task would not.
   - *After the fix:* the bound makes an id of zero or below a 422 as well, since no id can
     be one. A 404 remains the answer for any id in range that the owner does not have.
+- **R9. Two behaviours the endpoint table left implicit (tester).**
+  - **A repeated DELETE answers 404.** The adjustment no longer exists. This matches a
+    missing id, not an idempotent 204.
+  - **The table's note `CHECK` is weaker than the service.** SQLite's `trim()` removes spaces
+    only, while the service strips all whitespace, so a note of tabs or no-break spaces is
+    refused by the service. The `CHECK` is a backstop against an empty string written
+    around the service, not the rule.
