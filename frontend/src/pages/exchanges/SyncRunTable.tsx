@@ -91,6 +91,10 @@ interface SyncRunTableProps {
  * The run log (spec criterion 4): the newest runs first, each with its trigger, status,
  * duration, account and fill counts and per-account detail. An empty log renders a fixed
  * sentence instead of an empty table.
+ *
+ * Seven columns do not fit a phone, so the table sits in a focusable scroll region: the page
+ * itself never scrolls sideways. See `PositionTable` for the pattern. The region has a name of
+ * its own, not the "Sync history" section's, so the two landmarks are told apart.
  */
 export function SyncRunTable({ runs }: SyncRunTableProps) {
   if (runs.length === 0) {
@@ -98,35 +102,37 @@ export function SyncRunTable({ runs }: SyncRunTableProps) {
   }
 
   return (
-    <table>
-      <thead>
-        <tr>
-          <th scope="col">Started</th>
-          <th scope="col">Trigger</th>
-          <th scope="col">Status</th>
-          <th scope="col">Duration</th>
-          <th scope="col">Exchanges</th>
-          <th scope="col">Fills</th>
-          <th scope="col">Details</th>
-        </tr>
-      </thead>
-      <tbody>
-        {runs.map((run) => (
-          <tr key={run.run_id}>
-            <td>
-              <RelativeTime value={run.started_at} />
-            </td>
-            <td>{TRIGGER_LABELS[run.trigger]}</td>
-            <td>{RUN_STATUS_LABELS[run.status]}</td>
-            <td>{formatRunDuration(run.duration_ms)}</td>
-            <td>{exchangesCell(run)}</td>
-            <td>{fillsCell(run)}</td>
-            <td>
-              <DetailsCell run={run} />
-            </td>
+    <div className="table-scroll" role="region" aria-label="Sync runs" tabIndex={0}>
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Started</th>
+            <th scope="col">Trigger</th>
+            <th scope="col">Status</th>
+            <th scope="col">Duration</th>
+            <th scope="col">Exchanges</th>
+            <th scope="col">Fills</th>
+            <th scope="col">Details</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {runs.map((run) => (
+            <tr key={run.run_id}>
+              <td>
+                <RelativeTime value={run.started_at} />
+              </td>
+              <td>{TRIGGER_LABELS[run.trigger]}</td>
+              <td>{RUN_STATUS_LABELS[run.status]}</td>
+              <td>{formatRunDuration(run.duration_ms)}</td>
+              <td>{exchangesCell(run)}</td>
+              <td>{fillsCell(run)}</td>
+              <td>
+                <DetailsCell run={run} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
