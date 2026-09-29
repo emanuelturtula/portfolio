@@ -3,6 +3,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { positionsQueryKey, usePositions } from '@/api/accounting';
 import {
   EXCHANGE_RUNS_LIMIT,
   exchangeRunsQueryKey,
@@ -16,6 +17,7 @@ import {
   useSyncExchanges,
 } from '@/api/exchanges';
 import { createQueryClient } from '@/lib/queryClient';
+import { emptySnapshot, investedPortfolio } from '@/test/accountingFixtures';
 import {
   accountFailed,
   authFailedExchange,
@@ -26,6 +28,7 @@ import {
   runningExchangeRun,
   unsyncedExchange,
 } from '@/test/exchangeFixtures';
+import { fakeAccounting } from '@/test/fakeAccounting';
 import { fakeExchanges, type FakeExchanges } from '@/test/fakeExchanges';
 import { settle } from '@/test/render';
 import { problem, server } from '@/test/server';
@@ -348,5 +351,97 @@ describe('the exchange hooks: polling', () => {
     await advance(SLOW_POLL_MS - FAST_POLL_MS);
     expect(fake.count('list')).toBe(list + 1);
     expect(fake.count('runs')).toBe(runs + 1);
+  });
+});
+
+/**
+ * Spec 022: a sync that stored a fill has already recomputed the position snapshot by the
+ * time it answers (spec 021), so settling it re-reads `['accounting', ...]` as well as
+ * `['exchanges', ...]`, success or failure.
+ */
+describe('the exchange sync and the invested figures', () => {
+  function setUp(options: { readonly failSync: boolean }) {
+    const exchanges = fakeExchanges({ exchanges: [exchange()] });
+    const accounting = fakeAccounting({ positions: emptySnapshot() });
+    if (options.failSync) {
+      exchanges.fail('sync', () => problem(504, 'Gateway Timeout', 'The upstream did not answer.'));
+    }
+    server.use(...exchanges.handlers, ...accounting.handlers);
+    const client = createQueryClient();
+
+    const hook = renderHook(() => ({ positions: usePositions(), sync: useSyncExchanges() }), {
+      wrapper: wrapperFor(client),
+    });
+
+    return { exchanges, accounting, client, hook };
+  }
+
+  it('re-reads the positions when the sync succeeds, and shows the new snapshot', async () => {
+    const { accounting, client, hook } = setUp({ failSync: false });
+    await waitFor(() => {
+      expect(hook.result.current.positions.isSuccess).toBe(true);
+    });
+    const before = accounting.count();
+    // The sync stores fills; the server recomputes before it answers.
+    const recomputed = investedPortfolio();
+    accounting.setPositions(recomputed);
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+
+    await waitFor(() => {
+      expect(hook.result.current.sync.isSuccess).toBe(true);
+    });
+    await waitFor(() => {
+      expect(accounting.count()).toBe(before + 1);
+    });
+    await waitFor(() => {
+      expect(hook.result.current.positions.data).toEqual(recomputed);
+    });
+    expect(client.getQueryData(positionsQueryKey)).toEqual(recomputed);
+  });
+
+  it('re-reads the positions when the sync fails, too', async () => {
+    // A cut-off request very often means the run is still going: it may yet store a fill.
+    const { accounting, hook } = setUp({ failSync: true });
+    await waitFor(() => {
+      expect(hook.result.current.positions.isSuccess).toBe(true);
+    });
+    const before = accounting.count();
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+
+    await waitFor(() => {
+      expect(hook.result.current.sync.isError).toBe(true);
+    });
+    await waitFor(() => {
+      expect(accounting.count()).toBe(before + 1);
+    });
+  });
+
+  it('marks an inactive positions query stale, so the dashboard re-reads it on return', async () => {
+    // On the exchanges page the dashboard is not mounted: nothing observes the positions.
+    // The invalidation still reaches the cached entry, so it is not served as fresh later.
+    const { client, hook } = setUp({ failSync: false });
+    client.setQueryData(['accounting', 'positions', 'inactive-probe'], emptySnapshot());
+    await waitFor(() => {
+      expect(hook.result.current.positions.isSuccess).toBe(true);
+    });
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+    await waitFor(() => {
+      expect(hook.result.current.sync.isSuccess).toBe(true);
+    });
+
+    await waitFor(() => {
+      expect(
+        client.getQueryState(['accounting', 'positions', 'inactive-probe'])?.isInvalidated,
+      ).toBe(true);
+    });
   });
 });

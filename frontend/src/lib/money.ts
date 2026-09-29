@@ -53,6 +53,18 @@ export interface FormatMoneyOptions {
   readonly maximumFractionDigits?: number;
   /** Minimum fractional digits to show, padding with zeros. Defaults to 0. */
   readonly minimumFractionDigits?: number;
+  /**
+   * When a sign is shown, named after `Intl.NumberFormat`'s option of the same name.
+   *
+   * - `'auto'`, the default: only a negative amount carries a sign.
+   * - `'exceptZero'`: a positive amount is prefixed with `+`, a negative one keeps its `-`,
+   *   and zero stays unsigned. For profit and loss, where the sign is the only thing that
+   *   tells a gain from a loss once colour is not relied on.
+   *
+   * The sign follows the exact value, never the rounded one, so a gain too small to show
+   * renders as the boundary `< +0.01` and never as `+0.00`.
+   */
+  readonly signDisplay?: 'auto' | 'exceptZero';
 }
 
 /**
@@ -84,6 +96,9 @@ export interface FormatMoneyOptions {
  * invariant `Intl.NumberFormat` enforces - because the alternative is padding
  * that silently never happens.
  *
+ * `signDisplay: 'exceptZero'` adds a `+` to a positive amount, including the boundary of
+ * rule 1 (`< +0.01`); a negative amount and a zero render exactly as they do under `'auto'`.
+ *
  * Built entirely from `decimal.js` string output and manual string
  * manipulation, never `Number()`, so the module that exists to keep money out
  * of floating point does not reach for one itself.
@@ -93,6 +108,7 @@ export interface FormatMoneyOptions {
 export function formatMoney(value: Money, options: FormatMoneyOptions = {}): string {
   const maximumFractionDigits = options.maximumFractionDigits ?? 8;
   const minimumFractionDigits = options.minimumFractionDigits ?? 0;
+  const plus = options.signDisplay === 'exceptZero' ? '+' : '';
 
   if (minimumFractionDigits > maximumFractionDigits) {
     throw new RangeError(
@@ -106,7 +122,7 @@ export function formatMoney(value: Money, options: FormatMoneyOptions = {}): str
 
   if (rounded.isZero() && !decimal.isZero()) {
     const threshold = smallestUnit(maximumFractionDigits);
-    return decimal.isNegative() ? `> -${threshold}` : `< ${threshold}`;
+    return decimal.isNegative() ? `> -${threshold}` : `< ${plus}${threshold}`;
   }
 
   const fixed = rounded.toFixed(maximumFractionDigits);
@@ -121,7 +137,14 @@ export function formatMoney(value: Money, options: FormatMoneyOptions = {}): str
   const fraction = trimTrailingZeros(fractionPart, minimumFractionDigits);
   const formatted = fraction.length > 0 ? `${groupedWhole}.${fraction}` : groupedWhole;
 
-  return negative ? `-${formatted}` : formatted;
+  if (negative) {
+    return `-${formatted}`;
+  }
+
+  // Reaching here with a non-zero `decimal` means `rounded` is non-zero too - rule 1 above
+  // has already returned for every value that rounds away - so `!decimal.isZero()` is
+  // also "the digits shown are not all zero", and `+0.00` cannot be produced.
+  return decimal.isZero() ? formatted : `${plus}${formatted}`;
 }
 
 /** The smallest positive amount representable at `maximumFractionDigits`, e.g. `0.01` for 2. */
@@ -199,4 +222,21 @@ export function addMoney(a: Money, b: Money): Money {
   // eventually be wrong, and the cost of one more regex test is negligible
   // next to what a silently-mistagged value would cost downstream.
   return money(new Decimal(a).plus(new Decimal(b)).toFixed());
+}
+
+/**
+ * Whether `value` is exactly zero, however the wire spells it: `"0"`, `"0.00"`, `"-0"` and
+ * `"0.000000000000000000"` are all zero. Comparing the strings would call the last one
+ * non-zero, which is how a fully sold position ends up listed as held.
+ */
+export function isZeroMoney(value: Money): boolean {
+  return new Decimal(value).isZero();
+}
+
+/**
+ * Whether `a` and `b` are the same amount, however each is spelled: `"5"` equals
+ * `"5.000000000000000000"`, which a comparison of the strings would call different.
+ */
+export function equalsMoney(a: Money, b: Money): boolean {
+  return new Decimal(a).equals(new Decimal(b));
 }

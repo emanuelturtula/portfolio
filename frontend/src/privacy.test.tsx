@@ -2,6 +2,8 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { fakeAccounting } from '@/test/fakeAccounting';
+import { fakeExchanges } from '@/test/fakeExchanges';
 import { fakePortfolio, recordRequestUrls } from '@/test/fakePortfolio';
 import { ADDRESSES, ALL_ADDRESSES, healthyPortfolio, wallet } from '@/test/fixtures';
 import { renderApp, settle, visitedPaths } from '@/test/render';
@@ -49,7 +51,12 @@ describe('privacy', () => {
     });
     const fake = fakePortfolio({ ...scenario, wallets: [...scenario.wallets, archived] });
     fake.rejectAddress(ADDRESSES.btcRegtest, 'bad_checksum');
-    server.use(...fakeSession({ initialUser: TEST_USERNAME }).handlers, ...fake.handlers);
+    server.use(
+      ...fakeSession({ initialUser: TEST_USERNAME }).handlers,
+      ...fake.handlers,
+      ...fakeAccounting().handlers,
+      ...fakeExchanges().handlers,
+    );
     const consoleCalls = CONSOLE_METHODS.map((method) => vi.spyOn(console, method));
     const urls = recordRequestUrls();
 
@@ -124,6 +131,7 @@ describe('privacy', () => {
     expect(paths).toContain('/api/balances/current');
     expect(paths).toContain('/api/balances/runs?limit=2');
     expect(paths).toContain('/api/balances/sync');
+    expect(paths).toContain('/api/accounting/positions');
     expect(fake.writes('POST', '/api/wallets')).toHaveLength(3);
 
     for (const url of urls) {

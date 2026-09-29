@@ -11,6 +11,8 @@ import {
   UNKNOWN_FAILURE_MESSAGE,
 } from '@/lib/freshness';
 import { PRICE_UNAVAILABLE_MESSAGES } from '@/lib/prices';
+import { fakeAccounting } from '@/test/fakeAccounting';
+import { fakeExchanges } from '@/test/fakeExchanges';
 import {
   BALANCES_CURRENT_PATH,
   BALANCES_RUNS_PATH,
@@ -93,7 +95,15 @@ function openDashboard(
 ): Setup {
   const user = userEvent.setup();
   const fake = fakePortfolio(options);
-  server.use(...fakeSession({ initialUser: TEST_USERNAME }).handlers, ...fake.handlers);
+  server.use(
+    ...fakeSession({ initialUser: TEST_USERNAME }).handlers,
+    ...fake.handlers,
+    // The invested section below the values (spec 022) reads the positions and the exchange
+    // list. These are the first-time owner's answers - a snapshot over no events, and no
+    // venue configured - so its empty state renders no amount, no alert and no status.
+    ...fakeAccounting().handlers,
+    ...fakeExchanges().handlers,
+  );
   server.use(...overrides);
 
   renderApp(['/']);
@@ -222,10 +232,19 @@ async function lastUpdated(): Promise<HTMLElement> {
   return screen.findByText(/balances as of/i, { selector: 'p' });
 }
 
-/** Waits until the dashboard has rendered its data. */
+/**
+ * Waits until the dashboard has rendered its data: the value regions, and the invested
+ * section below them (spec 022) past its own loading state. Both sections' skeletons are
+ * `role="status"`, so a page-wide "no status" assertion only means something about this
+ * section once the other one has settled too.
+ */
 async function loaded(): Promise<void> {
   await totalRegion();
   await walletsRegion();
+  const invested = await screen.findByRole('region', { name: 'Invested' });
+  await waitFor(() => {
+    expect(within(invested).queryByRole('status')).not.toBeInTheDocument();
+  });
 }
 
 /** The healthy portfolio, with one wallet row replaced. */
@@ -1807,7 +1826,12 @@ describe('DashboardPage: states', () => {
     const user = userEvent.setup();
     const session = fakeSession({ initialUser: TEST_USERNAME });
     const fake = fakePortfolio({ ...healthyPortfolio(), session });
-    server.use(...session.handlers, ...fake.handlers);
+    server.use(
+      ...session.handlers,
+      ...fake.handlers,
+      ...fakeAccounting({ session }).handlers,
+      ...fakeExchanges({ session }).handlers,
+    );
     renderApp(['/']);
     expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
 

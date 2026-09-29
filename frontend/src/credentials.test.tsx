@@ -14,6 +14,7 @@ import {
   syncTriggered,
   truncatedExchange,
 } from '@/test/exchangeFixtures';
+import { fakeAccounting } from '@/test/fakeAccounting';
 import { fakeExchanges, type FakeExchangesOptions } from '@/test/fakeExchanges';
 import { fakePortfolio } from '@/test/fakePortfolio';
 import { healthyPortfolio } from '@/test/fixtures';
@@ -200,6 +201,7 @@ function serve(signedIn: boolean, exchanges: FakeExchangesOptions = EXCHANGES_SC
     ...session.handlers,
     ...fakePortfolio({ ...scenario, session }).handlers,
     ...fakeExchanges({ ...exchanges, session }).handlers,
+    ...fakeAccounting({ session }).handlers,
   );
 }
 

@@ -130,11 +130,19 @@ export function useExchangeRuns(
  * very often means the run is still going rather than that it never started (the
  * coordinator shields the run from the client connection; see the spec's Risks section), so
  * the list and the run log are worth re-reading either way.
+ *
+ * Every `['accounting', ...]` query is invalidated with them (spec 022): a sync that stored
+ * a fill has already recomputed the position snapshot before it answers (spec 021), so the
+ * invested-per-asset figures are worth re-reading at the same moment, not at the next poll.
  */
 export function useSyncExchanges(): UseMutationResult<ExchangeSyncTriggered, unknown, void> {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: () => apiFetch<ExchangeSyncTriggered>(SYNC_PATH, { method: 'POST' }),
-    onSettled: () => queryClient.invalidateQueries({ queryKey: ['exchanges'] }),
+    onSettled: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['exchanges'] }),
+        queryClient.invalidateQueries({ queryKey: ['accounting'] }),
+      ]),
   });
 }
