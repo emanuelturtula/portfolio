@@ -1,7 +1,7 @@
 # 022 — Invested per asset and unrealized P&L on the dashboard
 
 Issue: #20
-Status: in progress
+Status: done
 
 ## Problem
 
