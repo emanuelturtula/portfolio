@@ -357,3 +357,18 @@ These are the issue's criteria, all of them, backend and frontend, plus:
     cycle.
   - **A fee asset is listed whenever a matching fill carries one,** even when its amount or
     its sum is zero. A fill with no fee asset adds nothing.
+- **R4. The browser check (tech lead).** It ran against a local backend seeded with synthetic
+  fills from two venues: 76 fills, USDC-quoted and derived-quote rows, rebates, missing
+  order ids, one venue truncated and one failing.
+  - **1280 px:** the document fits, and so do the three tables.
+  - **375 px:** the document is exactly the viewport's width. The per-asset, not-valued and
+    fills tables scroll inside labelled, focusable regions.
+  - **Figures.** The totals match the seeded rows by hand: per-asset nets, a negative DOT
+    net, the eight USDC-quoted sells under "Not valued in USDT", and a USDC fee sum
+    including a rebate.
+  - **Behaviour.**
+    - Filtering by venue and by a single inclusive day, and the scope sentence, work.
+    - Back and forward restore the filters and their inputs.
+    - Paging shows "Showing 1 to 50 of 76".
+    - The failing-venue alert and both completeness sentences render.
+  - **Nothing needed fixing.**
