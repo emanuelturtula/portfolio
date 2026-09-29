@@ -1,7 +1,7 @@
 # 019 — Weighted-average cost-basis engine
 
 Issue: #17
-Status: implementing
+Status: done
 
 ## Problem
 
