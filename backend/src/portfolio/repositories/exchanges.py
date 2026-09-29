@@ -651,7 +651,7 @@ class ExchangeFillRepository:
         this loop runs once per fill in the history and was half the endpoint's time: a
         `Row`'s attribute access resolves each name, and `ExchangeKey(...)` and `FillSide(...)`
         each cost a call into `EnumType.__call__`. Measured at 20,000 fills, the load went from
-        0.199 s to 0.105 s. The unpacking follows `select_fills_for_view`'s column order, and a
+        0.199 s to 0.122 s. The unpacking follows `select_fills_for_view`'s column order, and a
         test pins the two together. A value outside either enum is a `KeyError`, which
         `ck_exchange_accounts_exchange_key` and `ck_exchange_fills_side` make unreachable.
         """
