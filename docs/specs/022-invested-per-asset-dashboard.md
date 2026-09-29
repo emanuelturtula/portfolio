@@ -241,7 +241,8 @@ None.
 ## Acceptance criteria
 
 1. The table shows, per held asset, quantity, average cost, total invested, market value,
-   unrealized P&L and return percentage, plus the price and its age.
+   unrealized P&L and return percentage, plus the price, with its age when it is stale
+   (#20: "a stale price shows its age"; review N7).
 2. The summary shows invested against market value, unrealized P&L and return, and realized
    P&L. It never shows a sum over nothing as zero.
 3. Every amount renders from its wire string. The `<data value>` of each amount is exactly the
@@ -341,3 +342,57 @@ None.
     - the `history_incomplete` explanation says the same.
   - The figures shown were checked by hand against the seeded trades. Dark mode was checked
     at 1280 px.
+- **R7. Nothing held at all is a genuine zero (tester).** When every position is closed, the
+  summary shows `0.00` invested and `0.00` market value, and the return shows "—". Holding
+  nothing is a real answer, not a total over nothing. The value section renders an empty
+  portfolio the same way. The "—" rule applies only when something is held and all of it is
+  excluded.
+- **R8. Review findings (reviewer, before the pull request).**
+  - **M1. A flag on an asset no longer held must stay visible.** `dispose` empties the pool
+    when a disposal exceeds it, and `history_incomplete` and `unattributed_fee` are sticky, so
+    a flag often sits on a closed position. The fix has three parts:
+    - The closed line names each closed asset, with its flag labels beside the flagged ones.
+    - The legend explains every flag shown anywhere, whether on a row or in the closed line.
+    - Realized P&L carries a caveat naming the assets when any position, held or closed,
+      carries `history_incomplete` or `unattributed_fee`.
+  - **S1. Empty-state rows follow what the positions response proves.** `event_count === 0`
+    on a snapshot proves no trades have been replayed. The new order is:
+    1. The recompute failed. Unchanged.
+    2. A venue's sync failed. Unchanged.
+    3. `no_trades`, in either of two cases:
+       - The exchanges list is known and `fills_stored` is 0 on every venue. `anyConfigured`
+         is a boolean.
+       - The list is unknown, `computed_at` is set and `event_count === 0`. `anyConfigured`
+         is `undefined`, and the description stays neutral.
+    4. `not_computed`: `computed_at === null` or `event_count === 0`. Rows 2 and 3 have
+       already ruled out "no trades", so this is fills whose snapshot predates them.
+    5. `no_positions`: only when `event_count > 0`.
+  - **S2.** The summary says it includes at least one stale price when a held, non-excluded
+    position has `price.stale`, as `TotalSummary` does.
+  - **S3. `unallocated_costs` has three sources** (`results.py`):
+    - a conversion's fee;
+    - the value given in a swap whose received side has no known cost;
+    - R11's share of a swap fee.
+
+    The line reads as costs not assigned to any asset and names both origins, stablecoin
+    conversions and swaps into units with no known cost. The earlier "(conversions between
+    stablecoins)" in *Summary* is superseded.
+  - **S4.** Fixtures must be shapes the engine writes. Every warning's asset has a position.
+    A `negative_inventory` implies `history_incomplete` on its asset, and an
+    `unattributed_fee` with `charged_to` implies that flag on `charged_to`. The fixture guard
+    checks all three.
+  - **S5. `unmatched_proceeds` is shown nowhere.** A portfolio figure needs a backend total,
+    because the page sums nothing, so it is filed as a follow-up issue rather than done here.
+  - **N1.** A held position with no known-cost units (`quantity` equal to
+    `unknown_basis_quantity`) shows "—" for Invested and Unrealized P&L, not a `0.00` that
+    reads as break-even.
+  - **N2, N3. Explanations corrected.**
+    - Unknown basis comes from units that arrived without a cost: a swap paid with
+      unknown-cost units, a fee rebate in a non-cash asset, and, from #18, an adjustment
+      without a cost. It does not come from buys before the history begins; selling those
+      units is `history_incomplete`. The explanation also says that market value covers
+      every unit.
+    - The `unpriced` exclusion says there is no market value, which is true for
+      `value_out_of_range` as well.
+  - **Kept as they are.** Two "Try again" buttons when both sections fail. Each sits under
+    its own titled alert.
