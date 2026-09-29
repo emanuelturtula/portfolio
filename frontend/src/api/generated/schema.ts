@@ -62,6 +62,11 @@ export interface paths {
          * @description Delete the adjustment; its id is never reused. The positions are recomputed first.
          *
          *     A repeat is a 404, as are another owner's id and a missing one.
+         *
+         *     **`/api/docs` cannot send this one.** Every write must carry `Content-Type:
+         *     application/json`, and Swagger UI sends no content type for a request without a body, so
+         *     the request is refused with a 403 before it gets here. `docs/operations.md`, section 15,
+         *     gives the one line to run in the browser console instead.
          */
         delete: operations["deleteAdjustment"];
         options?: never;
@@ -635,7 +640,7 @@ export interface components {
             quantity: string;
             /**
              * Unit Cost
-             * @description USD per unit, zero or more, as a JSON string, or `null`. **`null` is an unknown cost, not zero**: the quantity then counts toward the position but not toward its cost, and the asset shows the `unknown_basis` flag and the quantity in `unknown_basis_quantity` on `GET /api/accounting/positions`. Zero is a known cost of nothing. Unit cost times quantity must have at most 20 digits before the point.
+             * @description USD per unit, zero or more, as a JSON string, or `null`. **`null` is an unknown cost, not zero**: the quantity then counts toward the position but not toward its cost, and the asset shows the `unknown_basis` flag and the quantity in `unknown_basis_quantity` on `GET /api/accounting/positions`. Zero is a known cost of nothing. At most 18 decimal places, and unit cost times quantity must have at most 20 digits before the point.
              */
             unit_cost?: string | null;
         };
@@ -681,13 +686,13 @@ export interface components {
             quantity: string;
             /**
              * Unit Cost
-             * @description USD per unit, zero or more, as a JSON string, or `null`. **`null` is an unknown cost, not zero**: the quantity then counts toward the position but not toward its cost, and the asset shows the `unknown_basis` flag and the quantity in `unknown_basis_quantity` on `GET /api/accounting/positions`. Zero is a known cost of nothing. Unit cost times quantity must have at most 20 digits before the point.
+             * @description USD per unit, zero or more, as a JSON string, or `null`. **`null` is an unknown cost, not zero**: the quantity then counts toward the position but not toward its cost, and the asset shows the `unknown_basis` flag and the quantity in `unknown_basis_quantity` on `GET /api/accounting/positions`. Zero is a known cost of nothing. At most 18 decimal places, and unit cost times quantity must have at most 20 digits before the point.
              */
             unit_cost: string | null;
         };
         /**
          * AdjustmentResponse
-         * @description One adjustment, as stored: amounts as strings at 18 places, instants in UTC.
+         * @description One adjustment, as stored: amounts as strings at their stored scale, instants in UTC.
          */
         AdjustmentResponse: {
             /** Asset */
@@ -1562,6 +1567,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /** @description The adjustment's id, as a create returned it. */
                 adjustment_id: number;
             };
             cookie?: never;
@@ -1597,6 +1603,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /** @description The adjustment's id, as a create returned it. */
                 adjustment_id: number;
             };
             cookie?: never;

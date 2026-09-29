@@ -350,8 +350,19 @@ Every adjustment carries a note, in the owner's words, saying why it exists. The
 logged.
 
 The owner enters adjustments through the authenticated API under
-`/api/accounting/adjustments`. `/api/docs` works for this while signed in. Creating, replacing
-or deleting one recomputes the positions before the response returns.
+`/api/accounting/adjustments`. While signed in, `/api/docs` works for listing, creating and
+replacing them. It cannot delete one: every write must carry `Content-Type: application/json`,
+and Swagger UI sends no content type for a request without a body, so the delete gets a 403.
+To delete one, run this in the browser console on a page of the signed-in application, with
+the adjustment's id in place of `<id>`:
+
+```js
+await fetch('/api/accounting/adjustments/<id>', {method: 'DELETE', headers: {'Content-Type': 'application/json'}})
+```
+
+The browser adds the `Origin` header and the session cookie itself, and a `204` means it is
+gone. Creating, replacing or deleting an adjustment recomputes the positions before the
+response returns.
 
 ### Dating an opening balance
 

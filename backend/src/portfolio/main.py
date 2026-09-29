@@ -53,6 +53,7 @@ from portfolio.services.accounting import (
     RecomputeOutcome,
     RecomputeReason,
     RecomputeReport,
+    UnconvertibleAdjustmentError,
     build_accounting_service,
     utc_now,
 )
@@ -442,11 +443,12 @@ async def run_accounting_recompute(app: FastAPI, reason: RecomputeReason) -> Acc
     * **Logged once per run**: `accounting_recompute_finished` with the reason, the duration,
       the events replayed and the outcome (`written` if any owner's snapshot was written); or
       `accounting_recompute_failed` with the reason, the duration and **the first failure's
-      class name only**. Never its message and never a traceback. The engine is built with
-      `hide_parameters=True`, so a `StatementError` does not carry the values it was binding;
-      but its text still quotes the statement, and a message is free text that no exception
-      has promised to keep clear of a trade id or an amount. The class name is enough to act
-      on, and `docs/operations.md` says what each one means.
+      class name only** -- plus, for an `UnconvertibleAdjustmentError`, the adjustment's id,
+      which is what an operator needs to correct it. Never its message and never a traceback.
+      The engine is built with `hide_parameters=True`, so a `StatementError` does not carry the
+      values it was binding; but its text still quotes the statement, and a message is free
+      text that no exception has promised to keep clear of a trade id or an amount. The class
+      name is enough to act on, and `docs/operations.md` says what each one means.
     * **Recorded** on `app.state.accounting_status`, which `GET /api/accounting/positions`
       shows as `last_recompute`.
 
@@ -486,6 +488,7 @@ async def run_accounting_recompute(app: FastAPI, reason: RecomputeReason) -> Acc
                 reason=reason.value,
                 duration_ms=duration_ms,
                 error=status.error,
+                **_failed_row_of(failure),
             )
         else:
             outcome = (
@@ -503,6 +506,20 @@ async def run_accounting_recompute(app: FastAPI, reason: RecomputeReason) -> Acc
             )
         app.state.accounting_status = status
         return status
+
+
+def _failed_row_of(failure: Exception) -> dict[str, int]:
+    """The log fields that name the row a failed recompute stopped on, when naming it is safe.
+
+    **Only an adjustment's id** (spec 023, R8). `docs/operations.md` tells an operator to
+    correct or delete the adjustment an `UnconvertibleAdjustmentError` stopped on, which is
+    only possible knowing which one; and an adjustment id is already logged on every change to
+    one. A fill's identity -- its account and its venue's trade id -- stays out of the log, as
+    it always has: a trade id is a venue's record of the owner's trading.
+    """
+    if isinstance(failure, UnconvertibleAdjustmentError):
+        return {"adjustment_id": failure.adjustment_id}
+    return {}
 
 
 def last_recompute_failed(app: FastAPI) -> bool:

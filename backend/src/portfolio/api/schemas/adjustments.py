@@ -21,12 +21,23 @@ and R5): the owner's figures cross the wire one way, and a client that sends `1`
 `0.1` tomorrow. `MoneyInput` is `MoneyStr` with that refusal in front of it. On the way out
 every amount is a string at eighteen places, as `GET /api/accounting/positions` sends them.
 
-## `occurred_at` is a string too
+## `occurred_at` is ISO 8601, parsed by the standard library
 
-Pydantic reads a JSON number for a `datetime` as a Unix timestamp, and accepts it. The contract
-is an ISO 8601 string with an offset (spec 023, R5), so `InstantInput` refuses a number before
-Pydantic sees it. What a string must then be -- aware, representable in UTC, not later than
-now -- is the service's to decide, as for every other rule.
+Pydantic's lax `datetime` reads Unix time from a JSON number **and from a string of digits**:
+`"1767225600"` becomes 2026-01-01, and `"20260101"` -- an ISO 8601 basic-format date an owner
+could type -- becomes 1970-08-23. Both come out timezone-aware, so nothing downstream would
+notice, and strict mode does not change it. The contract is an ISO 8601 string with an offset
+(spec 023, R5 and R8), so `InstantInput` does the parsing itself, with `datetime.fromisoformat`,
+and hands Pydantic the `datetime` it gives:
+
+* a JSON number is refused;
+* a string that is not ISO 8601 -- `"1767225600"` among them -- is refused with a fixed message
+  that does not quote it;
+* `"20260101"` becomes the naive midnight it spells, which the service refuses as not
+  timezone-aware.
+
+What a parsed instant must then be -- aware, representable in UTC, not later than now -- is the
+service's to decide, as for every other rule.
 
 ## `unit_cost: null` is unknown, never zero
 
@@ -44,6 +55,8 @@ from typing import TYPE_CHECKING, Annotated, Final
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from portfolio.api.schemas.money import MoneyStr
+from portfolio.domain.accounting import DEFAULT_CASH_ASSETS
+from portfolio.domain.accounting.constants import AMOUNT_SCALE, MAX_AMOUNT_INTEGER_DIGITS
 from portfolio.services.adjustments import (
     ASSET_SYMBOL_PATTERN,
     NOTE_MAX_LENGTH,
@@ -61,6 +74,12 @@ INSTANT_NUMBER_REFUSAL: Final = (
 )
 """The refusal of a JSON number for `occurred_at`. Pydantic prefixes it with `Value error, `."""
 
+INSTANT_FORMAT_REFUSAL: Final = (
+    "occurred_at must be an ISO 8601 datetime with a timezone, such as 2026-01-01T00:00:00Z"
+)
+"""The refusal of a string that is not ISO 8601. Fixed: the parser's own message quotes the
+input. Pydantic prefixes it with `Value error, `."""
+
 
 def _require_a_json_string(value: object) -> object:
     """Refuse a JSON number -- an integer as well as a float -- or a boolean, for an amount.
@@ -74,14 +93,26 @@ def _require_a_json_string(value: object) -> object:
 
 
 def _require_an_iso_string(value: object) -> object:
-    """Refuse a JSON number -- or a boolean -- for `occurred_at`, before Pydantic reads it.
+    """Parse `occurred_at` as ISO 8601 here, so that Pydantic never reads it as Unix time.
 
-    Without this, `1767225600` is accepted as a Unix timestamp. Anything else goes on to
-    Pydantic's `datetime`, which parses a string -- or passes a `datetime` built in Python --
-    and refuses whatever does not parse, without quoting it.
+    * A JSON number, or a boolean, is refused.
+    * A string is parsed by `datetime.fromisoformat`, and the `datetime` it gives is what
+      Pydantic then validates. A string that does not parse is refused with
+      `INSTANT_FORMAT_REFUSAL`, raised `from None`: `fromisoformat`'s own message quotes the
+      input.
+    * Anything else goes on unchanged: a `datetime` built in Python passes, and `null` or an
+      object is refused by Pydantic, without quoting it.
+
+    A naive result is returned as it is. Refusing it is the engine's rule, applied by the
+    service, so that the API and the recompute cannot disagree about it.
     """
     if isinstance(value, int | float):
         raise ValueError(INSTANT_NUMBER_REFUSAL)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            raise ValueError(INSTANT_FORMAT_REFUSAL) from None
     return value
 
 
@@ -92,23 +123,28 @@ The validator is last in the annotation, and Pydantic runs before-validators las
 sees the raw JSON value before `MoneyStr`'s own."""
 
 InstantInput = Annotated[datetime, BeforeValidator(_require_an_iso_string)]
-"""`occurred_at` in a request body: a string, never a Unix timestamp (spec 023, R5)."""
+"""`occurred_at` in a request body: an ISO 8601 string, never Unix time (spec 023, R5, R8)."""
 
+# The descriptions below state limits the engine and the service enforce, so every figure in
+# them is built from the constant that enforces it, never typed out: a limit that moved would
+# otherwise leave the documentation describing the old one.
+_CASH_ASSETS: Final = " and ".join(sorted(DEFAULT_CASH_ASSETS))
 _ASSET_DESCRIPTION: Final = (
     "The symbol exactly as the exchanges spell it: 1 to 20 upper-case letters or digits, such "
     "as `BTC`. A lower-case symbol is refused rather than corrected, and so are the cash "
-    "assets USDC and USDT."
+    f"assets {_CASH_ASSETS}."
 )
 _QUANTITY_DESCRIPTION: Final = (
-    "How much was acquired, above zero, as a JSON string. At most 18 decimal places and 20 "
-    "digits before the point."
+    f"How much was acquired, above zero, as a JSON string. At most {AMOUNT_SCALE} decimal "
+    f"places and {MAX_AMOUNT_INTEGER_DIGITS} digits before the point."
 )
 _UNIT_COST_DESCRIPTION: Final = (
     "USD per unit, zero or more, as a JSON string, or `null`. **`null` is an unknown cost, not "
     "zero**: the quantity then counts toward the position but not toward its cost, and the "
     "asset shows the `unknown_basis` flag and the quantity in `unknown_basis_quantity` on "
-    "`GET /api/accounting/positions`. Zero is a known cost of nothing. Unit cost times quantity "
-    "must have at most 20 digits before the point."
+    "`GET /api/accounting/positions`. Zero is a known cost of nothing. At most "
+    f"{AMOUNT_SCALE} decimal places, and unit cost times quantity must have at most "
+    f"{MAX_AMOUNT_INTEGER_DIGITS} digits before the point."
 )
 _OCCURRED_AT_DESCRIPTION: Final = (
     "When the coins were acquired: an ISO 8601 datetime with an offset, not later than now. It "
@@ -170,7 +206,7 @@ class AdjustmentReplaceRequest(_AdjustmentRequest):
 
 
 class AdjustmentResponse(BaseModel):
-    """One adjustment, as stored: amounts as strings at 18 places, instants in UTC."""
+    """One adjustment, as stored: amounts as strings at their stored scale, instants in UTC."""
 
     id: int
     asset: str

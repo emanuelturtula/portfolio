@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Annotated, Final
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Path, Response, status
 from fastapi.exceptions import RequestValidationError
 
 from portfolio.api.dependencies import get_adjustment_service, get_principal
@@ -46,6 +46,19 @@ from portfolio.services.auth import Principal
 # gives: FastAPI resolves these annotations at import time.
 CurrentPrincipal = Annotated[Principal, Depends(get_principal)]
 CurrentAdjustmentService = Annotated[AdjustmentService, Depends(get_adjustment_service)]
+
+MAX_ADJUSTMENT_ID: Final = 2**63 - 1
+"""The largest id SQLite can hold: its `INTEGER` is a signed 64-bit integer.
+
+A larger id cannot name a row, and binding one raises `OverflowError` inside the driver -- a
+500 with a traceback -- so the path parameter refuses it first, as a 422 (spec 023, R8). An id
+below 1 is refused the same way: `AUTOINCREMENT` starts at 1, so none names a row either.
+"""
+
+AdjustmentId = Annotated[
+    int,
+    Path(ge=1, le=MAX_ADJUSTMENT_ID, description="The adjustment's id, as a create returned it."),
+]
 
 router = APIRouter(prefix="/accounting/adjustments", tags=["accounting"])
 
@@ -114,7 +127,7 @@ async def create_adjustment(
     response_model=AdjustmentResponse,
 )
 async def replace_adjustment(
-    adjustment_id: int,
+    adjustment_id: AdjustmentId,
     body: AdjustmentReplaceRequest,
     principal: CurrentPrincipal,
     service: CurrentAdjustmentService,
@@ -143,13 +156,18 @@ async def replace_adjustment(
     response_class=Response,
 )
 async def delete_adjustment(
-    adjustment_id: int,
+    adjustment_id: AdjustmentId,
     principal: CurrentPrincipal,
     service: CurrentAdjustmentService,
 ) -> Response:
     """Delete the adjustment; its id is never reused. The positions are recomputed first.
 
     A repeat is a 404, as are another owner's id and a missing one.
+
+    **`/api/docs` cannot send this one.** Every write must carry `Content-Type:
+    application/json`, and Swagger UI sends no content type for a request without a body, so
+    the request is refused with a 403 before it gets here. `docs/operations.md`, section 15,
+    gives the one line to run in the browser console instead.
     """
     try:
         await service.delete(principal.user_id, adjustment_id)
