@@ -295,3 +295,21 @@ None.
   them unchanged, apart from new default handlers.
 - **Two currencies on one page.** The value section may be in EUR while this one is in USD.
   Every amount carries its currency, in the header or the suffix.
+
+## Rulings during implementation
+
+- **R1. No branch for a response the backend cannot write (tester, before the gate).** Three
+  branches were type-legal, but no backend response reaches them:
+  - positions without a snapshot (`computed_at` null while `positions` is not empty);
+  - a null `market_value` with a null reason;
+  - a failed recompute with a null `error`.
+
+  The 100 % branch floor would have needed a contradictory fixture for each. The page
+  instead narrows once, where the backend's contract guarantees the shape:
+  - The section's empty-state gate is `computed_at === null || positions.length === 0`.
+    `computed_at` null is the endpoint's own definition of "no snapshot".
+  - The unavailable-value sentence and the error class name render only when present,
+    with no invented fallback.
+
+  The rule for the rest of the issue is the same: never keep a branch only a contradictory
+  fixture can reach, and never invent a value to fill it.
