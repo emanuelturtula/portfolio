@@ -72,10 +72,21 @@ spec 019's R8 claim went false in the first place.
 
 Criterion 3 of #99 is carried here as a recommendation #19 must implement or explicitly
 overrule. A stored row that does not convert to a `Trade` must **fail the recompute loudly**,
-naming the exchange account and the fill's `external_trade_id`. It must not be skipped
-silently: a skipped fill is a position that is wrong with nothing to say so, and it is exactly
-the confident-wrong-number failure the engine was built to avoid. The existing snapshot then
+with an error that carries the exchange account and the fill's `external_trade_id` **as
+attributes, never in its message**. That follows the pattern of `ConflictingEventError`,
+because a message is what gets logged and stored as a sync run's `detail`, and this
+codebase keeps trade ids out of both. The row must not be skipped silently: a skipped fill
+is a position that is wrong with nothing to say so, which is exactly the
+confident-wrong-number failure the engine was built to avoid. The existing snapshot then
 stays as it was.
+
+No stored row is known to have these shapes:
+
+- Fills arrived through `NormalizedFill`, where no venue's fee parsing can produce them.
+- The one-time backfills were loaded with a zero fee, which rules out both fee shapes.
+- A base equal to its quote is not a real pair.
+
+The first recompute #19 runs is what would surface an exception.
 
 ## API contract
 
