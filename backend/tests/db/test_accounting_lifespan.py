@@ -369,6 +369,74 @@ async def test_one_owners_failure_neither_stops_nor_undoes_anothers(
     assert (before[second]["event_count"], after[second]["event_count"]) == (3, 4)
 
 
+async def test_one_owner_written_and_another_unchanged_is_a_written_run(
+    accounting_database: Path,
+) -> None:
+    """The run's outcome is `written` when any owner's snapshot was, not only when all were."""
+    first = await plant_owner_with_fills(accounting_database, count=2)
+    async with own_factory(accounting_database) as factory, factory() as session:
+        second = await plant_owner(session, "second-owner")
+        second_account = await plant_account(session, second, ExchangeKey.BINGX)
+        await plant_fills(session, second_account, [make_fill(4001, at(1))])
+
+    async with settled_app(accounting_database) as app:
+        before = {row["user_id"]: row for row in await headers_in(accounting_database)}
+        async with own_factory(accounting_database) as factory, factory() as session:
+            await plant_fills(session, second_account, [make_fill(4002, at(2))])
+        with capture_logs() as captured:
+            status = await run_accounting_recompute(app, RecomputeReason.EXCHANGE_SYNC)
+        after = {row["user_id"]: row for row in await headers_in(accounting_database)}
+
+    assert status.outcome is RecomputeOutcome.WRITTEN
+    assert after[first] == before[first], "the first owner's snapshot was unchanged"
+    assert after[second]["event_count"] == 2
+    (finished,) = events_named(captured, "accounting_recompute_finished")
+    assert (str(finished["outcome"]), finished["event_count"]) == ("written", 4)
+
+
+async def test_the_first_owners_failure_is_the_one_reported(accounting_database: Path) -> None:
+    """Two owners failing differently: the status and the log name the first failure's class."""
+    first = await plant_owner_with_fills(accounting_database, count=1)
+    async with own_factory(accounting_database) as factory, factory() as session:
+        second = await plant_owner(session, "second-owner")
+        second_account = await plant_account(session, second, ExchangeKey.BINGX)
+        await plant_fills(session, second_account, [make_fill(4001, at(1))])
+
+    async with settled_app(accounting_database) as app:
+        async with own_factory(accounting_database) as factory, factory() as session:
+            first_account = int(
+                await session.scalar(
+                    text("SELECT id FROM exchange_accounts WHERE user_id = :user"),
+                    {"user": first},
+                )
+            )
+            await plant_unconvertible_fill(
+                session, first_account, trade_id=LEAKY_TRADE_ID, shape="same_asset"
+            )
+            absurd = "90000000000000000000"
+            await plant_fills(
+                session,
+                second_account,
+                [
+                    make_fill(
+                        4999,
+                        at(9),
+                        quantity="1",
+                        price=absurd,
+                        quote_quantity=absurd,
+                        fee_amount=absurd,
+                        fee_asset="USDT",
+                    )
+                ],
+            )
+        with capture_logs() as captured:
+            status = await run_accounting_recompute(app, RecomputeReason.EXCHANGE_SYNC)
+
+    assert (status.outcome, status.error) == (RecomputeOutcome.FAILED, "UnconvertibleFillError")
+    (failed,) = events_named(captured, "accounting_recompute_failed")
+    assert failed["error"] == "UnconvertibleFillError"
+
+
 async def test_a_startup_recompute_never_delays_readiness_and_is_cancelled_at_shutdown(
     accounting_database: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
