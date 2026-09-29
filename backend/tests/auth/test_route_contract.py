@@ -111,6 +111,9 @@ def test_the_walk_actually_finds_the_routes(auth_app: FastAPI) -> None:
     assert ("GET", "/api/exchanges") in routes
     assert ("POST", "/api/exchanges/sync") in routes
     assert ("GET", "/api/exchanges/runs") in routes
+    # #93's one. Not in `PUBLIC_API_PATHS`, so registering it protected it; named so the
+    # sweep visibly covers the endpoint that serves the owner's trades and what they total.
+    assert ("GET", "/api/exchanges/fills") in routes
     # #19's one. Not in `PUBLIC_API_PATHS`, so registering it protected it; named so the
     # sweep visibly covers the endpoint that serves the owner's holdings and returns.
     assert ("GET", "/api/accounting/positions") in routes
