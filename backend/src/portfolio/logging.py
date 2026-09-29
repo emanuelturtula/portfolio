@@ -37,6 +37,14 @@ than discovered later: **it is a named list, not a mechanism.** Any library that
 through the standard library bypasses `redact_sensitive` entirely, and silencing two
 loggers closes today's leak without closing that hole. The general case is a separate
 issue.
+
+#106 found the second door of the same shape, and it is the database driver. `aiosqlite`
+logs every statement it runs at **DEBUG** with its bound parameters, so turning the
+application up to DEBUG put the values of every row it wrote on stdout -- wallet addresses,
+fills' raw payloads, trade ids, session token hashes, and the Argon2 hash of the owner's
+password whenever one is written. `STATEMENT_LOGGING_LIBRARIES` closes it the same way, and
+it is the same kind of list: the general case is still open, and this entry is the evidence
+that a hand-maintained list is incomplete until somebody happens to look.
 """
 
 from __future__ import annotations
@@ -102,13 +110,43 @@ siblings: none of them sets its own level, so each inherits its effective level 
 one. That would stop being true if httpcore ever called `setLevel` on a child.
 """
 
+STATEMENT_LOGGING_LIBRARIES: Final[tuple[str, ...]] = ("aiosqlite",)
+"""Standard-library loggers that render a statement's bound parameters, silenced likewise.
+
+`aiosqlite` is the measured leak (#106). The worker thread behind every connection calls
+`LOG.debug("executing %s", function)` for each call it makes on that connection, and for a
+statement `function` is `functools.partial(cursor.execute, sql, parameters)` -- whose `repr`
+is the SQL text followed by the tuple of values. At DEBUG that is every INSERT and UPDATE the
+application writes, on stdout, values and all -- the owner's password hash among them.
+
+Verified in aiosqlite 0.22.1: the package logs through this one logger and no child of it.
+Three calls are at DEBUG -- the call, its completion, and the exception it raised -- and the
+first two render the partial. The other three carry no row: an INFO when closing a connection
+fails, which the floor also drops and whose exception is re-raised anyway, and an ERROR and a
+WARNING from `iterdump`, which the application never calls.
+
+`hide_parameters=True` in `db/engine.py` does not cover this and cannot. It decides what
+*SQLAlchemy* renders into its own log lines and exception messages; this record is written
+underneath SQLAlchemy, by the driver SQLAlchemy calls, through a logger of the driver's own.
+"""
+
+SILENCED_VENDOR_LOGGERS: Final[tuple[str, ...]] = (
+    URL_LOGGING_LIBRARIES + STATEMENT_LOGGING_LIBRARIES
+)
+"""Every standard-library logger `silence_vendor_logging` raises to `VENDOR_LOG_FLOOR`.
+
+Two lists joined rather than one, because why a logger is here is what somebody needs to find
+before taking it off: a URL and a bound parameter leak for different reasons, from different
+packages, and each list's docstring records the version its claim was verified against.
+"""
+
 VENDOR_LOG_FLOOR: Final = logging.WARNING
 """An absolute floor for those loggers, not a maximum against `settings.log_level`.
 
 Deliberately not `max(level, WARNING)`. Turning the application's own logging up to DEBUG
-to investigate a provider must not be the act that puts every wallet address on stdout --
-which is exactly when someone would be tailing it, and exactly when a copy would end up
-pasted into an issue.
+to investigate a provider or a sync must not be the act that puts every wallet address on
+stdout -- which is exactly when someone would be tailing it, and exactly when a copy would
+end up pasted into an issue.
 
 WARNING rather than silencing the loggers outright, because `httpx` has no URL-bearing call
 above INFO and a genuine warning from it is worth hearing. Our own transport already logs
@@ -151,8 +189,8 @@ def redact_sensitive(
     return {key: _redact_item(key, value) for key, value in event_dict.items()}
 
 
-def silence_vendor_url_logging() -> None:
-    """Raise every logger in `URL_LOGGING_LIBRARIES` to `VENDOR_LOG_FLOOR`.
+def silence_vendor_logging() -> None:
+    """Raise every logger in `SILENCED_VENDOR_LOGGERS` to `VENDOR_LOG_FLOOR`.
 
     Called from `configure_logging`, which is the one place that decides what may reach
     stdout, so the rule applies to the whole process rather than to whichever factory
@@ -164,7 +202,7 @@ def silence_vendor_url_logging() -> None:
     fixing the leak with something a later call silently undoes is worse than not fixing
     it, because the gate would stay green.
     """
-    for library in URL_LOGGING_LIBRARIES:
+    for library in SILENCED_VENDOR_LOGGERS:
         logging.getLogger(library).setLevel(VENDOR_LOG_FLOOR)
 
 
@@ -176,7 +214,7 @@ def configure_logging(settings: Settings) -> None:
     # propagate to. `force=True` resets the root logger's handlers and does not touch a
     # named logger's level, so the order is not load-bearing -- but reading it in the
     # order the records travel is.
-    silence_vendor_url_logging()
+    silence_vendor_logging()
 
     renderer: Processor = (
         structlog.processors.JSONRenderer()

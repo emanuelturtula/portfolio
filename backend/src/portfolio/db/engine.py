@@ -81,6 +81,12 @@ def create_database_engine(database_url: str) -> AsyncEngine:
 
     The statement text and the driver's own message are untouched, so a failure is still
     diagnosable; only the values are replaced.
+
+    **What the flag does not reach is the driver.** `aiosqlite` logs every statement it
+    runs, values included, through a logger of its own at DEBUG -- underneath SQLAlchemy,
+    where no engine option applies. `portfolio.logging.STATEMENT_LOGGING_LIBRARIES` is the
+    other half, and it is enforced where logging is configured rather than here, because
+    that is the only place a logger's level can be set once for the whole process (#106).
     """
     engine = create_async_engine(database_url, hide_parameters=True)
     if engine.dialect.name == "sqlite":

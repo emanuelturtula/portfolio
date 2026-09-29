@@ -29,7 +29,6 @@ ordinary output by chance. None is assigned to a name containing a venue's name.
 from __future__ import annotations
 
 import logging
-import traceback
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 
@@ -50,6 +49,7 @@ from tests.providers.exchanges.bitget_harness import (
     fills_body,
 )
 from tests.providers.harness import retrying_client
+from tests.security.conftest import EveryRecord
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
@@ -235,22 +235,6 @@ def test_the_window_search_catches_a_leaked_tail_and_ignores_ordinary_output() -
 
     assert ACCESS_SENTINEL not in str(caught.value), "the failure must not print the secret"
     assert_no_window("success exchange_sync_finished bitget", list(SENTINELS), where="text")
-
-
-class EveryRecord(logging.Handler):
-    """A root handler of this test's own: every standard-library record, rendered in full."""
-
-    def __init__(self) -> None:
-        super().__init__(level=logging.NOTSET)
-        self.rendered: list[str] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        parts = [record.name, record.getMessage(), repr(record.args), repr(record.__dict__)]
-        if record.exc_info:
-            parts.append("".join(traceback.format_exception(*record.exc_info)))
-        if record.exc_text:
-            parts.append(record.exc_text)
-        self.rendered.append(" ".join(parts))
 
 
 class SwitchingVenue:

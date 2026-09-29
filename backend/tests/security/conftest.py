@@ -5,7 +5,8 @@ These five names were written for `test_address_logging.py` and are now needed b
 second copy of the `production_logging` fixture would be a second copy of the reason it is
 a callable instead of a fixture body -- and that reason is the one thing about this file
 that must not drift, because forgetting it turns every "the address is absent" assertion
-into a check against an empty string.
+into a check against an empty string. `EveryRecord` joined them on #106, when a fourth
+module needed it and three secrets tests already carried identical copies.
 
 **Why stdout and not `structlog.testing.capture_logs`.** `capture_logs` swaps the whole
 processor chain out for a `LogCapture`, so `format_exc_info` never runs and an address
@@ -19,6 +20,8 @@ these tests read.
 from __future__ import annotations
 
 import json
+import logging
+import traceback
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -92,6 +95,29 @@ def assert_carried_something(written: str, *, marker: str) -> None:
         f"stdout carried no line containing {marker!r}; "
         f"the log under test never ran. What was captured: {written[:400]!r}"
     )
+
+
+class EveryRecord(logging.Handler):
+    """A root handler of the test's own: every standard-library record, rendered in full.
+
+    stdout is the artifact, but it is the artifact *after* the root handler's `%(message)s`
+    format, which drops a record's arguments, extras and traceback when it has nothing to
+    put them in. This renders all of them, so a value a future format string would print is
+    caught today. Level `NOTSET`, so it sees everything the loggers above it let through --
+    and nothing they do not, which is what makes it a witness for a logger's level as well.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.NOTSET)
+        self.rendered: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        parts = [record.name, record.getMessage(), repr(record.args), repr(record.__dict__)]
+        if record.exc_info:
+            parts.append("".join(traceback.format_exception(*record.exc_info)))
+        if record.exc_text:
+            parts.append(record.exc_text)
+        self.rendered.append(" ".join(parts))
 
 
 @pytest.fixture

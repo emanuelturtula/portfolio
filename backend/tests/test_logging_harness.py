@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
 
@@ -32,7 +33,7 @@ import structlog
 
 from portfolio.config import Settings
 from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_TIME_COST
-from portfolio.logging import configure_logging
+from portfolio.logging import SILENCED_VENDOR_LOGGERS, VENDOR_LOG_FLOOR, configure_logging
 from tests import test_logging_redaction
 from tests.db import conftest as db_conftest
 from tests.logging_harness import logging_state, preserved_logging
@@ -181,6 +182,28 @@ def test_the_harness_restores_even_when_the_block_raises() -> None:
         reconfigure_and_fail()
 
     assert logging_state() == before
+
+
+@pytest.mark.parametrize("library", SILENCED_VENDOR_LOGGERS)
+def test_the_harness_puts_back_a_vendor_floor_a_control_lifted(library: str) -> None:
+    """A control that lifts a floor on purpose cannot leave the rest of the session exposed.
+
+    The restore test above cannot see this half. `configure_logging` raises every silenced
+    logger to the same floor, so its reconfiguration sets each one to the level it already
+    had, and a harness that forgot the vendor levels would still compare equal. The security
+    controls do something different -- they lift a floor to show the leak it closes is real
+    -- and a lifted floor that outlived its test would put a wallet address on stdout for
+    every test after it. So one is lifted here, the same way, and has to come back.
+    """
+    logger = logging.getLogger(library)
+    assert logger.level == VENDOR_LOG_FLOOR, "the baseline is the application's own floor"
+    assert library in logging_state()["vendor_levels"]
+
+    with preserved_logging():
+        logger.setLevel(logging.DEBUG)
+        assert logger.level != VENDOR_LOG_FLOOR, "the lift has to change something"
+
+    assert logger.level == VENDOR_LOG_FLOOR
 
 
 def test_the_comparison_can_see_a_configuration_that_was_not_restored() -> None:
