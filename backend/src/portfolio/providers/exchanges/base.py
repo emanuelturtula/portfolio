@@ -16,7 +16,7 @@ A provider parses its response into `NormalizedFill`s and hands them to
 `assemble_fill_page`, and the rules follow from the code rather than from the implementer
 having remembered them: every fill inside the window, no trade id twice, no more fills than
 the declared page size, and a cursor that moved. `NormalizedFill` itself refuses any amount
-the column would change.
+the column would change, and any fill the accounting engine could not replay.
 
 ## Money is `Decimal` from the parser to the column
 
@@ -50,15 +50,17 @@ from datetime import UTC, datetime, timedelta
 # Real imports, not `TYPE_CHECKING` ones: both are checked against at run time.
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Protocol
 
 from portfolio.db.models import FILL_SCALE
+from portfolio.domain.accounting import TradeShapeProblem, trade_shape_problem
 from portfolio.domain.exchanges import FillSide
 from portfolio.domain.money import MONEY_PRECISION, multiply, quantize
 from portfolio.providers.exchanges.errors import ExchangeSchemaError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 
     from portfolio.domain.exchanges import ExchangeKey
 
@@ -331,8 +333,18 @@ class NormalizedFill:
       `\\ud800` escape the JSON parser accepted;
     * a `side` that is not a `FillSide`;
     * a `fee_asset` of `None` beside a non-zero fee, or a blank one;
-    * a naive `executed_at`;
-    * a `quote_quantity_derived` that is not exactly a `bool`, or a blank `raw_payload`.
+    * a naive `executed_at`, or one that cannot be expressed in UTC at all -- `datetime.min`
+      at a positive offset is an instant before year one in UTC, which neither the
+      `UtcDateTime` column nor an accounting `EventKey` can hold. The value is kept as
+      given; only whether it converts is checked;
+    * a `quote_quantity_derived` that is not exactly a `bool`, or a blank `raw_payload`;
+    * **a fill the accounting engine cannot replay** (spec 020), whatever its fields: a
+      `base_asset` equal to the `quote_asset`, a fee in the asset received that consumes
+      everything received, or a rebate in the asset given that is at least everything
+      given. `trade_shape_problem` decides all three, the same function `Trade` refuses
+      them with, so the two cannot drift apart. They are refused here because the fill log
+      is append-only: a row once stored is a row every recompute after it must build a
+      `Trade` from, and one that cannot be built stops every position being computed.
 
     **No message quotes an amount or a trade id**: a fill quantity is the owner's holdings.
     Each names the field and the rule.
@@ -403,8 +415,36 @@ class NormalizedFill:
         if not _is_aware(self.executed_at):
             detail = "executed_at must be a timezone-aware datetime"
             raise ExchangeSchemaError(detail)
+        _require_utc_representable(self.executed_at, field="executed_at")
         _require_flag(self.quote_quantity_derived, field="quote_quantity_derived")
         _require_text(self.raw_payload, field="raw_payload")
+        # Last, because every field rule above is its precondition.
+        problem = trade_shape_problem(
+            base_asset=self.base_asset,
+            quote_asset=self.quote_asset,
+            side=self.side,
+            quantity=self.quantity,
+            quote_quantity=self.quote_quantity,
+            fee_amount=self.fee_amount,
+            fee_asset=self.fee_asset,
+        )
+        if problem is not None:
+            raise ExchangeSchemaError(_FILL_SHAPE_DETAILS[problem])
+
+
+_FILL_SHAPE_DETAILS: Final[Mapping[TradeShapeProblem, str]] = MappingProxyType(
+    {
+        TradeShapeProblem.SAME_ASSET: "base_asset and quote_asset must be different assets",
+        TradeShapeProblem.FEE_CONSUMES_RECEIVED: (
+            "fee_amount, paid in the asset received, must leave a quantity received greater "
+            "than zero"
+        ),
+        TradeShapeProblem.REBATE_EXCEEDS_GIVEN: (
+            "fee_amount, rebated in the asset given, must leave a quantity given greater than zero"
+        ),
+    }
+)
+"""`NormalizedFill`'s detail for each shape. Names the fields and the rule, never a value."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1009,6 +1049,22 @@ def _is_aware(value: object) -> bool:
     return (
         isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
     )
+
+
+def _require_utc_representable(moment: datetime, *, field: str) -> None:
+    """Refuse an aware instant that has no UTC spelling, as the schema error it is.
+
+    `astimezone` overflows at the ends of the calendar: `datetime.min` is a valid aware
+    value at `+05:00`, and five hours before it is not a `datetime` at all. The interpreter
+    says so with an `OverflowError`, which is outside the taxonomy -- and it is what the
+    `UtcDateTime` column would raise on insert and `EventKey` refuses. The converted value
+    is discarded: the fill keeps the instant as the venue gave it.
+    """
+    try:
+        moment.astimezone(UTC)
+    except OverflowError:
+        detail = f"{field} is outside the range a UTC datetime can represent"
+        raise ExchangeSchemaError(detail) from None
 
 
 def _require_aware(value: object, *, field: str) -> None:
