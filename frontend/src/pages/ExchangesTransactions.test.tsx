@@ -747,6 +747,8 @@ describe('Transactions: totals', () => {
       expect(text(cell(btc, 'Fills'))).toBe('60');
       expect(dataIn(cell(btc, 'Bought'))).toHaveAttribute('value', '0.060000000000000000');
       expect(text(summaryValue(await totals(), 'USDT spent'))).toBe('3,600.00 USDT');
+      // The scope counts every match too, not the 50 or 10 rows on screen.
+      expect(within(section).getByText('60 fills on all exchanges at any date.')).toBeTruthy();
     };
 
     await assertTotals();
