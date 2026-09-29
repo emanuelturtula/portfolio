@@ -123,6 +123,11 @@ a larger page.
 """
 
 
+_EXCHANGE_KEYS: Final = {key.value: key for key in ExchangeKey}
+_FILL_SIDES: Final = {side.value: side for side in FillSide}
+"""The column text to its enum member, for the per-row loop in `list_fills_for_view`."""
+
+
 @dataclass(frozen=True, slots=True)
 class ExchangeAccountState:
     """One `exchange_accounts` row, copied out of the session. See the module docstring."""
@@ -641,26 +646,49 @@ class ExchangeFillRepository:
 
         **Neither `raw_payload` nor `external_trade_id` is loaded**: the statement names its
         columns, and `select_fills_for_view` is public so that a test can compile it and see.
+
+        **Each row is unpacked as a tuple, and the two enums are looked up in a dict**, because
+        this loop runs once per fill in the history and was half the endpoint's time: a
+        `Row`'s attribute access resolves each name, and `ExchangeKey(...)` and `FillSide(...)`
+        each cost a call into `EnumType.__call__`. Measured at 20,000 fills, the load went from
+        0.199 s to 0.105 s. The unpacking follows `select_fills_for_view`'s column order, and a
+        test pins the two together. A value outside either enum is a `KeyError`, which
+        `ck_exchange_accounts_exchange_key` and `ck_exchange_fills_side` make unreachable.
         """
         result = await self._session.execute(select_fills_for_view(user_id, exchanges))
         return [
             FillViewRecord(
-                id=row.id,
-                exchange_key=ExchangeKey(row.exchange_key),
-                external_order_id=row.external_order_id,
-                symbol=row.symbol,
-                base_asset=row.base_asset,
-                quote_asset=row.quote_asset,
-                side=FillSide(row.side),
-                quantity=row.quantity,
-                price=row.price,
-                quote_quantity=row.quote_quantity,
-                quote_quantity_derived=row.quote_quantity_derived,
-                fee_amount=row.fee_amount,
-                fee_asset=row.fee_asset,
-                executed_at=row.executed_at,
+                id=fill_id,
+                exchange_key=_EXCHANGE_KEYS[exchange_key],
+                external_order_id=external_order_id,
+                symbol=symbol,
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+                side=_FILL_SIDES[side],
+                quantity=quantity,
+                price=price,
+                quote_quantity=quote_quantity,
+                quote_quantity_derived=quote_quantity_derived,
+                fee_amount=fee_amount,
+                fee_asset=fee_asset,
+                executed_at=executed_at,
             )
-            for row in result
+            for (
+                fill_id,
+                exchange_key,
+                external_order_id,
+                symbol,
+                base_asset,
+                quote_asset,
+                side,
+                quantity,
+                price,
+                quote_quantity,
+                quote_quantity_derived,
+                fee_amount,
+                fee_asset,
+                executed_at,
+            ) in result
         ]
 
 
