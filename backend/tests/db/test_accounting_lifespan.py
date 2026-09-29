@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Final
 import pytest
 from anyio import to_thread
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 from structlog.testing import capture_logs
 
 from portfolio.config import get_settings
@@ -307,6 +308,65 @@ async def test_every_owner_is_recomputed(accounting_database: Path) -> None:
     assert counts == {first: 2, second: 5}
     (finished,) = events_named(captured, "accounting_recompute_finished")
     assert finished["event_count"] == 7
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["a write the column refuses", "a row that does not convert"],
+)
+async def test_one_owners_failure_neither_stops_nor_undoes_anothers(
+    accounting_database: Path, failure: str
+) -> None:
+    """Each owner in their own transaction, over one session (spec 021, *The trigger*).
+
+    The first owner's recompute fails -- at the write, with a basis of 1.8E20 that
+    `NumericText(18)` refuses after the old header's `DELETE` has already run, or before it,
+    on a stored row that does not convert. Either way their previous snapshot stands, and
+    the second owner's new fill is still written in the same run.
+    """
+    first = await plant_owner_with_fills(accounting_database, count=2)
+    async with own_factory(accounting_database) as factory, factory() as session:
+        second = await plant_owner(session, "second-owner")
+        second_account = await plant_account(session, second, ExchangeKey.BINGX)
+        await plant_fills(session, second_account, [make_fill(4001 + n, at(n)) for n in range(3)])
+
+    async with settled_app(accounting_database) as app:
+        before = {row["user_id"]: row for row in await headers_in(accounting_database)}
+        async with own_factory(accounting_database) as factory, factory() as session:
+            first_account = int(
+                await session.scalar(
+                    text("SELECT id FROM exchange_accounts WHERE user_id = :user"),
+                    {"user": first},
+                )
+            )
+            if failure == "a write the column refuses":
+                absurd = "90000000000000000000"
+                await plant_fills(
+                    session,
+                    first_account,
+                    [
+                        make_fill(
+                            1999,
+                            at(70),
+                            quantity="1",
+                            price=absurd,
+                            quote_quantity=absurd,
+                            fee_amount=absurd,
+                            fee_asset="USDT",
+                        )
+                    ],
+                )
+            else:
+                await plant_unconvertible_fill(
+                    session, first_account, trade_id=LEAKY_TRADE_ID, shape="same_asset"
+                )
+            await plant_fills(session, second_account, [make_fill(4999, at(80))])
+        status = await run_accounting_recompute(app, RecomputeReason.EXCHANGE_SYNC)
+        after = {row["user_id"]: row for row in await headers_in(accounting_database)}
+
+    assert status.outcome is RecomputeOutcome.FAILED
+    assert after[first] == before[first], "the failing owner's snapshot is untouched"
+    assert (before[second]["event_count"], after[second]["event_count"]) == (3, 4)
 
 
 async def test_a_startup_recompute_never_delays_readiness_and_is_cancelled_at_shutdown(
