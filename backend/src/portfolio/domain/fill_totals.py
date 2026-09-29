@@ -10,11 +10,12 @@ the caller builds them from whatever it loaded.
 
 ## Every sum is exact
 
-Each figure is accumulated with `money.add` and `money.subtract`, which align the operands
-and add their coefficients as integers, so no sum is ever rounded -- not by the interpreter's
-default context of 28 significant digits, and not by anyone's `decimal.localcontext()`. An
-18-place amount beside a total in the billions already needs more than 28 digits, and `+`
-under the default context would drop the last of them without a word (spec 024).
+Each figure is accumulated with `money.add` and `money.subtract`, which evaluate in one
+explicit context whose precision no sum reaches and which traps any rounding, so no sum is
+ever rounded -- not by the interpreter's default context of 28 significant digits, and not by
+anyone's `decimal.localcontext()`. An 18-place amount beside a total in the billions already
+needs more than 28 digits, and `+` under the default context would drop the last of them
+without a word (spec 024).
 
 A sum over no fills is zero **at the stored scale**, `0E-18`, so an empty figure reads on the
 wire as `0.000000000000000000`, like every other amount beside it. A sum over stored amounts
