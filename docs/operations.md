@@ -3,8 +3,9 @@
 Day-two tasks on the running instance: creating the account, tuning the password hash to the
 hardware, changing the password, understanding when a session ends, pointing the application
 at the chain index it reads balances from, refreshing the prices that turn a balance into
-a value, connecting the Bitget and BingX accounts whose trades say what each asset cost, and
-keeping the import of those trades running.
+a value, connecting the Bitget and BingX accounts whose trades say what each asset cost,
+keeping the import of those trades running, and reading the cost-basis snapshot built from
+them.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -1071,6 +1072,83 @@ So the first time you have traded **two different pairs** on BingX, check once:
 The same check is worth making once the account has more than 500 fills in any 30 days, the
 first time BingX pages past a single answer.
 
+## 15. The cost-basis snapshot: recomputing it, and reading it
+
+The stored fills are replayed into one position per asset -- quantity, cost basis, average
+cost, realized P&L -- by the engine `docs/accounting.md` describes, and the result is kept as a
+**snapshot** in four tables (`accounting_snapshots` and its positions, lots and warnings).
+`GET /api/accounting/positions` serves that snapshot, valued at the cached USD prices. The
+contract is spec `docs/specs/021-position-snapshots.md`.
+
+### When it is recomputed
+
+- **Once at startup**, in the background. The health check does not wait for it, so a deploy
+  never fails over a slow replay. This is the run that covers the first deploy over fills
+  already stored, and an engine upgrade.
+- **After every exchange sync run that stored at least one new fill**, inside that run. A
+  manual `POST /api/exchanges/sync` therefore returns only once the snapshot is current. A run
+  that stored nothing leaves the snapshot alone.
+- **Never on a request.** The endpoint reads what is stored.
+
+Two recomputes never overlap: a second one waits for the first. A recompute whose input has
+not changed -- the same fills, the same engine version -- writes nothing, and the snapshot's
+`computed_at` stays where it was.
+
+### The two log lines
+
+```bash
+~/portfolio-app/prod/compose.sh logs app | grep accounting_recompute
+```
+
+| Event | Fields | Meaning |
+|---|---|---|
+| `accounting_recompute_finished` | `reason`, `duration_ms`, `event_count`, `outcome` | `reason` is `startup` or `exchange_sync`. `outcome` is `written` (the snapshot was replaced) or `unchanged` (the input was the same, nothing was written). `event_count` is the number of fills replayed. |
+| `accounting_recompute_failed` | `reason`, `duration_ms`, `error` | The recompute raised. `error` is the exception's **class name only** -- never its message and never a traceback, because the message of a failed write carries the owner's quantities. |
+
+**The startup run's `duration_ms` on the Pi is the measurement for spec 021's criterion 8**
+(under two seconds). It is the replay of the whole history on the real hardware.
+
+### What a failed recompute means
+
+**The previous snapshot stays exactly as it was, and is still served.** A recompute replaces
+the snapshot in one transaction, and a failure rolls it back. The sync that triggered it is
+not affected: its run and its fills are recorded as usual.
+
+The endpoint says so. `last_recompute` carries the last attempt since the process started:
+
+```bash
+curl -s -b "$COOKIE" https://<host>/api/accounting/positions | jq '.computed_at, .last_recompute'
+```
+
+`computed_at` is when the snapshot served was written, `null` before the first one.
+`last_recompute` is `{"at", "outcome", "error"}`, with `outcome` `unchanged`, `written` or
+`failed`. It lives in memory, so it is `null` after a restart until the startup run finishes.
+
+| `error` | What it means | What to do |
+|---|---|---|
+| `UnconvertibleFillError` | A stored fill has a shape the engine cannot account for: a pair whose base and quote are the same asset, a fee that consumes everything received, or a rebate larger than everything given. Ingestion has refused these since #99, so this is a row written before that, or by hand. | Do not edit the database: `exchange_fills` is append-only, and the recompute will keep failing until the row is dealt with. Report it with the venue and the date. The error names neither the account nor the trade on purpose, so that trade ids stay out of the log. |
+| `StatementError` | The write was refused. The likeliest cause is a figure of 10²⁰ or more, which no column can hold and no real history reaches. | Report it. |
+| `InvalidOperation` | Replay left the engine's range (spec 019, *Risks*). | Report it. |
+| anything else | A defect of ours. | Report it with the class name and the time. |
+
+A failure from one of these does not clear itself, because the same fills will fail the same
+way. A restart runs the startup recompute again, which is a way to check whether it has been
+fixed, but it fixes nothing.
+
+### Reading the positions
+
+Every amount is a JSON string at eighteen decimal places, and the percentage at four.
+Valuation is in **USD**, because the unit of account is USDT/USDC pinned at 1. EUR is not
+offered: it would need an exchange rate at every purchase, which the application does not
+have.
+
+**Only a chain's native asset is priced** -- BTC and KAS today -- because those are the only
+pairs the price refresh fetches. Any other asset a venue traded shows `market_value: null` with
+`market_value_unavailable_reason: "unsupported_pair"`, and is listed in `totals.excluded` as
+`unpriced`. A chain asset with no price yet shows `never_fetched` instead (section 10). An
+asset holding units of unknown cost is listed there as `unknown_basis`. The totals cover only
+what is left, so their percentage is the return on exactly the money in the total beside it.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -1127,3 +1205,7 @@ first time BingX pages past a single answer.
 | A BingX error says venue code `100419` | The key has an IP whitelist that does not include the host's address — section 14 |
 | BingX holds fewer fills than BingX's own trade history shows | The case the application cannot detect by itself: report it with the two counts — section 14 |
 | BingX holds more fills than its own trade history, around the time BingX renamed a pair (to a name like `XYZ-OLD-USDT`) | A fill read under both names is stored twice, because its id includes the pair's name. Report it with the two counts and the date; do not edit the database — section 14 |
+| `/api/accounting/positions` has `computed_at: null` | No snapshot has been written yet. The startup recompute has not finished, or it failed: read `last_recompute` — section 15 |
+| `last_recompute.outcome` is `failed` | The previous snapshot is still the one served. Read `error` — section 15 |
+| New trades are imported but the positions do not change | Check `last_recompute`: a failed recompute keeps the old snapshot. If it says `unchanged`, the run stored no new fill — section 15 |
+| An asset shows `market_value: null` with `unsupported_pair` | Only chain assets (BTC, KAS) are priced. It is left out of the totals and named in `totals.excluded` — section 15 |
