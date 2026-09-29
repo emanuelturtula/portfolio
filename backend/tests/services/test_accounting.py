@@ -1035,6 +1035,84 @@ async def test_positions_never_serve_one_snapshots_header_over_anothers_rows(
     ), f"a mixed snapshot was served: {served}"
 
 
+async def test_a_retried_read_does_not_serve_rows_remembered_from_the_first_attempt(
+    factory: async_sessionmaker[AsyncSession],
+    clock: SettableClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec 021, R5: the retry reads the rows afresh, not from the session's identity map.
+
+    Snapshot A is one sale of 2 BTC nobody bought: all 30000 of proceeds unmatched, and a
+    shortfall of 2. Snapshot B adds an earlier buy of 0.5 BTC for 30000: the sale then takes
+    that 0.5 at a basis of 30000 against 7500 of the proceeds (realized -22500) and leaves
+    22500 unmatched and a shortfall of 1.5. B's position and warning rows reuse A's ids, so a
+    retry that handed back the objects the first attempt loaded would serve A's figures under
+    B's header -- the case `populate_existing` is there for, on both lists.
+    """
+    async with factory() as session:
+        user_id = await plant_owner(session)
+        account = await plant_account(session, user_id)
+        await plant_fills(
+            session,
+            account,
+            [
+                make_fill(
+                    1,
+                    at(60),
+                    side=FillSide.SELL,
+                    quantity="2",
+                    quote_quantity="30000",
+                    fee_amount="0",
+                    fee_asset=None,
+                )
+            ],
+        )
+    await recompute(factory, user_id, clock)
+    later = SettableClock(COMPUTED_AT + timedelta(hours=1))
+    original = AccountingSnapshotRepository.list_warnings
+    armed = [True]
+
+    async def recompute_after_both_lists(
+        repository: AccountingSnapshotRepository, snapshot_id: int
+    ) -> Any:
+        # Delegate first: the first attempt loads A's positions *and* A's warnings into the
+        # session, and only then does B commit -- so the retry meets both sets of old objects.
+        listed = await original(repository, snapshot_id)
+        if armed[0]:
+            armed[0] = False
+            async with factory() as other:
+                await plant_fills(
+                    other,
+                    account,
+                    [
+                        make_fill(
+                            0,
+                            at(0),
+                            quantity="0.5",
+                            quote_quantity="30000",
+                            fee_amount="0",
+                            fee_asset=None,
+                        )
+                    ],
+                )
+            assert (await recompute(factory, user_id, later)).outcome is RecomputeOutcome.WRITTEN
+        return listed
+
+    monkeypatch.setattr(AccountingSnapshotRepository, "list_warnings", recompute_after_both_lists)
+
+    async with factory() as session:
+        view = await build_accounting_service(session, clock=clock).positions(user_id)
+
+    assert not armed[0], "the hook ran: a recompute really committed mid-read"
+    (btc,) = [entry.value.position for entry in view.positions]
+    (warning,) = view.warnings
+    served = (view.event_count, btc.realized_pnl, btc.unmatched_proceeds, warning.quantity)
+    assert served in (
+        (1, Decimal(0), Decimal(30000), Decimal(2)),
+        (2, Decimal(-22500), Decimal(22500), Decimal("1.5")),
+    ), f"a mixed snapshot was served: {served}"
+
+
 async def test_a_snapshot_that_never_stops_moving_is_refused_not_mixed(
     factory: async_sessionmaker[AsyncSession],
     clock: SettableClock,
