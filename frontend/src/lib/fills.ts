@@ -36,6 +36,18 @@ import { formatHistoryStart, parseInstant } from '@/lib/time';
 export const SIGNED_QUANTITY_FORMAT: FormatMoneyOptions = { signDisplay: 'exceptZero' };
 
 /**
+ * A net in a fill's *quote* asset, the "Not valued in USDT" table: signed, at least 2 and up
+ * to 8 places. Those sums are in whatever the pair is quoted in, which is often a crypto, and
+ * 0.025 BTC shown as "0.03" would be a 20% misstatement. Unlike the USDT figures, they are
+ * never rounded to the cent.
+ */
+export const SIGNED_QUOTE_FORMAT: FormatMoneyOptions = {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 8,
+  signDisplay: 'exceptZero',
+};
+
+/**
  * The side is a word. A colour would be a second channel, never the only one.
  * `Record` over the generated union, so a side added on the backend fails `tsc` until it has
  * a word.

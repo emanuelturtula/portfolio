@@ -1,11 +1,12 @@
 import type { ExchangeFillTotals } from '@/api/exchanges';
 import { Money } from '@/components/Money';
-import { AMOUNT_FORMAT, SIGNED_FORMAT } from '@/lib/accounting';
+import { AMOUNT_FORMAT, SIGNED_FORMAT, UNIT_PRICE_FORMAT } from '@/lib/accounting';
 import {
   describeUnvaluedFills,
   FEES_LEGEND,
   NET_LEGEND,
   SIGNED_QUANTITY_FORMAT,
+  SIGNED_QUOTE_FORMAT,
 } from '@/lib/fills';
 import { formatCount } from '@/lib/exchanges';
 import { money } from '@/lib/money';
@@ -98,9 +99,12 @@ export function FillTotalsView({ totals }: FillTotalsViewProps) {
                 <th scope="row">
                   {asset.asset}
                   {asset.usdt_unvalued_fill_count > 0 && (
-                    <span className="row-note">
-                      {describeUnvaluedFills(asset.usdt_unvalued_fill_count)}
-                    </span>
+                    <>
+                      {' '}
+                      <span className="row-note">
+                        {describeUnvaluedFills(asset.usdt_unvalued_fill_count)}
+                      </span>
+                    </>
                   )}
                 </th>
                 <td className="num">{formatCount(asset.fill_count)}</td>
@@ -168,13 +172,13 @@ export function FillTotalsView({ totals }: FillTotalsViewProps) {
                     <th scope="row">{quote.quote_asset}</th>
                     <td className="num">{formatCount(quote.fill_count)}</td>
                     <td className="num">
-                      <Money value={money(quote.spent)} options={AMOUNT_FORMAT} />
+                      <Money value={money(quote.spent)} options={UNIT_PRICE_FORMAT} />
                     </td>
                     <td className="num">
-                      <Money value={money(quote.received)} options={AMOUNT_FORMAT} />
+                      <Money value={money(quote.received)} options={UNIT_PRICE_FORMAT} />
                     </td>
                     <td className="num">
-                      <Money value={money(quote.net)} options={SIGNED_FORMAT} />
+                      <Money value={money(quote.net)} options={SIGNED_QUOTE_FORMAT} />
                     </td>
                   </tr>
                 ))}
