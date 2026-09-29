@@ -1,7 +1,7 @@
 # 023 — Manual adjustments for opening balances and off-exchange acquisitions
 
 Issue: #18
-Status: in progress
+Status: done
 
 ## Problem
 
