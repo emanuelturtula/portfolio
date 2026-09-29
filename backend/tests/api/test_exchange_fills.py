@@ -47,11 +47,12 @@ from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import text
 
 from portfolio.api.errors import PROBLEM_CONTENT_TYPE
 from portfolio.api.middleware import PUBLIC_API_PATHS
-from portfolio.api.schemas.exchanges import INSTANT_FORMAT_REFUSAL
+from portfolio.api.schemas.exchanges import INSTANT_FORMAT_REFUSAL, InstantQuery
 from portfolio.domain.exchanges import ExchangeKey, FillSide
 from portfolio.main import create_app
 from portfolio.services.exchanges import (
@@ -814,3 +815,40 @@ def test_the_side_is_a_word_in_the_schema(app: FastAPI) -> None:
     schemas: dict[str, Any] = app.openapi()["components"]["schemas"]
 
     assert set(schemas["FillSide"]["enum"]) == {side.value for side in FillSide}
+
+
+# --------------------------------------------------------------------------------------
+# `InstantQuery` at the type level
+# --------------------------------------------------------------------------------------
+#
+# Over HTTP a query parameter is always a string, so the parser's pass-through for anything
+# else is reached only by a Python caller validating the type directly. Tested here at that
+# level, where it is reached without contortion.
+
+
+def test_an_aware_datetime_passes_the_instant_type_unchanged() -> None:
+    moment = datetime(2026, 3, 1, 9, 10, tzinfo=timezone(timedelta(hours=2)))
+
+    parsed = TypeAdapter(InstantQuery).validate_python(moment)
+
+    assert parsed == moment
+    assert parsed.utcoffset() == timedelta(hours=2), "the offset is kept, not converted"
+
+
+def test_a_naive_datetime_passes_the_type_and_is_the_services_to_refuse() -> None:
+    """The type parses; whether a bound is aware is the service's rule, tested there."""
+    naive = datetime(2026, 3, 1, 9, 10)  # noqa: DTZ001 - the naive value under test
+
+    assert TypeAdapter(InstantQuery).validate_python(naive) == naive
+
+
+def test_the_instant_type_refuses_what_is_not_a_datetime() -> None:
+    adapter = TypeAdapter(InstantQuery)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python(None)
+    with pytest.raises(ValidationError, match="ISO 8601"):
+        adapter.validate_python("1721397431")
+    assert adapter.validate_python("2026-03-01T09:10:00Z") == datetime(
+        2026, 3, 1, 9, 10, tzinfo=UTC
+    )
