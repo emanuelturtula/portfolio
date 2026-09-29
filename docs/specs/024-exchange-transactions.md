@@ -304,3 +304,30 @@ These are the issue's criteria, all of them, backend and frontend, plus:
   - **Why in this issue.** The primitive belongs to the accounting engine (#17), and changing
     it here is deliberate. It is the only change that meets the budget without a written
     exception, and the engine gets faster too. It lands as its own commit.
+- **R2. Frontend interpretations (developer), accepted.**
+  - **Empty states.** The precedence is: failing sync, then filters active ("Nothing matches
+    these filters"), then "No fills imported yet". The spec's rows 2 and 4 render the same
+    state, so `fills_stored` is not read for it. Reading it would be a branch nothing could
+    observe.
+  - **An inverted day range stays where the owner typed it.** It is not dropped. The form
+    shows an alert and marks the To input `aria-invalid`, the fills query is disabled, and
+    no results render. Dropping it would make a controlled date input eat digits mid-typing.
+  - **Filters apply on change**, and each change is a history entry. Typing a year digit by
+    digit can push one entry per valid intermediate date. That is accepted.
+  - **Clear filters is always rendered,** and `aria-disabled` when nothing is set, so focus
+    is never dropped.
+  - **Paging keeps the previous page** while the next loads: rows dim with `aria-busy`, and
+    the pagination stays mounted, so focus survives. A filter change shows the skeleton.
+  - **A page past the end** (a hand-edited URL) keeps the totals and offers the last page.
+  - **Fees show their raw sign.** A rebate reads as negative, and a fee paid has no `+`,
+    because `+` would read as a credit. A legend says which is which.
+  - **The failing-account link is a plain `#exchange-<key>` anchor.** A router link would
+    drop the filters held in the URL.
+  - **Sync history is a controlled `<details>`.** The owner's click is the only thing that
+    records a choice. The heading sits outside the `<details>`, and with no runs there is
+    no `<details>` at all.
+  - **The run log table sits in a labelled scroll region** ("Sync runs"). It overflowed a
+    phone before this issue.
+  - **A DST bug was caught by the tester and fixed.** On a day whose local midnight does not
+    exist (Santiago, 6 Sep 2026), the next-day boundary came out an hour late. It is now
+    built from calendar fields.
