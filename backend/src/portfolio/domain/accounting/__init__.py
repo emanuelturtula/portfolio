@@ -24,7 +24,9 @@ from portfolio.domain.accounting.events import (
     Adjustment,
     EventKey,
     Trade,
+    TradeShapeProblem,
     Transfer,
+    trade_shape_problem,
 )
 from portfolio.domain.accounting.replay import ConflictingEventError, replay
 from portfolio.domain.accounting.results import (
@@ -53,7 +55,9 @@ __all__ = [
     "Position",
     "PositionFlag",
     "Trade",
+    "TradeShapeProblem",
     "Transfer",
     "UnattributedFee",
     "replay",
+    "trade_shape_problem",
 ]
