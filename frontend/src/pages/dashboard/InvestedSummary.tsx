@@ -53,7 +53,7 @@ export function InvestedSummary({
   // Only the positions the totals are made of: an excluded position's stale price is not in
   // any figure above, and saying so would blame the totals for a number they do not use.
   const anyStalePrice = held.some(
-    (position) => !excludedAssets.has(position.asset) && position.price?.stale === true,
+    (position) => position.price?.stale === true && !excludedAssets.has(position.asset),
   );
   const unreliableRealized = assetsWithUnreliableRealizedPnl(positions);
 
@@ -135,7 +135,7 @@ export function InvestedSummary({
         <p>
           Costs not assigned to any asset:{' '}
           <Money value={money(unallocatedCosts)} options={AMOUNT_FORMAT} /> {quoteCurrency}, from
-          stablecoin conversions and from swaps into units with no known cost.
+          stablecoin conversions or from swaps into units with no known cost.
         </p>
       )}
     </>

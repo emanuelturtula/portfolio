@@ -250,10 +250,12 @@ export type EmptyPositions =
  *
  * 1. the last recompute failed - ours, and the snapshot served is the one before it;
  * 2. a venue's last sync failed - trades may be missing, which is the opposite of "none";
- * 3. no trades - either the exchanges list is known and no venue has stored a fill, or it is
- *    unknown and the snapshot itself proves it: `computed_at` is set and `event_count` is
- *    0, so a snapshot was written and replayed nothing. `anyConfigured` is `undefined` for
- *    the second, since without the list nothing can be said about what is configured;
+ * 3. no trades - either the exchanges list is known, no venue has stored a fill and the
+ *    snapshot does not contradict it (none written, or one that replayed nothing), or the
+ *    list is unknown and the snapshot itself proves it: `computed_at` is set and
+ *    `event_count` is 0, so a snapshot was written and replayed nothing. `anyConfigured` is
+ *    `undefined` for the second, since without the list nothing can be said about what is
+ *    configured;
  * 4. not computed - no snapshot, or one that replayed nothing while fills exist. Rows 2 and
  *    3 have ruled out "no trades", so this is fills whose snapshot predates them;
  * 5. otherwise the snapshot replayed trades and holds nothing: every one is between
@@ -283,7 +285,13 @@ export function describeEmptyPositions(
     if (venues.length > 0) {
       return { kind: 'sync_failed', venues };
     }
-    if (exchanges.every((exchange) => exchange.fills_stored === 0)) {
+    // The snapshot outranks the list: a list polled before a stablecoin-only sync landed still
+    // says 0 fills while the snapshot, written after it, has replayed events. Telling the owner
+    // "no trades imported yet" then would contradict the data on the page.
+    if (
+      exchanges.every((exchange) => exchange.fills_stored === 0) &&
+      (data.computed_at === null || data.event_count === 0)
+    ) {
       return {
         kind: 'no_trades',
         anyConfigured: exchanges.some((exchange) => exchange.configured),
