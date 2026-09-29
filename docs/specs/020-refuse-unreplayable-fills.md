@@ -1,7 +1,7 @@
 # 020 — Refuse at ingestion the fills the accounting engine cannot replay
 
 Issue: #99
-Status: implementing
+Status: done
 
 ## Problem
 
