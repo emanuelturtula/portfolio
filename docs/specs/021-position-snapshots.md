@@ -41,7 +41,7 @@ in each asset, what it is worth now, or what it has gained.
   refuses.
 - **Comparing replay quantity with the balances actually held**, which spec 019's *Risks*
   recommends considering. It is worth its own issue, because venue balances are not read
-  today. A follow-up is filed with the PR.
+  today. It is filed as #104.
 - **Total return mixing realized and unrealized P&L.** Both are returned separately.
   *Absolute return* is the unrealized P&L; see *Acceptance criteria*.
 
