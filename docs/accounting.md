@@ -302,3 +302,29 @@ unmatched proceeds, plus unallocated costs, equals the net cash the trades put i
 cost of the adjustments of non-cash assets. For a conversion, the net cash counts only its fee,
 since both sides are pinned at 1. The property tests hold this exactly for random event
 sequences, with no tolerance.
+
+## Where the figures are stored and served
+
+The engine computes; #19 keeps and serves the result (spec
+`docs/specs/021-position-snapshots.md`).
+
+- **Stored as one snapshot per owner and method.** `accounting_snapshots` holds the header:
+  the method, the engine version, the input fingerprint, the event count, the unallocated costs
+  and `computed_at`. `accounting_positions`, `accounting_lots` and `accounting_warnings` hold
+  the result's three lists, every amount at eighteen places as the engine returns it. It is
+  derived data: deleting it loses nothing that a recompute cannot rebuild from the fills.
+- **Recomputed at startup and after every exchange sync that stored a fill**, and skipped when
+  the fingerprint is unchanged. A new engine version changes every fingerprint, so an upgrade
+  always recomputes. A stored fill that cannot become a trade fails the recompute and leaves
+  the previous snapshot in place, rather than being skipped. `docs/operations.md`, section 15,
+  covers the log lines and what a failure means.
+- **Served by `GET /api/accounting/positions`**, valued at the cached **USD** price of each
+  asset. The unit of account is USDT/USDC pinned at 1, so USD is the currency the figures are
+  already in.
+  - `market_value` is the price times every unit held.
+  - `unrealized_pnl` and `unrealized_return_pct` cover only the known-cost part, the only part
+    with a cost to compare against.
+  - `realized_pnl` is reported beside them, never added in.
+  - The totals leave out any position with unknown-cost units or no price, and name it.
+  - The arithmetic is `portfolio.domain.accounting.value_position`, pure and exact like the
+    engine.

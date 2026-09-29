@@ -17,7 +17,7 @@ from portfolio import __version__
 from portfolio.api.dependencies import auth_service_for, install_auth_runtime
 from portfolio.api.errors import register_exception_handlers
 from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware
-from portfolio.api.routers import auth, balances, exchanges, health, wallets
+from portfolio.api.routers import accounting, auth, balances, exchanges, health, wallets
 from portfolio.config import get_settings
 from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import (
@@ -33,12 +33,21 @@ from portfolio.logging import configure_logging
 # line that makes `get_chain_provider` able to answer for any chain at all.
 from portfolio.providers import chains as _registered_chain_providers  # noqa: F401
 from portfolio.providers.exchanges.registry import exchange_providers
-from portfolio.providers.http import build_http_client
+from portfolio.providers.http import build_http_client, monotonic_ms
 from portfolio.providers.prices.registry import price_sources
 from portfolio.providers.registry import get_chain_provider
 from portfolio.repositories.exchange_sync_runs import ExchangeSyncRunRepository
 from portfolio.repositories.prices import PriceRepository
 from portfolio.repositories.sync_runs import SyncRunRepository
+from portfolio.repositories.users import UserRepository
+from portfolio.services.accounting import (
+    AccountingStatus,
+    RecomputeOutcome,
+    RecomputeReason,
+    RecomputeReport,
+    build_accounting_service,
+    utc_now,
+)
 from portfolio.services.balance_sync import build_balance_sync_service
 from portfolio.services.exchange_sync import build_exchange_sync_service
 from portfolio.services.price_refresh import build_price_refresh_service
@@ -66,6 +75,9 @@ EXCHANGE_SYNC_TASK_NAME: Final = "exchange-sync"
 
 EXCHANGE_SYNC_LOG_PREFIX: Final = "exchange_sync"
 """What every event the exchange coordinator logs begins with."""
+
+ACCOUNTING_STARTUP_TASK_NAME: Final = "accounting-startup-recompute"
+"""The startup recompute's task name, as `app.state.accounting_startup_task` carries it."""
 
 _logger = structlog.get_logger(__name__)
 
@@ -115,6 +127,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     * **Both run tables are swept at startup and at shutdown**, and the two coordinators are
       drained **concurrently**: the deployment's `stop_grace_period` is twenty seconds, and
       two ten-second grace periods one after the other would spend all of it.
+
+    ## The accounting recompute (#19)
+
+    `run_accounting_recompute` runs once at startup, as `app.state.accounting_startup_task`,
+    **started after the migrations and the sweeps and never awaited here**: readiness -- and
+    the deploy's health check -- does not wait on a replay of the owner's whole history. It is
+    cancelled first thing on shutdown, before anything it could still be using is taken away.
+    The startup run is what covers the first deploy over fills already stored, and an engine
+    upgrade, whose new `ENGINE_VERSION` changes every fingerprint.
     """
     settings = get_settings()
     ensure_database_directory(settings.database_url)
@@ -128,11 +149,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     coordinator: SyncCoordinator[SyncRunSummary] | None = None
     exchange_coordinator: SyncCoordinator[ExchangeSyncRunSummary] | None = None
     schedulers: list[IntervalScheduler] = []
+    startup_recompute: asyncio.Task[AccountingStatus] | None = None
     try:
         await bootstrap_owner(app, settings)
         await warm_password_hasher(app)
         await sweep_interrupted_runs(app)
         await sweep_interrupted_exchange_runs(app)
+        startup_recompute = asyncio.create_task(
+            run_accounting_recompute(app, RecomputeReason.STARTUP),
+            name=ACCOUNTING_STARTUP_TASK_NAME,
+        )
+        app.state.accounting_startup_task = startup_recompute
         coordinator = SyncCoordinator(balance_sync_runner(app, client))
         app.state.sync_coordinator = coordinator
         app.state.balance_scheduler = balance_scheduler_for(app, settings, coordinator)
@@ -166,10 +193,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await scheduler.start()
         yield
     finally:
-        # Ordered, and the order is the content. Every timer stops first so that no new tick
-        # can start; the syncs already in flight then get their grace periods, side by side;
-        # the sweeps record whatever did not finish; and only then are the client and the
-        # engine taken away, because a sync still running would need both.
+        # Ordered, and the order is the content. The startup recompute is cancelled and
+        # awaited first: it is derived data, the next startup computes it again, and nothing
+        # is lost by abandoning it. Every timer stops next so that no new tick can start; the
+        # syncs already in flight then get their grace periods, side by side; the sweeps
+        # record whatever did not finish; and only then are the client and the engine taken
+        # away, because a sync still running would need both.
+        await cancel_and_wait(startup_recompute)
         for scheduler in reversed(schedulers):
             await scheduler.stop()
         await drain_coordinators(
@@ -291,6 +321,20 @@ def exchange_sync_runner(
     the mapping the lifespan built with `exchange_providers` -- **the only reference to the
     objects holding credentials**, and this closure is the only thing that keeps it. A request
     reaches it through the coordinator and no other way.
+
+    **A run that stored a fill recomputes the accounting snapshot before it returns** (#19).
+    After the sync's session is closed, so the recompute's write never waits on the sync's;
+    and before the summary is handed back, so a manual sync's response means the dashboard is
+    current. The recompute never raises, so the summary is the sync's own whatever became of
+    it -- a failed recompute is logged and shown on `GET /api/accounting/positions`, not
+    reported as a failed sync.
+
+    **A run that stored nothing recomputes only if the last recompute failed** (spec 021, R7).
+    Otherwise the fills it would replay are the ones already replayed, and the snapshot is left
+    alone. After a failure they are not: a transient one -- "database is locked" while another
+    write held SQLite's lock -- then clears at the next sync rather than waiting for the next
+    stored fill or a restart. A failure caused by the data fails again, which costs one replay
+    per sync and changes nothing.
     """
 
     async def run(trigger: SyncTrigger) -> ExchangeSyncRunSummary:
@@ -301,7 +345,10 @@ def exchange_sync_runner(
                 providers=providers,
                 history_start=settings.exchange_history_start,
             )
-            return await service.sync(trigger)
+            summary = await service.sync(trigger)
+        if summary.fills_inserted > 0 or last_recompute_failed(app):
+            await run_accounting_recompute(app, RecomputeReason.EXCHANGE_SYNC)
+        return summary
 
     return run
 
@@ -345,6 +392,116 @@ def exchange_scheduler_for(
         last_run_at=lambda: latest_exchange_sync_attempt(app),
         run=run,
     )
+
+
+def install_accounting_runtime(app: FastAPI) -> None:
+    """Publish the recompute lock, and "no attempt yet", on the application state.
+
+    From the application factory rather than the lifespan, for the reason
+    `install_auth_runtime` gives: the objects exist for a test that never starts the lifespan,
+    and two applications in one process never share a lock. `asyncio.Lock` binds to an event
+    loop only on its first contended acquire, so building it here, outside any loop, is safe.
+    """
+    app.state.accounting_lock = asyncio.Lock()
+    app.state.accounting_status = None
+
+
+async def run_accounting_recompute(app: FastAPI, reason: RecomputeReason) -> AccountingStatus:
+    """Recompute every owner's snapshot, log what happened, and record it. **Never raises.**
+
+    * **Serialised** by `app.state.accounting_lock`: the startup run and a sync's run can
+      overlap in time, and two replacements of one snapshot interleaving their writes would be
+      a snapshot neither computed.
+    * **Its own session**, never a request's or a sync's, for the reason `balance_sync_runner`
+      gives. Every owner is recomputed in turn -- there is one today, and the loop is the
+      honest shape for "every owner" -- each in its own transaction, so one owner's failure
+      neither stops nor undoes another's.
+    * **Logged once per run**: `accounting_recompute_finished` with the reason, the duration,
+      the events replayed and the outcome (`written` if any owner's snapshot was written); or
+      `accounting_recompute_failed` with the reason, the duration and **the first failure's
+      class name only**. Never its message and never a traceback. The engine is built with
+      `hide_parameters=True`, so a `StatementError` does not carry the values it was binding;
+      but its text still quotes the statement, and a message is free text that no exception
+      has promised to keep clear of a trade id or an amount. The class name is enough to act
+      on, and `docs/operations.md` says what each one means.
+    * **Recorded** on `app.state.accounting_status`, which `GET /api/accounting/positions`
+      shows as `last_recompute`.
+
+    "Never raises" means no `Exception` escapes: whatever the recompute raised is the outcome
+    `failed`, and the snapshot stored before stays in place. A cancellation is not an outcome
+    and propagates, which is what lets shutdown stop the startup run.
+
+    Returns:
+        What was recorded.
+    """
+    lock: asyncio.Lock = app.state.accounting_lock
+    async with lock:
+        started_ms = monotonic_ms()
+        failure: Exception | None = None
+        reports: list[RecomputeReport] = []
+        try:
+            sessionmaker = app.state.db_sessionmaker
+            async with sessionmaker() as session:
+                owner_ids = [user.id for user in await UserRepository(session).list_all()]
+                service = build_accounting_service(session)
+                for owner_id in owner_ids:
+                    try:
+                        reports.append(await service.recompute(owner_id))
+                    except Exception as exc:  # recorded as the outcome below
+                        failure = failure or exc
+        except Exception as exc:  # recorded as the outcome below
+            failure = failure or exc
+        duration_ms = monotonic_ms() - started_ms
+        if failure is not None:
+            status = AccountingStatus(
+                at=utc_now(),
+                outcome=RecomputeOutcome.FAILED,
+                error=type(failure).__name__,
+            )
+            _logger.error(
+                "accounting_recompute_failed",
+                reason=reason.value,
+                duration_ms=duration_ms,
+                error=status.error,
+            )
+        else:
+            outcome = (
+                RecomputeOutcome.WRITTEN
+                if any(report.outcome is RecomputeOutcome.WRITTEN for report in reports)
+                else RecomputeOutcome.UNCHANGED
+            )
+            status = AccountingStatus(at=utc_now(), outcome=outcome, error=None)
+            _logger.info(
+                "accounting_recompute_finished",
+                reason=reason.value,
+                duration_ms=duration_ms,
+                event_count=sum(report.event_count for report in reports),
+                outcome=outcome.value,
+            )
+        app.state.accounting_status = status
+        return status
+
+
+def last_recompute_failed(app: FastAPI) -> bool:
+    """Whether the last recompute attempt recorded on the application failed (spec 021, R7).
+
+    `False` before the first attempt, and for anything on `app.state.accounting_status` that
+    is not an `AccountingStatus` -- the reading `get_accounting_status` gives it too.
+    """
+    status = getattr(app.state, "accounting_status", None)
+    return isinstance(status, AccountingStatus) and status.outcome is RecomputeOutcome.FAILED
+
+
+async def cancel_and_wait(task: asyncio.Task[AccountingStatus] | None) -> None:
+    """Cancel a task and wait until it has actually stopped. A finished one is left alone.
+
+    `asyncio.wait` rather than `await task`, so the `CancelledError` does not need suppressing
+    here -- the pattern `IntervalScheduler.stop` uses.
+    """
+    if task is None or task.done():
+        return
+    task.cancel()
+    await asyncio.wait({task})
 
 
 def price_scheduler_for(
@@ -571,6 +728,7 @@ def create_app() -> FastAPI:
 
     register_exception_handlers(app)
     install_auth_runtime(app, settings)
+    install_accounting_runtime(app)
 
     # Middleware runs before routing, which is the whole point: the SPA is mounted at the
     # root and matches every path, so a check that ran after routing would see an API
@@ -585,6 +743,7 @@ def create_app() -> FastAPI:
     # a wallet route. Only the SPA mount below is order-sensitive.
     app.include_router(balances.router, prefix=API_PREFIX)
     app.include_router(exchanges.router, prefix=API_PREFIX)
+    app.include_router(accounting.router, prefix=API_PREFIX)
 
     # Mounted last and at the root: it matches every path, so any route registered
     # after it would be unreachable.

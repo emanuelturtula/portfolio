@@ -4,6 +4,34 @@
  */
 
 export interface paths {
+    "/api/accounting/positions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Every asset's position, cost and return, valued in USD, with portfolio totals
+         * @description Return the stored cost-basis snapshot, each position valued at its cached price.
+         *
+         *     **Per asset**: quantity, average cost, total invested, the price with its age, market value,
+         *     unrealized P&L and percentage return, realized P&L beside them, and the flags that qualify
+         *     them. **For the portfolio**: the totals over the positions that can be compared, and the
+         *     ones left out with their reason. Every amount is a JSON string.
+         *
+         *     With no snapshot yet the answer is still `200`, with `computed_at: null` and empty lists:
+         *     the first recompute runs at startup and after every exchange sync that stores a fill.
+         */
+        get: operations["readAccountingPositions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/login": {
         parameters: {
             query?: never;
@@ -384,6 +412,136 @@ export interface components {
          */
         AccountSyncStatus: "auth_failed" | "error" | "never_synced" | "ok";
         /**
+         * AccountingPositionResponse
+         * @description One asset's position, valued.
+         *
+         *     * `quantity` is everything held; `unknown_basis_quantity` the part of it with no known
+         *       cost.
+         *     * `total_invested` is the cost of the known-cost part, and `average_cost` that cost per
+         *       known-cost unit, `null` when there is none.
+         *     * `realized_pnl` is what sales of known-cost units made; `unmatched_proceeds` what sales
+         *       of units with no known cost brought in, kept out of it.
+         *     * `market_value` is the price times **every** unit held. `unrealized_pnl` and
+         *       `unrealized_return_pct` cover **only the known-cost part**, which is the only part with a
+         *       cost to compare against. The percentage is `null` when the basis is zero or negative.
+         */
+        AccountingPositionResponse: {
+            /** Asset */
+            asset: string;
+            /** Average Cost */
+            average_cost: string | null;
+            /** Flags */
+            flags: components["schemas"]["PositionFlag"][];
+            /** Market Value */
+            market_value: string | null;
+            /** Market Value Unavailable Reason */
+            market_value_unavailable_reason: components["schemas"]["PriceUnavailable"] | components["schemas"]["ValueUnavailable"] | null;
+            price: components["schemas"]["PriceResponse"] | null;
+            /**
+             * Quantity
+             * @example 1234.56789012
+             */
+            quantity: string;
+            /**
+             * Realized Pnl
+             * @example 1234.56789012
+             */
+            realized_pnl: string;
+            /**
+             * Total Invested
+             * @example 1234.56789012
+             */
+            total_invested: string;
+            /**
+             * Unknown Basis Quantity
+             * @example 1234.56789012
+             */
+            unknown_basis_quantity: string;
+            /**
+             * Unmatched Proceeds
+             * @example 1234.56789012
+             */
+            unmatched_proceeds: string;
+            /** Unrealized Pnl */
+            unrealized_pnl: string | null;
+            /** Unrealized Return Pct */
+            unrealized_return_pct: string | null;
+        };
+        /**
+         * AccountingTotalsResponse
+         * @description The portfolio's totals, over the positions that can be compared, and the ones left out.
+         *
+         *     `total_invested`, `market_value`, `unrealized_pnl` and `unrealized_return_pct` cover the same
+         *     positions -- valued, or holding nothing, and with no unknown-cost units -- so the
+         *     percentage is the return on exactly the money in the total beside it. `realized_pnl`
+         *     covers every position. The client sums nothing: every figure it shows is here.
+         */
+        AccountingTotalsResponse: {
+            /** Excluded */
+            excluded: components["schemas"]["ExclusionResponse"][];
+            /**
+             * Market Value
+             * @example 1234.56789012
+             */
+            market_value: string;
+            /**
+             * Realized Pnl
+             * @example 1234.56789012
+             */
+            realized_pnl: string;
+            /**
+             * Total Invested
+             * @example 1234.56789012
+             */
+            total_invested: string;
+            /**
+             * Unrealized Pnl
+             * @example 1234.56789012
+             */
+            unrealized_pnl: string;
+            /** Unrealized Return Pct */
+            unrealized_return_pct: string | null;
+        };
+        /**
+         * AccountingWarningKind
+         * @description Which of the engine's two warnings a stored row is. The member is its column value.
+         *
+         *     Defined here rather than in `domain`, because it is a storage vocabulary: the engine
+         *     distinguishes the two by type, and a column needs a word. `db.models` spells the same two
+         *     words in `_ACCOUNTING_WARNING_KIND_CHECK`, and a test holds them together.
+         * @enum {string}
+         */
+        AccountingWarningKind: "negative_inventory" | "unattributed_fee";
+        /**
+         * AccountingWarningResponse
+         * @description Something the history could not account for, and where to look. No trade id.
+         *
+         *     * `negative_inventory` -- a disposal of `asset` at `occurred_at` on `source` was
+         *       `quantity` larger than everything the history held: a deposit or an older fill is
+         *       missing.
+         *     * `unattributed_fee` -- `quantity` of a fee paid in `asset` could not be valued, so
+         *       `charged_to`'s figures leave it out (`null` for a conversion between two stablecoins).
+         */
+        AccountingWarningResponse: {
+            /** Asset */
+            asset: string;
+            /** Charged To */
+            charged_to: string | null;
+            kind: components["schemas"]["AccountingWarningKind"];
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
+            /**
+             * Quantity
+             * @example 1234.56789012
+             */
+            quantity: string;
+            /** Source */
+            source: string;
+        };
+        /**
          * ChainKey
          * @description Every chain balances can be read from.
          *
@@ -610,6 +768,30 @@ export interface components {
             status: components["schemas"]["SyncRunStatus"];
             trigger: components["schemas"]["SyncTrigger"];
         };
+        /**
+         * ExclusionReason
+         * @description Why a position was left out of the portfolio totals. The member is its wire form.
+         *
+         *     * `UNKNOWN_BASIS` -- some of its units have no known cost, so its value and its cost
+         *       describe different quantities.
+         *     * `UNPRICED` -- it holds something and has no market value: there is no price for it, or
+         *       the value cannot be represented (spec 021, R6). It has a cost and no value.
+         *
+         *     **A position that is both is reported once, as `UNKNOWN_BASIS`** (spec 021, R4): the
+         *     check runs in the order the members are declared, and one entry per position keeps the
+         *     list a list of positions rather than of problems.
+         * @enum {string}
+         */
+        ExclusionReason: "unknown_basis" | "unpriced";
+        /**
+         * ExclusionResponse
+         * @description A position left out of the totals, and why: `unknown_basis` or `unpriced`.
+         */
+        ExclusionResponse: {
+            /** Asset */
+            asset: string;
+            reason: components["schemas"]["ExclusionReason"];
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -634,6 +816,23 @@ export interface components {
             version: string;
         };
         /**
+         * LastRecomputeResponse
+         * @description The last recompute attempt since the process started. In memory: a restart clears it.
+         *
+         *     `error` is the exception's class name when `outcome` is `failed` -- never its message --
+         *     and `null` otherwise. A `failed` outcome means the snapshot served is the one before it.
+         */
+        LastRecomputeResponse: {
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Error */
+            error: string | null;
+            outcome: components["schemas"]["RecomputeOutcome"];
+        };
+        /**
          * LoginRequest
          * @description Credentials submitted by the login form.
          */
@@ -652,6 +851,51 @@ export interface components {
             current_password: string;
             /** New Password */
             new_password: string;
+        };
+        /**
+         * PositionFlag
+         * @description What a position's figures cannot be taken at face value for. Alphabetical.
+         *
+         *     * `HISTORY_INCOMPLETE` -- a disposal of the asset was larger than everything the
+         *       history held. **Sticky**: the pool was emptied and replay carried on, but the
+         *       realized P&L of that disposal was computed against a history that is missing
+         *       something, and nothing later can say what.
+         *     * `UNATTRIBUTED_FEE` -- a fee charged to this asset's trades, paid in a third asset,
+         *       could not be valued, so this asset's basis (or, for a sale, its proceeds) leaves the
+         *       fee out. **Sticky**, for the same reason.
+         *     * `UNKNOWN_BASIS` -- some of the quantity held has no known cost. **Not sticky**: it
+         *       describes the pool as it stands, and clears once those units have been disposed of.
+         * @enum {string}
+         */
+        PositionFlag: "history_incomplete" | "unattributed_fee" | "unknown_basis";
+        /**
+         * PositionsResponse
+         * @description The owner's cost-basis snapshot, valued in USD, with how old it is.
+         *
+         *     `computed_at` is when the snapshot was last written, `null` before the first one;
+         *     `last_recompute` is the last attempt since the process started, `null` before it, and
+         *     says whether the snapshot served is current. `unallocated_costs` is known value that
+         *     belongs to no position, such as a stablecoin conversion's fee.
+         */
+        PositionsResponse: {
+            /** Computed At */
+            computed_at: string | null;
+            /** Event Count */
+            event_count: number;
+            last_recompute: components["schemas"]["LastRecomputeResponse"] | null;
+            /** Method */
+            method: string;
+            /** Positions */
+            positions: components["schemas"]["AccountingPositionResponse"][];
+            quote_currency: components["schemas"]["QuoteCurrency"];
+            totals: components["schemas"]["AccountingTotalsResponse"];
+            /**
+             * Unallocated Costs
+             * @example 1234.56789012
+             */
+            unallocated_costs: string;
+            /** Warnings */
+            warnings: components["schemas"]["AccountingWarningResponse"][];
         };
         /**
          * PriceResponse
@@ -718,6 +962,16 @@ export interface components {
          * @enum {string}
          */
         QuoteCurrency: "EUR" | "USD";
+        /**
+         * RecomputeOutcome
+         * @description What a recompute did. The member is its wire form and its log field (spec 021, R1).
+         *
+         *     `recompute` itself returns only `UNCHANGED` or `WRITTEN`, and raises for anything else.
+         *     `FAILED` is what the trigger in `main.py` records when it raised, so that `last_recompute`
+         *     on the endpoint is one vocabulary rather than two.
+         * @enum {string}
+         */
+        RecomputeOutcome: "unchanged" | "written" | "failed";
         /**
          * SessionResponse
          * @description Who the caller is. Deliberately the only thing a session read discloses.
@@ -930,6 +1184,19 @@ export interface components {
             type: string;
         };
         /**
+         * ValueUnavailable
+         * @description Why a position has no market value although it has a price. The member is its wire form.
+         *
+         *     The price reasons -- `never_fetched`, `unsupported_pair` and the rest -- belong to
+         *     `services.prices.PriceUnavailable`, which `domain` may not import; a caller passes one in as
+         *     its string. This is the one reason the valuation itself can produce.
+         *
+         *     * `VALUE_OUT_OF_RANGE` -- the price times the quantity is 10**20 cash units or more, which
+         *       no figure here can hold (spec 021, R6).
+         * @enum {string}
+         */
+        ValueUnavailable: "value_out_of_range";
+        /**
          * WalletBalanceResponse
          * @description One wallet's latest reading, valued if its asset could be priced.
          *
@@ -1056,6 +1323,26 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    readAccountingPositions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PositionsResponse"];
+                };
+            };
+        };
+    };
     login: {
         parameters: {
             query?: never;

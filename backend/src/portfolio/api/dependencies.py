@@ -24,6 +24,11 @@ from fastapi import Request  # noqa: TC002
 
 from portfolio.api.errors import UnauthorizedError
 from portfolio.domain.auth import SessionLifetime
+from portfolio.services.accounting import (
+    AccountingService,
+    AccountingStatus,
+    build_accounting_service,
+)
 from portfolio.services.auth import (
     SESSION_REQUIRED_DETAIL,
     AuthService,
@@ -194,6 +199,31 @@ async def get_exchange_service(request: Request) -> AsyncIterator[ExchangeServic
             configured=configured_exchanges_of(request.app),
             syncing=coordinator.in_flight,
         )
+
+
+async def get_accounting_service(request: Request) -> AsyncIterator[AccountingService]:
+    """Open a session for this request and hand the router the accounting service.
+
+    The endpoint only reads through it -- `positions` -- so the session is never committed here
+    and closing it discards nothing. The recompute, which does commit, is never run on a
+    request's session: the trigger in `main.py` opens its own.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_accounting_service(session)
+
+
+def get_accounting_status(request: Request) -> AccountingStatus | None:
+    """The last recompute attempt the trigger recorded, or `None` before the first one.
+
+    Read from `app.state.accounting_status`, which `create_app` installs as `None` and the
+    trigger in `main.py` replaces after every attempt. `getattr` with a default so that an
+    application whose state was never installed answers "no attempt yet" rather than raising.
+    A value of any other type is treated the same way: the route renders what the trigger
+    wrote, and nothing else.
+    """
+    status = getattr(request.app.state, "accounting_status", None)
+    return status if isinstance(status, AccountingStatus) else None
 
 
 def get_principal(request: Request) -> Principal:

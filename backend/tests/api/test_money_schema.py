@@ -399,6 +399,9 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         "/api/exchanges",
         "/api/exchanges/sync",
         "/api/exchanges/runs",
+        # Positions, cost and returns (#19): the owner's holdings and what they are worth,
+        # every amount a string.
+        "/api/accounting/positions",
     }
 
 
@@ -407,7 +410,25 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
 #: `Number.MAX_SAFE_INTEGER` for the second -- which is why they are asserted together here
 #: and argued apart in `tests/api/test_balances.py`.
 MONEY_PROPERTIES: Final = frozenset(
-    {"total", "value", "quantity", "amount", "confirmed", "pending"}
+    {
+        "total",
+        "value",
+        "quantity",
+        "amount",
+        "confirmed",
+        "pending",
+        # #19: a position's cost and return, and the portfolio's. The percentage is here too:
+        # it is a quotient of two amounts, and a float would round it the same way.
+        "unknown_basis_quantity",
+        "average_cost",
+        "total_invested",
+        "realized_pnl",
+        "unmatched_proceeds",
+        "market_value",
+        "unrealized_pnl",
+        "unrealized_return_pct",
+        "unallocated_costs",
+    }
 )
 
 
@@ -448,7 +469,7 @@ def test_every_monetary_field_in_the_schema_is_declared_a_string(app: FastAPI) -
     assert offences == []
     # The walk has to have found something, or an application with no money in it at all
     # would satisfy the assertion above.
-    assert seen >= {"total", "value", "quantity", "amount", "confirmed", "pending"}
+    assert seen == MONEY_PROPERTIES
 
 
 def test_the_money_field_walk_can_actually_fail() -> None:

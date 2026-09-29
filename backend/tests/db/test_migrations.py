@@ -86,6 +86,12 @@ APPLICATION_TABLES = frozenset(
         "exchange_sync_windows",
         "exchange_sync_runs",
         "exchange_sync_run_accounts",
+        # #19. The current cost-basis snapshot per owner and method: its header, and the
+        # positions, lots and warnings it holds. Derived data, recomputed from the fills.
+        "accounting_snapshots",
+        "accounting_positions",
+        "accounting_lots",
+        "accounting_warnings",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -124,6 +130,12 @@ EXCHANGE_TABLES = frozenset({"exchange_accounts", "exchange_fills"})
 #: below `0007_exchange_sync` takes these down as well, and each test subtracts them.
 EXCHANGE_SYNC_TABLES = frozenset(
     {"exchange_sync_windows", "exchange_sync_runs", "exchange_sync_run_accounts"}
+)
+
+#: #19's four. Its revision sits on top of #15's, so every single-step reversal below
+#: `0008_accounting` takes these down as well, and each test subtracts them.
+ACCOUNTING_TABLES = frozenset(
+    {"accounting_snapshots", "accounting_positions", "accounting_lots", "accounting_warnings"}
 )
 
 EXPECTED_SEED_ROWS = [
@@ -216,6 +228,31 @@ EXPECTED_CONSTRAINT_NAMES = {
         "ck_exchange_sync_run_accounts_error_kind",
         "fk_exchange_sync_run_accounts_exchange_sync_run_id_exchange_sync_runs",
         "fk_exchange_sync_run_accounts_exchange_account_id_exchange_accounts",
+    },
+    # #19. Two CHECKs, compared with their model constants in
+    # `tests/db/test_accounting_migration.py`; every child cascades from the header and the
+    # header from `users`, and each natural key is a named unique constraint (spec 021, R3).
+    "accounting_snapshots": {
+        "pk_accounting_snapshots",
+        "uq_accounting_snapshots_user_method",
+        "fk_accounting_snapshots_user_id_users",
+    },
+    "accounting_positions": {
+        "pk_accounting_positions",
+        "uq_accounting_positions_snapshot_asset",
+        "fk_accounting_positions_snapshot_id_accounting_snapshots",
+    },
+    "accounting_lots": {
+        "pk_accounting_lots",
+        "uq_accounting_lots_snapshot_seq",
+        "ck_accounting_lots_kind",
+        "fk_accounting_lots_snapshot_id_accounting_snapshots",
+    },
+    "accounting_warnings": {
+        "pk_accounting_warnings",
+        "uq_accounting_warnings_snapshot_seq",
+        "ck_accounting_warnings_kind",
+        "fk_accounting_warnings_snapshot_id_accounting_snapshots",
     },
 }
 
@@ -395,7 +432,12 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
     # is what keeps this test about the prices migration rather than about how many
     # revisions happen to sit on top of it.
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - {"prices"} - BALANCE_TABLES - EXCHANGE_TABLES - EXCHANGE_SYNC_TABLES
+        APPLICATION_TABLES
+        - {"prices"}
+        - BALANCE_TABLES
+        - EXCHANGE_TABLES
+        - EXCHANGE_SYNC_TABLES
+        - ACCOUNTING_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -426,7 +468,11 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
 
     # Since #12 the exchange revision sits on top of this one and comes down with it.
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - BALANCE_TABLES - EXCHANGE_TABLES - EXCHANGE_SYNC_TABLES
+        APPLICATION_TABLES
+        - BALANCE_TABLES
+        - EXCHANGE_TABLES
+        - EXCHANGE_SYNC_TABLES
+        - ACCOUNTING_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -492,7 +538,7 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
     command.downgrade(build_alembic_config(database_url), BALANCES_REVISION)
 
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - EXCHANGE_TABLES - EXCHANGE_SYNC_TABLES
+        APPLICATION_TABLES - EXCHANGE_TABLES - EXCHANGE_SYNC_TABLES - ACCOUNTING_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:
