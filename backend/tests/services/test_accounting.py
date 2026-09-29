@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import pickle
 import sys
+import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -45,6 +46,7 @@ from portfolio.domain.exchanges import ExchangeKey, FillSide
 from portfolio.providers.exchanges import bingx, bitget
 from portfolio.providers.prices.base import SUPPORTED_PAIRS
 from portfolio.repositories.exchanges import select_fills_for_accounting
+from portfolio.services import accounting as accounting_module
 from portfolio.services.accounting import (
     PRICED_ASSETS,
     RecomputeOutcome,
@@ -465,6 +467,41 @@ async def test_recompute_reads_only_the_owners_fills(
     headers = {row["user_id"]: row for row in (await snapshot_tables(factory))["header"]}
     assert set(headers) == {user_id, stranger}
     assert headers[stranger]["event_count"] == 1
+
+
+async def test_the_conversion_and_the_replay_run_off_the_event_loop(
+    factory: async_sessionmaker[AsyncSession],
+    clock: SettableClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec 021, *Recompute*: CPU-bound work in a worker thread, so no request stalls on it.
+
+    Both names are wrapped where the service looks them up, and each records the thread it
+    ran on; the event loop's thread is the one this test runs on.
+    """
+    user_id, _bitget, _bingx = await plant_history(factory)
+    threads: dict[str, set[int]] = {"trade_of": set(), "replay": set()}
+    original_trade_of = accounting_module.trade_of
+    original_replay = accounting_module.replay
+
+    def recording_trade_of(record: Any) -> Trade:
+        threads["trade_of"].add(threading.get_ident())
+        return original_trade_of(record)
+
+    def recording_replay(*args: Any, **keywords: Any) -> Any:
+        threads["replay"].add(threading.get_ident())
+        return original_replay(*args, **keywords)
+
+    monkeypatch.setattr(accounting_module, "trade_of", recording_trade_of)
+    monkeypatch.setattr(accounting_module, "replay", recording_replay)
+
+    report = await recompute(factory, user_id, clock)
+
+    loop_thread = threading.get_ident()
+    assert report.outcome is RecomputeOutcome.WRITTEN
+    assert threads["trade_of"], "the conversion ran through the looked-up name"
+    assert threads["replay"], "the replay ran through the looked-up name"
+    assert loop_thread not in threads["trade_of"] | threads["replay"]
 
 
 async def test_a_user_without_fills_gets_an_empty_snapshot(
