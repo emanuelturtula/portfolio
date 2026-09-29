@@ -4,7 +4,7 @@ import { http, HttpResponse, type HttpHandler } from 'msw';
 import { useNavigate } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { SLOW_POLL_MS } from '@/api/exchanges';
+import { FAST_POLL_MS, SLOW_POLL_MS } from '@/api/exchanges';
 import {
   COMPLETENESS_UNKNOWN,
   DERIVED_LEGEND,
@@ -132,6 +132,14 @@ function HistoryButtons() {
         }}
       >
         Browser forward
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          void navigate('/health');
+        }}
+      >
+        Leave for health
       </button>
     </>
   );
@@ -470,6 +478,34 @@ describe('Transactions: rows', () => {
     expect(text(cell(derived, 'Quote value'))).toBe(`6,000.00 USDC ${DERIVED_MARKER}`);
     expect(dataIn(cell(derived, 'Quote value'))).toHaveAttribute('value', at18('6000'));
     expect(cell(reported, 'Quote value')).not.toHaveTextContent(DERIVED_MARKER);
+    // Quoted in USDC, it has no USDT value to mark.
+    expect(text(cell(derived, 'USDT value'))).toBe(NOT_IN_USDT);
+    expect(cell(reported, 'USDT value')).not.toHaveTextContent(DERIVED_MARKER);
+    expect(within(await transactions()).getByText(DERIVED_LEGEND)).toBeInTheDocument();
+  });
+
+  it('marks a derived USDT value too: it is the same derived figure (R5, N2)', async () => {
+    // A USDT fill's USDT value is its quote value, so when the venue did not report that,
+    // the USDT column is as derived as the quote column and must say so.
+    const rows = [
+      fill({
+        id: 1,
+        executed_at: '2026-03-01T00:00:00Z',
+        quote_quantity_derived: true,
+        order_id: '4001',
+      }),
+      fill({ id: 2, executed_at: '2026-03-02T00:00:00Z', order_id: '4002' }),
+    ];
+    openTransactions({ exchanges: venuesFor(rows), runs: [], fills: rows });
+    const table = await fillsTable();
+
+    const derived = rowAt(table, '2026-03-01T00:00:00Z');
+    expect(text(cell(derived, 'Quote value'))).toBe(`30,000.00 USDT ${DERIVED_MARKER}`);
+    expect(text(cell(derived, 'USDT value'))).toBe(`30,000.00 ${DERIVED_MARKER}`);
+    expect(dataIn(cell(derived, 'USDT value'))).toHaveAttribute('value', at18('30000'));
+
+    const reported = rowAt(table, '2026-03-02T00:00:00Z');
+    expect(text(cell(reported, 'USDT value'))).toBe('30,000.00');
     expect(within(await transactions()).getByText(DERIVED_LEGEND)).toBeInTheDocument();
   });
 
@@ -1057,6 +1093,127 @@ describe('Transactions: filters and the URL', () => {
     expect(dateInput(await transactions(), 'To')).not.toHaveAttribute('aria-invalid', 'true');
     expect(lastFillQuery(fake).get('from')).toBe('2026-03-10T00:00:00.000Z');
     expect(lastFillQuery(fake).get('to')).toBe('2026-03-11T00:00:00.000Z');
+  });
+
+  it('offers days from 1970-01-01 to 9999-12-30 only (R5, N4)', async () => {
+    openTransactions();
+    const section = await transactions();
+
+    for (const label of ['From', 'To'] as const) {
+      expect(dateInput(section, label)).toHaveAttribute('min', '1970-01-01');
+      expect(dateInput(section, label)).toHaveAttribute('max', '9999-12-30');
+    }
+  });
+
+  it('ignores a day in the URL outside those bounds, and asks for everything (R5, N4)', async () => {
+    const { fake } = openTransactions(marchScenario(), '/exchanges?from=1969-12-31&to=9999-12-31');
+    const section = await transactions();
+
+    expect(ids(await fillsTable())).toHaveLength(5);
+    expect(lastFillQuery(fake).toString()).toBe('limit=50&offset=0');
+    expect(dateInput(section, 'From')).toHaveValue('');
+    expect(dateInput(section, 'To')).toHaveValue('');
+  });
+
+  it('keeps a day typed outside the bounds in the input, and sends nothing for it (R5, N4)', async () => {
+    // Typing a year by keyboard passes through 0002, 0020 and 0202 on the way to 2026, and the
+    // browser reports each one as a real date.
+    const { fake } = openTransactions();
+    const section = await transactions();
+    await fillsTable();
+    await settle();
+    const requests = fake.count('fills');
+
+    for (const typed of ['0002-09-01', '0202-09-01', '1969-12-31', '9999-12-31']) {
+      pickDay(dateInput(section, 'From'), typed);
+      await settle();
+      expect(dateInput(section, 'From')).toHaveValue(typed);
+      expect(currentPath()).toBe('/exchanges');
+    }
+    expect(fake.count('fills')).toBe(requests);
+
+    pickDay(dateInput(section, 'From'), '2026-03-10');
+    await waitFor(() => {
+      expect(currentPath()).toBe('/exchanges?from=2026-03-10');
+    });
+    expect(dateInput(section, 'From')).toHaveValue('2026-03-10');
+    await waitFor(async () => {
+      expect(ids(await fillsTable())).toEqual(['5005', '7004', '7003', NO_ORDER_ID]);
+    });
+
+    // Emptying the input removes the day.
+    pickDay(dateInput(section, 'From'), '');
+    await waitFor(() => {
+      expect(currentPath()).toBe('/exchanges');
+    });
+    expect(dateInput(section, 'From')).toHaveValue('');
+  });
+
+  it('a held draft gives way to the URL when another control changes the filters (R5, N4)', async () => {
+    const { user } = openTransactions(marchScenario(), '/exchanges?from=2026-03-01');
+    const section = await transactions();
+    await fillsTable();
+
+    pickDay(dateInput(section, 'From'), '0002-09-01');
+    await settle();
+    expect(dateInput(section, 'From')).toHaveValue('0002-09-01');
+
+    await user.click(within(filtersGroup(section)).getByRole('checkbox', { name: 'Bitget' }));
+
+    await waitFor(() => {
+      expect(currentPath()).toBe('/exchanges?exchange=bitget&from=2026-03-01');
+    });
+    expect(dateInput(section, 'From')).toHaveValue('2026-03-01');
+  });
+
+  it('Clear filters empties a held draft too (R5, N4)', async () => {
+    const { user } = openTransactions(marchScenario(), '/exchanges?exchange=bitget');
+    const section = await transactions();
+    await fillsTable();
+
+    pickDay(dateInput(section, 'To'), '0020-01-01');
+    await settle();
+    expect(dateInput(section, 'To')).toHaveValue('0020-01-01');
+
+    await user.click(formClearButton(section));
+
+    await waitFor(() => {
+      expect(currentPath()).toBe('/exchanges');
+    });
+    expect(dateInput(section, 'To')).toHaveValue('');
+    expect(dateInput(section, 'From')).toHaveValue('');
+  });
+
+  it('back restores the day the URL held, over a held draft (R5, N4)', async () => {
+    const { user } = openTransactions(marchScenario(), '/exchanges?from=2026-03-01');
+    const section = await transactions();
+    await fillsTable();
+
+    pickDay(dateInput(section, 'From'), '2026-03-10');
+    await waitFor(() => {
+      expect(currentPath()).toBe('/exchanges?from=2026-03-10');
+    });
+    pickDay(dateInput(section, 'From'), '0002-01-01');
+    await settle();
+
+    await user.click(screen.getByRole('button', { name: 'Browser back' }));
+
+    await waitFor(() => {
+      expect(currentPath()).toBe('/exchanges?from=2026-03-01');
+    });
+    expect(dateInput(section, 'From')).toHaveValue('2026-03-01');
+    await waitFor(async () => {
+      expect(ids(await fillsTable())).toHaveLength(5);
+    });
+  });
+
+  it('sends the bounds themselves as instants the API can hold (R5, N4)', async () => {
+    inTimeZone('UTC');
+    const { fake } = openTransactions(marchScenario(), '/exchanges?from=1970-01-01&to=9999-12-30');
+
+    expect(ids(await fillsTable())).toHaveLength(5);
+    expect(lastFillQuery(fake).get('from')).toBe('1970-01-01T00:00:00.000Z');
+    expect(lastFillQuery(fake).get('to')).toBe('9999-12-31T00:00:00.000Z');
   });
 });
 
@@ -1756,6 +1913,24 @@ describe('Transactions: refresh', () => {
       '3',
     );
     await settle();
+    // R5, S1, as the coordinator approved: the settled mutation invalidates ['exchanges'],
+    // and the list it re-reads shows Bitget's fills_stored moved, which invalidates the
+    // fills once more. One spare read, and no more than one.
+    expect(fake.count('fills')).toBe(requests + 2);
+  });
+
+  it('reads the fills once after a sync that stored nothing', async () => {
+    // The default fake sync records a run and stores no fill: the counts do not move, so
+    // only the mutation's own invalidation reads the fills.
+    const { user, fake } = openTransactions();
+    await fillsTable();
+    await settle();
+    const requests = fake.count('fills');
+
+    await user.click(screen.getByRole('button', { name: 'Sync now' }));
+    await screen.findByText(/^The sync /);
+    await settle();
+
     expect(fake.count('fills')).toBe(requests + 1);
   });
 
@@ -1791,6 +1966,166 @@ describe('Transactions: refresh', () => {
 
     expect(fake.count('list')).toBeGreaterThan(list);
     expect(fake.count('fills')).toBe(fills);
+  });
+
+  it('the first load reads the fills no more often than the list (R5, S1)', async () => {
+    const { fake } = openTransactions();
+    await fillsTable();
+    await settle();
+
+    // The list's first answer is not a change in what is stored, so it invalidates nothing.
+    // Under StrictMode every query here is read twice on mount: the first mount's read is
+    // aborted when React unmounts it, and the remount reads again. So the measure is the
+    // list's own count, which no invalidation touches, not a literal 1.
+    expect(fake.count('fills')).toBe(fake.count('list'));
+    expect(fake.count('fills')).toBe(fake.count('runs'));
+  });
+
+  it('a scheduled sync that stores fills is read through the list poll, with no sync of this page (R5, S1)', async () => {
+    fakeIntervals();
+    const { fake } = openTransactions();
+    const section = await transactions();
+    await fillsTable();
+    await settle();
+    const before = fake.count('fills');
+
+    // A scheduled run stores a fill: the rows and Bitget's fills_stored move together, and
+    // nothing on this page asked for it.
+    fake.addFills([fill({ id: 201, executed_at: '2026-09-24T11:59:00Z', order_id: '9201' })]);
+    await advance(SLOW_POLL_MS);
+
+    await waitFor(async () => {
+      expect(ids(await fillsTable())[0]).toBe('9201');
+    });
+    expect(within(section).getByText('6 fills on all exchanges at any date.')).toBeTruthy();
+    await settle();
+    expect(fake.count('fills')).toBe(before + 1);
+    expect(fake.count('sync')).toBe(0);
+
+    // And the next poll, which finds the same counts, reads nothing more.
+    await advance(SLOW_POLL_MS);
+    expect(fake.count('fills')).toBe(before + 1);
+  });
+
+  it("a list poll that moves only a venue's windows and sync time reads no fills (R5, S1)", async () => {
+    fakeIntervals();
+    const { fake } = openTransactions();
+    await fillsTable();
+    await settle();
+    const fills = fake.count('fills');
+    const list = fake.count('list');
+
+    // A run planned windows and has stored nothing yet; then it is marked synced again.
+    fake.patchExchange('bingx', { pending_windows: 3 });
+    await advance(SLOW_POLL_MS);
+    fake.patchExchange('bingx', { pending_windows: 0, last_synced_at: NOW });
+    await advance(SLOW_POLL_MS);
+
+    expect(fake.count('list')).toBe(list + 2);
+    expect(fake.count('fills')).toBe(fills);
+  });
+
+  it('coming back to the page reads nothing the cache already holds (R5, S1)', async () => {
+    // The page's first reading of the counts is a baseline, not a change, even when the
+    // list comes from the cache on a return visit.
+    const { user, fake } = openTransactions();
+    await fillsTable();
+    await settle();
+    const fills = fake.count('fills');
+
+    await user.click(screen.getByRole('button', { name: 'Leave for health' }));
+    await screen.findByRole('heading', { name: 'Backend health' });
+    await user.click(screen.getByRole('button', { name: 'Browser back' }));
+    await waitFor(() => {
+      expect(currentPath()).toBe('/exchanges');
+    });
+    expect(ids(await fillsTable())).toHaveLength(5);
+    await settle();
+
+    expect(fake.count('fills')).toBe(fills);
+  });
+
+  it('a list that recovers from a failed first load does not read the fills again (R5, S1)', async () => {
+    const { user, fake } = openTransactions();
+    fake.fail('list', () => problem(503, 'Service Unavailable', 'The database is restarting.'));
+    const alert = await within(await accounts()).findByRole('alert');
+    await fillsTable();
+    await settle();
+    const fills = fake.count('fills');
+
+    // Unknown counts becoming known is not a change in what is stored.
+    fake.fail('list', null);
+    await user.click(within(alert).getByRole('button', { name: 'Try again' }));
+    await within(await accounts()).findByRole('listitem', { name: 'Bitget' });
+    await settle();
+
+    expect(fake.count('fills')).toBe(fills);
+  });
+
+  it('while a venue is syncing, a rising count reads nothing until the run ends (R5, S1)', async () => {
+    // A backfill commits a page at a time, and refreshing the whole view and its totals at
+    // every 5-second poll would be polling by another name. One read, once it has ended.
+    fakeIntervals();
+    const { fake } = openTransactions();
+    await fillsTable();
+    await settle();
+    const before = fake.count('fills');
+
+    fake.patchExchange('bitget', { syncing: true });
+    await advance(SLOW_POLL_MS);
+    fake.addFills([fill({ id: 201, executed_at: '2026-09-24T11:58:00Z', order_id: '9201' })]);
+    await advance(FAST_POLL_MS);
+    fake.addFills([fill({ id: 202, executed_at: '2026-09-24T11:59:00Z', order_id: '9202' })]);
+    await advance(FAST_POLL_MS);
+    expect(fake.count('fills')).toBe(before);
+
+    fake.patchExchange('bitget', { syncing: false });
+    await advance(FAST_POLL_MS);
+
+    await waitFor(async () => {
+      expect(ids(await fillsTable()).slice(0, 2)).toEqual(['9202', '9201']);
+    });
+    await settle();
+    expect(fake.count('fills')).toBe(before + 1);
+  });
+
+  it('a run that ends having stored nothing reads nothing (R5, S1)', async () => {
+    fakeIntervals();
+    const { fake } = openTransactions();
+    await fillsTable();
+    await settle();
+    const before = fake.count('fills');
+
+    fake.patchExchange('bingx', { syncing: true });
+    await advance(SLOW_POLL_MS);
+    fake.patchExchange('bingx', { syncing: false });
+    await advance(FAST_POLL_MS);
+    await advance(SLOW_POLL_MS);
+
+    expect(fake.count('fills')).toBe(before);
+  });
+
+  it('a venue appearing with fills of its own is a change in what is stored (R5, S1)', async () => {
+    fakeIntervals();
+    const bitgetOnly = marchFills().filter((row) => row.exchange_key === 'bitget');
+    const { fake } = openTransactions({
+      exchanges: [exchange({ fills_stored: bitgetOnly.length })],
+      runs: [finishedRun()],
+      fills: bitgetOnly,
+    });
+    await fillsTable();
+    await settle();
+    const before = fake.count('fills');
+
+    // BingX's credentials are configured and its first scheduled run stores two fills.
+    fake.setExchanges([exchange({ exchange_key: 'bingx', fills_stored: 0 }), ...fake.exchanges()]);
+    fake.addFills(marchFills().filter((row) => row.exchange_key === 'bingx'));
+    await advance(SLOW_POLL_MS);
+
+    await waitFor(async () => {
+      expect(ids(await fillsTable())).toHaveLength(5);
+    });
+    expect(fake.count('fills')).toBe(before + 1);
   });
 });
 
@@ -1944,6 +2279,49 @@ describe('Sync history: the disclosure', () => {
     await waitFor(() => {
       expect(details).toHaveAttribute('open');
     });
+  });
+
+  it('a disclosure the browser opened closes on the next click (R5, N5)', async () => {
+    // Find-in-page opens a closed <details> on its own to show a match, and React is not
+    // asked. The next click must act on what the owner sees, which is an open log.
+    const { user } = openTransactions();
+    const details = await disclosure();
+    expect(details).not.toHaveAttribute('open');
+
+    act(() => {
+      details.open = true;
+      details.dispatchEvent(new Event('toggle'));
+    });
+    await settle();
+    expect(details).toHaveAttribute('open');
+
+    await user.click(summaryOf(details));
+    expect(details).not.toHaveAttribute('open');
+    await settle();
+    expect(details).not.toHaveAttribute('open');
+
+    // And it opens again on the one after.
+    await user.click(summaryOf(details));
+    expect(details).toHaveAttribute('open');
+  });
+
+  it('a disclosure the browser closed opens on the next click (R5, N5)', async () => {
+    const { user } = openTransactions({
+      ...marchScenario(),
+      runs: [finishedRun({ accounts: [accountFailed('bitget', 'unavailable')] })],
+    });
+    const details = await disclosure();
+    expect(details).toHaveAttribute('open');
+
+    act(() => {
+      details.open = false;
+      details.dispatchEvent(new Event('toggle'));
+    });
+    await settle();
+    expect(details).not.toHaveAttribute('open');
+
+    await user.click(summaryOf(details));
+    expect(details).toHaveAttribute('open');
   });
 
   it('with no run yet there is nothing to summarise, and no disclosure', async () => {

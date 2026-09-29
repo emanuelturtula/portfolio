@@ -100,6 +100,25 @@ describe('readFillFilters', () => {
     expect(readFillFilters(params('from=2028-02-29')).filters.fromDay).toBe('2028-02-29');
   });
 
+  it.each([
+    ['1969-12-31', 'the day before the first day the pickers offer'],
+    ['0001-01-01', 'the first day of the calendar'],
+    ['0099-06-15', 'a two-digit year, which Date reads as 19xx'],
+    ['9999-12-31', 'the last day, whose next midnight no instant can hold'],
+  ])('drops %j, %s (R5, N4)', (value) => {
+    const read = readFillFilters(params(`from=${value}&to=${value}`));
+
+    expect(read.filters.fromDay).toBeNull();
+    expect(read.filters.toDay).toBeNull();
+  });
+
+  it.each(['1970-01-01', '9999-12-30'])('keeps %j, a bound the pickers offer (R5, N4)', (value) => {
+    const read = readFillFilters(params(`from=${value}&to=${value}`));
+
+    expect(read.filters.fromDay).toBe(value);
+    expect(read.filters.toDay).toBe(value);
+  });
+
   it.each(['0', '-1', '1.5', '1e3', 'abc', '', '02', '1000000'])(
     'reads page %j as the first page',
     (value) => {
