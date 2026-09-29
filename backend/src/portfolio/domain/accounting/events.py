@@ -23,8 +23,8 @@ the same reason.
 is accepted with its twenty places (spec 019, R9). The amount rule is the same so that no
 stored amount is refused for its precision or its size.
 
-**Three shapes are refused whatever their amounts** -- `TradeShapeProblem` names them, and
-`trade_shape_problem` is their single definition:
+**Three shapes are refused even when every field passes its own rule** -- `TradeShapeProblem`
+names them, and `trade_shape_problem` is their single definition:
 
 * a `base_asset` equal to the `quote_asset`;
 * a fee in the asset received that consumes everything received;
