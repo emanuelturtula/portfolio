@@ -298,3 +298,22 @@ money fields are the owner's holdings and returns.
 - **A symbol case mismatch** between a venue's `base_asset` (e.g. `BTC`) and a chain's
   `asset_symbol` would leave an asset unpriced. Both are upper case today, and a test pins
   it.
+
+## Rulings during implementation
+
+- **R1. `recompute(user_id)` returns `RecomputeReport(outcome, event_count)`.**
+  `RecomputeOutcome` is one `StrEnum`: `UNCHANGED`, `WRITTEN`, `FAILED`.
+  - `recompute` itself returns only the first two.
+  - `FAILED` is what the trigger records on `accounting_status` when `recompute` raised.
+  - `last_recompute.outcome` on the wire is that enum.
+- **R2. `accounting_lots.kind` is the event kind:** `trade` today, `adjustment` from #18. A
+  named `CHECK` over the two values is mirrored in `db/models.py`, in the reflection-test
+  pattern. A transfer never makes a lot.
+- **R3. `UNIQUE (snapshot_id, seq)` on `accounting_lots` and `accounting_warnings`.** It is the
+  natural key, and it indexes the cascade and the ordered read.
+- **R4. Two valuation edges:**
+  - `unrealized_return_pct`, per position and in the totals, is `None` rather than a 500
+    when its 4-place quotient does not fit `MONEY_PRECISION`. This mirrors spec 019's R1.
+  - A position that is both unknown-basis and unpriced appears once in `totals.excluded`,
+    as `unknown_basis`, which is checked first.
+- Converting the fills to `Trade`s runs in the worker thread together with `replay`.
