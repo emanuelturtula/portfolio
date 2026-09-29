@@ -371,6 +371,27 @@ describe('describeEmptyPositions', () => {
       expect(result).not.toEqual({ kind: 'no_trades', anyConfigured: false });
     });
 
+    it('does not hold when the snapshot has replayed trades, whatever a lagging list says (R9 N-a)', () => {
+      // A list polled before a stablecoin-only sync landed still says 0 fills everywhere.
+      expect(describeEmptyPositions(stablecoinOnlySnapshot(), [])).toEqual({
+        kind: 'no_positions',
+      });
+      expect(describeEmptyPositions(stablecoinOnlySnapshot(), [unsyncedExchange('bingx')])).toEqual(
+        {
+          kind: 'no_positions',
+        },
+      );
+      // The same list with a snapshot over nothing, or none at all, still says "no trades".
+      expect(describeEmptyPositions(emptySnapshot(), [unsyncedExchange('bingx')])).toEqual({
+        kind: 'no_trades',
+        anyConfigured: true,
+      });
+      expect(describeEmptyPositions(noSnapshot(), [unsyncedExchange('bingx')])).toEqual({
+        kind: 'no_trades',
+        anyConfigured: true,
+      });
+    });
+
     it('does not hold with no exchange list and no snapshot: that is not computed yet', () => {
       expect(describeEmptyPositions(noSnapshot(), undefined)).toEqual({ kind: 'not_computed' });
     });

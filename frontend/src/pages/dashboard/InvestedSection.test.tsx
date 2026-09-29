@@ -264,7 +264,7 @@ const COLUMNS = [
  */
 const STALE_TOTALS = 'These totals include at least one stale price.';
 const UNALLOCATED_LINE =
-  'Costs not assigned to any asset: 0.10 USD, from stablecoin conversions and from swaps ' +
+  'Costs not assigned to any asset: 0.10 USD, from stablecoin conversions or from swaps ' +
   'into units with no known cost.';
 const NO_TRADES_NEUTRAL = 'Positions appear here once trades are imported from an exchange.';
 
@@ -1245,6 +1245,17 @@ describe('InvestedSection: empty states (criterion 7)', () => {
       'Every trade imported so far is between stablecoins, which are held at cost.',
     );
     await expectNoFigures();
+  });
+
+  it('believes the snapshot over a list that lags it: trades replayed are not "no trades" (R9 N-a)', async () => {
+    // The list was polled before a stablecoin-only sync landed and still says 0 fills; the
+    // snapshot, written after it, replayed 4 events. "No trades imported yet" would contradict it.
+    openDashboard({ positions: stablecoinOnlySnapshot(), exchanges: [unsyncedExchange('bingx')] });
+
+    await emptyHeading('No positions');
+    const region = await loadedRegion();
+    expect(within(region).queryByRole('heading', { name: 'No trades imported yet' })).toBeNull();
+    expect(region).not.toHaveTextContent(/Syncing the exchanges imports/);
   });
 
   it('falls back when the exchanges query fails: what the snapshot proves, and nothing it does not (S1)', async () => {
