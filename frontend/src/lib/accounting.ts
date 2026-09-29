@@ -15,7 +15,7 @@
 import type { Exclusion, Position, Positions } from '@/api/accounting';
 import type { Exchange } from '@/api/exchanges';
 import type { components } from '@/api/generated/schema';
-import { EXCHANGES, type ExchangeKey } from '@/lib/exchanges';
+import { EXCHANGES, hasFailedSync, type ExchangeKey } from '@/lib/exchanges';
 import { equalsMoney, isZeroMoney, money, type FormatMoneyOptions } from '@/lib/money';
 import { PRICE_UNAVAILABLE_MESSAGES, type PriceUnavailable } from '@/lib/prices';
 
@@ -226,12 +226,11 @@ export function venueLabel(source: string): string {
 
 /**
  * The venues whose last sync failed - `error` or `auth_failed` - in the list's own order.
- * A venue that has never synced, or is syncing, has not failed.
+ * A venue that has never synced, or is syncing, has not failed. The rule itself is
+ * `hasFailedSync`, so the dashboard's failing-sync checks and the transactions view's cannot drift.
  */
 export function venuesWithFailedSync(exchanges: readonly Exchange[]): ExchangeKey[] {
-  return exchanges
-    .filter((exchange) => exchange.status === 'error' || exchange.status === 'auth_failed')
-    .map((exchange) => exchange.exchange_key);
+  return exchanges.filter(hasFailedSync).map((exchange) => exchange.exchange_key);
 }
 
 /**
