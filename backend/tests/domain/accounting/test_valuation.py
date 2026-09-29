@@ -527,7 +527,8 @@ def test_a_value_past_the_range_is_none_with_its_reason_rather_than_an_error() -
     assert str(value.market_value_unavailable_reason) == VALUE_OUT_OF_RANGE
     assert excluded_of(totals) == [("BTC", "unpriced")]
     assert_exact(totals.market_value, "0")
-    assert_exact(totals.realized_pnl, "3"), "realized is still summed"
+    # Realized P&L is still summed for a position left out of the other totals.
+    assert_exact(totals.realized_pnl, "3")
 
 
 def test_the_largest_value_that_fits_is_still_reported() -> None:

@@ -488,7 +488,8 @@ async def test_the_conversion_and_the_replay_run_off_the_event_loop(
     user_id, _bitget, _bingx = await plant_history(factory)
     threads: dict[str, set[int]] = {"trade_of": set(), "replay": set()}
     original_trade_of = accounting_module.trade_of
-    original_replay = accounting_module.replay
+    # The object the service imported by name: `replay` from `portfolio.domain.accounting`.
+    original_replay = replay
 
     def recording_trade_of(record: Any) -> Trade:
         threads["trade_of"].add(threading.get_ident())
