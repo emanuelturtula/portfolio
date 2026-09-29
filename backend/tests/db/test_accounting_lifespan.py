@@ -574,6 +574,49 @@ async def test_a_sync_that_inserted_nothing_does_not_recompute(
     assert events_named(captured, "accounting_recompute_finished") == []
 
 
+@pytest.mark.parametrize(
+    ("last_outcome", "retried"),
+    [
+        (RecomputeOutcome.FAILED, True),
+        (RecomputeOutcome.WRITTEN, False),
+        (RecomputeOutcome.UNCHANGED, False),
+    ],
+)
+async def test_a_sync_that_inserted_nothing_retries_only_a_failed_recompute(
+    accounting_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    last_outcome: RecomputeOutcome,
+    retried: bool,
+) -> None:
+    """Spec 021, R7: a transient failure is retried by the next sync, even one that stored nothing.
+
+    Without it, a recompute that failed on a locked database would leave the snapshot stale
+    until the next fill arrived -- which, for an owner who trades rarely, is weeks.
+    """
+    user_id = await plant_owner_with_fills(accounting_database)
+    fake = FakeSync(summary_with(fills_inserted=0))
+    fake_the_sync(monkeypatch, fake)
+
+    async with settled_app(accounting_database) as app:
+        app.state.accounting_status = AccountingStatus(
+            at=datetime.now(UTC),
+            outcome=last_outcome,
+            error="OperationalError" if last_outcome is RecomputeOutcome.FAILED else None,
+        )
+        calls = RecomputeCalls(monkeypatch)
+        runner = exchange_sync_runner(app, {}, get_settings())
+        summary = await runner(SyncTrigger.SCHEDULED)
+        status = status_of(app)
+
+    assert summary is fake.summary
+    assert calls.users == ([user_id] if retried else [])
+    assert status is not None
+    if retried:
+        assert (status.outcome, status.error) == (RecomputeOutcome.UNCHANGED, None)
+    else:
+        assert status.outcome is last_outcome
+
+
 async def test_a_failing_recompute_leaves_the_sync_summary_intact_and_logs_the_class_only(
     accounting_database: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

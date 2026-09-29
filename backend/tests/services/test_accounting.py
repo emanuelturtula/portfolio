@@ -37,21 +37,27 @@ from portfolio.domain.accounting import (
     ENGINE_VERSION,
     METHOD,
     AccountingConfig,
+    Adjustment,
     EventKey,
     Trade,
+    Transfer,
     replay,
 )
 from portfolio.domain.chains import CHAIN_ASSET_SYMBOLS, ChainKey
 from portfolio.domain.exchanges import ExchangeKey, FillSide
 from portfolio.providers.exchanges import bingx, bitget
 from portfolio.providers.prices.base import SUPPORTED_PAIRS
+from portfolio.repositories.accounting import AccountingSnapshotRepository
 from portfolio.repositories.exchanges import select_fills_for_accounting
 from portfolio.services import accounting as accounting_module
 from portfolio.services.accounting import (
     PRICED_ASSETS,
+    SNAPSHOT_READ_ATTEMPTS,
     RecomputeOutcome,
+    SnapshotReadError,
     UnconvertibleFillError,
     build_accounting_service,
+    lot_kinds_of,
 )
 from tests.accounting_harness import (
     at,
@@ -960,6 +966,170 @@ async def test_an_open_holding_of_a_non_chain_asset_is_unsupported_without_a_loo
     assert [(entry.asset, str(entry.reason)) for entry in view.totals.excluded] == [
         ("ETH", "unpriced")
     ]
+
+
+async def test_positions_never_serve_one_snapshots_header_over_anothers_rows(
+    factory: async_sessionmaker[AsyncSession],
+    clock: SettableClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec 021, R5 (review S1): a recompute committed mid-read never yields a mixed answer.
+
+    The reads are autocommit statements, and SQLite hands the replacement header the id the
+    deleted one had. So a recompute committed between the header read and the positions read
+    would serve snapshot A's header -- one event, computed at `COMPUTED_AT` -- over snapshot
+    B's rows, BTC *and* KAS. The hook commits exactly that recompute the first time the
+    positions are read. Whichever snapshot is served, it must be one of them, whole.
+    """
+    async with factory() as session:
+        user_id = await plant_owner(session)
+        account = await plant_account(session, user_id)
+        await plant_fills(session, account, [make_fill(1, at(0), quantity="1")])
+    await recompute(factory, user_id, clock)
+    later = SettableClock(COMPUTED_AT + timedelta(hours=1))
+    original = AccountingSnapshotRepository.list_positions
+    armed = [True]
+
+    async def recompute_in_between(
+        repository: AccountingSnapshotRepository, snapshot_id: int
+    ) -> Any:
+        if armed[0]:
+            armed[0] = False
+            async with factory() as other:
+                await plant_fills(
+                    other,
+                    account,
+                    [
+                        make_fill(
+                            2,
+                            at(1),
+                            symbol="KASUSDT",
+                            base_asset="KAS",
+                            quantity="1000",
+                            price="0.1",
+                            quote_quantity="100",
+                            fee_amount="0",
+                            fee_asset=None,
+                        )
+                    ],
+                )
+            written = await recompute(factory, user_id, later)
+            assert written.outcome is RecomputeOutcome.WRITTEN
+        return await original(repository, snapshot_id)
+
+    monkeypatch.setattr(AccountingSnapshotRepository, "list_positions", recompute_in_between)
+
+    async with factory() as session:
+        view = await build_accounting_service(session, clock=clock).positions(user_id)
+
+    assert not armed[0], "the hook ran: a recompute really committed mid-read"
+    served = (
+        view.event_count,
+        view.computed_at,
+        [entry.value.position.asset for entry in view.positions],
+    )
+    assert served in (
+        (1, COMPUTED_AT, ["BTC"]),
+        (2, later.moment, ["BTC", "KAS"]),
+    ), f"a mixed snapshot was served: {served}"
+
+
+async def test_a_snapshot_that_never_stops_moving_is_refused_not_mixed(
+    factory: async_sessionmaker[AsyncSession],
+    clock: SettableClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec 021, R5: the retry is bounded, and past the bound nothing mixed is served.
+
+    A recompute commits during every read, so no two header reads ever agree. After
+    `SNAPSHOT_READ_ATTEMPTS` reads the service raises `SnapshotReadError` -- whose message
+    carries no figure -- rather than answering from two snapshots, or looping forever.
+    """
+    async with factory() as session:
+        user_id = await plant_owner(session)
+        account = await plant_account(session, user_id)
+        await plant_fills(session, account, [make_fill(1, at(0), quantity="1")])
+    await recompute(factory, user_id, clock)
+    original = AccountingSnapshotRepository.list_positions
+    interruptions = [0]
+
+    async def always_interrupted(repository: AccountingSnapshotRepository, snapshot_id: int) -> Any:
+        interruptions[0] += 1
+        async with factory() as other:
+            await plant_fills(other, account, [make_fill(100 + interruptions[0], at(10))])
+        moved = SettableClock(COMPUTED_AT + timedelta(minutes=interruptions[0]))
+        await recompute(factory, user_id, moved)
+        return await original(repository, snapshot_id)
+
+    monkeypatch.setattr(AccountingSnapshotRepository, "list_positions", always_interrupted)
+
+    async with factory() as session:
+        service = build_accounting_service(session, clock=clock)
+        with pytest.raises(SnapshotReadError) as raised:
+            await service.positions(user_id)
+
+    assert interruptions[0] == SNAPSHOT_READ_ATTEMPTS
+    assert SNAPSHOT_READ_ATTEMPTS >= 2, "a bound of one would be no retry at all"
+    assert not any(
+        character.isdigit()
+        for character in str(raised.value).replace(str(SNAPSHOT_READ_ATTEMPTS), "")
+    ), "the message carries no figure"
+
+
+def test_lot_kinds_come_from_trades_and_adjustments_never_transfers() -> None:
+    """Spec 021, R8: a transfer sharing a trade's whole key does not relabel the trade's lot.
+
+    The golden scenario has exactly this -- a transfer with a trade's key (spec 019) -- and a
+    map keyed by `EventKey` alone would have stored the lot with kind `transfer`, which the
+    `CHECK` refuses, failing every recompute after #18 loads transfers.
+    """
+    key = EventKey(at(0), "bitget", "1001")
+    manual = EventKey(at(1), "manual", "adj-1")
+    trade = Trade(
+        key=key,
+        base_asset="BTC",
+        quote_asset="USDT",
+        side=FillSide.BUY,
+        quantity=Decimal(1),
+        quote_quantity=Decimal(100),
+        fee_amount=Decimal(0),
+        fee_asset=None,
+    )
+    transfer = Transfer(
+        key=key,
+        asset="BTC",
+        quantity=Decimal(1),
+        from_location="bitget",
+        to_location="cold-storage",
+    )
+    adjustment = Adjustment(key=manual, asset="KAS", quantity=Decimal(5), unit_cost=None)
+
+    assert lot_kinds_of([trade, transfer, adjustment]) == {key: "trade", manual: "adjustment"}
+    assert lot_kinds_of([transfer, trade]) == {key: "trade"}, "whichever comes first"
+    assert lot_kinds_of([transfer]) == {}
+    assert lot_kinds_of([trade, trade]) == {key: "trade"}, "the same event read twice"
+
+
+def test_two_kinds_under_one_key_are_refused_rather_than_overwritten() -> None:
+    """Spec 021, R8: the key cannot tell a trade's lot from an adjustment's, so it is refused."""
+    shared = EventKey(at(0), "manual", "7")
+    trade = Trade(
+        key=shared,
+        base_asset="BTC",
+        quote_asset="USDT",
+        side=FillSide.BUY,
+        quantity=Decimal(1),
+        quote_quantity=Decimal(100),
+        fee_amount=Decimal(0),
+        fee_asset=None,
+    )
+    adjustment = Adjustment(key=shared, asset="BTC", quantity=Decimal(1), unit_cost=None)
+
+    with pytest.raises(ValueError, match="share one event key") as raised:
+        lot_kinds_of([trade, adjustment])
+
+    assert "manual" not in str(raised.value)
+    assert "7" not in str(raised.value)
 
 
 async def test_positions_without_a_snapshot_are_empty_zeros(

@@ -577,6 +577,51 @@ async def test_a_stale_price_is_used_as_it_is_and_flagged(
     assert body["totals"]["excluded"] == []
 
 
+async def test_a_value_past_the_range_is_a_null_with_its_reason_never_a_500(
+    api_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 021, R6: 1E19 BTC bought for 1 USDT, priced at 100, is worth 1E21.
+
+    Every input is legal -- a 20-digit quantity is what `NormalizedFill` accepts, and 100 is
+    a price -- but the product has 22 digits before the point. The endpoint answers 200, with
+    the value and the P&L null and the reason named, and leaves BTC out of the totals.
+    """
+    del api_environment
+    absurd_quantity = "10000000000000000000"
+    async with application(monkeypatch) as (app, client):
+        await plant(
+            app,
+            {
+                ExchangeKey.BITGET: [
+                    make_fill(
+                        6001,
+                        at(0),
+                        quantity=absurd_quantity,
+                        price="1",
+                        quote_quantity="1",
+                        fee_amount="0",
+                        fee_asset=None,
+                    )
+                ]
+            },
+        )
+        await price(app, "BTC", "100", age=timedelta(minutes=5))
+        await recompute(app)
+        response = await client.get(POSITIONS)
+
+    assert response.status_code == 200, response.text
+    btc = by_asset(response.json())["BTC"]
+    assert dec(btc["quantity"]) == Decimal(absurd_quantity)
+    assert (btc["market_value"], btc["unrealized_pnl"], btc["unrealized_return_pct"]) == (
+        None,
+        None,
+        None,
+    )
+    assert btc["market_value_unavailable_reason"] == "value_out_of_range"
+    assert dec(btc["price"]["amount"]) == Decimal(100), "the price itself is still served"
+    assert response.json()["totals"]["excluded"] == [{"asset": "BTC", "reason": "unpriced"}]
+
+
 # --------------------------------------------------------------------------------------
 # Warnings, and what never crosses the wire
 # --------------------------------------------------------------------------------------

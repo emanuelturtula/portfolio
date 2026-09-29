@@ -506,6 +506,60 @@ def test_the_largest_percentage_that_fits_is_still_reported() -> None:
     assert_exact(value.unrealized_return_pct, "999999999999999999900")
 
 
+VALUE_OUT_OF_RANGE: Final = "value_out_of_range"
+
+
+def test_a_value_past_the_range_is_none_with_its_reason_rather_than_an_error() -> None:
+    """Spec 021, R6: 1E19 units at 10 is 1E20, which needs 21 digits before the point.
+
+    No `NumericText(18)` column and no 18-place wire amount holds it, so the value and the
+    P&L are absent, the reason says why, and the totals leave the position out as `unpriced`
+    -- where an unguarded `quantize` would raise, and the endpoint answer 500.
+    """
+    huge = held(quantity="10000000000000000000", cost_basis="1", average_cost="0", realized="3")
+
+    value = priced(huge, "10")
+    totals = value_portfolio([value])
+
+    assert value.market_value is None
+    assert value.unrealized_pnl is None
+    assert value.unrealized_return_pct is None
+    assert str(value.market_value_unavailable_reason) == VALUE_OUT_OF_RANGE
+    assert excluded_of(totals) == [("BTC", "unpriced")]
+    assert_exact(totals.market_value, "0")
+    assert_exact(totals.realized_pnl, "3"), "realized is still summed"
+
+
+def test_the_largest_value_that_fits_is_still_reported() -> None:
+    """The control: 99999999999999999999.999999999999999999 x 1 has 20 integer digits."""
+    at_the_edge = held(
+        quantity="99999999999999999999.999999999999999999", cost_basis="1", average_cost="0"
+    )
+
+    value = priced(at_the_edge, "1")
+
+    assert_exact(value.market_value, "99999999999999999999.999999999999999999")
+    assert value.market_value_unavailable_reason is None
+    assert_exact(value.unrealized_pnl, "99999999999999999998.999999999999999999")
+
+
+def test_a_value_that_only_rounding_takes_past_the_range_is_out_of_range() -> None:
+    """Below 1E20 before rounding, 1E20 after it: the rounded value is what must fit.
+
+    99999999999900000000.0000999999999999 x 1.000000000001 = 1E20 - 1E-28 exactly (checked
+    with `fractions.Fraction`), which rounds at 18 places to 1E20 -- 21 integer digits. A
+    guard that compared the unrounded product with 1E20 would let it through to `quantize`.
+    """
+    rounds_up = held(
+        quantity="99999999999900000000.000099999999999900", cost_basis="1", average_cost="0"
+    )
+
+    value = priced(rounds_up, "1.000000000001")
+
+    assert value.market_value is None
+    assert str(value.market_value_unavailable_reason) == VALUE_OUT_OF_RANGE
+
+
 # --------------------------------------------------------------------------------------
 # Exactness: the ambient decimal context plays no part
 # --------------------------------------------------------------------------------------
