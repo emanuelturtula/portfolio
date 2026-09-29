@@ -154,6 +154,18 @@ _EXCHANGE_SYNC_RUN_ACCOUNT_ERROR_KIND_CHECK: Final = (
     "'rate_limited', 'retention_window', 'schema', 'unavailable')"
 )
 
+# The two warnings `replay` returns (#19): `NegativeInventory` and `UnattributedFee`, as the
+# `repositories.accounting.AccountingWarningKind` members, alphabetical. The same duplication
+# hazard as every constant above -- repeated verbatim in `0008_accounting` -- and the same
+# reflection test.
+_ACCOUNTING_WARNING_KIND_CHECK: Final = "kind IN ('negative_inventory', 'unattributed_fee')"
+
+# The kind of event a lot was acquired by: a fill's received leg or third-asset rebate is a
+# `trade`, and an opening balance the owner records (#18) is an `adjustment`. A transfer never
+# acquires anything, so it is not a value here (spec 021, R2). The same hazard and the same
+# test as the constant above.
+_ACCOUNTING_LOT_KIND_CHECK: Final = "kind IN ('adjustment', 'trade')"
+
 PRICE_SCALE: Final = 12
 """Decimal places `prices.amount` rounds to and stores. Public, because a test pins it.
 
@@ -824,6 +836,185 @@ class ExchangeSyncRunAccount(Base):
     fills_inserted: Mapped[int] = mapped_column(Integer, nullable=False)
     error_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+ACCOUNTING_SCALE: Final = 18
+"""Decimal places every amount of the four `accounting_*` tables rounds to and stores.
+
+**It rounds nothing.** Every amount `replay` returns is carried at exactly eighteen places
+(`domain.accounting.constants`, whose scales are this number spelled again because `domain`
+imports nothing), so a snapshot stores the engine's figures as they are. What the column does
+enforce is the engine's range: a figure of 10**20 or more has no room in front of the point,
+and binding it raises -- which rolls the recompute's transaction back and leaves the previous
+snapshot in place (spec 021, *Recompute*).
+"""
+
+
+class AccountingSnapshot(Base):
+    """The header of one owner's current cost-basis snapshot under one method (#19).
+
+    **Derived data, recomputable from `exchange_fills` at any time**, which is what makes two
+    otherwise surprising choices right:
+
+    * **`ON DELETE CASCADE` from `users`.** A snapshot is not history; deleting the owner
+      deletes what was computed about them, and nothing is lost that a recompute cannot
+      rebuild. The fills are the history, and they `RESTRICT`.
+    * **One row per `(user_id, method)`, replaced whole.** A recompute that writes deletes the
+      old header -- the cascade takes its positions, lots and warnings -- and inserts the new
+      one, in one transaction. There is no snapshot history (spec 021, *Non-goals*).
+
+    `input_fingerprint` is `AccountingResult.input_fingerprint`: equal means the stored
+    snapshot is already the answer, and the recompute writes nothing. `ENGINE_VERSION` is part
+    of it, so an engine upgrade always writes. `engine_version` and `method` are stored beside
+    it for a reader, not for the comparison.
+
+    `computed_at` is our clock at the write. It does not move when a recompute finds the
+    fingerprint unchanged, so it says how old the figures are, not when anyone last looked.
+    """
+
+    __tablename__ = "accounting_snapshots"
+    __table_args__ = (
+        UniqueConstraint("user_id", "method", name="uq_accounting_snapshots_user_method"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No index of its own: `uq_accounting_snapshots_user_method` leads with it, which serves
+    # both the only lookup there is and the cascade.
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    method: Mapped[str] = mapped_column(Text, nullable=False)
+    engine_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    unallocated_costs: Mapped[Decimal] = mapped_column(
+        NumericText(ACCOUNTING_SCALE), nullable=False
+    )
+    computed_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
+class AccountingPosition(Base):
+    """One non-cash asset's position in a snapshot: `domain.accounting.Position`, stored.
+
+    Every amount is `NumericText(ACCOUNTING_SCALE)` and none carries a `CHECK`, for the reason
+    `ExchangeFill` gives: `quantity >= 0` on a `TEXT` column is a comparison SQLite makes by
+    numeric affinity, the float coercion rule 2 forbids. The engine's invariants are what hold
+    the signs, and its property tests are what hold the engine.
+
+    `average_cost` is nullable: `None` when no known-cost quantity is held, or when the
+    quotient is out of range (spec 019, R1). `flags` is the sorted, comma-joined
+    `PositionFlag` values, and the empty string for none -- a set of three known words, which
+    a child table would store at a cost and query never.
+    """
+
+    __tablename__ = "accounting_positions"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "asset", name="uq_accounting_positions_snapshot_asset"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No index of its own: the unique constraint leads with it.
+    snapshot_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("accounting_snapshots.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    asset: Mapped[str] = mapped_column(Text, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(NumericText(ACCOUNTING_SCALE), nullable=False)
+    unknown_basis_quantity: Mapped[Decimal] = mapped_column(
+        NumericText(ACCOUNTING_SCALE), nullable=False
+    )
+    cost_basis: Mapped[Decimal] = mapped_column(NumericText(ACCOUNTING_SCALE), nullable=False)
+    average_cost: Mapped[Decimal | None] = mapped_column(
+        NumericText(ACCOUNTING_SCALE), nullable=True
+    )
+    realized_pnl: Mapped[Decimal] = mapped_column(NumericText(ACCOUNTING_SCALE), nullable=False)
+    unmatched_proceeds: Mapped[Decimal] = mapped_column(
+        NumericText(ACCOUNTING_SCALE), nullable=False
+    )
+    flags: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class AccountingLot(Base):
+    """One acquisition into a non-cash asset, with the cost the snapshot's method gave it.
+
+    **Written and never read**, until a FIFO pass exists (spec 019, *Lots*): the issue asks
+    for the table to be populated from the first snapshot, so that a later method writes its
+    own lots under its own header without a migration. The method is on the header.
+
+    `seq` is the lot's place in the result, in event order, from 0; `UNIQUE (snapshot_id, seq)`
+    is the natural key and the index the cascade and the ordered read use (spec 021, R3).
+    `kind`, `source` and `external_id` are the identity of the event that acquired it -- the
+    kind completes it, because a venue's trade ids and another kind's ids are separate number
+    spaces -- and `occurred_at` its place in time.
+
+    **`external_id` is a trade id, and this table is the one place a snapshot keeps it.** No
+    endpoint reads it and no log line carries it.
+    """
+
+    __tablename__ = "accounting_lots"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "seq", name="uq_accounting_lots_snapshot_seq"),
+        # Named, because a batch rebuild cannot re-create an anonymous CHECK.
+        CheckConstraint(_ACCOUNTING_LOT_KIND_CHECK, name="kind"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No index of its own: the unique constraint leads with it.
+    snapshot_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("accounting_snapshots.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    asset: Mapped[str] = mapped_column(Text, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    external_id: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(NumericText(ACCOUNTING_SCALE), nullable=False)
+    cost_basis: Mapped[Decimal] = mapped_column(NumericText(ACCOUNTING_SCALE), nullable=False)
+    unknown_basis_quantity: Mapped[Decimal] = mapped_column(
+        NumericText(ACCOUNTING_SCALE), nullable=False
+    )
+
+
+class AccountingWarning(Base):
+    """One warning `replay` returned: a disposal past the pool, or a fee nobody could value.
+
+    `NegativeInventory` and `UnattributedFee` flattened into one shape: `asset` is the asset
+    that fell short or the fee's asset, `quantity` the shortfall or the unvalued part of the
+    fee, and `charged_to` the position that leaves the fee out -- `NULL` for a shortfall, and
+    for a fee on a conversion between two cash assets (spec 019, R3).
+
+    **No `external_id`, deliberately.** The venue and the moment identify the fill for the
+    owner, and a warning is exactly the kind of row that ends up quoted in a log or a support
+    message. `seq` orders them, from 0, under `UNIQUE (snapshot_id, seq)` (spec 021, R3).
+    """
+
+    __tablename__ = "accounting_warnings"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "seq", name="uq_accounting_warnings_snapshot_seq"),
+        # Named, because a batch rebuild cannot re-create an anonymous CHECK.
+        CheckConstraint(_ACCOUNTING_WARNING_KIND_CHECK, name="kind"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No index of its own: the unique constraint leads with it.
+    snapshot_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("accounting_snapshots.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    asset: Mapped[str] = mapped_column(Text, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(NumericText(ACCOUNTING_SCALE), nullable=False)
+    charged_to: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 # Re-exported so that anything needing the schema -- Alembic's `env.py`, the drift check --
