@@ -966,8 +966,21 @@ more than `FILL_SCALE` (18) fractional digits.** `NumericText` would round that 
 which is right for a price and wrong for a quote quantity stored "as reported". The test is
 `quantize(value, FILL_SCALE) != value`, so trailing zeros are not a false refusal. It also
 refuses a blank trade id, symbol or asset, a `side` that is not a `FillSide`, a naive
-`executed_at`, and a `fee_asset` of `None` beside a non-zero fee. `fee_amount` is signed:
-positive is paid, negative a rebate.
+`executed_at` or one with no UTC spelling (`datetime.min` at a positive offset, which neither
+the `UtcDateTime` column nor an accounting `EventKey` can hold), and a `fee_asset` of `None`
+beside a non-zero fee. `fee_amount` is signed: positive is paid, negative a rebate.
+
+**It refuses a fill the accounting engine cannot replay**, whatever its fields (spec 020): a
+`base_asset` equal to the `quote_asset`; a fee paid in the asset received that consumes
+everything received; and a rebate in the asset given that is at least everything given. Each
+leaves the trade with nothing received to carry a cost or nothing given to take it from. The
+fill log is append-only, so it must only ever hold rows the engine can replay: a stored row
+that cannot become a `Trade` would stop every position being computed, on every recompute
+after it. `trade_shape_problem` in `portfolio.domain.accounting` decides all three, and it is
+the same function `Trade` refuses them with, so the two cannot drift apart. A zero fee is no
+fee leg, so a zero fee naming the received asset is accepted. No venue is known to send any of
+these shapes; one that did would stop its account's sync with a schema error, which is the
+contract for any fill the application cannot account for.
 
 **Every text field must encode as UTF-8.** `"\ud800"` is valid JSON -- an escape for a lone
 surrogate -- and `json.loads` returns it as a `str` that passes every string check until
