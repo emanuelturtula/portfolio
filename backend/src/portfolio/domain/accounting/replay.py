@@ -148,8 +148,8 @@ def replay(
             or `config` is not an `AccountingConfig`.
         ConflictingEventError: two events share an identity and differ in content.
         decimal.InvalidOperation: a split -- a disposal's known part or basis, a sale's
-            matched proceeds, a swap's known quantity -- whose rounded quotient would be
-            10**20 or more (spec 019, *Risks*).
+            matched proceeds, a swap's known quantity or known share of its fee -- whose
+            rounded quotient would be 10**20 or more (spec 019, *Risks*).
     """
     _require_config(config)
     ordered = _deduplicated_in_order(events)
@@ -313,9 +313,7 @@ class _Ledger:
         elif received_is_cash:
             self._book_sale(given_asset, given, subtract(received, fee_value), disposal)
         else:
-            self._book_swap(
-                received_asset, received, given, add(disposal.basis, fee_value), disposal, key
-            )
+            self._book_swap(received_asset, received, given, fee_value, disposal, key)
 
     def _book_sale(
         self, asset: str, given: Decimal, proceeds: Decimal, disposal: _Disposal
@@ -341,28 +339,44 @@ class _Ledger:
         asset: str,
         received: Decimal,
         given: Decimal,
-        value: Decimal,
+        fee_value: Decimal,
         disposal: _Disposal,
         key: EventKey,
     ) -> None:
-        """Carry `value` -- the given leg's basis and the fee's -- over to `received` units.
+        """Carry the given leg's basis, and the known share of the fee, over to `received` units.
 
         Nothing is realized: no price exists in this system to realize it at, and carried
         cost is weighted average's own valuation of what was given. The received units take
-        the known/unknown proportion of the units given for them. When none of them have a
-        known cost, the value has no known quantity to attach to, and it goes to
-        `unallocated_costs` rather than into a basis over zero units.
+        the known/unknown proportion of the units given for them.
+
+        **The fee splits in that proportion too** (spec 019, R11), as a sale's proceeds do.
+        The share that belongs to the known-cost units received -- `fee_value` times the
+        known part given, over everything given, rounded once -- joins their basis. The
+        complement, by subtraction, is known value that belongs to units of unknown cost,
+        and goes to `unallocated_costs`. Attaching the whole fee to the known units instead
+        would load a sliver of known quantity with all of it, inflating its average, and the
+        average would then jump when that sliver reached zero. With the split, the path
+        below where no received unit has a known cost -- the whole value to
+        `unallocated_costs`, rather than into a basis over zero units -- is the limit of the
+        general rule rather than a discontinuity.
         """
-        known_in = (
-            received
-            if disposal.uncovered.is_zero()
-            else divide(multiply(received, disposal.known), given, QUANTITY_SCALE)
-        )
+        if disposal.uncovered.is_zero():
+            known_in, fee_known = received, fee_value
+        else:
+            known_in = divide(multiply(received, disposal.known), given, QUANTITY_SCALE)
+            fee_known = divide(multiply(fee_value, disposal.known), given, BASIS_SCALE)
         if known_in > 0:
-            self.acquire(asset, known_in, value, subtract(received, known_in), key)
+            self.acquire(
+                asset,
+                known_in,
+                add(disposal.basis, fee_known),
+                subtract(received, known_in),
+                key,
+            )
+            self.unallocated_costs = add(self.unallocated_costs, subtract(fee_value, fee_known))
         else:
             self.acquire(asset, _ZERO, _ZERO, received, key)
-            self.unallocated_costs = add(self.unallocated_costs, value)
+            self.unallocated_costs = add(self.unallocated_costs, add(disposal.basis, fee_value))
 
     def apply_adjustment(self, adjustment: Adjustment) -> None:
         """Acquire an adjustment's units, at its cost or at unknown cost. Cash changes nothing.

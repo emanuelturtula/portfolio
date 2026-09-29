@@ -159,8 +159,10 @@ class AccountingResult:
     * `warnings` -- in event order, and within one trade in the order its legs were worked
       (spec 019, R4).
     * `lots` -- one per acquisition into a non-cash asset, in the same order.
-    * `unallocated_costs` -- known value that belongs to no position: a conversion's fee,
-      and the value given in a swap whose received side has no known-cost part.
+    * `unallocated_costs` -- known value that belongs to no position: a conversion's fee;
+      the value given in a swap whose received side has no known-cost part; and, in a swap
+      from units partly of unknown cost, the share of the fee that belongs to the received
+      units of unknown cost (spec 019, R11).
     * `event_count` -- after deduplication, so a log read twice counts once.
     """
 
