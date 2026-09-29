@@ -294,7 +294,7 @@ class ExchangeSyncRunRepository:
             .where(ExchangeSyncRunAccount.exchange_sync_run_id.in_(outcomes))
             .order_by(ExchangeSyncRunAccount.exchange_sync_run_id, ExchangeAccount.exchange_key)
         )
-        for row, exchange_key in rows.tuples():
+        for row, exchange_key in rows:
             outcomes[row.exchange_sync_run_id].append(_outcome_of(row, exchange_key))
         return [
             ExchangeSyncRunSummary(
@@ -334,7 +334,7 @@ class ExchangeSyncRunRepository:
             .order_by(ExchangeSyncRunAccount.id.desc())
             .limit(1)
         )
-        row = found.tuples().first()
+        row = found.first()
         if row is None:
             return None
         outcome, exchange_key = row

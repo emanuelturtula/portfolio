@@ -941,7 +941,7 @@ async def test_another_users_wallet_is_a_404(
             ),
             {"created_at": sqlite_timestamp(THIRD_SEEN)},
         )
-        other_user = result.scalar_one()
+        other_user: int = result.scalar_one()
         result = await session.execute(
             text(
                 "INSERT INTO wallets (user_id, chain_key, address_canonical, address_display, "
@@ -955,7 +955,7 @@ async def test_another_users_wallet_is_a_404(
                 "now": sqlite_timestamp(THIRD_SEEN),
             },
         )
-        their_wallet = result.scalar_one()
+        their_wallet: int = result.scalar_one()
         await session.commit()
 
     response = await signed_in_api_client.get(f"{WALLETS}/{their_wallet}/balances")

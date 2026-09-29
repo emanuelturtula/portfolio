@@ -245,7 +245,7 @@ async def arrange_accounts(factory: async_sessionmaker[AsyncSession], accounts: 
             username=SECOND_USERNAME,
         )
     async with factory() as session:
-        found = (await session.execute(text("SELECT COUNT(*) FROM users"))).scalar_one()
+        found: int = (await session.execute(text("SELECT COUNT(*) FROM users"))).scalar_one()
     assert found == accounts
 
 
@@ -303,7 +303,7 @@ async def test_a_successful_create_user_hashes_exactly_once(
 
     assert hasher.hashes == 1
     async with sessionmaker() as session:
-        stored = (await session.execute(text("SELECT password_hash FROM users"))).scalar_one()
+        stored: str = (await session.execute(text("SELECT password_hash FROM users"))).scalar_one()
     assert FAST_HASHER.verify(stored, REPLACEMENT_PHRASE)
 
 
@@ -342,7 +342,9 @@ async def test_replace_renames_only_when_asked(
 
     assert resulting == expected
     async with sessionmaker() as session:
-        stored = list((await session.execute(text("SELECT username FROM users"))).scalars())
+        stored: list[str] = list(
+            (await session.execute(text("SELECT username FROM users"))).scalars()
+        )
     assert stored == [expected]
     # The password changed either way, under whichever name the account now has.
     await in_new_session(
@@ -364,5 +366,7 @@ async def test_replace_on_an_empty_database_creates_the_account_under_the_given_
 
     assert resulting == OPERATORS_OWN_NAME
     async with sessionmaker() as session:
-        stored = list((await session.execute(text("SELECT username FROM users"))).scalars())
+        stored: list[str] = list(
+            (await session.execute(text("SELECT username FROM users"))).scalars()
+        )
     assert stored == [OPERATORS_OWN_NAME]

@@ -20,7 +20,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from sqlalchemy import Column, Integer, MetaData, Table, Text, select, text
+from sqlalchemy import Column, Integer, MetaData, ScalarResult, Table, Text, select, text
 from sqlalchemy.dialects.sqlite import dialect as sqlite_dialect
 from sqlalchemy.exc import StatementError
 from sqlalchemy.types import TypeDecorator
@@ -277,7 +277,9 @@ async def test_the_column_rounds_on_the_way_in(money_engine: AsyncEngine) -> Non
         await connection.execute(amounts.insert().values(id=2, fiat=Decimal("1.015")))
 
     async with money_engine.connect() as connection:
-        stored = (await connection.execute(select(amounts.c.fiat).order_by(amounts.c.id))).scalars()
+        stored: ScalarResult[Decimal] = (
+            await connection.execute(select(amounts.c.fiat).order_by(amounts.c.id))
+        ).scalars()
         values = list(stored)
 
     assert values == [Decimal("1.00"), Decimal("1.02")]
@@ -304,7 +306,9 @@ async def test_negative_zero_is_stored_as_one_spelling(money_engine: AsyncEngine
         await connection.execute(amounts.insert().values(id=2, fiat=Decimal("0.00")))
 
     async with money_engine.connect() as connection:
-        raw = (await connection.execute(text("SELECT fiat FROM amounts ORDER BY id"))).scalars()
+        raw: ScalarResult[str] = (
+            await connection.execute(text("SELECT fiat FROM amounts ORDER BY id"))
+        ).scalars()
         values = list(raw)
 
     assert values == ["0.00", "0.00"]
