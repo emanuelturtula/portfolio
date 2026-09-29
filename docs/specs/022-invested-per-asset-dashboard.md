@@ -382,7 +382,7 @@ None.
     `unattributed_fee` with `charged_to` implies that flag on `charged_to`. The fixture guard
     checks all three.
   - **S5. `unmatched_proceeds` is shown nowhere.** A portfolio figure needs a backend total,
-    because the page sums nothing, so it is filed as a follow-up issue rather than done here.
+    because the page sums nothing, so it is filed as #108 rather than done here.
   - **N1.** A held position with no known-cost units (`quantity` equal to
     `unknown_basis_quantity`) shows "—" for Invested and Unrealized P&L, not a `0.00` that
     reads as break-even.
