@@ -125,3 +125,14 @@ None. No migration.
   position, rebates, zero fees naming an asset, 18-place and 20-integer-digit amounts,
   timestamps across the whole range `executed_at` accepts, and text at the edges of the UTF-8
   rule.
+
+## Rulings during implementation
+
+- **R1. A fourth shape: an `executed_at` that cannot be expressed in UTC.** Examples are
+  `datetime.min` at +05:00 and `datetime.max` at −05:00. Such a value is timezone-aware, so
+  `NormalizedFill` accepted it. `EventKey` refuses it, and the `UtcDateTime` column's bind
+  would raise a bare `OverflowError`, outside the error taxonomy. No venue sends one, because
+  `datetime_from_epoch_ms` always returns UTC. Under criterion 2's decision rule,
+  `NormalizedFill` now refuses it with `ExchangeSchemaError`
+  ("executed_at is outside the range a UTC datetime can represent"). The stored value stays
+  as given. The backend developer found it by reading, before the property test ran.
