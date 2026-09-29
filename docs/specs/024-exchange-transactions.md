@@ -1,7 +1,7 @@
 # 024 — Exchange transactions with filters and totals
 
 Issue: #93
-Status: in progress
+Status: done
 
 ## Problem
 
@@ -400,3 +400,10 @@ These are the issue's criteria, all of them, backend and frontend, plus:
     range.
   - **N5.** The Sync history toggle follows the element's real `open` state, so a disclosure
     the browser opened itself (find in page) closes on the next click.
+  - *As built:* the N5 toggle keeps `preventDefault` on the summary click and sets the element
+    from its real `open` state. React commits the new `open` before the native activation
+    runs, so without it a real browser toggles twice. This was checked with real clicks,
+    including after a script opened the disclosure. The fills are read twice after a manual
+    sync that stored fills: once when the mutation settles, and once for the changed
+    signature. A test pins it.
+  - Gate 2 passed at `6c77cba`, after these changes.
