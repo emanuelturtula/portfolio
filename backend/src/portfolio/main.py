@@ -17,7 +17,15 @@ from portfolio import __version__
 from portfolio.api.dependencies import auth_service_for, install_auth_runtime
 from portfolio.api.errors import register_exception_handlers
 from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware
-from portfolio.api.routers import accounting, auth, balances, exchanges, health, wallets
+from portfolio.api.routers import (
+    accounting,
+    adjustments,
+    auth,
+    balances,
+    exchanges,
+    health,
+    wallets,
+)
 from portfolio.config import get_settings
 from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import (
@@ -135,7 +143,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     the deploy's health check -- does not wait on a replay of the owner's whole history. It is
     cancelled first thing on shutdown, before anything it could still be using is taken away.
     The startup run is what covers the first deploy over fills already stored, and an engine
-    upgrade, whose new `ENGINE_VERSION` changes every fingerprint.
+    upgrade, whose new `ENGINE_VERSION` changes every fingerprint. The other two triggers are a
+    sync that stored a fill, and a change to a manual adjustment (#18), which reaches the
+    trigger through `app.state.accounting_recompute`.
     """
     settings = get_settings()
     ensure_database_directory(settings.database_url)
@@ -395,23 +405,36 @@ def exchange_scheduler_for(
 
 
 def install_accounting_runtime(app: FastAPI) -> None:
-    """Publish the recompute lock, and "no attempt yet", on the application state.
+    """Publish the recompute lock, "no attempt yet", and the trigger, on the application state.
 
     From the application factory rather than the lifespan, for the reason
     `install_auth_runtime` gives: the objects exist for a test that never starts the lifespan,
     and two applications in one process never share a lock. `asyncio.Lock` binds to an event
     loop only on its first contended acquire, so building it here, outside any loop, is safe.
+
+    **`accounting_recompute` is `run_accounting_recompute` bound to this application** (#18), a
+    `(RecomputeReason) -> Awaitable[AccountingStatus]`. A change to a manual adjustment has to
+    recompute before its response, and the request path cannot import this module -- it imports
+    every router -- so the trigger is published here and `api.dependencies` reads it back. It is
+    the same function the startup run and the exchange sync call, so it takes the same lock and
+    records to the same `accounting_status`, and it never raises.
     """
     app.state.accounting_lock = asyncio.Lock()
     app.state.accounting_status = None
+
+    async def accounting_recompute(reason: RecomputeReason) -> AccountingStatus:
+        return await run_accounting_recompute(app, reason)
+
+    app.state.accounting_recompute = accounting_recompute
 
 
 async def run_accounting_recompute(app: FastAPI, reason: RecomputeReason) -> AccountingStatus:
     """Recompute every owner's snapshot, log what happened, and record it. **Never raises.**
 
-    * **Serialised** by `app.state.accounting_lock`: the startup run and a sync's run can
-      overlap in time, and two replacements of one snapshot interleaving their writes would be
-      a snapshot neither computed.
+    * **Serialised** by `app.state.accounting_lock`: the startup run, a sync's run and a
+      request's run after an adjustment changed (#18) can overlap in time, and two
+      replacements of one snapshot interleaving their writes would be a snapshot neither
+      computed.
     * **Its own session**, never a request's or a sync's, for the reason `balance_sync_runner`
       gives. Every owner is recomputed in turn -- there is one today, and the loop is the
       honest shape for "every owner" -- each in its own transaction, so one owner's failure
@@ -744,6 +767,9 @@ def create_app() -> FastAPI:
     app.include_router(balances.router, prefix=API_PREFIX)
     app.include_router(exchanges.router, prefix=API_PREFIX)
     app.include_router(accounting.router, prefix=API_PREFIX)
+    # `/accounting/adjustments` beside `/accounting/positions`: two routers under one prefix,
+    # and no path of one is a path of the other.
+    app.include_router(adjustments.router, prefix=API_PREFIX)
 
     # Mounted last and at the root: it matches every path, so any route registered
     # after it would be unreachable.
