@@ -279,3 +279,28 @@ These are the issue's criteria, all of them, backend and frontend, plus:
   covers a DST boundary in a fixed timezone (the test setup pins one).
 - **Owner data.** The owner's real fill count is not written anywhere in the repository. The
   budget is stated against synthetic rows.
+
+## Rulings during implementation
+
+- **R1. `money.add` and `subtract` become 27× faster, to meet the budget (backend developer).**
+  As first built, 20,000 fills took 0.446 s on the development machine, about 1.8 s on the
+  Pi against a 1 s budget.
+  - **Profile.** About 69,000 `money.add` calls at about 2.6 µs each. The rest was SQLAlchemy
+    row access and enum construction in the load.
+  - **Filtering in SQL would not help.** The worst case is no filter, which totals every
+    fill anyway.
+  - **Two fixes, both taken:**
+    - **The load** unpacks row tuples and looks the enums up in dicts, inside the repository.
+    - **`_exact_sum` becomes one call** on an explicit module-level `decimal.Context` with
+      maximum precision and exponent range. It traps `Inexact`, `Rounded`, `Overflow` and
+      `InvalidOperation`, so a rounding raises and never passes silently.
+  - **Same results.** The public API and every result are unchanged. The developer checked
+    them bit-identical on `as_tuple()` over 300,000 random pairs, with signed zeros,
+    exponents from −60 to 60, and 5,001-digit coefficients, plus the 1E+100000 + 1E−100000
+    gap.
+  - **A standing guarantee.** A permanent Hypothesis property now holds the new functions
+    equal to the old integer algorithm, kept in the test module as an oracle. A lab mutant
+    lowering the precision to 28 must fail it.
+  - **Why in this issue.** The primitive belongs to the accounting engine (#17), and changing
+    it here is deliberate. It is the only change that meets the budget without a written
+    exception, and the engine gets faster too. It lands as its own commit.
