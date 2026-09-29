@@ -4,6 +4,7 @@ import { http, HttpResponse } from 'msw';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { exchange } from '@/test/exchangeFixtures';
+import { fakeAccounting } from '@/test/fakeAccounting';
 import { fakeExchanges } from '@/test/fakeExchanges';
 import { fakePortfolio, recordRequestUrls } from '@/test/fakePortfolio';
 import { currentPath, renderApp, settle, visitedPaths } from '@/test/render';
@@ -25,8 +26,13 @@ function loginFormIsShown(): boolean {
 beforeEach(() => {
   // The dashboard reads the portfolio as soon as a session exists. An empty
   // one is the first-time owner; tests that need data register their own.
-  // The exchanges page likewise, with no exchange configured.
-  server.use(...fakePortfolio().handlers, ...fakeExchanges().handlers);
+  // The exchanges page likewise, with no exchange configured, and the dashboard's invested
+  // section with a snapshot over no events.
+  server.use(
+    ...fakePortfolio().handlers,
+    ...fakeExchanges().handlers,
+    ...fakeAccounting().handlers,
+  );
 });
 
 describe('App', () => {
