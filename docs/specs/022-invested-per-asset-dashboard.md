@@ -327,3 +327,17 @@ None.
 - **R5. "Exchange status is unavailable" shows whenever the exchanges query is in error,** in
   the empty and the non-empty case. A list kept across a failed poll is treated as unknown, as
   `ValueSection` treats its runs.
+- **R6. The browser check (criterion 10) found the app header overflowing a phone.** It was
+  run against a local backend seeded with synthetic fills. At 375 px, `.app-header` (title,
+  nav, owner and "Sign out" in one flex row that did not wrap) made the document 513 px wide
+  on every page. It predates this issue. The criterion forbids horizontal page scroll, so the
+  header, the nav and the account controls now wrap.
+  - After the fix, the document is exactly the viewport's width at 320 and 375 px. At 1280 px
+    the header stays on one row.
+  - The same check changed three sentences, because a fee paid in an asset never held is a
+    disposal, not a sale:
+    - the closed line says "no longer held";
+    - the `negative_inventory` sentence says "A sale of, or a fee paid in, …";
+    - the `history_incomplete` explanation says the same.
+  - The figures shown were checked by hand against the seeded trades. Dark mode was checked
+    at 1280 px.
