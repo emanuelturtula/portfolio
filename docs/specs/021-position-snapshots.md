@@ -1,7 +1,7 @@
 # 021 — Position snapshots and the invested-per-asset endpoint
 
 Issue: #19
-Status: implementing
+Status: done
 
 ## Problem
 
