@@ -23,19 +23,21 @@ the same reason.
 is accepted with its twenty places (spec 019, R9). The amount rule is the same so that no
 stored amount is refused for its precision or its size.
 
-**A stored fill does not always convert, though.** `Trade` refuses three shapes that
-`NormalizedFill`, and so the `exchange_fills` table, accepts:
+**Three shapes are refused even when every field passes its own rule** -- `TradeShapeProblem`
+names them, and `trade_shape_problem` is their single definition:
 
 * a `base_asset` equal to the `quote_asset`;
 * a fee in the asset received that consumes everything received;
 * a rebate in the asset given that is at least as large as everything given.
 
 Each leaves the trade without a leg to account for -- nothing received to carry the cost,
-or nothing given to take it from -- so the refusals stay: a replay that guessed would be
-computing a position from something no venue meant. No venue is known to send any of the
-three. Refusing them where fills are ingested, so that every stored fill does convert, is a
-follow-up filed for #19 to rely on; until it lands, a stored fill of one of these shapes
-makes building its `Trade` raise `ValueError`, which is where #19 will see it.
+or nothing given to take it from -- and a replay that guessed would be computing a position
+from something no venue meant. **`NormalizedFill` refuses the same three** by calling the
+same function (spec 020), so a fill is refused where a venue's answer becomes a row, and the
+append-only fill log holds only rows a `Trade` can be built from. One definition is the
+point: two copies of these rules are how the claim that every stored fill converts went
+false the first time. A row stored before that check, of one of these shapes, still makes
+building its `Trade` raise `ValueError`; what the recompute does with it is #19's.
 """
 
 from __future__ import annotations
@@ -43,8 +45,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from enum import Enum
-from typing import Final
+from enum import Enum, StrEnum
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final
 
 from portfolio.domain.accounting.constants import (
     AMOUNT_SCALE,
@@ -54,6 +57,9 @@ from portfolio.domain.accounting.constants import (
 from portfolio.domain.exchanges import FillSide
 from portfolio.domain.money import add, multiply, quantize, subtract
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 __all__ = [
     "DEFAULT_CASH_ASSETS",
     "AccountingConfig",
@@ -61,7 +67,9 @@ __all__ = [
     "Adjustment",
     "EventKey",
     "Trade",
+    "TradeShapeProblem",
     "Transfer",
+    "trade_shape_problem",
 ]
 
 DEFAULT_CASH_ASSETS: Final[frozenset[str]] = frozenset({"USDC", "USDT"})
@@ -103,6 +111,83 @@ class EventKey:
         _require_text(self.external_id, field="EventKey.external_id")
 
 
+class TradeShapeProblem(StrEnum):
+    """Why a trade whose every field is well formed still has no leg to account for.
+
+    The three shapes `Trade` and `NormalizedFill` both refuse beyond their field rules, and
+    `trade_shape_problem` is the one place they are decided (spec 020). Each leaves nothing
+    received to carry the cost, or nothing given to take it from.
+    """
+
+    SAME_ASSET = "same_asset"
+    """`base_asset` equals `quote_asset`: an asset traded for itself moves no position."""
+    FEE_CONSUMES_RECEIVED = "fee_consumes_received"
+    """A fee in the asset received that is at least everything received: nothing came in."""
+    REBATE_EXCEEDS_GIVEN = "rebate_exceeds_given"
+    """A rebate in the asset given that is at least everything given: nothing went out."""
+
+
+def trade_shape_problem(
+    *,
+    base_asset: str,
+    quote_asset: str,
+    side: FillSide,
+    quantity: Decimal,
+    quote_quantity: Decimal,
+    fee_amount: Decimal,
+    fee_asset: str | None,
+) -> TradeShapeProblem | None:
+    """What leaves this trade without a leg to account for, or `None` when nothing does.
+
+    **It assumes the field rules already passed**, and checks none of them: amounts that are
+    finite `Decimal`s within the amount rule, `quantity` and `quote_quantity` above zero,
+    non-blank text, and a `FillSide`. `Trade` and `NormalizedFill` each refuse a bad field
+    first, with their own exception type; a second refusal here would give one condition
+    two. Outside that precondition the answer is not specified -- an amount past the rule
+    can raise `decimal.InvalidOperation`, or be judged at a rounded value.
+
+    The checks, in the enum's order, and the first that applies is the answer:
+
+    * `base_asset` equal to `quote_asset` is `SAME_ASSET`, compared exactly, as the text is
+      stored;
+    * **a zero fee is no leg** (spec 019, R8), so it is never a fee problem, whatever
+      `fee_asset` names; nor is a `fee_asset` of `None`, which beside a non-zero fee is a
+      field rule each caller has already refused;
+    * a fee in the asset received that leaves nothing received is `FEE_CONSUMES_RECEIVED`;
+    * a fee in the asset given that leaves nothing given is `REBATE_EXCEEDS_GIVEN`. A fee
+      paid there only adds to what is given, so only a rebate can do it;
+    * a fee in any third asset is a leg of its own and constrains neither.
+
+    "Received" and "given" are `FillSide`'s: the base asset is received on a `BUY` and given
+    on a `SELL`. **The comparison is at `AMOUNT_SCALE`, with `add` and `subtract`**, as
+    `replay` carries the amounts: exact, since each amount is within the rule, and the sum's
+    integers stay as small as the values rather than as wide as a caller's spelling -- `1`
+    followed by a point and ten thousand zeros is one.
+    """
+    if base_asset == quote_asset:
+        return TradeShapeProblem.SAME_ASSET
+    if fee_amount.is_zero() or fee_asset is None:
+        return None
+    received_asset, given_asset = _received_then_given(side, base_asset, quote_asset)
+    received_quantity, given_quantity = _received_then_given(side, quantity, quote_quantity)
+    fee = quantize(fee_amount, AMOUNT_SCALE)
+    if fee_asset == received_asset:
+        if subtract(quantize(received_quantity, AMOUNT_SCALE), fee) <= 0:
+            return TradeShapeProblem.FEE_CONSUMES_RECEIVED
+    elif fee_asset == given_asset and add(quantize(given_quantity, AMOUNT_SCALE), fee) <= 0:
+        return TradeShapeProblem.REBATE_EXCEEDS_GIVEN
+    return None
+
+
+def _received_then_given[T](side: FillSide, base: T, quote: T) -> tuple[T, T]:
+    """A base-then-quote pair reordered as received-then-given, for `side`.
+
+    A `BUY` receives the base and gives the quote; a `SELL` the reverse. The one place that
+    reading of `FillSide` is written down, for assets and quantities alike.
+    """
+    return (base, quote) if side is FillSide.BUY else (quote, base)
+
+
 @dataclass(frozen=True, slots=True)
 class Trade:
     """One fill: `quantity` of `base_asset` bought or sold for `quote_quantity` of `quote_asset`.
@@ -125,7 +210,9 @@ class Trade:
     * a fee in the **given** asset is added to what is given, which must stay above zero --
       a rebate of a whole fill's cost gave nothing.
 
-    A fee in any third asset is a leg of its own and constrains neither.
+    A fee in any third asset is a leg of its own and constrains neither. Those two refusals,
+    and a `base_asset` equal to the `quote_asset`, are decided by `trade_shape_problem`, the
+    one definition `NormalizedFill` applies too.
 
     Raises:
         TypeError: `key` is not an `EventKey`, `side` is not a `FillSide` (a plain `"buy"`
@@ -147,63 +234,71 @@ class Trade:
     """Required when `fee_amount` is not zero. Ignored when it is."""
 
     def __post_init__(self) -> None:
-        """Refuse a trade that is malformed, or whose fee leaves one of its legs empty."""
+        """Refuse a trade that is malformed, or whose shape leaves one of its legs empty.
+
+        Every field rule first, then `trade_shape_problem`, whose precondition they are.
+        """
         _require_key(self.key, kind="Trade")
         _require_text(self.base_asset, field="Trade.base_asset")
         _require_text(self.quote_asset, field="Trade.quote_asset")
-        if self.base_asset == self.quote_asset:
-            message = "Trade.base_asset and Trade.quote_asset must be different assets"
-            raise ValueError(message)
         _require_side(self.side)
         _require_amount(self.quantity, field="Trade.quantity", minimum=_Bound.POSITIVE)
         _require_amount(self.quote_quantity, field="Trade.quote_quantity", minimum=_Bound.POSITIVE)
         _require_amount(self.fee_amount, field="Trade.fee_amount", minimum=_Bound.ANY)
         if self.fee_asset is not None:
             _require_text(self.fee_asset, field="Trade.fee_asset")
-        if self.fee_amount.is_zero():
-            return
-        if self.fee_asset is None:
+        elif not self.fee_amount.is_zero():
             message = "Trade.fee_asset must name an asset when Trade.fee_amount is not zero"
             raise ValueError(message)
-        # At `AMOUNT_SCALE`, as replay carries them: exact, since each amount passed the rule
-        # above, and it keeps the sum's integers as small as the values rather than as wide
-        # as a caller's spelling -- `1` followed by a point and ten thousand zeros is one.
-        fee = quantize(self.fee_amount, AMOUNT_SCALE)
-        received = quantize(self.received_quantity, AMOUNT_SCALE)
-        given = quantize(self.given_quantity, AMOUNT_SCALE)
-        if self.fee_asset == self.received_asset:
-            if subtract(received, fee) <= 0:
-                message = (
-                    "Trade.fee_amount, paid in the asset received, must leave a quantity "
-                    "received greater than zero"
-                )
-                raise ValueError(message)
-        elif self.fee_asset == self.given_asset and add(given, fee) <= 0:
-            message = (
-                "Trade.fee_amount, rebated in the asset given, must leave a quantity given "
-                "greater than zero"
-            )
-            raise ValueError(message)
+        problem = trade_shape_problem(
+            base_asset=self.base_asset,
+            quote_asset=self.quote_asset,
+            side=self.side,
+            quantity=self.quantity,
+            quote_quantity=self.quote_quantity,
+            fee_amount=self.fee_amount,
+            fee_asset=self.fee_asset,
+        )
+        if problem is not None:
+            raise ValueError(_TRADE_SHAPE_MESSAGES[problem])
 
     @property
     def received_asset(self) -> str:
         """The base asset for a `BUY`, the quote asset for a `SELL`."""
-        return self.base_asset if self.side is FillSide.BUY else self.quote_asset
+        return _received_then_given(self.side, self.base_asset, self.quote_asset)[0]
 
     @property
     def received_quantity(self) -> Decimal:
         """What `received_asset` came in, before any fee folds into it."""
-        return self.quantity if self.side is FillSide.BUY else self.quote_quantity
+        return _received_then_given(self.side, self.quantity, self.quote_quantity)[0]
 
     @property
     def given_asset(self) -> str:
         """The quote asset for a `BUY`, the base asset for a `SELL`."""
-        return self.quote_asset if self.side is FillSide.BUY else self.base_asset
+        return _received_then_given(self.side, self.base_asset, self.quote_asset)[1]
 
     @property
     def given_quantity(self) -> Decimal:
         """What `given_asset` went out, before any fee folds into it."""
-        return self.quote_quantity if self.side is FillSide.BUY else self.quantity
+        return _received_then_given(self.side, self.quantity, self.quote_quantity)[1]
+
+
+_TRADE_SHAPE_MESSAGES: Final[Mapping[TradeShapeProblem, str]] = MappingProxyType(
+    {
+        TradeShapeProblem.SAME_ASSET: (
+            "Trade.base_asset and Trade.quote_asset must be different assets"
+        ),
+        TradeShapeProblem.FEE_CONSUMES_RECEIVED: (
+            "Trade.fee_amount, paid in the asset received, must leave a quantity received "
+            "greater than zero"
+        ),
+        TradeShapeProblem.REBATE_EXCEEDS_GIVEN: (
+            "Trade.fee_amount, rebated in the asset given, must leave a quantity given "
+            "greater than zero"
+        ),
+    }
+)
+"""`Trade`'s message for each shape: the text it raised before the rule was shared (#99)."""
 
 
 @dataclass(frozen=True, slots=True)

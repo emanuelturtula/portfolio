@@ -1078,9 +1078,13 @@ async def test_an_amount_finer_than_the_fill_scale_is_refused(field: str) -> Non
     """Nineteen places would be rounded by the column: refused. Eighteen: kept exactly."""
     sign = "-" if field == "feeDetail.totalFee" else ""
     key = field.replace(".", "__")
+    # One unit of BTC cannot pay the sample's BTC fee, and spec 020 refuses a fee that
+    # consumes everything received. The size case pays none, so what it tests is the
+    # spelling; `test_a_fee_that_consumes_the_size_bought_is_refused` is the fee.
+    free = {"feeDetail__totalFee": '"0"'} if field == "size" else {}
 
     error = await refused(one_fill_fake(**{key: f'"{sign}{NINETEEN_PLACES}"'}))
-    page = await fetch_page(one_fill_fake(**{key: f'"{sign}{EIGHTEEN_PLACES}"'}))
+    page = await fetch_page(one_fill_fake(**{key: f'"{sign}{EIGHTEEN_PLACES}"'}, **free))
 
     assert type(error) is ExchangeSchemaError
     (fill,) = page.fills
@@ -1091,6 +1095,39 @@ async def test_an_amount_finer_than_the_fill_scale_is_refused(field: str) -> Non
         "feeDetail.totalFee": fill.fee_amount,
     }[field]
     assert exact(read, EIGHTEEN_PLACES)
+
+
+@pytest.mark.parametrize(
+    "size",
+    [
+        pytest.param("0.0000007", id="the fee, exactly"),
+        pytest.param("0.000000000000000001", id="one unit"),
+    ],
+)
+async def test_a_fee_that_consumes_the_size_bought_is_refused(size: str) -> None:
+    """Spec 020: a buy whose BTC fee is all the BTC bought is refused at the parser.
+
+    The sample's fee, 0.0000007 BTC, is taken off a size of exactly that, or of one unit,
+    and leaves nothing received for the accounting engine to carry. The venue's answer never
+    becomes a row.
+    """
+    error = await refused(one_fill_fake(size=f'"{size}"'))
+
+    assert type(error) is ExchangeSchemaError
+    assert error.detail == (
+        "fee_amount, paid in the asset received, must leave a quantity received greater than zero"
+    )
+
+
+async def test_the_same_asset_on_both_sides_is_refused() -> None:
+    """Spec 020: a symbol whose base and quote the venue reports as one asset is refused."""
+    symbol = "A" * 40
+    fake = FakeBitget(spread_fills(1, symbols=(symbol,)), symbols={symbol: ("A" * 20, "A" * 20)})
+
+    error = await refused(fake)
+
+    assert type(error) is ExchangeSchemaError
+    assert error.detail == "base_asset and quote_asset must be different assets"
 
 
 async def test_a_seconds_timestamp_fails_the_page() -> None:
@@ -1531,9 +1568,12 @@ async def test_an_unsafe_symbol_is_refused_before_a_url_is_built(fragment: str) 
 
 
 async def test_a_forty_character_symbol_is_asked_about() -> None:
-    """The companion: forty characters is inside the pattern, so the venue is asked."""
+    """The companion: forty characters is inside the pattern, so the venue is asked.
+
+    Two different assets, because one asset on both sides is a fill spec 020 refuses.
+    """
     symbol = "A" * 40
-    fake = FakeBitget(spread_fills(1, symbols=(symbol,)), symbols={symbol: ("A" * 20, "A" * 20)})
+    fake = FakeBitget(spread_fills(1, symbols=(symbol,)), symbols={symbol: ("A" * 20, "B" * 20)})
 
     page = await fetch_page(fake)
 

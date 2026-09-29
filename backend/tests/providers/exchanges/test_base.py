@@ -1644,3 +1644,386 @@ def test_a_cursor_that_is_not_text_is_a_schema_error(
 
     assert type(caught.value) is ExchangeSchemaError
     assert reason in str(caught.value), str(caught.value)
+
+
+# --------------------------------------------------------------------------------------
+# Spec 020, criterion 1: a fill the accounting engine could not replay is refused
+# --------------------------------------------------------------------------------------
+#
+# Three shapes pass every field rule and still leave a `Trade` with no leg to account for:
+# the same asset on both sides, a fee in the asset received that consumes all of it, and a
+# rebate in the asset given that is at least all of it. The fill log is append-only, so each
+# is refused where a venue's answer becomes a row, with the detail naming the fields and the
+# rule. The amounts are written with the digits 1, 3, 7 and 9 only, so that any four-digit
+# window of one found in a message is a leak rather than a coincidence.
+
+SAME_ASSET_DETAIL: Final = "base_asset and quote_asset must be different assets"
+FEE_CONSUMES_RECEIVED_DETAIL: Final = (
+    "fee_amount, paid in the asset received, must leave a quantity received greater than zero"
+)
+REBATE_EXCEEDS_GIVEN_DETAIL: Final = (
+    "fee_amount, rebated in the asset given, must leave a quantity given greater than zero"
+)
+UTC_RANGE_DETAIL: Final = "executed_at is outside the range a UTC datetime can represent"
+
+#: What is bought or sold, and what it is sold or bought for.
+SHAPE_QUANTITY: Final = Decimal("7.31731731")
+SHAPE_QUOTE_QUANTITY: Final = Decimal("91739.173917")
+ONE_UNIT: Final = Decimal("0.000000000000000001")
+
+
+def shape_fill(side: FillSide, fee_amount: Decimal, fee_asset: str | None) -> NormalizedFill:
+    """A BTC/USDT fill of the two shape amounts, on `side`, with the fee given."""
+    return make_fill(
+        side=side,
+        quantity=SHAPE_QUANTITY,
+        quote_quantity=SHAPE_QUOTE_QUANTITY,
+        fee_amount=fee_amount,
+        fee_asset=fee_asset,
+    )
+
+
+def shape_refusal(
+    side: FillSide, fee_amount: Decimal, fee_asset: str | None
+) -> ExchangeSchemaError:
+    """Build a shape fill that must be refused, and hand back the exact error it raised."""
+    with pytest.raises(ExchangeSchemaError) as caught:
+        shape_fill(side, fee_amount, fee_asset)
+    assert type(caught.value) is ExchangeSchemaError
+    return caught.value
+
+
+def assert_no_amount_window(error: ExchangeSchemaError, *amounts: Decimal) -> None:
+    """No four-digit window of any amount appears in anything the error renders.
+
+    Windows rather than whole values: a message that leaked `7317` of a quantity, or a
+    rounded or reformatted spelling of it, has leaked the holding as surely as one that
+    quoted it whole, and a check for the whole value would pass it. Separators are removed
+    from the rendering first, so `91,739.17` is found too. Windows holding a zero are
+    skipped; they say nothing about an amount.
+    """
+    rendered = f"{error}{error!r}{error.args}{error.detail}"
+    flattened = rendered.replace(".", "").replace(",", "").replace("_", "")
+    checked = 0
+    for amount in amounts:
+        digits = format(abs(amount), "f").replace(".", "")
+        for start in range(len(digits) - 3):
+            window = digits[start : start + 4]
+            if "0" in window:
+                continue
+            checked += 1
+            assert window not in flattened, (window, rendered)
+    assert checked, "no amount had a window worth checking"
+
+
+@pytest.mark.parametrize("side", [FillSide.BUY, FillSide.SELL])
+@pytest.mark.parametrize(
+    ("fee_amount", "fee_asset"),
+    [
+        pytest.param(Decimal(0), None, id="no fee"),
+        pytest.param(Decimal(0), "USDT", id="a zero fee naming the asset"),
+        pytest.param(Decimal("1.3"), "USDT", id="a fee in the asset"),
+        pytest.param(Decimal("-1.3"), "USDT", id="a rebate in the asset"),
+        pytest.param(Decimal("91739.173917"), "USDT", id="a fee that is all of one side"),
+        pytest.param(Decimal("1.3"), "BNB", id="a fee in a third asset"),
+    ],
+)
+def test_normalized_fill_refuses_the_same_asset_on_both_sides(
+    side: FillSide, fee_amount: Decimal, fee_asset: str | None
+) -> None:
+    """Whatever the fee, and on either side: the same asset is checked before any fee.
+
+    A fee that would also consume everything received is reported as the same asset, the
+    first shape, as `Trade` reports it.
+    """
+    with pytest.raises(ExchangeSchemaError) as caught:
+        make_fill(
+            side=side,
+            base_asset="USDT",
+            quote_asset="USDT",
+            quantity=SHAPE_QUANTITY,
+            quote_quantity=SHAPE_QUOTE_QUANTITY,
+            fee_amount=fee_amount,
+            fee_asset=fee_asset,
+        )
+
+    assert type(caught.value) is ExchangeSchemaError
+    assert caught.value.detail == SAME_ASSET_DETAIL
+    assert SAME_ASSET_DETAIL in str(caught.value)
+    assert_no_amount_window(caught.value, SHAPE_QUANTITY, SHAPE_QUOTE_QUANTITY)
+
+
+@pytest.mark.parametrize(
+    ("base_asset", "quote_asset"),
+    [
+        pytest.param("BTC", "btc", id="case"),
+        pytest.param("BTC", "BTC ", id="a trailing space"),
+        pytest.param(
+            "\N{LATIN SMALL LETTER E WITH ACUTE}TH",
+            "e\N{COMBINING ACUTE ACCENT}TH",
+            id="composed and decomposed",
+        ),
+    ],
+)
+def test_assets_that_differ_only_as_text_are_different_assets(
+    base_asset: str, quote_asset: str
+) -> None:
+    """Compared exactly, as the text is stored.
+
+    Normalising in the check and not in the column would leave the fill and its row
+    disagreeing about what was traded.
+    """
+    fill = make_fill(base_asset=base_asset, quote_asset=quote_asset, fee_asset="BNB")
+
+    assert (fill.base_asset, fill.quote_asset) == (base_asset, quote_asset)
+
+
+@pytest.mark.parametrize(
+    ("side", "fee_amount", "fee_asset"),
+    [
+        pytest.param(
+            FillSide.BUY, Decimal("7.31731731"), "BTC", id="buy, fee in base equal to quantity"
+        ),
+        pytest.param(
+            FillSide.BUY,
+            Decimal("7.317317310000000000000"),
+            "BTC",
+            id="buy, fee equal to the quantity in another spelling",
+        ),
+        pytest.param(FillSide.BUY, Decimal("7.317317310000000001"), "BTC", id="buy, one unit past"),
+        pytest.param(FillSide.BUY, Decimal("9179.3"), "BTC", id="buy, far past"),
+        pytest.param(
+            FillSide.SELL,
+            Decimal("91739.173917"),
+            "USDT",
+            id="sell, fee in quote equal to proceeds",
+        ),
+        pytest.param(
+            FillSide.SELL, Decimal("91739.173917000000000001"), "USDT", id="sell, one unit past"
+        ),
+        pytest.param(
+            FillSide.SELL, Decimal("1.3E+5"), "USDT", id="sell, far past in exponent form"
+        ),
+    ],
+)
+def test_normalized_fill_refuses_a_fee_that_consumes_what_was_received(
+    side: FillSide, fee_amount: Decimal, fee_asset: str
+) -> None:
+    error = shape_refusal(side, fee_amount, fee_asset)
+
+    assert error.detail == FEE_CONSUMES_RECEIVED_DETAIL
+    assert_no_amount_window(error, fee_amount, SHAPE_QUANTITY, SHAPE_QUOTE_QUANTITY)
+
+
+@pytest.mark.parametrize(
+    ("side", "fee_amount", "fee_asset"),
+    [
+        pytest.param(
+            FillSide.BUY, Decimal("-91739.173917"), "USDT", id="buy, rebate in quote equal to cost"
+        ),
+        pytest.param(
+            FillSide.BUY, Decimal("-91739.173917000000000001"), "USDT", id="buy, one unit past"
+        ),
+        pytest.param(FillSide.BUY, Decimal("-1.3E+5"), "USDT", id="buy, far past in exponent form"),
+        pytest.param(
+            FillSide.SELL, Decimal("-7.31731731"), "BTC", id="sell, rebate in base equal to it"
+        ),
+        pytest.param(
+            FillSide.SELL,
+            Decimal("-7.3173173100000000000"),
+            "BTC",
+            id="sell, rebate equal to the quantity in another spelling",
+        ),
+        pytest.param(
+            FillSide.SELL, Decimal("-7.317317310000000001"), "BTC", id="sell, one unit past"
+        ),
+    ],
+)
+def test_normalized_fill_refuses_a_rebate_that_exceeds_what_was_given(
+    side: FillSide, fee_amount: Decimal, fee_asset: str
+) -> None:
+    error = shape_refusal(side, fee_amount, fee_asset)
+
+    assert error.detail == REBATE_EXCEEDS_GIVEN_DETAIL
+    assert_no_amount_window(error, fee_amount, SHAPE_QUANTITY, SHAPE_QUOTE_QUANTITY)
+
+
+@pytest.mark.parametrize(
+    ("side", "fee_amount", "fee_asset"),
+    [
+        # One unit inside each shape's boundary.
+        pytest.param(
+            FillSide.BUY,
+            Decimal("7.317317309999999999"),
+            "BTC",
+            id="buy, fee one unit under the quantity",
+        ),
+        pytest.param(
+            FillSide.SELL,
+            Decimal("91739.173916999999999999"),
+            "USDT",
+            id="sell, fee one unit under the proceeds",
+        ),
+        pytest.param(
+            FillSide.BUY,
+            Decimal("-91739.173916999999999999"),
+            "USDT",
+            id="buy, rebate one unit under the cost",
+        ),
+        pytest.param(
+            FillSide.SELL,
+            Decimal("-7.317317309999999999"),
+            "BTC",
+            id="sell, rebate one unit under the quantity",
+        ),
+        # R8: a zero fee is no leg, whatever asset it names and however zero is spelled.
+        pytest.param(FillSide.BUY, Decimal(0), "BTC", id="buy, zero fee naming the received"),
+        pytest.param(FillSide.SELL, Decimal(0), "USDT", id="sell, zero fee naming the received"),
+        pytest.param(FillSide.BUY, Decimal("-0"), "BTC", id="buy, negative zero, the received"),
+        pytest.param(FillSide.SELL, Decimal("0E-18"), "USDT", id="sell, 0E-18, the received"),
+        pytest.param(FillSide.BUY, Decimal("-0.000"), "USDT", id="buy, a zero rebate, the given"),
+        # The two positions no size of fee can empty.
+        pytest.param(FillSide.BUY, Decimal("-9179.3"), "BTC", id="buy, rebate in the received"),
+        pytest.param(
+            FillSide.SELL, Decimal("99999999999999999999"), "BTC", id="sell, fee in the given"
+        ),
+        # R7: a third asset constrains neither leg, however large the rebate.
+        pytest.param(
+            FillSide.BUY, Decimal("-99999999999999999999"), "BNB", id="buy, rebate in a third"
+        ),
+    ],
+)
+def test_the_fills_just_inside_each_shape_are_accepted(
+    side: FillSide, fee_amount: Decimal, fee_asset: str
+) -> None:
+    fill = shape_fill(side, fee_amount, fee_asset)
+
+    assert fill.fee_amount.as_tuple() == fee_amount.as_tuple()
+    assert fill.fee_asset == fee_asset
+
+
+def test_the_smallest_fill_with_a_zero_fee_naming_what_it_received_is_accepted() -> None:
+    """One unit received, and a zero fee naming it: R8's zero fee takes nothing."""
+    fill = make_fill(quantity=ONE_UNIT, fee_amount=Decimal(0), fee_asset="BTC")
+
+    assert fill.quantity == ONE_UNIT
+
+
+def test_a_one_unit_fee_on_a_one_unit_fill_is_refused() -> None:
+    """The smallest fill there is, consumed by the smallest fee there is."""
+    error = refusal(quantity=ONE_UNIT, fee_amount=ONE_UNIT, fee_asset="BTC")
+
+    assert error.detail == FEE_CONSUMES_RECEIVED_DETAIL
+
+
+@pytest.mark.parametrize(
+    ("overrides", "detail"),
+    [
+        pytest.param(
+            {
+                "quote_asset": "BTC",
+                "fee_amount": Decimal("0.0000000000000000011"),
+                "fee_asset": "BTC",
+            },
+            "fee_amount has more than 18 decimal places",
+            id="the same asset, and a fee finer than the grid",
+        ),
+        pytest.param(
+            {"fee_amount": Decimal("Infinity"), "fee_asset": "BTC"},
+            "fee_amount must be a finite number",
+            id="an infinite fee in the asset received",
+        ),
+        pytest.param(
+            {"fee_amount": Decimal("9" * 21), "fee_asset": "BTC"},
+            "fee_amount has more than 20 digits before the decimal point",
+            id="a fee too wide to store, in the asset received",
+        ),
+        pytest.param(
+            {"quote_asset": "BTC", "executed_at": datetime(2026, 9, 3, 15, 30)},  # noqa: DTZ001
+            "executed_at must be a timezone-aware datetime",
+            id="the same asset, and a naive execution time",
+        ),
+    ],
+)
+def test_a_shape_is_judged_only_after_every_field_rule(
+    overrides: dict[str, object], detail: str
+) -> None:
+    """The field rules are the shape check's precondition, and each keeps its own detail.
+
+    Judged first, a fee too wide or not finite would reach `quantize` in the shape check and
+    escape as a bare `decimal.InvalidOperation`, outside the taxonomy.
+    """
+    error = refusal(**overrides)
+
+    assert error.detail.startswith(detail), error.detail
+
+
+# Spec 020, R1: an aware `executed_at` with no UTC spelling. `datetime.min` at +05:00 is five
+# hours before the first instant a `datetime` holds once it is converted to UTC, and
+# `datetime.max` at -05:00 five hours after the last. Neither the `UtcDateTime` column nor an
+# accounting `EventKey` can hold one, so both are refused, and their nearest neighbours are
+# accepted.
+
+#: The first and last wall-clock readings a `datetime` holds, written at UTC.
+FIRST_READING: Final = datetime.min.replace(tzinfo=UTC)
+LAST_READING: Final = datetime.max.replace(tzinfo=UTC)
+FIVE_HOURS: Final = timedelta(hours=5)
+#: The widest offset `datetime.timezone` accepts: strictly less than a day.
+WIDEST_OFFSET: Final = timedelta(hours=24) - ONE_MICROSECOND
+
+
+def at(reading: datetime, offset: timedelta) -> datetime:
+    """The same wall-clock reading as `reading`, at `offset`."""
+    return reading.replace(tzinfo=timezone(offset))
+
+
+@pytest.mark.parametrize(
+    "executed_at",
+    [
+        pytest.param(at(FIRST_READING, FIVE_HOURS), id="datetime.min at +05:00"),
+        pytest.param(at(FIRST_READING, ONE_MICROSECOND), id="datetime.min a microsecond east"),
+        pytest.param(at(FIRST_READING, WIDEST_OFFSET), id="datetime.min at the widest east"),
+        pytest.param(
+            at(FIRST_READING + FIVE_HOURS - ONE_MICROSECOND, FIVE_HOURS),
+            id="a microsecond before the first instant, at +05:00",
+        ),
+        pytest.param(at(LAST_READING, -FIVE_HOURS), id="datetime.max at -05:00"),
+        pytest.param(at(LAST_READING, -ONE_MICROSECOND), id="datetime.max a microsecond west"),
+        pytest.param(at(LAST_READING, -WIDEST_OFFSET), id="datetime.max at the widest west"),
+        pytest.param(
+            at(LAST_READING - FIVE_HOURS + ONE_MICROSECOND, -FIVE_HOURS),
+            id="a microsecond after the last instant, at -05:00",
+        ),
+    ],
+)
+def test_an_execution_time_utc_cannot_represent_is_refused(executed_at: datetime) -> None:
+    error = refusal(executed_at=executed_at)
+    rendered = f"{error}{error!r}{error.args}{error.detail}"
+
+    assert error.detail == UTC_RANGE_DETAIL
+    assert "9999" not in rendered
+    assert "0001" not in rendered
+
+
+@pytest.mark.parametrize(
+    "executed_at",
+    [
+        pytest.param(FIRST_READING, id="datetime.min at UTC"),
+        pytest.param(LAST_READING, id="datetime.max at UTC"),
+        pytest.param(at(FIRST_READING + FIVE_HOURS, FIVE_HOURS), id="the first instant at +05:00"),
+        pytest.param(at(LAST_READING - FIVE_HOURS, -FIVE_HOURS), id="the last instant at -05:00"),
+        pytest.param(at(FIRST_READING, -FIVE_HOURS), id="datetime.min at -05:00, later in UTC"),
+        pytest.param(at(LAST_READING, FIVE_HOURS), id="datetime.max at +05:00, earlier in UTC"),
+        pytest.param(at(FIRST_READING, -WIDEST_OFFSET), id="datetime.min at the widest west"),
+        pytest.param(at(LAST_READING, WIDEST_OFFSET), id="datetime.max at the widest east"),
+    ],
+)
+def test_the_nearest_instants_utc_can_represent_are_accepted_as_given(
+    executed_at: datetime,
+) -> None:
+    """Accepted, and kept at the offset the venue gave: only whether it converts is checked."""
+    fill = make_fill(executed_at=executed_at)
+
+    assert fill.executed_at == executed_at
+    assert fill.executed_at.tzinfo is executed_at.tzinfo
+    assert fill.executed_at.utcoffset() == executed_at.utcoffset()

@@ -11,13 +11,17 @@ up in a log. Every amount refusal is checked against the digits of the value it 
 
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import FrozenInstanceError
 from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
+from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from portfolio.domain.accounting import (
     DEFAULT_CASH_ASSETS,
@@ -25,9 +29,12 @@ from portfolio.domain.accounting import (
     Adjustment,
     EventKey,
     Trade,
+    TradeShapeProblem,
     Transfer,
+    trade_shape_problem,
 )
 from portfolio.domain.exchanges import FillSide
+from tests.domain.accounting.strategies import amounts, from_units, to_units
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -616,3 +623,320 @@ def test_a_blank_or_unencodable_cash_asset_is_refused(member: str) -> None:
 def test_cash_assets_that_are_not_a_frozenset_of_str_are_a_type_error(assets: object) -> None:
     with pytest.raises(TypeError):
         AccountingConfig(assets)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------------------
+# Spec 020: one definition of an unaccountable shape, and Trade's messages kept
+# --------------------------------------------------------------------------------------
+#
+# `trade_shape_problem` is the single definition `Trade` and `NormalizedFill` both refuse
+# with. It validates nothing -- the field rules are its precondition -- so every input here
+# passes them, and every expected answer is written by hand beside it.
+
+#: Trade's three shape messages, copied by hand from `events.py` at badf77d, before spec 020
+#: moved the rules into `trade_shape_problem`. Nothing pinned them until now: every Trade
+#: refusal test above matches `r"."`, so a reworded message would have passed unnoticed.
+SAME_ASSET_MESSAGE: Final = "Trade.base_asset and Trade.quote_asset must be different assets"
+FEE_CONSUMES_RECEIVED_MESSAGE: Final = (
+    "Trade.fee_amount, paid in the asset received, must leave a quantity received greater than zero"
+)
+REBATE_EXCEEDS_GIVEN_MESSAGE: Final = (
+    "Trade.fee_amount, rebated in the asset given, must leave a quantity given greater than zero"
+)
+
+
+def shape_of(**overrides: object) -> TradeShapeProblem | None:
+    """`trade_shape_problem` of a buy of `DISTINCT`, no fee, with `overrides` applied."""
+    fields: dict[str, object] = {
+        "base_asset": "BTC",
+        "quote_asset": "USDT",
+        "side": FillSide.BUY,
+        "quantity": DISTINCT["quantity"],
+        "quote_quantity": DISTINCT["quote_quantity"],
+        "fee_amount": Decimal(0),
+        "fee_asset": None,
+    }
+    fields.update(overrides)
+    return trade_shape_problem(**fields)  # type: ignore[arg-type]
+
+
+def test_the_shape_problems_are_the_pinned_set() -> None:
+    """Their values are what `NormalizedFill` and `Trade` look their messages up by."""
+    assert issubclass(TradeShapeProblem, StrEnum)
+    assert {member.name: member.value for member in TradeShapeProblem} == {
+        "SAME_ASSET": "same_asset",
+        "FEE_CONSUMES_RECEIVED": "fee_consumes_received",
+        "REBATE_EXCEEDS_GIVEN": "rebate_exceeds_given",
+    }
+
+
+def test_trade_shape_problem_takes_keywords_only() -> None:
+    """Seven arguments, two of them quantities and two of them assets: positions would swap."""
+    parameters = inspect.signature(trade_shape_problem).parameters.values()
+
+    assert [parameter.name for parameter in parameters] == [
+        "base_asset",
+        "quote_asset",
+        "side",
+        "quantity",
+        "quote_quantity",
+        "fee_amount",
+        "fee_asset",
+    ]
+    assert all(parameter.kind is inspect.Parameter.KEYWORD_ONLY for parameter in parameters)
+
+
+@pytest.mark.parametrize("side", [FillSide.BUY, FillSide.SELL])
+@pytest.mark.parametrize(
+    ("fee_amount", "fee_asset"),
+    [
+        pytest.param("0", None, id="no fee"),
+        pytest.param("0", "USDT", id="a zero fee naming it"),
+        pytest.param("31415.926535", "USDT", id="a fee that would consume a side"),
+        pytest.param("-31415.926535", "USDT", id="a rebate that would empty a side"),
+        pytest.param("5", "BNB", id="a fee in a third asset"),
+    ],
+)
+def test_the_same_asset_is_a_shape_problem_whatever_the_fee(
+    side: FillSide, fee_amount: str, fee_asset: str | None
+) -> None:
+    """Checked first: a fee that would also consume a side is still `SAME_ASSET`."""
+    assert (
+        shape_of(
+            base_asset="USDT",
+            quote_asset="USDT",
+            side=side,
+            fee_amount=Decimal(fee_amount),
+            fee_asset=fee_asset,
+        )
+        is TradeShapeProblem.SAME_ASSET
+    )
+
+
+@pytest.mark.parametrize(
+    ("base_asset", "quote_asset"),
+    [
+        pytest.param("BTC", "btc", id="case"),
+        pytest.param("BTC", " BTC", id="a leading space"),
+        pytest.param(
+            "\N{LATIN SMALL LETTER E WITH ACUTE}TH",
+            "e\N{COMBINING ACUTE ACCENT}TH",
+            id="composed and decomposed",
+        ),
+    ],
+)
+def test_assets_are_compared_exactly(base_asset: str, quote_asset: str) -> None:
+    assert shape_of(base_asset=base_asset, quote_asset=quote_asset) is None
+
+
+@pytest.mark.parametrize(
+    ("side", "fee_asset", "fee"),
+    [
+        pytest.param(FillSide.BUY, "BTC", "1.23456789", id="buy, fee in base equal to quantity"),
+        pytest.param(FillSide.BUY, "BTC", "1.234567890000000001", id="buy, one unit past"),
+        pytest.param(FillSide.BUY, "BTC", "99999999999999999999", id="buy, far past"),
+        pytest.param(FillSide.SELL, "USDT", "31415.926535", id="sell, fee in quote equal to it"),
+        pytest.param(FillSide.SELL, "USDT", "31415.926535000000000001", id="sell, one unit past"),
+        pytest.param(FillSide.SELL, "USDT", "3.2E+4", id="sell, past, in exponent form"),
+        pytest.param(
+            FillSide.BUY, "BTC", "1.234567890000000000000000", id="buy, equal in a longer spelling"
+        ),
+    ],
+)
+def test_a_fee_that_consumes_what_was_received_is_a_shape_problem(
+    side: FillSide, fee_asset: str, fee: str
+) -> None:
+    assert (
+        shape_of(side=side, fee_asset=fee_asset, fee_amount=Decimal(fee))
+        is TradeShapeProblem.FEE_CONSUMES_RECEIVED
+    )
+
+
+@pytest.mark.parametrize(
+    ("side", "fee_asset", "fee"),
+    [
+        pytest.param(FillSide.BUY, "USDT", "-31415.926535", id="buy, rebate in quote equals cost"),
+        pytest.param(FillSide.BUY, "USDT", "-31415.926535000000000001", id="buy, one unit past"),
+        pytest.param(FillSide.SELL, "BTC", "-1.23456789", id="sell, rebate in base equals it"),
+        pytest.param(FillSide.SELL, "BTC", "-1.234567890000000001", id="sell, one unit past"),
+        pytest.param(FillSide.SELL, "BTC", "-99999999999999999999", id="sell, far past"),
+    ],
+)
+def test_a_rebate_that_empties_what_was_given_is_a_shape_problem(
+    side: FillSide, fee_asset: str, fee: str
+) -> None:
+    assert (
+        shape_of(side=side, fee_asset=fee_asset, fee_amount=Decimal(fee))
+        is TradeShapeProblem.REBATE_EXCEEDS_GIVEN
+    )
+
+
+@pytest.mark.parametrize(
+    ("side", "fee_asset", "fee"),
+    [
+        # One unit inside each boundary.
+        pytest.param(FillSide.BUY, "BTC", "1.234567889999999999", id="buy, fee one unit under"),
+        pytest.param(FillSide.SELL, "USDT", "31415.926534999999999999", id="sell, fee one under"),
+        pytest.param(FillSide.BUY, "USDT", "-31415.926534999999999999", id="buy, rebate one under"),
+        pytest.param(FillSide.SELL, "BTC", "-1.234567889999999999", id="sell, rebate one under"),
+        # R8: a zero fee is no leg, whichever asset it names and however zero is spelled.
+        pytest.param(FillSide.BUY, "BTC", "0", id="buy, zero naming the received"),
+        pytest.param(FillSide.SELL, "USDT", "-0", id="sell, negative zero naming the received"),
+        pytest.param(FillSide.BUY, "USDT", "0E-18", id="buy, 0E-18 naming the given"),
+        pytest.param(FillSide.SELL, "BNB", "0.000", id="sell, zero naming a third"),
+        pytest.param(FillSide.BUY, None, "0", id="no fee at all"),
+        # The two positions no size of fee can empty.
+        pytest.param(FillSide.BUY, "BTC", "-99999999999999999999", id="buy, rebate in received"),
+        pytest.param(FillSide.SELL, "BTC", "99999999999999999999", id="sell, fee in given"),
+        # R7: a third asset constrains neither leg.
+        pytest.param(FillSide.BUY, "BNB", "99999999999999999999", id="buy, fee in a third"),
+        pytest.param(FillSide.SELL, "USDC", "-99999999999999999999", id="sell, rebate in a third"),
+    ],
+)
+def test_every_other_fee_is_no_shape_problem(
+    side: FillSide, fee_asset: str | None, fee: str
+) -> None:
+    assert shape_of(side=side, fee_asset=fee_asset, fee_amount=Decimal(fee)) is None
+
+
+def test_a_non_zero_fee_without_an_asset_is_no_shape_problem() -> None:
+    """A field rule each caller refuses first, so the shape check leaves it alone."""
+    assert shape_of(fee_amount=Decimal("1.23456789"), fee_asset=None) is None
+
+
+def test_the_comparison_is_by_value_however_long_the_spelling() -> None:
+    """`1` followed by a point and ten thousand zeros is one, and one unit is one unit."""
+    long_one = Decimal("1." + "0" * 10_000)
+
+    assert shape_of(quantity=Decimal(1), fee_amount=long_one, fee_asset="BTC") is (
+        TradeShapeProblem.FEE_CONSUMES_RECEIVED
+    )
+    assert (
+        shape_of(quantity=long_one, fee_amount=Decimal("0.999999999999999999"), fee_asset="BTC")
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        pytest.param(
+            {"base_asset": "USDT", "fee_asset": None, "fee_amount": Decimal(0)},
+            SAME_ASSET_MESSAGE,
+            id="the same asset",
+        ),
+        pytest.param(
+            {"base_asset": "USDT", "fee_asset": "USDT", "fee_amount": Decimal("30000")},
+            SAME_ASSET_MESSAGE,
+            id="the same asset, with a fee that would consume a side",
+        ),
+        pytest.param(
+            {"side": FillSide.BUY, "fee_asset": "BTC", "fee_amount": Decimal("1")},
+            FEE_CONSUMES_RECEIVED_MESSAGE,
+            id="buy, a fee in the base consuming it",
+        ),
+        pytest.param(
+            {"side": FillSide.SELL, "fee_asset": "USDT", "fee_amount": Decimal("30000.5")},
+            FEE_CONSUMES_RECEIVED_MESSAGE,
+            id="sell, a fee in the quote past it",
+        ),
+        pytest.param(
+            {"side": FillSide.BUY, "fee_asset": "USDT", "fee_amount": Decimal("-30000")},
+            REBATE_EXCEEDS_GIVEN_MESSAGE,
+            id="buy, a rebate in the quote equal to it",
+        ),
+        pytest.param(
+            {"side": FillSide.SELL, "fee_asset": "BTC", "fee_amount": Decimal("-1.5")},
+            REBATE_EXCEEDS_GIVEN_MESSAGE,
+            id="sell, a rebate in the base past it",
+        ),
+    ],
+)
+def test_trade_keeps_its_shape_messages_word_for_word(
+    overrides: dict[str, object], message: str
+) -> None:
+    """Spec 020 moved the rules, not the words: `Trade` says exactly what it said before."""
+    with pytest.raises(ValueError, match=r".") as caught:
+        trade(**overrides)
+
+    assert type(caught.value) is ValueError
+    assert str(caught.value) == message
+
+
+def test_a_bad_field_is_reported_before_the_shape() -> None:
+    """The field rules are the shape check's precondition, and each keeps its own refusal."""
+    with pytest.raises(TypeError):
+        trade(base_asset="USDT", side="buy")
+    with pytest.raises(ValueError, match="decimal places"):
+        trade(base_asset="USDT", fee_amount=NINETEEN_PLACES)
+
+
+#: Assets drawn from few enough that any two fields often name the same one.
+SHAPE_ASSETS: Final = ("BTC", "USDT", "KAS")
+
+
+@st.composite
+def shape_inputs(draw: st.DrawFn) -> dict[str, object]:
+    """Field-valid trade inputs aimed at the three shapes' boundaries.
+
+    The same asset one time in six; otherwise a fee in the asset received or given drawn one
+    unit inside, at, or one unit past the leg it folds into, a fee or rebate of any size in
+    any asset, or a zero fee naming any asset or none.
+    """
+    side = draw(st.sampled_from([FillSide.BUY, FillSide.SELL]))
+    base, other = draw(st.permutations(SHAPE_ASSETS))[:2]
+    quote = base if draw(st.sampled_from([False] * 5 + [True])) else other
+    quantity = draw(amounts(maximum=10**19))
+    quote_quantity = draw(amounts(maximum=10**19))
+    if side is FillSide.BUY:
+        received, given, received_asset, given_asset = quantity, quote_quantity, base, quote
+    else:
+        received, given, received_asset, given_asset = quote_quantity, quantity, quote, base
+    around = draw(st.sampled_from(["received", "given", "free", "zero"]))
+    fee_asset: str | None
+    if around == "zero":
+        fee = Decimal(draw(st.sampled_from(["0", "-0", "0E-18"])))
+        fee_asset = draw(st.one_of(st.none(), st.sampled_from([*SHAPE_ASSETS, "BNB"])))
+    elif around == "free":
+        paid = draw(amounts(maximum=10**19))
+        fee = paid.copy_negate() if draw(st.booleans()) else paid
+        fee_asset = draw(st.sampled_from([*SHAPE_ASSETS, "BNB"]))
+    else:
+        leg = received if around == "received" else given
+        units = to_units(leg) + draw(st.sampled_from([-1, 0, 1]))
+        fee = from_units(units) if around == "received" else from_units(units).copy_negate()
+        fee_asset = received_asset if around == "received" else given_asset
+    return {
+        "base_asset": base,
+        "quote_asset": quote,
+        "side": side,
+        "quantity": quantity,
+        "quote_quantity": quote_quantity,
+        "fee_amount": fee,
+        "fee_asset": fee_asset,
+    }
+
+
+@settings(max_examples=300, deadline=None)
+@given(inputs=shape_inputs())
+def test_trade_refuses_exactly_the_shapes_trade_shape_problem_names(
+    inputs: dict[str, object],
+) -> None:
+    """One definition: `Trade` accepts field-valid inputs if and only if the function does.
+
+    And when it refuses, it refuses with the message for the member the function returned,
+    so the two cannot disagree about which shape a trade has.
+    """
+    problem = trade_shape_problem(**inputs)  # type: ignore[arg-type]
+    messages = {
+        TradeShapeProblem.SAME_ASSET: SAME_ASSET_MESSAGE,
+        TradeShapeProblem.FEE_CONSUMES_RECEIVED: FEE_CONSUMES_RECEIVED_MESSAGE,
+        TradeShapeProblem.REBATE_EXCEEDS_GIVEN: REBATE_EXCEEDS_GIVEN_MESSAGE,
+    }
+
+    if problem is None:
+        Trade(key=key(), **inputs)  # type: ignore[arg-type]
+    else:
+        with pytest.raises(ValueError, match=r".") as caught:
+            Trade(key=key(), **inputs)  # type: ignore[arg-type]
+        assert str(caught.value) == messages[problem]
