@@ -275,3 +275,30 @@ is regenerated, because the drift job checks it.
   deletes the attribute, so the dependency reads it directly (#20's R1 rule). The
   coordinators' guards differ: an application whose lifespan never ran really has no
   coordinator.
+- **R8. Review findings (reviewer, before the pull request).** The baseline gate passed at
+  `0095233` before these fixes.
+  - **Must-fix: `occurred_at` accepted Unix time spelled as a string.** Pydantic's lax
+    datetime parser reads a string of digits as Unix time, and the result is aware:
+    - `"1767225600"` was stored as 2026-01-01;
+    - `"20260101"`, a valid ISO 8601 basic-format date, was stored as 1970-08-23. That
+      silently replays an acquisition before the whole history.
+
+    A string is now parsed with `datetime.fromisoformat`, and a failure is a fixed 422 that
+    quotes nothing. `"20260101"` then parses as a naive date, which the service refuses as
+    not timezone-aware.
+  - **Should-fix: DELETE through `/api/docs` is refused.** The write guard requires
+    `Content-Type: application/json` on every non-safe method, and Swagger UI sends none for
+    a bodiless operation, so DELETE there answers 403. The docs keep `/api/docs` for list,
+    create and replace. For delete, they give a `fetch` to run in the browser console on the
+    signed-in app's page. The middleware is unchanged: relaxing it is a security decision,
+    not this issue's.
+  - **Nits taken:**
+    - An id beyond 64 bits is a 422 (`Path(ge=1, le=2**63 - 1)`), not an `OverflowError` 500.
+    - The schema descriptions are built from the engine's constants.
+    - `accounting_recompute_failed` also carries `adjustment_id` when the error is
+      `UnconvertibleAdjustmentError`, so an operator can find the row to fix. Adjustment ids
+      are already logged; fill ids still are not.
+    - A guard test holds every `ExchangeKey` below `"manual"`, so a future venue cannot
+      silently reverse the documented same-instant order.
+    - A test shows the recompute finishes before `http.response.start`, which a background
+      task would not.
