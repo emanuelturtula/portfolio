@@ -21,21 +21,26 @@ from __future__ import annotations
 import decimal
 import threading
 from decimal import Decimal
+from fractions import Fraction
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from portfolio.domain.money import (
     MONEY_PRECISION,
     MONEY_ROUNDING,
+    add,
+    divide,
     from_base_units,
     multiply,
     quantize,
     require_amount,
+    subtract,
     to_base_units,
 )
+from tests.domain.accounting.oracle import round_half_even
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -685,3 +690,370 @@ def test_multiply_refuses_a_product_whose_exponent_decimal_cannot_hold() -> None
 
     with pytest.raises(decimal.InvalidOperation):
         multiply(enormous, enormous)
+
+
+# --------------------------------------------------------------------------------------
+# `add`, `subtract` and `divide` (#17): the engine's only arithmetic.
+# --------------------------------------------------------------------------------------
+#
+# Spec 019 forbids a bare `+ - * /` on a `Decimal` anywhere in the accounting package, so
+# these three and `multiply` are the whole of its arithmetic. `add` and `subtract` must be
+# exact however many digits they carry, and `divide` must round exactly once. Every
+# expectation below is either written out by hand or computed in `fractions.Fraction` by
+# the oracle's `round_half_even`, which rounds an exact rational and nothing else -- never
+# by calling the function under test a second way.
+
+#: 41 significant digits: `10**40` plus one unit in the 18th decimal place. Any sum under a
+#: context of 38 digits or fewer loses the trailing `1`.
+FORTY_DIGIT_ONE: Final = Decimal("1" + "0" * 40)
+ONE_UNIT_AT_18: Final = Decimal("0.000000000000000001")
+
+
+def test_add_is_exact_past_the_money_precision() -> None:
+    """`10**40 + 1E-18` keeps both ends: 59 significant digits, none rounded."""
+    total = add(FORTY_DIGIT_ONE, ONE_UNIT_AT_18)
+
+    assert format(total, "f") == "1" + "0" * 40 + "." + "0" * 17 + "1"
+    assert total.as_tuple().exponent == -18
+    # The control: the operator, even under the 38-digit money context, drops the unit.
+    money_context = decimal.Context(prec=MONEY_PRECISION)
+    assert money_context.add(FORTY_DIGIT_ONE, ONE_UNIT_AT_18) == FORTY_DIGIT_ONE
+
+
+def test_subtract_is_exact_past_the_money_precision() -> None:
+    """`10**40 - 1E-18` is forty nines and eighteen, with no rounding back up to `10**40`."""
+    difference = subtract(FORTY_DIGIT_ONE, ONE_UNIT_AT_18)
+
+    assert format(difference, "f") == "9" * 40 + "." + "9" * 18
+    money_context = decimal.Context(prec=MONEY_PRECISION)
+    assert money_context.subtract(FORTY_DIGIT_ONE, ONE_UNIT_AT_18) == FORTY_DIGIT_ONE
+
+
+def test_add_and_subtract_ignore_a_narrowed_ambient_context() -> None:
+    """Inside `localcontext(prec=6, rounding=ROUND_UP)` the answers are the same exact ones."""
+    left = Decimal("123456.789012345678901234")
+    right = Decimal("0.000000000000000001")
+    with decimal.localcontext() as context:
+        context.prec = 6
+        context.rounding = decimal.ROUND_UP
+        inside_sum = add(left, right)
+        inside_difference = subtract(left, right)
+        ambient = left + right
+
+    assert inside_sum == Decimal("123456.789012345678901235")
+    assert inside_difference == Decimal("123456.789012345678901233")
+    assert ambient != inside_sum, "the control did not round; the test proves nothing"
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected_sum", "expected_difference"),
+    [
+        pytest.param("0", "0", "0", "0", id="zero and zero"),
+        pytest.param("-0", "-0", "-0", "0", id="negative zeros"),
+        pytest.param("-0", "0", "0", "-0", id="negative zero and zero"),
+        pytest.param("1", "-1", "0", "2", id="a sum that cancels"),
+        pytest.param("1.5", "1.5", "3.0", "0.0", id="a difference that cancels"),
+    ],
+)
+def test_the_sign_of_a_zero_follows_decimal(
+    left: str, right: str, expected_sum: str, expected_difference: str
+) -> None:
+    """`Decimal`'s own rule under half-even: a zero sum is negative only if both are.
+
+    Compared by `str`, because `-0 == 0` and a value comparison would pass whichever sign
+    came back.
+    """
+    assert str(add(Decimal(left), Decimal(right))) == expected_sum
+    assert str(subtract(Decimal(left), Decimal(right))) == expected_difference
+
+
+@pytest.mark.parametrize("operation", [add, subtract], ids=["add", "subtract"])
+@pytest.mark.parametrize(
+    ("left", "right", "raised"),
+    [
+        pytest.param(1.5, Decimal(2), TypeError, id="float"),
+        pytest.param(Decimal(2), True, TypeError, id="bool"),
+        pytest.param(Decimal(2), 2, TypeError, id="int"),
+        pytest.param(Decimal("NaN"), Decimal(2), ValueError, id="nan"),
+        pytest.param(Decimal(2), Decimal("-Infinity"), ValueError, id="infinity"),
+    ],
+)
+def test_add_and_subtract_refuse_what_is_not_a_finite_decimal(
+    operation: Callable[[Decimal, Decimal], Decimal],
+    left: object,
+    right: object,
+    raised: type[Exception],
+) -> None:
+    with pytest.raises(raised):
+        operation(left, right)  # type: ignore[arg-type]
+
+
+def test_add_and_subtract_are_exact_past_the_int_str_digit_limit() -> None:
+    """Two 5000-digit coefficients, with no `int(str)` conversion that would refuse them."""
+    ones = Decimal("0." + "1" * OVERLONG_ONES)
+    twos = Decimal("0." + "2" * OVERLONG_ONES)
+
+    assert format(add(ones, twos), "f") == "0." + "3" * OVERLONG_ONES
+    assert format(subtract(twos, ones), "f") == "0." + "1" * OVERLONG_ONES
+
+
+# `st.decimals` with `places` draws values on a fixed grid, which is exactly the engine's
+# domain: 18 places, and a range wide enough to cross the 38-digit precision.
+EIGHTEEN_PLACE_AMOUNTS: Final = st.decimals(
+    min_value=Decimal("-1E+30"),
+    max_value=Decimal("1E+30"),
+    places=18,
+    allow_nan=False,
+    allow_infinity=False,
+)
+
+
+@given(left=EIGHTEEN_PLACE_AMOUNTS, right=EIGHTEEN_PLACE_AMOUNTS)
+def test_add_and_subtract_agree_with_exact_rationals(left: Decimal, right: Decimal) -> None:
+    """Against `Fraction`, which cannot round: every digit of every result is right."""
+    assert Fraction(add(left, right)) == Fraction(left) + Fraction(right)
+    assert Fraction(subtract(left, right)) == Fraction(left) - Fraction(right)
+
+
+# ---- divide -------------------------------------------------------------------------
+
+#: A quotient whose digits past the 18th place read `4999...9` for thirty places and then
+#: stop: `1.000000000000000001` and a remainder just under half a unit. Rounded once it is
+#: `...001`. Rounded first to 38 significant digits, the tail becomes an exact `5`, a tie,
+#: and half-even then rounds the odd `1` up to `...002` -- the double rounding the spec's
+#: *Arithmetic* section forbids.
+BELOW_A_TIE: Final = Decimal("1.000000000000000001" + "4" + "9" * 29)
+
+
+@pytest.mark.parametrize("divisor", ["1", "7", "0.003"], ids=["by 1", "by 7", "by 0.003"])
+def test_divide_rounds_once_where_rounding_twice_would_differ(divisor: str) -> None:
+    """The case that separates one rounding from two, through three different divisors.
+
+    The dividend is `BELOW_A_TIE * divisor`, computed exactly by `multiply`, so the true
+    quotient is `BELOW_A_TIE` itself. The control rounds it the two-step way and shows the
+    answers differ, so the assertion is about the rounding and not about an easy number.
+    """
+    divisor_value = Decimal(divisor)
+    dividend = multiply(BELOW_A_TIE, divisor_value)
+
+    quotient = divide(dividend, divisor_value, 18)
+
+    assert quotient == Decimal("1.000000000000000001")
+    assert quotient.as_tuple().exponent == -18
+    money_context = decimal.Context(prec=MONEY_PRECISION)
+    rounded_twice = quantize(money_context.divide(dividend, divisor_value), 18)
+    assert rounded_twice == Decimal("1.000000000000000002"), "the control did not double-round"
+
+
+@pytest.mark.parametrize(
+    ("dividend", "divisor", "scale", "expected"),
+    [
+        # Ties, which only half-even disambiguates: to the even neighbour, up and down.
+        pytest.param("0.000000000000000001", "2", 18, "0", id="0.5 units to 0"),
+        pytest.param("0.000000000000000003", "2", 18, "0.000000000000000002", id="1.5 to 2"),
+        pytest.param("0.000000000000000005", "2", 18, "0.000000000000000002", id="2.5 to 2"),
+        pytest.param("0.000000000000000007", "2", 18, "0.000000000000000004", id="3.5 to 4"),
+        pytest.param("-0.000000000000000005", "2", 18, "-0.000000000000000002", id="-2.5 to -2"),
+        pytest.param("-0.000000000000000007", "2", 18, "-0.000000000000000004", id="-3.5 to -4"),
+        pytest.param("1", "4", 1, "0.2", id="0.25 at one place to 0.2"),
+        pytest.param("3", "4", 1, "0.8", id="0.75 at one place to 0.8"),
+        # Not ties: the nearest neighbour, whichever way it lies.
+        pytest.param("1", "3", 18, "0.333333333333333333", id="1 by 3"),
+        pytest.param("2", "3", 18, "0.666666666666666667", id="2 by 3"),
+        pytest.param("-2", "3", 18, "-0.666666666666666667", id="-2 by 3"),
+        pytest.param("2", "-3", 18, "-0.666666666666666667", id="2 by -3"),
+        # docs/accounting.md example 6: 0.666666666666666667 / 2 is a tie on an odd digit.
+        pytest.param("0.666666666666666667", "2", 18, "0.333333333333333334", id="example 6"),
+        # An exact quotient comes back padded to the scale.
+        pytest.param("70000", "2", 18, "35000", id="exact"),
+    ],
+)
+def test_divide_rounds_half_to_even_at_the_scale(
+    dividend: str, divisor: str, scale: int, expected: str
+) -> None:
+    quotient = divide(Decimal(dividend), Decimal(divisor), scale)
+
+    assert quotient == Decimal(expected)
+    assert quotient.as_tuple().exponent == -scale
+
+
+def test_divide_keeps_the_sign_of_a_quotient_too_small_to_show() -> None:
+    """`-1E-30 / 1` at 18 places is a negative zero, as the docstring promises."""
+    assert str(divide(Decimal("-1E-30"), Decimal(1), 18)) == "-0E-18"
+    assert str(divide(Decimal("1E-30"), Decimal(1), 18)) == "0E-18"
+    assert str(divide(Decimal(0), Decimal(7), 18)) == "0E-18"
+
+
+@pytest.mark.parametrize("zero", ["0", "-0", "0E-18"])
+def test_divide_refuses_a_zero_divisor(zero: str) -> None:
+    """Refused as a `ZeroDivisionError`, which `decimal.DivisionByZero` is."""
+    with pytest.raises(ZeroDivisionError):
+        divide(Decimal(1), Decimal(zero), 18)
+
+
+@pytest.mark.parametrize(
+    "dividend",
+    [
+        pytest.param("100000000000000000000", id="21 integer digits"),
+        pytest.param("99999999999999999999.9999999999999999995", id="rounds up to 21 digits"),
+        pytest.param("1E+100000", id="an exponent no quotient here can hold"),
+    ],
+)
+def test_divide_refuses_a_quotient_beyond_the_money_precision(dividend: str) -> None:
+    """`InvalidOperation`, the type `quantize` raises, for more than 38 digits at 18 places."""
+    with pytest.raises(decimal.InvalidOperation):
+        divide(Decimal(dividend), Decimal(1), 18)
+
+
+def test_divide_accepts_the_widest_quotient_that_fits() -> None:
+    """Twenty integer digits and eighteen places is 38 digits, and fits."""
+    widest = Decimal("99999999999999999999.999999999999999999")
+
+    assert divide(widest, Decimal(1), 18) == widest
+
+
+def test_divide_ignores_a_narrowed_ambient_context() -> None:
+    """The spec's own hostile context, `prec=6, rounding=ROUND_UP`, changes nothing."""
+    outside = divide(BELOW_A_TIE, Decimal(3), 18)
+    with decimal.localcontext() as context:
+        context.prec = 6
+        context.rounding = decimal.ROUND_UP
+        inside = divide(BELOW_A_TIE, Decimal(3), 18)
+        ambient = BELOW_A_TIE / Decimal(3)
+
+    assert str(inside) == str(outside)
+    assert outside == Decimal("0.333333333333333334")
+    assert ambient != outside, "the control did not round; the test proves nothing"
+
+
+@pytest.mark.parametrize(
+    ("dividend", "divisor"),
+    [
+        pytest.param(Decimal("0." + "1" * OVERLONG_ONES), Decimal(3), id="long dividend"),
+        pytest.param(Decimal(1), Decimal("0." + "3" * OVERLONG_ONES), id="long divisor"),
+        pytest.param(
+            Decimal("1." + "1" * OVERLONG_ONES),
+            Decimal("0." + "7" * OVERLONG_ONES),
+            id="both long",
+        ),
+        pytest.param(Decimal("1E+100000"), Decimal("3E+100000"), id="far exponents"),
+    ],
+)
+def test_divide_is_exact_past_the_int_str_digit_limit(dividend: Decimal, divisor: Decimal) -> None:
+    """Operands of 5000 digits, or exponents of 100000, and still one correct rounding."""
+    expected = round_half_even(Fraction(dividend) / Fraction(divisor), 18)
+
+    assert Fraction(divide(dividend, divisor, 18)) == expected
+
+
+@pytest.mark.parametrize(
+    ("scale", "raised"),
+    [
+        pytest.param(-1, ValueError, id="negative"),
+        pytest.param(True, TypeError, id="bool"),
+        pytest.param(Decimal(18), TypeError, id="a Decimal"),
+    ],
+)
+def test_divide_refuses_a_scale_that_is_not_a_whole_number_of_places(
+    scale: object, raised: type[Exception]
+) -> None:
+    with pytest.raises(raised):
+        divide(Decimal(1), Decimal(3), scale)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("dividend", "divisor", "raised"),
+    [
+        pytest.param(1, Decimal(3), TypeError, id="int dividend"),
+        pytest.param(Decimal(1), 0.5, TypeError, id="float divisor"),
+        pytest.param(Decimal("NaN"), Decimal(3), ValueError, id="nan"),
+        pytest.param(Decimal(1), Decimal("Infinity"), ValueError, id="infinity"),
+    ],
+)
+def test_divide_refuses_what_is_not_a_finite_decimal(
+    dividend: object, divisor: object, raised: type[Exception]
+) -> None:
+    with pytest.raises(raised):
+        divide(dividend, divisor, 18)  # type: ignore[arg-type]
+
+
+NONZERO_AMOUNTS: Final = EIGHTEEN_PLACE_AMOUNTS.filter(lambda value: not value.is_zero())
+SMALL_AMOUNTS: Final = st.decimals(
+    min_value=Decimal("-1E+6"),
+    max_value=Decimal("1E+6"),
+    places=18,
+    allow_nan=False,
+    allow_infinity=False,
+)
+
+
+@settings(max_examples=300)
+@given(
+    dividend=st.one_of(SMALL_AMOUNTS, EIGHTEEN_PLACE_AMOUNTS),
+    divisor=NONZERO_AMOUNTS,
+    scale=st.integers(min_value=0, max_value=18),
+)
+def test_divide_agrees_with_one_exact_half_even_rounding(
+    dividend: Decimal, divisor: Decimal, scale: int
+) -> None:
+    """Over generated operands: the rational quotient rounded once, or a refusal.
+
+    300 examples rather than the default 100: this is the one function the engine rounds
+    through, each example costs microseconds, and a tie or a near-tie is the input worth
+    finding. It refuses exactly when the rounded quotient needs more than 38 significant
+    digits at `scale` places.
+    """
+    expected = round_half_even(Fraction(dividend) / Fraction(divisor), scale)
+    if abs(expected) >= Fraction(10) ** (MONEY_PRECISION - scale):
+        with pytest.raises(decimal.InvalidOperation):
+            divide(dividend, divisor, scale)
+        return
+
+    quotient = divide(dividend, divisor, scale)
+
+    assert Fraction(quotient) == expected
+    assert quotient.as_tuple().exponent == -scale
+
+
+@pytest.mark.parametrize(
+    ("dividend", "divisor"),
+    [
+        pytest.param("1E+20", "1.1", id="gap of 20, quotient 9.09E+19"),
+        pytest.param("1E+20", "9.999999999999999999", id="gap of 20, just over 1E+19"),
+        pytest.param("5E+19", "0.6", id="gap of 20 through a fractional divisor"),
+        pytest.param("-1E+20", "1.000000000000000001", id="gap of 20, negative"),
+    ],
+)
+def test_divide_computes_a_quotient_that_fits_even_when_the_exponents_are_20_apart(
+    dividend: str, divisor: str
+) -> None:
+    """The refusal read off the exponents must not refuse what fits.
+
+    With the adjusted exponents 20 apart, the quotient lies between 10**19 and 10**21, so
+    only the digits can say whether it fits in 20 integer digits. Each of these does, and
+    must be computed, not refused. The mutation sweep found a pre-check one digit too early
+    surviving every other test, because random operands rarely land here.
+    """
+    expected = round_half_even(Fraction(Decimal(dividend)) / Fraction(Decimal(divisor)), 18)
+    assert abs(expected) < Fraction(10) ** 20
+
+    quotient = divide(Decimal(dividend), Decimal(divisor), 18)
+
+    assert Fraction(quotient) == expected
+
+
+@pytest.mark.parametrize(
+    ("dividend", "divisor", "scale"),
+    [
+        pytest.param("1E+38", "1.1", 0, id="scale 0: 38 digits fit"),
+        pytest.param("1E+30", "1.1", 8, id="scale 8: 30 digits fit"),
+    ],
+)
+def test_divide_computes_the_widest_quotients_at_other_scales(
+    dividend: str, divisor: str, scale: int
+) -> None:
+    """The same edge at other scales: `MONEY_PRECISION - scale` integer digits fit."""
+    expected = round_half_even(Fraction(Decimal(dividend)) / Fraction(Decimal(divisor)), scale)
+    assert abs(expected) < Fraction(10) ** (MONEY_PRECISION - scale)
+
+    assert Fraction(divide(Decimal(dividend), Decimal(divisor), scale)) == expected

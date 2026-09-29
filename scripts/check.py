@@ -17,7 +17,9 @@ import argparse
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from enum import Enum
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,10 +29,42 @@ FRONTEND = REPO_ROOT / "frontend"
 Step = tuple[str, list[str], Path]
 
 
-def backend_steps(fast: bool) -> list[Step]:
+class Outcome(Enum):
+    """What running one step came to. A skip is not a pass, and the gate keeps them apart."""
+
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+PREREQUISITES: dict[str, str] = {"domain coverage": "pytest"}
+"""A step that reads what another step wrote, mapped to that step.
+
+The domain coverage floor reads the JSON report the pytest run writes. When pytest was
+skipped -- `uv` is not installed -- there is no report, and running the floor anyway would
+fail it as "unusable report", which sends the reader after the wrong cause. So the floor is
+skipped too, and says why. **Only a skip propagates.** A pytest that ran and failed still
+wrote a report, or tried to, and the floor runs over it as usual; one that died before
+writing it leaves the floor to fail closed, which is the right answer when pytest ran.
+"""
+
+
+def backend_steps(fast: bool, scratch: Path) -> list[Step]:
+    """The backend gate. In full mode, pytest also writes a JSON coverage report to `scratch`.
+
+    The domain coverage floor (criterion 13 of #17) runs over that report, straight after
+    the run that wrote it. `scratch` is a directory made fresh for this invocation, so a
+    pytest that died before writing its report leaves nothing behind for the floor to read
+    and pass on: `domain_coverage.py` refuses a missing report as unusable.
+    """
     if not (BACKEND / "pyproject.toml").exists():
         return []
-    pytest_args = ["-q", "-x"] if fast else ["--cov", "--cov-report=term-missing"]
+    domain_report = scratch / "coverage.json"
+    pytest_args = (
+        ["-q", "-x"]
+        if fast
+        else ["--cov", "--cov-report=term-missing", f"--cov-report=json:{domain_report}"]
+    )
     steps: list[Step] = [
         ("ruff check", ["uv", "run", "ruff", "check", "."], BACKEND),
         ("ruff format", ["uv", "run", "ruff", "format", "--check", "."], BACKEND),
@@ -38,6 +72,14 @@ def backend_steps(fast: bool) -> list[Step]:
         ("import layering", ["uv", "run", "lint-imports"], BACKEND),
         ("pytest", ["uv", "run", "pytest", *pytest_args], BACKEND),
     ]
+    if not fast:
+        steps.append(
+            (
+                "domain coverage",
+                [sys.executable, "scripts/domain_coverage.py", str(domain_report)],
+                REPO_ROOT,
+            )
+        )
     return steps
 
 
@@ -77,7 +119,7 @@ def shared_steps(fast: bool) -> list[Step]:
     return steps
 
 
-def run(step: Step) -> bool:
+def run(step: Step) -> Outcome:
     name, command, cwd = step
     if command[0] == sys.executable:
         resolved = command
@@ -86,14 +128,34 @@ def run(step: Step) -> bool:
         executable = shutil.which(command[0])
         if executable is None:
             print(f"  SKIP  {name}: {command[0]} is not installed")
-            return True
+            return Outcome.SKIPPED
         resolved = [executable, *command[1:]]
     started = time.monotonic()
     result = subprocess.run(resolved, cwd=cwd, check=False)
     elapsed = time.monotonic() - started
     status = "ok" if result.returncode == 0 else "FAILED"
     print(f"  {status:6} {name}  ({elapsed:.1f}s)")
-    return result.returncode == 0
+    return Outcome.PASSED if result.returncode == 0 else Outcome.FAILED
+
+
+def run_steps(steps: list[Step]) -> list[str]:
+    """Run every step in order and return the names of the ones that failed.
+
+    A skipped step is not a failure, as before. What is new is `PREREQUISITES`: a step whose
+    prerequisite was skipped is skipped too, with the reason, instead of being run against
+    output that was never written.
+    """
+    outcomes: dict[str, Outcome] = {}
+    for step in steps:
+        name = step[0]
+        prerequisite = PREREQUISITES.get(name)
+        if prerequisite is not None and outcomes.get(prerequisite) is Outcome.SKIPPED:
+            reason = "so there is no coverage report to hold to the floor"
+            print(f"  SKIP  {name}: {prerequisite} was skipped, {reason}")
+            outcomes[name] = Outcome.SKIPPED
+            continue
+        outcomes[name] = run(step)
+    return [name for name, outcome in outcomes.items() if outcome is Outcome.FAILED]
 
 
 def nothing_changed() -> bool:
@@ -132,19 +194,20 @@ def main(argv: list[str] | None = None) -> int:
     only_backend = args.backend and not args.frontend
     only_frontend = args.frontend and not args.backend
 
-    steps: list[Step] = []
-    if not only_frontend:
-        steps += backend_steps(args.fast)
-    if not only_backend:
-        steps += frontend_steps(args.fast)
-    if not (only_backend or only_frontend):
-        steps += shared_steps(args.fast)
+    with tempfile.TemporaryDirectory(prefix="portfolio-check-", ignore_cleanup_errors=True) as tmp:
+        steps: list[Step] = []
+        if not only_frontend:
+            steps += backend_steps(args.fast, Path(tmp))
+        if not only_backend:
+            steps += frontend_steps(args.fast)
+        if not (only_backend or only_frontend):
+            steps += shared_steps(args.fast)
 
-    if not steps:
-        print("Nothing to check yet.")
-        return 0
+        if not steps:
+            print("Nothing to check yet.")
+            return 0
 
-    failures = [step[0] for step in steps if not run(step)]
+        failures = run_steps(steps)
     print()
     if failures:
         print(f"FAILED: {', '.join(failures)}")

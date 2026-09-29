@@ -128,3 +128,105 @@ source_modules =
     portfolio.api
 forbidden_modules =
     portfolio.providers.exchanges
+
+[importlinter:contract:domain-is-pure]
+name = portfolio domain is pure
+# Criterion 1 of #17: `portfolio.domain` does no I/O and has no source of nondeterminism,
+# so that `accounting.replay` -- and everything else here -- is a function of its
+# arguments and nothing else. The `layers` contract above already stops `domain` importing
+# the application; this contract is about what it may not import from *outside* it.
+#
+# **Two halves.** The frameworks and clients (`sqlalchemy`, `httpx`, `fastapi`, `starlette`,
+# `pydantic`), and the standard-library modules that do I/O or introduce nondeterminism.
+# Naming a stdlib module here works because `include_external_packages = True` above makes
+# grimp add every top-level package an application module imports -- the standard library
+# included -- to the graph as one squashed node, so `from urllib import parse` arrives as an
+# import of `urllib`. Measured with import-linter 2.15 and grimp 3.17 by planting
+# `import os`, `import socket`, `import time`, `from urllib import parse`, `import logging`,
+# `import http.client` and `import sqlalchemy` in a domain module of a shadow copy of the
+# package: each was reported BROKEN, by its top-level name, and without them the contract
+# was KEPT. `logging` and `http` resolve to the standard library rather than to
+# `portfolio.logging` or `portfolio.providers.http`, because an absolute import is. Only
+# top-level names are accepted (`os`, never `os.path`); import-linter refuses a submodule of
+# an external package with a configuration error rather than ignoring it.
+#
+# **The second twelve, from `zoneinfo` on, were added at review**, and each is here for the
+# same two reasons as the first sixteen:
+#
+# * `zoneinfo` reads the host's time-zone database from disk, and its answer for one instant
+#   changes with the tzdata release installed. An event key is UTC and needs neither.
+# * `tempfile`, `shutil` and `glob` are the filesystem, by other names than `os` and
+#   `pathlib`.
+# * `multiprocessing` and `concurrent` run work in other processes and threads, where the
+#   order things finish in is the scheduler's rather than the input's.
+# * `ctypes` calls native code, which can do anything at all.
+# * `signal`, `select` and `selectors` are the operating system's signals and I/O waits.
+# * `platform` describes the host it runs on, so an answer built on it differs by machine.
+# * `locale` is process-wide state that changes how numbers format and strings collate, so a
+#   result built on it differs by the host's settings rather than by the events.
+#
+# Planted together in a shadow domain module, `from concurrent import futures` included, all
+# twelve were reported BROKEN by their top-level names, as the first batch was. Criterion 1
+# of spec 019 lists all thirty-three. Builtins that do I/O without any import -- `open`,
+# `print`, `input` -- and an argument-less `astimezone()`, which reads the host's zone, are
+# beyond what an import contract can see; they are for the AST test in `tests/security/` to
+# forbid, beside the clock calls.
+#
+# **Vacuous per module until something imports it**, and that is inherent rather than a
+# gap: import-linter checks only the forbidden modules that are in the graph, and an
+# external module enters the graph when any application module imports it. `socket` is in
+# no graph until somebody writes `import socket`, and that is exactly the edit this contract
+# then reports. What proves the harness can see such an edit at all is the planted-violation
+# test in `tests/test_import_contracts.py`.
+#
+# **The clock is not here, because it is a call, not an import.** `datetime` is needed for
+# an event's key, and `datetime.now()` needs nothing more; `tests/security/` forbids the
+# calls with an AST test instead. `hashlib` is deliberately absent too: SHA-256 is a pure
+# function, and the accounting fingerprint is built on it.
+#
+# **Deliberately without `allow_indirect_imports`**, and what that does and does not buy
+# was measured rather than assumed. The source is the whole `portfolio.domain` package, so
+# imports between domain modules collapse into one node: in a chain `domain.a -> domain.b
+# -> socket` only `domain.b -> socket` is reported, with the flag or without it. The flag
+# matters for a chain that *leaves* the package. With a planted `domain.caller ->
+# portfolio.outside -> socket`, this contract reports the whole chain as it stands, and
+# with the flag added it is KEPT. `domain` importing the application at all is the layers
+# contract's to refuse, but a module that sits in no layer is one that contract does not
+# constrain, and this one still sees through it.
+type = forbidden
+source_modules =
+    portfolio.domain
+forbidden_modules =
+    sqlalchemy
+    httpx
+    fastapi
+    starlette
+    pydantic
+    os
+    io
+    pathlib
+    socket
+    ssl
+    subprocess
+    urllib
+    http
+    sqlite3
+    asyncio
+    threading
+    time
+    random
+    secrets
+    uuid
+    logging
+    zoneinfo
+    tempfile
+    shutil
+    glob
+    multiprocessing
+    concurrent
+    ctypes
+    signal
+    select
+    selectors
+    platform
+    locale

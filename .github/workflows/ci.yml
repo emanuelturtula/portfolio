@@ -117,7 +117,15 @@ jobs:
         working-directory: backend
       - name: pytest with coverage
         working-directory: backend
-        run: uv run pytest --cov --cov-report=term-missing
+        # The JSON report is for the next step, and goes to the runner's temporary
+        # directory so that nothing lands in the checkout.
+        run: uv run pytest --cov --cov-report=term-missing --cov-report="json:$RUNNER_TEMP/coverage.json"
+      - name: Domain coverage floor
+        # Criterion 13 of #17: 95% of lines and 90% of branches under src/portfolio/domain/,
+        # on top of the repository-wide floor in backend/pyproject.toml, which one number
+        # over everything would let the accounting engine slip under. Standard library only,
+        # so it needs nothing the backend installs; it fails closed on a report it cannot use.
+        run: python3 scripts/domain_coverage.py "$RUNNER_TEMP/coverage.json"
       - name: Deployment guardrail tests
         # Plain unittest, no dependencies: these protect the path from a workflow run to a
         # production deployment, so they must run even if the backend fails to install.

@@ -163,4 +163,8 @@ See `docs/specs/003-single-user-password-login.md` for the decisions and what th
 
 - `CLAUDE.md` — the working agreement, and the enforcement behind each rule.
 - `docs/operations.md` — running the instance: the account, the password hash, sessions.
+- `docs/accounting.md` — how fills become cost basis, average cost and realized P&L, with
+  worked examples.
+- `docs/adr/` — architecture decision records, starting with weighted-average cost basis and
+  why it is not a tax figure.
 - `docs/specs/` — the per-issue implementation specs.

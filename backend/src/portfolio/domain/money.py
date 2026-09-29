@@ -192,6 +192,162 @@ def multiply(left: Decimal, right: Decimal) -> Decimal:
     )
 
 
+def add(left: Decimal, right: Decimal) -> Decimal:
+    """The exact sum of two amounts. Never rounded, whatever the ambient context says.
+
+    `multiply`'s reasoning, applied to a sum. **`left + right`** evaluates in the calling
+    thread's context: at the interpreter's default of 28 digits, or inside anyone's
+    `decimal.localcontext()`, a sum of a large basis and an 18-place fee is rounded before
+    anybody asked for a rounding, silently. **Adding under a 38-digit context** fixes the
+    thread dependence and still rounds any sum longer than 38 digits, and whatever rounds
+    it next is then a second rounding. So the operands are aligned to the smaller exponent
+    and summed as integers, and the result carries every digit.
+
+    **The shape of the answer is `Decimal`'s own**, so this is a drop-in for an exact `+`:
+    the exponent is the smaller of the two, and a zero result is negative only when both
+    operands are (`-0 + -0` is `-0`; `1 + -1` is `0`), which is the rule `Decimal` applies
+    under every rounding mode but `ROUND_FLOOR`.
+
+    **Built from integers like `multiply`, and with the same care**: `int(Decimal)` and
+    `Decimal(int)` rather than any `str` round trip, which the interpreter refuses beyond
+    4300 digits, and the alignment spelled as a `Decimal` exponent rather than as `10**k`,
+    which typeshed types as `Any`. **The work grows with the gap between the exponents**,
+    because an exact sum of `1E+100000` and `1E-100000` has two hundred thousand digits and
+    converting them is quadratic -- measured at about a fifth of a second for a gap of a
+    hundred thousand places. Every amount the accounting engine adds has exactly eighteen
+    places, so its gaps are zero; a caller summing amounts from anywhere else should bound
+    their exponents first, as `NormalizedFill` does.
+
+    Raises:
+        TypeError: either operand is not a `Decimal` (a `bool` or a `float` included).
+        ValueError: either operand is a NaN or an infinity.
+    """
+    require_amount(left, subject="add")
+    require_amount(right, subject="add")
+    return _exact_sum(left, right)
+
+
+def subtract(left: Decimal, right: Decimal) -> Decimal:
+    """The exact difference `left - right`. Never rounded, whatever the ambient context says.
+
+    `add` of `right` negated, and negated with `copy_negate`, which only flips the sign bit:
+    unary `-right` is an arithmetic operation in `decimal`, and it rounds `right` to the
+    calling thread's precision on the way. Everything `add` says about exactness, the shape
+    of the result and the cost of a wide exponent gap holds here too, and so does the sign of
+    a zero: `x - x` is `0`, and `-0 - 0` is `-0`.
+
+    Raises:
+        TypeError: either operand is not a `Decimal` (a `bool` or a `float` included).
+        ValueError: either operand is a NaN or an infinity.
+    """
+    require_amount(left, subject="subtract")
+    require_amount(right, subject="subtract")
+    return _exact_sum(left, right.copy_negate())
+
+
+def divide(dividend: Decimal, divisor: Decimal, scale: int) -> Decimal:
+    """`dividend / divisor`, rounded **once**, by `MONEY_ROUNDING`, to exactly `scale` places.
+
+    The one arithmetic operation here that has to round, since a quotient such as `1 / 3`
+    has no finite expansion. Two things make it round exactly once.
+
+    **The quotient is never approximated before the rounding.** Integer division yields the
+    quotient truncated one place past `scale`, and a remainder. Where the remainder is not
+    zero, a trailing `1` -- a sticky digit -- is appended two places past `scale`. That
+    stand-in sits strictly between the truncation and the next value at that place, and so
+    does the true quotient, and no rounding boundary or midpoint at `scale` places lies in
+    that open interval: every rounding mode treats the two identically. A stand-in with no
+    sticky digit is the quotient itself. The alternative -- `dividend / divisor` in some
+    context, then `quantize` -- is two roundings, and `multiply` explains how two half-even
+    roundings in a row put the last digit one unit off.
+
+    **The rounding itself is `quantize`'s**, applied to that stand-in, so this function
+    carries no copy of the rounding rule to drift from the one the rest of the system uses:
+    change `MONEY_ROUNDING` and this changes with it. That is also where the ceiling comes
+    from. A quotient needing more than `MONEY_PRECISION` significant digits at `scale`
+    places raises `decimal.InvalidOperation`, the type `quantize` raises, and so does a
+    `scale` finer than the context's exponent range allows. The ambient context plays no
+    part: `quantize` passes `_MONEY_CONTEXT` explicitly.
+
+    **The integers are bounded by the operands, not by their exponents.** An operand is a
+    `Decimal`, so `1E+999999` is a legal one, and aligning it naively would build a
+    million-digit integer and convert it -- quadratic, and measured at seconds for a few
+    hundred thousand digits. So the quotient's order of magnitude is read off the adjusted
+    exponents first. A quotient certain to exceed the ceiling is refused without being
+    computed, and one certain to be under a tenth of a unit at `scale` places is replaced by
+    a sticky digit alone -- which rounds as it would, so the rounding mode is still
+    `quantize`'s to apply. What remains needs integers of no more digits than the two
+    coefficients hold between them, plus the forty or so the ceiling allows.
+
+    The sign follows the usual rule, including for a zero quotient: `-1 / 3` at a scale too
+    coarse to show it is `-0`, which `NumericText` normalises.
+
+    Raises:
+        TypeError: `dividend` or `divisor` is not a `Decimal` (a `bool` or a `float`
+            included), or `scale` is not an `int` (a `bool` included).
+        ValueError: `dividend` or `divisor` is a NaN or an infinity, or `scale` is negative.
+        decimal.DivisionByZero: `divisor` is zero. The type `decimal` itself raises for a
+            division by zero, and a subclass of `ZeroDivisionError`, so a caller catching
+            either catches this.
+        decimal.InvalidOperation: the rounded quotient needs more than `MONEY_PRECISION`
+            significant digits.
+    """
+    require_amount(dividend, subject="divide")
+    require_amount(divisor, subject="divide")
+    _require_decimals(scale, subject="divide")
+    if divisor.is_zero():
+        message = "divide refuses a zero divisor"
+        raise decimal.DivisionByZero(message)
+    dividend_sign, dividend_digits, dividend_exponent = dividend.as_tuple()
+    divisor_sign, divisor_digits, divisor_exponent = divisor.as_tuple()
+    sign = dividend_sign ^ divisor_sign
+    if dividend.is_zero():
+        return quantize(Decimal((sign, (0,), 0)), scale)
+    # 10**m <= |dividend / divisor| * 10**(1 - (adjusted gap)) ... in plain words: with
+    # `magnitude = dividend.adjusted() - divisor.adjusted()`, the quotient lies strictly
+    # between 10**(magnitude - 1) and 10**(magnitude + 1). `adjusted()` reads the exponent
+    # and the digit count; it involves no context and no arithmetic on the value.
+    magnitude = dividend.adjusted() - divisor.adjusted()
+    if magnitude + scale - 1 >= MONEY_PRECISION:
+        # At `scale` places the quotient is above 10**MONEY_PRECISION units, so its rounded
+        # coefficient has more digits than the context holds, under any rounding mode.
+        message = (
+            f"divide cannot represent a quotient of more than {MONEY_PRECISION} "
+            f"significant digits at {scale} decimal places"
+        )
+        raise decimal.InvalidOperation(message)
+    if magnitude + scale + 2 <= 0:
+        # Below a tenth of a unit at `scale` places. A lone sticky digit two places past
+        # `scale` stands in for it: truncated one place past `scale` it is zero with a
+        # non-zero remainder, exactly as the quotient is.
+        return quantize(Decimal((sign, (1,), -(scale + 2))), scale)
+    # One place past `scale`: the guard digit the sticky digit is appended after.
+    shift = int(dividend_exponent) - int(divisor_exponent) + scale + 1
+    numerator = _scaled_coefficient(dividend_digits, max(shift, 0))
+    denominator = _scaled_coefficient(divisor_digits, max(-shift, 0))
+    truncated, remainder = divmod(numerator, denominator)
+    digits = Decimal(truncated).as_tuple().digits
+    if remainder:
+        return quantize(Decimal((sign, (*digits, 1), -(scale + 2))), scale)
+    return quantize(Decimal((sign, digits, -(scale + 1))), scale)
+
+
+def _exact_sum(left: Decimal, right: Decimal) -> Decimal:
+    """The exact sum of two finite amounts, aligned to the smaller exponent. See `add`."""
+    left_sign, left_digits, left_exponent = left.as_tuple()
+    right_sign, right_digits, right_exponent = right.as_tuple()
+    # Both exponents are `int` on a finite Decimal; `require_amount` has refused the rest.
+    exponent = min(int(left_exponent), int(right_exponent))
+    left_value = _scaled_coefficient(left_digits, int(left_exponent) - exponent)
+    right_value = _scaled_coefficient(right_digits, int(right_exponent) - exponent)
+    total = (-left_value if left_sign else left_value) + (
+        -right_value if right_sign else right_value
+    )
+    if total == 0:
+        return Decimal((left_sign & right_sign, (0,), exponent))
+    return Decimal((int(total < 0), Decimal(abs(total)).as_tuple().digits, exponent))
+
+
 def _coefficient(digits: tuple[int, ...]) -> int:
     """A Decimal's coefficient digits as the integer they spell. Exact by construction.
 
@@ -199,6 +355,17 @@ def _coefficient(digits: tuple[int, ...]) -> int:
     the interpreter's 4300-digit conversion limit, and this one is not.
     """
     return int(Decimal((0, digits, 0)))
+
+
+def _scaled_coefficient(digits: tuple[int, ...], shift: int) -> int:
+    """The integer `digits` spell, times ten to the `shift`. `shift` is not negative.
+
+    `_coefficient` with the power of ten carried as the exponent of the `Decimal` being
+    converted, which `int()` resolves exactly -- a `Decimal` with a non-negative exponent is
+    already an integer, and converting one involves no rounding and no context. It avoids
+    `10**shift`, which typeshed types as `Any`, for the reason `to_base_units` gives.
+    """
+    return int(Decimal((0, digits, shift)))
 
 
 def to_base_units(amount: Decimal, decimals: int) -> int:
