@@ -317,3 +317,23 @@ money fields are the owner's holdings and returns.
   - A position that is both unknown-basis and unpriced appears once in `totals.excluded`,
     as `unknown_basis`, which is checked first.
 - Converting the fills to `Trade`s runs in the worker thread together with `replay`.
+- **R5. `positions()` never mixes two snapshots (review S1).** Reads are autocommit
+  statements on this engine, and SQLite reuses the header id. So a recompute committed
+  between the header read and the children's reads served one snapshot's header over another
+  snapshot's rows. The fix:
+  - read the header, positions and warnings first, and the prices after them, since prices
+    are not part of the snapshot;
+  - re-read the header and compare `input_fingerprint` and `computed_at`;
+  - on a mismatch, retry the snapshot read, a bounded number of times.
+- **R6. A value that cannot be represented is not a 500 (review N1).** When a price's product
+  with the quantity does not fit 18 places within `MONEY_PRECISION`:
+  - `market_value` and `unrealized_pnl` are `None`, with reason `value_out_of_range`;
+  - the position is excluded from the totals as `unpriced`.
+
+  This extends R4's rule. It is unreachable with real prices.
+- **R7. A failed recompute is retried at the next sync (review N2).** The post-sync trigger
+  also runs when `fills_inserted == 0`, if the last recorded status is `FAILED`. A transient
+  failure such as "database is locked" then clears itself at the next sync rather than at the
+  next stored fill or restart.
+- **R8. Lot kinds are derived by full identity (review N4).** Transfers never enter the map,
+  because they never make lots.
