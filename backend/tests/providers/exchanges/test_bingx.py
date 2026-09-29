@@ -1335,8 +1335,12 @@ EIGHTEEN_PLACES: Final = "0.000000000000000001"
 async def test_price_and_qty_are_never_rounded(field: str) -> None:
     """Exact strings the venue formats: nineteen significant digits survive; nineteen places,
     one past `FILL_SCALE`, are refused rather than rounded; eighteen are kept exactly."""
+    # One unit of BTC cannot pay the sample's BTC commission, and spec 020 refuses a fee
+    # that consumes everything received. The qty case pays none, so what it tests is the
+    # spelling; `test_a_commission_that_consumes_the_quantity_bought_is_refused` is the fee.
+    free = {"commission": "0"} if field == "qty" else {}
     kept = await fetch_page(one_fill_fake(**{field: f'"{NINETEEN_DIGITS}"'}))
-    finest = await fetch_page(one_fill_fake(**{field: f'"{EIGHTEEN_PLACES}"'}))
+    finest = await fetch_page(one_fill_fake(**{field: f'"{EIGHTEEN_PLACES}"'}, **free))
     error = await refused(one_fill_fake(**{field: f'"{NINETEEN_PLACES}"'}))
 
     (fill,) = kept.fills
@@ -1354,6 +1358,31 @@ async def test_a_missing_quote_quantity_is_derived_and_flagged(fragment: str | N
     (fill,) = page.fills
     assert fill.quote_quantity_derived is True
     assert exact(fill.quote_quantity, "6696.471396937000000000")
+
+
+@pytest.mark.parametrize(
+    "qty",
+    [
+        pytest.param("0.000046483255", id="the commission, exactly"),
+        pytest.param("0.000000000000000001", id="one unit"),
+    ],
+)
+async def test_a_commission_that_consumes_the_quantity_bought_is_refused(qty: str) -> None:
+    """Spec 020: a buy whose BTC commission is all the BTC bought is refused at the parser.
+
+    The sample's commission, 0.000046483255 BTC, is taken off a quantity of exactly that, or
+    of one unit, and leaves nothing received for the accounting engine to carry. The venue's
+    answer never becomes a row, and the refusal quotes neither amount.
+    """
+    error = await refused(one_fill_fake(qty=f'"{qty}"'))
+    rendered = f"{error}{error!r}{error.args}"
+
+    assert type(error) is ExchangeSchemaError
+    assert error.detail == (
+        "fee_amount, paid in the asset received, must leave a quantity received greater than zero"
+    )
+    assert "46483255" not in rendered
+    assert "4648" not in rendered
 
 
 async def test_a_positive_commission_is_refused() -> None:
