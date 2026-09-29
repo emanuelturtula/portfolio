@@ -12,8 +12,9 @@ parses it into an IEEE-754 double, and a cost basis at eighteen places is inexac
 client code runs. The percentage return is a string too -- it is a quotient of two money
 figures, and a number there would be the one field a client could sum with `+`.
 
-Amounts arrive at the scale the engine carries them at, eighteen places, and the percentage
-at four. They are exact rather than pretty; the frontend formats them with `decimal.js`.
+Amounts and quantities arrive at the scale the engine carries them at, eighteen places; the
+price at the scale it is stored at, twelve (`PRICE_SCALE`); and the percentage at four. They
+are exact rather than pretty; the frontend formats them with `decimal.js`.
 
 ## Nothing identifies a trade
 
@@ -26,8 +27,10 @@ needs -- on its lots, which no endpoint reads.
 
 A position without a price has `market_value`, `unrealized_pnl` and `unrealized_return_pct`
 `null` and `market_value_unavailable_reason` set; the totals leave it out and name it in
-`totals.excluded`. So does a position holding units of unknown cost. With no snapshot yet,
-`computed_at` is `null` and the lists are empty: "not computed" rather than "holds nothing".
+`totals.excluded`. So does a position holding units of unknown cost. The reason is a price's
+(`PriceUnavailable`), or `value_out_of_range` when the price times the quantity is too large to
+represent (`ValueUnavailable`, spec 021, R6). With no snapshot yet, `computed_at` is `null` and
+the lists are empty: "not computed" rather than "holds nothing".
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from portfolio.api.schemas.money import MoneyStr
 # class is created. The two storage enums come from the service, which re-exports them,
 # because the API layer may not import `portfolio.repositories`; the domain's own
 # vocabulary comes from `domain`, which every layer may import.
-from portfolio.domain.accounting import ExclusionReason, PositionFlag
+from portfolio.domain.accounting import ExclusionReason, PositionFlag, ValueUnavailable
 from portfolio.domain.currencies import QuoteCurrency
 from portfolio.services.accounting import AccountingWarningKind, RecomputeOutcome
 from portfolio.services.prices import PriceUnavailable
@@ -57,6 +60,21 @@ if TYPE_CHECKING:
         PricedPosition,
         SnapshotWarning,
     )
+
+
+def _unavailable(reason: str | None) -> PriceUnavailable | ValueUnavailable | None:
+    """A position's reason as the member of the vocabulary it belongs to.
+
+    Two vocabularies, because two layers produce them: `services.prices` knows why there is no
+    price, and `domain.accounting.valuation` -- which may not import it -- knows when a price
+    gives a value too large to represent. A string in neither raises `ValueError`, which is a
+    defect in whatever produced it rather than something to render.
+    """
+    if reason is None:
+        return None
+    if reason in {member.value for member in ValueUnavailable}:
+        return ValueUnavailable(reason)
+    return PriceUnavailable(reason)
 
 
 class LastRecomputeResponse(BaseModel):
@@ -100,7 +118,7 @@ class AccountingPositionResponse(BaseModel):
     flags: list[PositionFlag]
     price: PriceResponse | None
     market_value: MoneyStr | None
-    market_value_unavailable_reason: PriceUnavailable | None
+    market_value_unavailable_reason: PriceUnavailable | ValueUnavailable | None
     unrealized_pnl: MoneyStr | None
     unrealized_return_pct: MoneyStr | None
 
@@ -121,7 +139,7 @@ class AccountingPositionResponse(BaseModel):
             flags=sorted(position.flags),
             price=None if entry.price is None else PriceResponse.of(entry.price),
             market_value=value.market_value,
-            market_value_unavailable_reason=None if reason is None else PriceUnavailable(reason),
+            market_value_unavailable_reason=_unavailable(reason),
             unrealized_pnl=value.unrealized_pnl,
             unrealized_return_pct=value.unrealized_return_pct,
         )

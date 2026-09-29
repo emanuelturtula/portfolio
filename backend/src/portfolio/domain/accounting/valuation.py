@@ -31,6 +31,12 @@ showing an error, because it is believed.* The one exception is a position holdi
 which is worth exactly zero whatever the price is -- a statement about the quantity, not a
 guess about the price.
 
+**A value that cannot be represented is a reason too** (spec 021, R6). A price times a quantity
+of 10**20 cash units or more has no room at `VALUE_SCALE` places within `MONEY_PRECISION`, and
+rather than raise out of a read it reports `market_value` and `unrealized_pnl` as `None` with
+`ValueUnavailable.VALUE_OUT_OF_RANGE` -- the rule spec 019's R1 set for the average cost and
+R4 for the percentage. No real price reaches it.
+
 ## The totals cover only what can be compared
 
 `value_portfolio` sums the invested amount, the market value and the unrealized P&L over the
@@ -64,6 +70,7 @@ __all__ = [
     "ExclusionReason",
     "PortfolioTotals",
     "PositionValue",
+    "ValueUnavailable",
     "value_portfolio",
     "value_position",
 ]
@@ -87,13 +94,27 @@ _ZERO: Final = Decimal((0, (0,), -VALUE_SCALE))
 amount, and an empty portfolio's totals have the same shape as a full one's."""
 
 
+class ValueUnavailable(StrEnum):
+    """Why a position has no market value although it has a price. The member is its wire form.
+
+    The price reasons -- `never_fetched`, `unsupported_pair` and the rest -- belong to
+    `services.prices.PriceUnavailable`, which `domain` may not import; a caller passes one in as
+    its string. This is the one reason the valuation itself can produce.
+
+    * `VALUE_OUT_OF_RANGE` -- the price times the quantity is 10**20 cash units or more, which
+      no figure here can hold (spec 021, R6).
+    """
+
+    VALUE_OUT_OF_RANGE = "value_out_of_range"
+
+
 class ExclusionReason(StrEnum):
     """Why a position was left out of the portfolio totals. The member is its wire form.
 
     * `UNKNOWN_BASIS` -- some of its units have no known cost, so its value and its cost
       describe different quantities.
-    * `UNPRICED` -- it holds something and there is no price for it, so it has a cost and no
-      value.
+    * `UNPRICED` -- it holds something and has no market value: there is no price for it, or
+      the value cannot be represented (spec 021, R6). It has a cost and no value.
 
     **A position that is both is reported once, as `UNKNOWN_BASIS`** (spec 021, R4): the
     check runs in the order the members are declared, and one entry per position keeps the
@@ -119,10 +140,12 @@ class PositionValue:
     * `price` -- the price used, or `None` when there was none.
     * `market_value` -- `price x quantity`; `None` when there is no price and something is
       held, zero when nothing is held.
-    * `market_value_unavailable_reason` -- the price's reason whenever `market_value` is
-      `None`, and `None` otherwise. Never one without the other.
+    * `market_value_unavailable_reason` -- whenever `market_value` is `None`, why: the price's
+      reason, or `value_out_of_range` when the product cannot be represented (spec 021, R6).
+      `None` otherwise. Never one without the other.
     * `unrealized_pnl` -- `price x known quantity - cost_basis`; `None` when there is no price
-      and a known-cost quantity is held, zero when none is.
+      and a known-cost quantity is held, zero when none is; and `None` whenever the market value
+      is out of range.
     * `unrealized_return_pct` -- `unrealized_pnl / cost_basis x 100` at four places; `None`
       when there is no P&L, when the basis is zero or negative, or when the quotient cannot
       be represented at all (spec 021, R4), which is the rule spec 019's R1 set for the
@@ -177,7 +200,17 @@ def value_position(
     if (price is None) == (price_reason is None):
         message = "value_position takes either a price or the reason there is none, not both"
         raise ValueError(message)
-    market_value = _market_value(position.quantity, price)
+    try:
+        market_value = _market_value(position.quantity, price)
+    except InvalidOperation:
+        return PositionValue(
+            position=position,
+            price=price,
+            market_value=None,
+            market_value_unavailable_reason=ValueUnavailable.VALUE_OUT_OF_RANGE.value,
+            unrealized_pnl=None,
+            unrealized_return_pct=None,
+        )
     unrealized_pnl = _unrealized_pnl(position.known_quantity, position.cost_basis, price)
     return PositionValue(
         position=position,
@@ -222,7 +255,12 @@ def value_portfolio(values: Iterable[PositionValue]) -> PortfolioTotals:
 
 
 def _market_value(quantity: Decimal, price: Decimal | None) -> Decimal | None:
-    """`price x quantity` at `VALUE_SCALE`; zero when nothing is held; `None` when unpriced."""
+    """`price x quantity` at `VALUE_SCALE`; zero when nothing is held; `None` when unpriced.
+
+    Raises:
+        decimal.InvalidOperation: the product is 10**20 or more, past what `VALUE_SCALE`
+            places leave room for; `value_position` reports it as `value_out_of_range`.
+    """
     if quantity.is_zero():
         return _ZERO
     if price is None:
@@ -235,6 +273,9 @@ def _unrealized_pnl(known: Decimal, basis: Decimal, price: Decimal | None) -> De
 
     Zero rather than `-basis` when `known` is zero, because the engine guarantees the basis is
     then exactly zero too (spec 019, I4) -- so zero is the same answer, reached without a price.
+
+    The `quantize` cannot raise: it is called only after `_market_value` fitted the product of
+    the same price and the whole quantity, and `known` is part of that quantity.
     """
     if known.is_zero():
         return _ZERO

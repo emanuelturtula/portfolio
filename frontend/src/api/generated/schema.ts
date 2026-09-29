@@ -434,7 +434,8 @@ export interface components {
             flags: components["schemas"]["PositionFlag"][];
             /** Market Value */
             market_value: string | null;
-            market_value_unavailable_reason: components["schemas"]["PriceUnavailable"] | null;
+            /** Market Value Unavailable Reason */
+            market_value_unavailable_reason: components["schemas"]["PriceUnavailable"] | components["schemas"]["ValueUnavailable"] | null;
             price: components["schemas"]["PriceResponse"] | null;
             /**
              * Quantity
@@ -773,8 +774,8 @@ export interface components {
          *
          *     * `UNKNOWN_BASIS` -- some of its units have no known cost, so its value and its cost
          *       describe different quantities.
-         *     * `UNPRICED` -- it holds something and there is no price for it, so it has a cost and no
-         *       value.
+         *     * `UNPRICED` -- it holds something and has no market value: there is no price for it, or
+         *       the value cannot be represented (spec 021, R6). It has a cost and no value.
          *
          *     **A position that is both is reported once, as `UNKNOWN_BASIS`** (spec 021, R4): the
          *     check runs in the order the members are declared, and one entry per position keeps the
@@ -1182,6 +1183,19 @@ export interface components {
             /** Error Type */
             type: string;
         };
+        /**
+         * ValueUnavailable
+         * @description Why a position has no market value although it has a price. The member is its wire form.
+         *
+         *     The price reasons -- `never_fetched`, `unsupported_pair` and the rest -- belong to
+         *     `services.prices.PriceUnavailable`, which `domain` may not import; a caller passes one in as
+         *     its string. This is the one reason the valuation itself can produce.
+         *
+         *     * `VALUE_OUT_OF_RANGE` -- the price times the quantity is 10**20 cash units or more, which
+         *       no figure here can hold (spec 021, R6).
+         * @enum {string}
+         */
+        ValueUnavailable: "value_out_of_range";
         /**
          * WalletBalanceResponse
          * @description One wallet's latest reading, valued if its asset could be priced.

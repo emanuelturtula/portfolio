@@ -49,6 +49,7 @@ from portfolio.domain.accounting.valuation import (
     ExclusionReason,
     PortfolioTotals,
     PositionValue,
+    ValueUnavailable,
     value_portfolio,
     value_position,
 )
@@ -79,6 +80,7 @@ __all__ = [
     "TradeShapeProblem",
     "Transfer",
     "UnattributedFee",
+    "ValueUnavailable",
     "event_kind",
     "replay",
     "trade_shape_problem",

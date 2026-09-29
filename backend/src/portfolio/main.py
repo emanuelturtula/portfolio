@@ -327,8 +327,14 @@ def exchange_sync_runner(
     and before the summary is handed back, so a manual sync's response means the dashboard is
     current. The recompute never raises, so the summary is the sync's own whatever became of
     it -- a failed recompute is logged and shown on `GET /api/accounting/positions`, not
-    reported as a failed sync. A run that stored nothing leaves the snapshot alone: the fills
-    it would replay are the ones it already replayed.
+    reported as a failed sync.
+
+    **A run that stored nothing recomputes only if the last recompute failed** (spec 021, R7).
+    Otherwise the fills it would replay are the ones already replayed, and the snapshot is left
+    alone. After a failure they are not: a transient one -- "database is locked" while another
+    write held SQLite's lock -- then clears at the next sync rather than waiting for the next
+    stored fill or a restart. A failure caused by the data fails again, which costs one replay
+    per sync and changes nothing.
     """
 
     async def run(trigger: SyncTrigger) -> ExchangeSyncRunSummary:
@@ -340,7 +346,7 @@ def exchange_sync_runner(
                 history_start=settings.exchange_history_start,
             )
             summary = await service.sync(trigger)
-        if summary.fills_inserted > 0:
+        if summary.fills_inserted > 0 or last_recompute_failed(app):
             await run_accounting_recompute(app, RecomputeReason.EXCHANGE_SYNC)
         return summary
 
@@ -413,8 +419,11 @@ async def run_accounting_recompute(app: FastAPI, reason: RecomputeReason) -> Acc
     * **Logged once per run**: `accounting_recompute_finished` with the reason, the duration,
       the events replayed and the outcome (`written` if any owner's snapshot was written); or
       `accounting_recompute_failed` with the reason, the duration and **the first failure's
-      class name only**. Never its message and never a traceback: a `StatementError`'s text
-      carries the statement's parameters, and those are the owner's quantities.
+      class name only**. Never its message and never a traceback. The engine is built with
+      `hide_parameters=True`, so a `StatementError` does not carry the values it was binding;
+      but its text still quotes the statement, and a message is free text that no exception
+      has promised to keep clear of a trade id or an amount. The class name is enough to act
+      on, and `docs/operations.md` says what each one means.
     * **Recorded** on `app.state.accounting_status`, which `GET /api/accounting/positions`
       shows as `last_recompute`.
 
@@ -471,6 +480,16 @@ async def run_accounting_recompute(app: FastAPI, reason: RecomputeReason) -> Acc
             )
         app.state.accounting_status = status
         return status
+
+
+def last_recompute_failed(app: FastAPI) -> bool:
+    """Whether the last recompute attempt recorded on the application failed (spec 021, R7).
+
+    `False` before the first attempt, and for anything on `app.state.accounting_status` that
+    is not an `AccountingStatus` -- the reading `get_accounting_status` gives it too.
+    """
+    status = getattr(app.state, "accounting_status", None)
+    return isinstance(status, AccountingStatus) and status.outcome is RecomputeOutcome.FAILED
 
 
 async def cancel_and_wait(task: asyncio.Task[AccountingStatus] | None) -> None:

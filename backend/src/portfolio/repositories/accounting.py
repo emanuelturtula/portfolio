@@ -280,11 +280,17 @@ class AccountingSnapshotRepository:
         return _header_of(header)
 
     async def list_positions(self, snapshot_id: int) -> tuple[Position, ...]:
-        """A snapshot's positions, as the engine's own `Position`s, ordered by asset."""
+        """A snapshot's positions, as the engine's own `Position`s, ordered by asset.
+
+        `populate_existing`, because the ids are reused: a row loaded earlier in this session
+        under the same id may belong to a snapshot that has since been replaced, and without it
+        the identity map would hand back the old values (spec 021, R5).
+        """
         rows = await self._session.scalars(
             select(AccountingPosition)
             .where(AccountingPosition.snapshot_id == snapshot_id)
             .order_by(AccountingPosition.asset)
+            .execution_options(populate_existing=True)
         )
         return tuple(
             Position(
@@ -301,11 +307,12 @@ class AccountingSnapshotRepository:
         )
 
     async def list_warnings(self, snapshot_id: int) -> tuple[SnapshotWarning, ...]:
-        """A snapshot's warnings, in event order (`seq`)."""
+        """A snapshot's warnings, in event order (`seq`). `populate_existing`, as for positions."""
         rows = await self._session.scalars(
             select(AccountingWarning)
             .where(AccountingWarning.snapshot_id == snapshot_id)
             .order_by(AccountingWarning.seq)
+            .execution_options(populate_existing=True)
         )
         return tuple(
             SnapshotWarning(

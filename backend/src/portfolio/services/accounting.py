@@ -32,6 +32,21 @@ confident-wrong-number failure the engine exists to avoid (spec 020, *For #19*).
 `UnconvertibleFillError`, which carries the row's identity as attributes and never in its
 message, and the snapshot already stored stays.
 
+## Reading: one snapshot, never two
+
+Reads on this engine are autocommit statements -- pysqlite opens no transaction for a
+`SELECT` -- and SQLite reuses the header's id when a snapshot is replaced. So a recompute that
+commits between reading the header and reading its positions would serve one snapshot's header
+over another's rows. `positions` therefore reads the header, the positions and the warnings,
+then reads the header again, and uses what it read only if the two headers are the same
+snapshot; otherwise it reads again, up to `SNAPSHOT_READ_ATTEMPTS` times (spec 021, R5). The
+prices are read afterwards: they are not part of the snapshot, and a price that moves between
+two reads is simply the newer price.
+
+An explicit read transaction would do the same in one pass, but on this engine it would mean
+issuing `BEGIN` behind SQLAlchemy's back or changing the transaction mode of every
+connection, and neither is worth it for a read that a recompute interrupts a few times a day.
+
 ## Valuing: USD, chain assets only, a reason for every missing price
 
 The unit of account is USDT/USDC pinned at 1, so the valuation is in USD. EUR would need a
@@ -58,6 +73,7 @@ from portfolio.domain.accounting import (
     VALUE_SCALE,
     EventKey,
     Trade,
+    Transfer,
     event_kind,
     replay,
     value_portfolio,
@@ -75,23 +91,25 @@ from portfolio.repositories.exchanges import ExchangeFillRepository
 from portfolio.services.prices import Price, PriceUnavailable, build_price_service
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from portfolio.domain.accounting import (
         AccountingResult,
-        Adjustment,
         PortfolioTotals,
         Position,
         PositionValue,
     )
+    from portfolio.domain.accounting.events import AccountingEvent
+    from portfolio.repositories.accounting import SnapshotHeader
     from portfolio.repositories.exchanges import AccountingFillRecord
     from portfolio.services.prices import PriceLookup, PriceService
 
 __all__ = [
     "ACCOUNTING_QUOTE_CURRENCY",
     "PRICED_ASSETS",
+    "SNAPSHOT_READ_ATTEMPTS",
     "AccountingService",
     "AccountingStatus",
     "AccountingWarningKind",
@@ -100,9 +118,11 @@ __all__ = [
     "RecomputeOutcome",
     "RecomputeReason",
     "RecomputeReport",
+    "SnapshotReadError",
     "SnapshotWarning",
     "UnconvertibleFillError",
     "build_accounting_service",
+    "lot_kinds_of",
     "trade_of",
     "utc_now",
 ]
@@ -119,6 +139,15 @@ PRICED_ASSETS: Final[frozenset[str]] = frozenset(CHAIN_ASSET_SYMBOLS.values())
 Taken from `domain.chains` rather than from `providers/prices/base.py`'s `SUPPORTED_PAIRS`,
 which a request path may not import. A test holds the two sets equal, the way the three
 spellings of the quote currencies are held together.
+"""
+
+SNAPSHOT_READ_ATTEMPTS: Final = 3
+"""How many times `positions` reads the snapshot before giving up on a consistent one.
+
+A read is retried only when a recompute committed in the middle of it, and a recompute writes
+at startup and after an exchange sync that stored a fill -- a few times a day, each commit a
+fraction of a second. Two in a row inside one read is already beyond what the triggers do;
+three is a margin, not a measurement. See `SnapshotReadError` for what happens past it.
 """
 
 _NOTHING: Final = Decimal((0, (0,), -VALUE_SCALE))
@@ -207,6 +236,45 @@ class UnconvertibleFillError(ValueError):
         )
 
 
+class SnapshotReadError(RuntimeError):
+    """The snapshot changed during every one of `SNAPSHOT_READ_ATTEMPTS` reads.
+
+    Not reachable with the triggers this application has (see `SNAPSHOT_READ_ATTEMPTS`), and
+    raised rather than answered, because the alternative is a response built from two
+    snapshots. It is unhandled on purpose: the request fails with a 500, and the next one
+    reads a snapshot that has stopped moving.
+    """
+
+    def __init__(self) -> None:
+        """A fixed message: the snapshot's figures have no place in it."""
+        super().__init__(
+            f"the accounting snapshot changed during each of {SNAPSHOT_READ_ATTEMPTS} reads"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredSnapshot:
+    """One snapshot as read: a header and the children read under it, checked to belong."""
+
+    header: SnapshotHeader
+    positions: tuple[Position, ...]
+    warnings: tuple[SnapshotWarning, ...]
+
+
+def _same_snapshot(first: SnapshotHeader, again: SnapshotHeader | None) -> bool:
+    """Whether two reads of the header saw the same snapshot (spec 021, R5).
+
+    The id alone cannot say so, because SQLite reuses it. The fingerprint says the content is
+    the same, and `computed_at` -- a fresh clock reading at every write -- says it is the same
+    write.
+    """
+    return again is not None and (
+        again.id,
+        again.input_fingerprint,
+        again.computed_at,
+    ) == (first.id, first.input_fingerprint, first.computed_at)
+
+
 @dataclass(frozen=True, slots=True)
 class PricedPosition:
     """One stored position, valued, and the price it was valued at if there was one.
@@ -275,14 +343,36 @@ def trade_of(record: AccountingFillRecord) -> Trade:
         raise UnconvertibleFillError(record.exchange_account_id, record.external_trade_id) from exc
 
 
-def _lot_kinds(events: Sequence[Trade | Adjustment]) -> dict[EventKey, str]:
-    """The kind of each event that can acquire a lot, by key (spec 021, R2).
+def lot_kinds_of(events: Iterable[AccountingEvent]) -> dict[EventKey, str]:
+    """The kind of the event behind each key a lot can carry (spec 021, R2 and R8).
 
-    A `Lot` carries its event's key and not its kind, and the stored lot needs both to name
-    the event. Trades and adjustments are the only events that acquire anything; a transfer
-    never does, so it is not in the map. #18 adds its adjustments to `events` here.
+    A `Lot` carries its event's key and not its kind, and the stored lot needs both to name the
+    event by its identity, `(kind, source, external_id)`. So the kind is looked up by key, and
+    this map is built so that the lookup can never pick the wrong event:
+
+    * **Transfers never enter it.** They never acquire anything, so no lot can carry their key.
+    * **Two events of different kinds under one key are refused**, rather than one silently
+      overwriting the other. The key's `source` keeps them apart in every case that exists --
+      a fill's is its venue, an adjustment's is `manual` -- so this is a guard on that
+      invariant, not a case the data can produce.
+    * An event repeated under one key with its own kind is the same event read twice, which
+      `replay` counts once (I6), and it maps to the kind it has.
+
+    Raises:
+        ValueError: a trade and an adjustment share one `EventKey`. The message names neither.
     """
-    return {event.key: event_kind(event) for event in events}
+    kinds: dict[EventKey, str] = {}
+    for event in events:
+        if isinstance(event, Transfer):
+            continue
+        kind = event_kind(event)
+        if kinds.setdefault(event.key, kind) != kind:
+            message = (
+                "two events of different kinds share one event key, so the lots they acquire "
+                "could not be told apart"
+            )
+            raise ValueError(message)
+    return kinds
 
 
 def _replay_fills(records: Sequence[AccountingFillRecord]) -> _Replayed:
@@ -293,7 +383,7 @@ def _replay_fills(records: Sequence[AccountingFillRecord]) -> _Replayed:
     pipeline.
     """
     events = [trade_of(record) for record in records]
-    return _Replayed(result=replay(events), lot_kinds=_lot_kinds(events))
+    return _Replayed(result=replay(events), lot_kinds=lot_kinds_of(events))
 
 
 class AccountingService:
@@ -361,10 +451,15 @@ class AccountingService:
         """The owner's stored snapshot, each position valued at its cached USD price.
 
         Reads only: the snapshot as the last recompute left it, and the price cache. **No
-        recompute and no fetch happen here**; a request is served from what is stored.
+        recompute and no fetch happen here**; a request is served from what is stored. The
+        snapshot is read whole and checked to be one snapshot before any price is read (see
+        the module docstring).
+
+        Raises:
+            SnapshotReadError: the snapshot changed during every read attempt.
         """
-        header = await self._snapshots.get_header(user_id, METHOD)
-        if header is None:
+        snapshot = await self._read_snapshot(user_id)
+        if snapshot is None:
             return PositionsView(
                 method=METHOD,
                 quote_currency=ACCOUNTING_QUOTE_CURRENCY,
@@ -375,8 +470,8 @@ class AccountingService:
                 unallocated_costs=_NOTHING,
                 warnings=(),
             )
-        stored = await self._snapshots.list_positions(header.id)
-        priced = tuple([await self._priced(position) for position in stored])
+        header = snapshot.header
+        priced = tuple([await self._priced(position) for position in snapshot.positions])
         return PositionsView(
             method=header.method,
             quote_currency=ACCOUNTING_QUOTE_CURRENCY,
@@ -385,8 +480,29 @@ class AccountingService:
             positions=priced,
             totals=value_portfolio(entry.value for entry in priced),
             unallocated_costs=header.unallocated_costs,
-            warnings=await self._snapshots.list_warnings(header.id),
+            warnings=snapshot.warnings,
         )
+
+    async def _read_snapshot(self, user_id: int) -> _StoredSnapshot | None:
+        """The owner's snapshot as one consistent read, or `None` when there is none.
+
+        The header, then its positions and warnings, then the header again: if the second read
+        is the same snapshot, nothing was replaced in between and the children belong to the
+        header. Otherwise the whole read is repeated (spec 021, R5).
+
+        Raises:
+            SnapshotReadError: every one of `SNAPSHOT_READ_ATTEMPTS` reads was interrupted.
+        """
+        for _ in range(SNAPSHOT_READ_ATTEMPTS):
+            header = await self._snapshots.get_header(user_id, METHOD)
+            if header is None:
+                return None
+            positions = await self._snapshots.list_positions(header.id)
+            warnings = await self._snapshots.list_warnings(header.id)
+            again = await self._snapshots.get_header(user_id, METHOD)
+            if _same_snapshot(header, again):
+                return _StoredSnapshot(header=header, positions=positions, warnings=warnings)
+        raise SnapshotReadError
 
     async def _priced(self, position: Position) -> PricedPosition:
         """Value one position at its price, or with the reason it has none."""
