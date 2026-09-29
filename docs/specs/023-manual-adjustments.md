@@ -183,8 +183,8 @@ is regenerated, because the drift job checks it.
 2. An opening balance dated before a sale that exceeded the history removes that sale's
    `negative_inventory` warning, and the `history_incomplete` flag the sale caused, after the
    recompute. The realized P&L of the sale is then computed against the adjustment's cost.
-3. An adjustment without a unit cost counts toward quantity, and the asset shows
-   `unknown_basis` with that quantity in `unknown_basis_quantity` in every positions response.
+3. An adjustment without a unit cost counts toward quantity. While those units are held, the
+   asset shows `unknown_basis` with that quantity in `unknown_basis_quantity` (R3).
    It is never valued at zero cost: the sale of those units realizes no profit, and the
    proceeds go to `unmatched_proceeds`.
 4. Adjustments order deterministically alongside executions, in the engine's order. A replay
@@ -233,3 +233,37 @@ is regenerated, because the drift job checks it.
 - **The recompute runs inside the request.** At 53 ms on the Pi that is fine. If a history
   ever makes it slow, the trigger can move to a background task without an API change,
   because the response carries no recompute result.
+
+## Rulings during implementation
+
+- **R1. The conversion lives beside `trade_of`.** `ADJUSTMENT_SOURCE`, `external_id_of`,
+  `adjustment_of` and `UnconvertibleAdjustmentError` are defined in `services/accounting.py`
+  and re-exported from `services/adjustments.py`. Defining them in `adjustments` would make
+  the two modules import each other. There is still one definition.
+- **R2. `AUTOINCREMENT` costs the primary key its name.** SQLAlchemy writes the key inline for
+  `sqlite_autoincrement`, so `pk_manual_adjustments` exists in the metadata and not in the
+  DDL. A future Alembic batch rebuild of this table must pass
+  `table_kwargs={"sqlite_autoincrement": True}` or it drops `AUTOINCREMENT`. The migration
+  and the model say so.
+- **R3. `unknown_basis` describes units still held.** The flag is not sticky (spec 019), so it
+  clears once the unknown-cost units are sold. What is permanent is that their sale realizes
+  nothing and its proceeds go to `unmatched_proceeds`. Criterion 3 is reworded to match.
+- **R4. Validation order and trigger failures (developer).**
+  - Only the first failure is reported, checked in the order asset, occurred_at, quantity,
+    unit_cost, note.
+  - A PUT validates its body before looking up the id, so a bad body on a missing id is a
+    422. That reveals nothing about which ids exist.
+  - If `after_change` raises, the service logs `adjustment_after_change_failed` with the id
+    and the error class, and still answers success. The change is committed, and a 500 would
+    say it was not. The real trigger never raises; the service does not rely on that promise.
+    A cancellation is not caught.
+- **R5. No JSON number where the spec asks for a string.**
+  - Amounts refuse every JSON number, integers included. That is stricter than the shared
+    money type elsewhere, and it is what "a JSON number is refused" means.
+  - `occurred_at` refuses a JSON number too. Pydantic would otherwise read it as a Unix
+    timestamp, and the contract is an ISO 8601 string with a timezone.
+- **R6. The limits are machine-readable, with one authority.** The OpenAPI schema states
+  `maxLength` for `note` and `pattern` for `asset` as schema metadata, taken from the
+  service's own constants (`NOTE_MAX_LENGTH`, the asset pattern). The service remains the
+  only validator. This keeps its field-specific messages, and gives #111's form limits it can
+  read.
