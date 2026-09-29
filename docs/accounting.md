@@ -49,7 +49,7 @@ Then one of four things happens:
 |---|---|---|---|
 | cash | an asset | a buy | The asset's basis rises by the cash given, fees included. |
 | an asset | cash | a sale | The asset's pool gives up the proportional basis. Realized P&L is the proceeds, net of fees, minus that basis. |
-| an asset | another asset | a swap | The given asset's basis moves to the received asset. Nothing is realized, because no price exists to realize it at. |
+| an asset | another asset | a swap | The given asset's basis, plus the fee, moves to the received asset. Nothing is realized, because no price exists to realize it at. If some of the units given had unknown cost, the received units split in the same proportion, and so does the fee: the unknown share of the fee goes to `unallocated_costs`, not onto the few units of known cost. |
 | cash | cash | a conversion | Nothing changes, since both sides are pinned at 1. A fee is recorded in `unallocated_costs`. |
 
 **When a short history shows, the engine says so rather than guessing:**
