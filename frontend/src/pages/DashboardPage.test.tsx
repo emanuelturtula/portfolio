@@ -232,10 +232,19 @@ async function lastUpdated(): Promise<HTMLElement> {
   return screen.findByText(/balances as of/i, { selector: 'p' });
 }
 
-/** Waits until the dashboard has rendered its data. */
+/**
+ * Waits until the dashboard has rendered its data: the value regions, and the invested
+ * section below them (spec 022) past its own loading state. Both sections' skeletons are
+ * `role="status"`, so a page-wide "no status" assertion only means something about this
+ * section once the other one has settled too.
+ */
 async function loaded(): Promise<void> {
   await totalRegion();
   await walletsRegion();
+  const invested = await screen.findByRole('region', { name: 'Invested' });
+  await waitFor(() => {
+    expect(within(invested).queryByRole('status')).not.toBeInTheDocument();
+  });
 }
 
 /** The healthy portfolio, with one wallet row replaced. */

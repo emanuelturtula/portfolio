@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  bgbFeeNeverHeld,
   breakEvenPortfolio,
   emptySnapshot,
   ethUnpriced,
   everyHeldPositionExcluded,
   failedFirstRecompute,
+  FEE_OCCURRED_AT,
+  feeInNeverHeldAsset,
   investedPortfolio,
   kasLossPortfolio,
   kasUnknownBasis,
@@ -17,6 +20,7 @@ import {
   stablecoinOnlySnapshot,
   tinyPnlPortfolio,
   totals,
+  warning,
   xrpClosed,
   ZERO,
 } from './accountingFixtures';
@@ -148,5 +152,101 @@ describe('the accounting fixture guard', () => {
       }),
     ).toThrow('XRP market_value is null');
     expect(xrpClosed().market_value).toBe(ZERO);
+  });
+
+  it('holds the fee pool the engine opens for a fee paid in an asset never held', () => {
+    // A SOL buy's fee paid in BGB: a closed, history_incomplete BGB position, a shortfall and
+    // an unvalued fee at the same moment, and the fee's flag on SOL.
+    const response = investedPortfolio();
+    const bgb = response.positions.find((entry) => entry.asset === 'BGB');
+
+    expect(bgb?.flags).toEqual(['history_incomplete']);
+    expect(bgb?.quantity).toBe(ZERO);
+    expect(response.warnings.map((entry) => [entry.kind, entry.asset, entry.charged_to])).toEqual([
+      ['negative_inventory', 'ETH', null],
+      ['negative_inventory', 'BGB', null],
+      ['unattributed_fee', 'BGB', 'SOL'],
+    ]);
+    expect(response.warnings.slice(1).map((entry) => entry.occurred_at)).toEqual([
+      FEE_OCCURRED_AT,
+      FEE_OCCURRED_AT,
+    ]);
+  });
+
+  it('refuses a warning on an asset with no position', () => {
+    // The fee leg opened a BGB pool: dropping it is the shape spec 022's review caught (S4).
+    expect(() =>
+      positionsResponse({
+        positions: [position({ flags: ['unattributed_fee'] })],
+        totals: totals({
+          total_invested: '52500.000000000000000000',
+          market_value: '90000.000000000000000000',
+          unrealized_pnl: '37500.000000000000000000',
+          unrealized_return_pct: '71.4286',
+          realized_pnl: '7500.000000000000000000',
+        }),
+        warnings: [warning({ kind: 'unattributed_fee', asset: 'BGB', charged_to: 'BTC' })],
+      }),
+    ).toThrow('opened a BGB pool, so it has a position');
+  });
+
+  it('refuses a shortfall on an asset not flagged history_incomplete', () => {
+    expect(() =>
+      positionsResponse({
+        positions: [ethUnpriced({ flags: [] })],
+        totals: totals({ realized_pnl: '-250.000000000000000000' }),
+        warnings: [warning()],
+      }),
+    ).toThrow('the shortfall sets history_incomplete on ETH');
+  });
+
+  it('refuses an unvalued fee whose charged_to is not flagged', () => {
+    expect(() =>
+      positionsResponse({
+        positions: [bgbFeeNeverHeld(), solUnknownAndUnpriced({ flags: ['unknown_basis'] })],
+        warnings: feeInNeverHeldAsset({ charged_to: 'SOL' }),
+      }),
+    ).toThrow('the fee sets unattributed_fee on SOL');
+  });
+
+  it('refuses a flag with no warning behind it, either flag', () => {
+    expect(() =>
+      positionsResponse({
+        positions: [ethUnpriced()],
+        totals: totals({ realized_pnl: '-250.000000000000000000' }),
+      }),
+    ).toThrow('ETH: history_incomplete is set only with a negative_inventory warning');
+    expect(() =>
+      positionsResponse({
+        positions: [bgbFeeNeverHeld(), solUnknownAndUnpriced()],
+        warnings: feeInNeverHeldAsset({ charged_to: null }),
+      }),
+    ).toThrow('SOL: unattributed_fee is set only with a warning charged to it');
+  });
+
+  it('accepts an unvalued fee on a conversion between stablecoins, charged to nothing', () => {
+    expect(() =>
+      positionsResponse({
+        positions: [bgbFeeNeverHeld()],
+        warnings: feeInNeverHeldAsset({ charged_to: null }),
+      }),
+    ).not.toThrow();
+  });
+
+  it('refuses warnings out of event order, and a warning of nothing', () => {
+    expect(() =>
+      positionsResponse({
+        positions: [bgbFeeNeverHeld(), ethUnpriced()],
+        totals: totals({ realized_pnl: '-250.000000000000000000' }),
+        warnings: [...feeInNeverHeldAsset({ charged_to: null }), warning()],
+      }),
+    ).toThrow('warnings are stored in event order');
+    expect(() =>
+      positionsResponse({
+        positions: [ethUnpriced()],
+        totals: totals({ realized_pnl: '-250.000000000000000000' }),
+        warnings: [warning({ quantity: ZERO })],
+      }),
+    ).toThrow('a positive quantity');
   });
 });

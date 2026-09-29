@@ -11,6 +11,7 @@ import {
 } from '@/lib/accounting';
 import {
   accountingPrice,
+  bgbFeeNeverHeld,
   breakEvenPortfolio,
   COMPUTED_AT,
   emptySnapshot,
@@ -18,6 +19,8 @@ import {
   everyHeldPositionExcluded,
   failedFirstRecompute,
   failedRecompute,
+  FEE_OCCURRED_AT,
+  feeInNeverHeldAsset,
   INVESTED_TOTALS,
   investedPortfolio,
   kasLossPortfolio,
@@ -27,7 +30,6 @@ import {
   positionsResponse,
   RECOMPUTE_ERROR,
   RECOMPUTE_FAILED_AT,
-  solUnknownAndUnpriced,
   stablecoinOnlySnapshot,
   tinyPnlPortfolio,
   totals,
@@ -35,7 +37,6 @@ import {
   WARNING_OCCURRED_AT,
   xrpClosed,
   ZERO,
-  type PositionFlag,
   type PositionsResponse,
 } from '@/test/accountingFixtures';
 import {
@@ -257,6 +258,32 @@ const COLUMNS = [
   'Return',
 ];
 
+/*
+ * The round-2 sentences (spec 022, R8), written out: each is a statement to the owner, and a
+ * change to one should be a diff here.
+ */
+const STALE_TOTALS = 'These totals include at least one stale price.';
+const UNALLOCATED_LINE =
+  'Costs not assigned to any asset: 0.10 USD, from stablecoin conversions and from swaps ' +
+  'into units with no known cost.';
+const NO_TRADES_NEUTRAL = 'Positions appear here once trades are imported from an exchange.';
+
+function realizedCaveat(assets: string): string {
+  return (
+    `Realized P&L may be inaccurate for ${assets}: the imported history is incomplete, or a ` +
+    'fee could not be valued.'
+  );
+}
+
+/** BTC alone, fully comparable: the totals are its own figures. */
+const BTC_ONLY_TOTALS = {
+  total_invested: '52500.000000000000000000',
+  market_value: '90000.000000000000000000',
+  unrealized_pnl: '37500.000000000000000000',
+  unrealized_return_pct: '71.4286',
+  realized_pnl: '7500.000000000000000000',
+} as const;
+
 describe('InvestedSection: the table (criteria 1 and 3)', () => {
   it('lists the held assets in the endpoint order, under the columns the spec names', async () => {
     openDashboard();
@@ -378,6 +405,70 @@ describe('InvestedSection: the table (criteria 1 and 3)', () => {
     expect(cell(row, 'Market value (USD)').textContent.trim()).toBe('84.91');
   });
 
+  it('shows "—" for invested and unrealized P&L when no unit held has a known cost (N1)', async () => {
+    // KAS: 500 held, all 500 of unknown cost. Its invested is 0 and its unrealized P&L 0 on
+    // the wire, which beside a value of 40 would read as a break-even. There is no cost at all.
+    const kas = position({
+      asset: 'KAS',
+      quantity: '500.000000000000000000',
+      unknown_basis_quantity: '500.000000000000000000',
+      average_cost: null,
+      total_invested: ZERO,
+      realized_pnl: ZERO,
+      flags: ['unknown_basis'],
+      price: accountingPrice({ amount: '0.080000000000', source: 'kaspa' }),
+      market_value: '40.000000000000000000',
+      unrealized_pnl: ZERO,
+      unrealized_return_pct: null,
+    });
+    openDashboard({
+      positions: positionsResponse({
+        positions: [position(), kas],
+        totals: totals(BTC_ONLY_TOTALS),
+      }),
+    });
+
+    const row = await positionRow('KAS');
+    expectDash(cell(row, 'Invested (USD)'));
+    expectDash(cell(row, 'Unrealized P&L (USD)'));
+    expectDash(cell(row, 'Average cost (USD)'));
+    expectDash(cell(row, 'Return'));
+    // What it is worth is known, over every unit.
+    expect(cell(row, 'Market value (USD)').textContent.trim()).toBe('40.00');
+    expect(cell(row, 'Quantity')).toHaveTextContent(/^500 \(500 with no known cost\)$/);
+    expect(row.querySelector('th')).toHaveAccessibleName('KAS Unknown cost Not in totals');
+    // A holding with some known cost keeps its figures.
+    expect(cell(await positionRow('BTC'), 'Invested (USD)').textContent.trim()).toBe('52,500.00');
+  });
+
+  it('says a value too large to show is missing, and leaves it out as having no market value', async () => {
+    // 2e15 BTC at 60000 is 1.2e20: past what a figure can hold (spec 021, R6). It has a price
+    // and no market value, which the unpriced exclusion's reason still describes (N3).
+    const btc = position({
+      quantity: '2000000000000000.000000000000000000',
+      average_cost: '1.000000000000000000',
+      total_invested: '2000000000000000.000000000000000000',
+      realized_pnl: ZERO,
+      market_value: null,
+      market_value_unavailable_reason: 'value_out_of_range',
+      unrealized_pnl: null,
+      unrealized_return_pct: null,
+    });
+    openDashboard({ positions: positionsResponse({ positions: [btc] }) });
+
+    const row = await positionRow('BTC');
+    expect(cell(row, 'Market value (USD)').textContent.trim()).toBe(
+      MARKET_VALUE_UNAVAILABLE_MESSAGES.value_out_of_range,
+    );
+    expect(dataValues(cell(row, 'Price (USD)'))).toEqual(['60000.000000000000']);
+    expect(row.querySelector('th')).toHaveAccessibleName('BTC Not in totals');
+    const region = await loadedRegion();
+    expect(
+      within(region).getByText('Left out of these totals:').nextElementSibling?.textContent,
+    ).toBe(`BTC: ${EXCLUSION_REASON_MESSAGES.unpriced}`);
+    expectDash(await summaryValue('Invested'));
+  });
+
   it('puts only wire strings in every <data value> of the section', async () => {
     const response = investedPortfolio();
     openDashboard({ positions: response });
@@ -493,15 +584,80 @@ describe('InvestedSection: the summary (criterion 2)', () => {
     expect(await summaryValue('Realized P&L')).toHaveTextContent(/^\+125\.50 USD$/);
   });
 
-  it('says what fees belong to no asset, and says nothing when there are none', async () => {
+  it('says what costs belong to no asset, naming both of their origins (S3)', async () => {
     openDashboard();
 
     const region = await loadedRegion();
-    const line = within(region).getByText(/Fees not assigned to any asset/);
-    expect(line.textContent).toBe(
-      'Fees not assigned to any asset: 0.10 USD (conversions between stablecoins).',
-    );
+    const line = within(region).getByText(/Costs not assigned to any asset/);
+    expect(line.textContent).toBe(UNALLOCATED_LINE);
     expect(dataValues(line)).toEqual([INVESTED_TOTALS.unallocatedCosts]);
+  });
+
+  it('says the totals include a stale price when a position in them has one (S2)', async () => {
+    const stale = accountingPrice({ as_of: STALE_PRICE_AS_OF, stale: true });
+    openDashboard({
+      positions: positionsResponse({
+        positions: [position({ price: stale })],
+        totals: totals(BTC_ONLY_TOTALS),
+      }),
+    });
+
+    const region = await loadedRegion();
+    expect(within(region).getByText(STALE_TOTALS)).toBeInTheDocument();
+    expect(cell(await positionRow('BTC'), 'Price (USD)')).toHaveTextContent(
+      /\(stale, as of 2 hours ago\)$/,
+    );
+  });
+
+  it('says nothing of a stale price that is not in the totals', async () => {
+    // In the full portfolio, KAS's price is stale, and KAS is left out as unknown-basis.
+    openDashboard();
+    await positionRow('KAS');
+    expect(within(await loadedRegion()).queryByText(STALE_TOTALS)).not.toBeInTheDocument();
+  });
+
+  it('says nothing of a stale price on a position no longer held', async () => {
+    const kasClosed = xrpClosed({
+      asset: 'KAS',
+      realized_pnl: ZERO,
+      price: accountingPrice({
+        amount: '0.080000000000',
+        source: 'kaspa',
+        as_of: STALE_PRICE_AS_OF,
+        stale: true,
+      }),
+    });
+    openDashboard({
+      positions: positionsResponse({
+        positions: [position(), kasClosed],
+        totals: totals(BTC_ONLY_TOTALS),
+      }),
+    });
+
+    await positionRow('BTC');
+    expect(within(await loadedRegion()).queryByText(STALE_TOTALS)).not.toBeInTheDocument();
+  });
+
+  it('warns that realized P&L may be inaccurate, naming every asset whose history is short (M1)', async () => {
+    // BGB is closed and history_incomplete; ETH is held and history_incomplete; SOL was charged
+    // a fee that could not be valued. Realized P&L covers all three, held or not.
+    openDashboard();
+
+    const region = await loadedRegion();
+    expect(within(region).getByText(realizedCaveat('BGB, ETH, and SOL'))).toBeInTheDocument();
+  });
+
+  it('names the one asset when only one is affected, even with no row of its own', async () => {
+    openDashboard({
+      positions: positionsResponse({
+        positions: [bgbFeeNeverHeld(), position()],
+        totals: totals(BTC_ONLY_TOTALS),
+        warnings: feeInNeverHeldAsset({ charged_to: null }),
+      }),
+    });
+
+    await positionRow('BTC');
+    expect(within(await loadedRegion()).getByText(realizedCaveat('BGB'))).toBeInTheDocument();
   });
 
   it('says nothing about fees, exclusions or a legend when there are none', async () => {
@@ -509,7 +665,9 @@ describe('InvestedSection: the summary (criterion 2)', () => {
 
     const region = await loadedRegion();
     await positionsTable();
-    expect(within(region).queryByText(/Fees not assigned/)).not.toBeInTheDocument();
+    expect(within(region).queryByText(/Costs not assigned/)).not.toBeInTheDocument();
+    expect(within(region).queryByText(/Realized P&L may be inaccurate/)).not.toBeInTheDocument();
+    expect(within(region).queryByText(STALE_TOTALS)).not.toBeInTheDocument();
     expect(within(region).queryByText(/Left out of these totals/)).not.toBeInTheDocument();
     expect(
       within(region).queryByText(/Realized P&L covers every position/),
@@ -589,6 +747,8 @@ describe('InvestedSection: flags and exclusions (criteria 5 and 8)', () => {
     expect(legend(region)).toEqual([
       { badge: FLAG_BADGES.unknown_basis, explanation: FLAG_EXPLANATIONS.unknown_basis },
     ]);
+    // Sales of unknown-cost units are kept out of realized P&L, so it is not called unreliable.
+    expect(within(region).queryByText(/Realized P&L may be inaccurate/)).not.toBeInTheDocument();
   });
 
   it('leaves an unpriced asset out of the totals with its own reason', async () => {
@@ -615,33 +775,50 @@ describe('InvestedSection: flags and exclusions (criteria 5 and 8)', () => {
     expect(legend(region)).toEqual([]);
   });
 
-  it.each<[PositionFlag]>([['history_incomplete'], ['unattributed_fee']])(
-    'marks a %s asset and explains it, without leaving it out of the totals',
-    async (flag) => {
-      openDashboard({
-        positions: positionsResponse({
-          positions: [position({ flags: [flag] })],
-          totals: totals({
-            total_invested: '52500.000000000000000000',
-            market_value: '90000.000000000000000000',
-            unrealized_pnl: '37500.000000000000000000',
-            unrealized_return_pct: '71.4286',
-            realized_pnl: '7500.000000000000000000',
-          }),
-        }),
-      });
+  it('marks a history_incomplete asset and explains it, without leaving it out of the totals', async () => {
+    // A BTC sale larger than the history held: its shortfall is the warning that set the flag.
+    openDashboard({
+      positions: positionsResponse({
+        positions: [position({ flags: ['history_incomplete'] })],
+        totals: totals(BTC_ONLY_TOTALS),
+        warnings: [warning({ asset: 'BTC', quantity: '0.100000000000000000' })],
+      }),
+    });
 
-      const btc = await positionRow('BTC');
-      expect(btc.querySelector('th')).toHaveAccessibleName(`BTC ${FLAG_BADGES[flag]}`);
-      const region = await loadedRegion();
-      expect(legend(region)).toEqual([
-        { badge: FLAG_BADGES[flag], explanation: FLAG_EXPLANATIONS[flag] },
-      ]);
-      // Neither flag excludes: the totals include BTC, and nothing is listed as left out.
-      expect(within(region).queryByText(/Left out of these totals/)).not.toBeInTheDocument();
-      expect(dataValues(await summaryValue('Invested'))).toEqual(['52500.000000000000000000']);
-    },
-  );
+    const btc = await positionRow('BTC');
+    expect(btc.querySelector('th')).toHaveAccessibleName('BTC History incomplete');
+    const region = await loadedRegion();
+    expect(legend(region)).toEqual([
+      { badge: 'History incomplete', explanation: FLAG_EXPLANATIONS.history_incomplete },
+    ]);
+    // It does not exclude: the totals include BTC, and nothing is listed as left out.
+    expect(within(region).queryByText(/Left out of these totals/)).not.toBeInTheDocument();
+    expect(dataValues(await summaryValue('Invested'))).toEqual(['52500.000000000000000000']);
+    expect(within(region).getByText(realizedCaveat('BTC'))).toBeInTheDocument();
+  });
+
+  it('marks an unattributed_fee asset and explains it, without leaving it out of the totals', async () => {
+    // A BTC buy paid its fee in BGB, which the history never held: the engine opens a BGB pool,
+    // finds it short, and cannot value the fee (S4). So BGB is closed and history_incomplete.
+    openDashboard({
+      positions: positionsResponse({
+        positions: [bgbFeeNeverHeld(), position({ flags: ['unattributed_fee'] })],
+        totals: totals(BTC_ONLY_TOTALS),
+        warnings: feeInNeverHeldAsset({ charged_to: 'BTC' }),
+      }),
+    });
+
+    const btc = await positionRow('BTC');
+    expect(btc.querySelector('th')).toHaveAccessibleName('BTC Fee not valued');
+    const region = await loadedRegion();
+    expect(legend(region)).toEqual([
+      { badge: 'History incomplete', explanation: FLAG_EXPLANATIONS.history_incomplete },
+      { badge: 'Fee not valued', explanation: FLAG_EXPLANATIONS.unattributed_fee },
+    ]);
+    expect(within(region).queryByText(/Left out of these totals/)).not.toBeInTheDocument();
+    expect(dataValues(await summaryValue('Invested'))).toEqual(['52500.000000000000000000']);
+    expect(within(region).getByText(realizedCaveat('BGB and BTC'))).toBeInTheDocument();
+  });
 
   it('marks a position that is both unknown-basis and unpriced, and leaves it out once', async () => {
     openDashboard();
@@ -660,19 +837,9 @@ describe('InvestedSection: flags and exclusions (criteria 5 and 8)', () => {
     );
   });
 
-  it('explains each flag in the table once, alphabetically, and none that is only on a sold asset', async () => {
-    // XRP, no longer held and not a row, carries history_incomplete here; ETH carries it too, so
-    // it is in the legend once. A flag on no held row would explain a badge nobody can see.
-    const response = investedPortfolio({
-      positions: [
-        position(),
-        ethUnpriced(),
-        kasUnknownBasis(),
-        solUnknownAndUnpriced(),
-        xrpClosed({ flags: ['history_incomplete'] }),
-      ],
-    });
-    openDashboard({ positions: response });
+  it('explains each flag shown anywhere once, alphabetically', async () => {
+    // history_incomplete is on ETH's row and on BGB, which has no row; it is explained once.
+    openDashboard();
 
     expect(legend(await loadedRegion())).toEqual([
       { badge: 'History incomplete', explanation: FLAG_EXPLANATIONS.history_incomplete },
@@ -681,22 +848,30 @@ describe('InvestedSection: flags and exclusions (criteria 5 and 8)', () => {
     ]);
   });
 
-  it('does not explain a flag that only a sold asset carries', async () => {
+  it('keeps a flag visible when only an asset no longer held carries it (M1)', async () => {
+    // A stablecoin conversion paid its fee in BGB, never held: BGB is closed and
+    // history_incomplete, and no row carries the flag. It is named in the closed line,
+    // explained in the legend, and it qualifies realized P&L.
     openDashboard({
       positions: positionsResponse({
-        positions: [position(), xrpClosed({ flags: ['unattributed_fee'] })],
-        totals: totals({
-          total_invested: '52500.000000000000000000',
-          market_value: '90000.000000000000000000',
-          unrealized_pnl: '37500.000000000000000000',
-          unrealized_return_pct: '71.4286',
-          realized_pnl: '7625.500000000000000000',
-        }),
+        positions: [bgbFeeNeverHeld(), position()],
+        totals: totals(BTC_ONLY_TOTALS),
+        warnings: feeInNeverHeldAsset({ charged_to: null }),
       }),
     });
 
-    await positionRow('BTC');
-    expect(legend(await loadedRegion())).toEqual([]);
+    expect((await positionRow('BTC')).querySelector('th')).toHaveAccessibleName('BTC');
+    const region = await loadedRegion();
+    expect(
+      within(region).getByText(
+        '1 asset no longer held is not listed: BGB (History incomplete). ' +
+          'Its realized P&L is in the total.',
+      ),
+    ).toBeInTheDocument();
+    expect(legend(region)).toEqual([
+      { badge: 'History incomplete', explanation: FLAG_EXPLANATIONS.history_incomplete },
+    ]);
+    expect(within(region).getByText(realizedCaveat('BGB'))).toBeInTheDocument();
   });
 });
 
@@ -716,13 +891,31 @@ describe('InvestedSection: a stale price (criterion 6)', () => {
 
 describe('InvestedSection: closed positions', () => {
   it('lists an asset no longer held in one line, not as a row', async () => {
-    openDashboard();
+    // Realized: 7500 (BTC) + 125.5 (XRP) = 7625.5.
+    openDashboard({
+      positions: positionsResponse({
+        positions: [position(), xrpClosed()],
+        totals: totals({ ...BTC_ONLY_TOTALS, realized_pnl: '7625.500000000000000000' }),
+      }),
+    });
 
     const region = await loadedRegion();
-    expect(await rowSymbols()).not.toContain('XRP');
+    expect(await rowSymbols()).toEqual(['BTC']);
     expect(
       within(region).getByText(
-        '1 asset no longer held (XRP) is not listed; its realized P&L is in the total.',
+        '1 asset no longer held is not listed: XRP. Its realized P&L is in the total.',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('names the flags of the assets no longer held, beside the flagged ones', async () => {
+    openDashboard();
+
+    expect(await rowSymbols()).not.toContain('BGB');
+    expect(
+      within(await loadedRegion()).getByText(
+        '2 assets no longer held are not listed: BGB (History incomplete), XRP. ' +
+          'Their realized P&L is in the total.',
       ),
     ).toBeInTheDocument();
   });
@@ -749,7 +942,7 @@ describe('InvestedSection: closed positions', () => {
     expect(await rowSymbols()).toEqual(['BTC']);
     expect(
       within(await loadedRegion()).getByText(
-        '2 assets no longer held (DOGE, XRP) are not listed; their realized P&L is in the total.',
+        '2 assets no longer held are not listed: DOGE, XRP. Their realized P&L is in the total.',
       ),
     ).toBeInTheDocument();
   });
@@ -765,7 +958,9 @@ describe('InvestedSection: closed positions', () => {
     const region = await loadedRegion();
     expect(await within(region).findByText('Nothing is held right now.')).toBeInTheDocument();
     expect(within(region).queryByRole('table')).not.toBeInTheDocument();
-    expect(within(region).getByText(/1 asset no longer held \(XRP\)/)).toBeInTheDocument();
+    expect(
+      within(region).getByText(/^1 asset no longer held is not listed: XRP\./),
+    ).toBeInTheDocument();
   });
 
   it('says nothing about sold assets when there are none', async () => {
@@ -872,15 +1067,21 @@ describe('InvestedSection: history warnings', () => {
     }
     expect(details.open).toBe(false);
     expect(details.querySelector('summary')?.textContent).toBe(
-      'What the imported history could not account for (2)',
+      'What the imported history could not account for (3)',
     );
 
-    const [shortSale, fee] = within(details).getAllByRole('listitem');
+    const [shortSale, feeShortfall, fee] = within(details).getAllByRole('listitem');
     expect(shortSale?.querySelector('time')?.getAttribute('datetime')).toBe(WARNING_OCCURRED_AT);
     expect(shortSale).toHaveTextContent(
       /on Bitget: A sale of, or a fee paid in, ETH exceeded the imported history by 0\.25 ETH\. A buy or a deposit is missing\.$/,
     );
     expect(dataValues(shortSale ?? details)).toEqual(['0.250000000000000000']);
+    // The fee paid in BGB, never held, is a shortfall and an unvalued fee at one moment.
+    expect(feeShortfall?.querySelector('time')?.getAttribute('datetime')).toBe(FEE_OCCURRED_AT);
+    expect(feeShortfall).toHaveTextContent(
+      /on BingX: A sale of, or a fee paid in, BGB exceeded the imported history by 0\.002 BGB\. A buy or a deposit is missing\.$/,
+    );
+    expect(fee?.querySelector('time')?.getAttribute('datetime')).toBe(FEE_OCCURRED_AT);
     expect(fee).toHaveTextContent(
       /on BingX: A fee of 0\.002 BGB could not be valued\. It is left out of the figures for SOL\.$/,
     );
@@ -890,10 +1091,12 @@ describe('InvestedSection: history warnings', () => {
     openDashboard({
       positions: investedPortfolio({
         warnings: [
-          warning({
-            kind: 'unattributed_fee',
+          warning(),
+          ...feeInNeverHeldAsset({ charged_to: 'SOL' }),
+          // A stablecoin conversion on a venue this build does not know, fee paid in BGB.
+          ...feeInNeverHeldAsset({
             source: 'kraken',
-            asset: 'USDC',
+            occurred_at: '2026-06-10T08:00:00Z',
             quantity: '0.100000000000000000',
             charged_to: null,
           }),
@@ -903,10 +1106,11 @@ describe('InvestedSection: history warnings', () => {
 
     const details = (await loadedRegion()).querySelector('details');
     expect(details?.querySelector('summary')?.textContent).toBe(
-      'What the imported history could not account for (1)',
+      'What the imported history could not account for (5)',
     );
-    expect(details).toHaveTextContent(
-      /on kraken: A fee of 0\.1 USDC could not be valued\. It was paid on a conversion between stablecoins\.$/,
+    const items = within(details ?? document.body).getAllByRole('listitem');
+    expect(items.at(-1)).toHaveTextContent(
+      /on kraken: A fee of 0\.1 BGB could not be valued\. It was paid on a conversion between stablecoins\.$/,
     );
   });
 
@@ -1022,6 +1226,17 @@ describe('InvestedSection: empty states (criterion 7)', () => {
     await expectNoFigures();
   });
 
+  it('row 4: a snapshot over no trades, while fills are stored, predates them (S1)', async () => {
+    // event_count 0 proves the snapshot replayed nothing, and the venue holds 1234 fills: it
+    // is not "no positions", which would claim every trade was between stablecoins.
+    openDashboard({ positions: emptySnapshot(), exchanges: [exchange()] });
+
+    await emptyHeading('Positions have not been computed yet');
+    const region = await loadedRegion();
+    expect(within(region).queryByRole('heading', { name: 'No positions' })).toBeNull();
+    expect(within(region).queryByRole('heading', { name: 'No trades imported yet' })).toBeNull();
+  });
+
   it('row 5: no positions, because every trade was between stablecoins', async () => {
     openDashboard({ positions: stablecoinOnlySnapshot(), exchanges: [exchange()] });
 
@@ -1032,9 +1247,9 @@ describe('InvestedSection: empty states (criterion 7)', () => {
     await expectNoFigures();
   });
 
-  it('falls back when the exchanges query fails: says so, and does not guess the sync', async () => {
-    // A venue whose sync failed would be row 2 - but the page cannot know that, so it does
-    // not claim "no trades imported yet" either. It says exchange status is unavailable.
+  it('falls back when the exchanges query fails: what the snapshot proves, and nothing it does not (S1)', async () => {
+    // A snapshot over no events proves no trade has been replayed, list or no list. What it
+    // cannot say is whether a venue is configured, so the description says neither.
     openDashboard({
       positions: emptySnapshot(),
       before: ({ exchanges }) => {
@@ -1042,19 +1257,40 @@ describe('InvestedSection: empty states (criterion 7)', () => {
       },
     });
 
-    await emptyHeading('No positions');
+    await emptyHeading('No trades imported yet');
     const region = await loadedRegion();
+    expect(region).toHaveTextContent(NO_TRADES_NEUTRAL);
+    expect(region).not.toHaveTextContent(/must be configured|Syncing the exchanges/);
+    expect(within(region).getByRole('link', { name: 'Open exchanges' })).toHaveAttribute(
+      'href',
+      '/exchanges',
+    );
     expect(within(region).getByRole('alert')).toHaveTextContent(
       'Exchange status is unavailable: The exchange list could not be read. ' +
         'A failed exchange sync cannot be ruled out.',
     );
-    expect(within(region).queryByRole('heading', { name: 'No trades imported yet' })).toBeNull();
+    expect(within(region).queryByRole('heading', { name: 'No positions' })).toBeNull();
     expect(within(region).queryByRole('heading', { name: 'The exchange sync failed' })).toBeNull();
+  });
+
+  it('falls back to "no positions" only when the snapshot replayed trades (S1)', async () => {
+    openDashboard({
+      positions: stablecoinOnlySnapshot(),
+      before: ({ exchanges }) => {
+        exchanges.fail('list', () => HttpResponse.error());
+      },
+    });
+
+    await emptyHeading('No positions');
+    const region = await loadedRegion();
+    expect(within(region).getByRole('alert')).toHaveTextContent(/Exchange status is unavailable/);
+    expect(within(region).queryByRole('heading', { name: 'No trades imported yet' })).toBeNull();
   });
 
   it.each<[string, PositionsResponse, string]>([
     ['with positions', investedPortfolio(), 'BTC'],
-    ['with none', emptySnapshot(), 'No positions'],
+    ['with none, over stablecoin trades', stablecoinOnlySnapshot(), 'No positions'],
+    ['with none, over no trade', emptySnapshot(), 'No trades imported yet'],
   ])(
     'treats an exchange list kept across a failed poll as unknown, %s (R5)',
     async (_label, positions, landmark) => {
@@ -1125,6 +1361,39 @@ describe('InvestedSection: empty states (criterion 7)', () => {
 
     await emptyHeading('The exchange sync failed');
     expect(within(region).queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('keeps one status element from the positions read to the exchanges read (N5)', async () => {
+    // Both loading cases are one Skeleton from one place, so the live region is not replaced -
+    // and re-announced - when the positions answer while the exchanges have not.
+    let releasePositions: () => void = () => undefined;
+    let releaseExchanges: () => void = () => undefined;
+    const { accounting } = openDashboard({
+      positions: emptySnapshot(),
+      exchanges: [],
+      before: (fakes) => {
+        releasePositions = fakes.accounting.hold();
+        releaseExchanges = fakes.exchanges.hold('list');
+      },
+    });
+
+    const region = await investedRegion();
+    const first = await within(region).findByRole('status');
+    await waitFor(() => {
+      expect(accounting.count()).toBeGreaterThan(0);
+    });
+
+    releasePositions();
+    await settle();
+    await settle();
+
+    expect(within(region).getByRole('status')).toBe(first);
+    expect(first).toBeInTheDocument();
+    expect(first).toHaveTextContent('Loading invested per asset…');
+
+    releaseExchanges();
+    await emptyHeading('No trades imported yet');
+    expect(first).not.toBeInTheDocument();
   });
 
   it('does not wait for the exchange list when there are positions to show', async () => {
@@ -1296,7 +1565,7 @@ describe('InvestedSection: loading and failures (criterion 8)', () => {
   it('picks up a new snapshot on its next poll, without a reload', async () => {
     vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
     vi.setSystemTime(new Date(NOW));
-    const { accounting } = openDashboard({ positions: emptySnapshot() });
+    const { accounting } = openDashboard({ positions: stablecoinOnlySnapshot() });
     await within(await loadedRegion()).findByRole('heading', { name: 'No positions' });
 
     accounting.setPositions(investedPortfolio());
@@ -1379,7 +1648,7 @@ describe('InvestedSection: after an exchange sync', () => {
     // invalidation they would be served as they were: "No positions".
     let accounting: FakeAccounting | undefined;
     const { user } = openDashboard({
-      positions: emptySnapshot(),
+      positions: stablecoinOnlySnapshot(),
       before: (fakes) => {
         accounting = fakes.accounting;
       },

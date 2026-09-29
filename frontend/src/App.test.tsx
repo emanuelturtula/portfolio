@@ -74,6 +74,11 @@ describe('App', () => {
     expect(
       await within(main).findByRole('heading', { name: /no wallets yet/i }),
     ).toBeInTheDocument();
+    // The invested section below settles to its own empty state; until it has, its skeleton
+    // is a `status` of its own, and the assertion below would be about a race.
+    expect(
+      await within(main).findByRole('heading', { name: 'No trades imported yet' }),
+    ).toBeInTheDocument();
     // An empty state, not a failure and not a permanent loading state.
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByRole('status')).not.toBeInTheDocument();

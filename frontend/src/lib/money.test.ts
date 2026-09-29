@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   addMoney,
+  equalsMoney,
   formatMoney,
   fromBaseUnits,
   isZeroMoney,
@@ -425,4 +426,27 @@ describe('isZeroMoney', () => {
       expect(isZeroMoney(money(value))).toBe(false);
     },
   );
+});
+
+describe('equalsMoney', () => {
+  it.each([
+    ['5', '5.000000000000000000'],
+    ['0', '-0.000000000000000000'],
+    ['10.5', '10.500000000000000000'],
+    ['28700000000.00000123', '28700000000.000001230000000000'],
+  ])('calls %j and %j the same amount', (a, b) => {
+    // The wire spells amounts at their own scale; two spellings of one amount are equal.
+    expect(equalsMoney(money(a), money(b))).toBe(true);
+    expect(equalsMoney(money(b), money(a))).toBe(true);
+  });
+
+  it.each([
+    ['10.000000000000000000', '9.999999999999999999'],
+    ['0.000000000000000001', '0'],
+    ['-1', '1'],
+    // Past a double's precision: as numbers these two would compare equal.
+    ['9007199254740993', '9007199254740992'],
+  ])('tells %j and %j apart', (a, b) => {
+    expect(equalsMoney(money(a), money(b))).toBe(false);
+  });
 });

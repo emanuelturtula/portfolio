@@ -355,7 +355,70 @@ export function assertWritablePositions(response: PositionsResponse): PositionsR
     sameValue('totals.unrealized_return_pct', totals.unrealized_return_pct, pct, RETURN_PCT_SCALE);
   }
 
+  assertWarningsMatchFlags(response);
   return response;
+}
+
+/**
+ * The warnings against the flags they set, as `replay.py` writes both (spec 022, R8 S4).
+ *
+ * - `dispose` opens the pool of whatever it touches, so every warning's asset has a position.
+ * - It records a `negative_inventory` and sets `history_incomplete` together, and nothing else
+ *   sets that flag.
+ * - `fee_leg` records an `unattributed_fee` and sets that flag on `charged_to` together, and
+ *   nothing else sets it.
+ *
+ * Every warning is stored, so each flag has its warning and each warning its flag. Warnings
+ * come out in event order, and a quantity is a positive amount at the engine's scale.
+ */
+function assertWarningsMatchFlags(response: PositionsResponse): void {
+  const byAsset = new Map(response.positions.map((entry) => [entry.asset, entry]));
+  let previous = Number.NEGATIVE_INFINITY;
+
+  for (const entry of response.warnings) {
+    const label = `${entry.kind} warning on ${entry.asset}`;
+    if (!exact(`${label} quantity`, entry.quantity, AMOUNT_SCALE).gt(0)) {
+      fail(`${label}: a shortfall or an unvalued fee is a positive quantity.`);
+    }
+    const at = Date.parse(entry.occurred_at);
+    if (at < previous) {
+      fail(`${label}: warnings are stored in event order.`);
+    }
+    previous = at;
+    const target = byAsset.get(entry.asset);
+    if (target === undefined) {
+      fail(`${label}: the leg that raised it opened a ${entry.asset} pool, so it has a position.`);
+    }
+    if (entry.kind === 'negative_inventory') {
+      if (entry.charged_to !== null) {
+        fail(`${label}: only an unvalued fee is charged to an asset.`);
+      }
+      if (!target.flags.includes('history_incomplete')) {
+        fail(`${label}: the shortfall sets history_incomplete on ${entry.asset}.`);
+      }
+    }
+    if (entry.kind === 'unattributed_fee' && entry.charged_to !== null) {
+      const charged = byAsset.get(entry.charged_to);
+      if (charged?.flags.includes('unattributed_fee') !== true) {
+        fail(`${label}: the fee sets unattributed_fee on ${entry.charged_to}, its charged_to.`);
+      }
+    }
+  }
+
+  for (const entry of response.positions) {
+    const shortfall = response.warnings.some(
+      (item) => item.kind === 'negative_inventory' && item.asset === entry.asset,
+    );
+    if (entry.flags.includes('history_incomplete') && !shortfall) {
+      fail(`${entry.asset}: history_incomplete is set only with a negative_inventory warning.`);
+    }
+    const fee = response.warnings.some(
+      (item) => item.kind === 'unattributed_fee' && item.charged_to === entry.asset,
+    );
+    if (entry.flags.includes('unattributed_fee') && !fee) {
+      fail(`${entry.asset}: unattributed_fee is set only with a warning charged to it.`);
+    }
+  }
 }
 
 /*
@@ -449,7 +512,8 @@ export function ethUnpriced(
 /**
  * KAS: part of it has no known cost, and its price is stale. Hand-worked:
  *
- * - 1500 held, 500 of them deposited with no known cost, so the known part is 1000;
+ * - 1500 held, 500 of them from a fee rebate paid in KAS, which arrives with no known cost,
+ *   so the known part is 1000;
  * - the 1000 cost 100: average 0.1;
  * - priced at 0.08, two hours old: market value 1500 x 0.08 = 120, over every unit;
  * - unrealized over the known part only: 1000 x 0.08 - 100 = -20, a return of -20 / 100 x 100 = -20.
@@ -528,6 +592,55 @@ export function xrpClosed(
     unrealized_return_pct: null,
     ...overrides,
   });
+}
+
+/** When a fee was paid in BGB, which the history never held: 2026-05-02, on BingX. */
+export const FEE_OCCURRED_AT = '2026-05-02T16:20:00Z';
+
+/**
+ * BGB: a fee paid in an asset the history never held (spec 022, R8 S4). The engine opens a BGB
+ * pool for the fee leg and disposes of more than it holds, so the pool stays at zero and is
+ * flagged `history_incomplete`. Its average is null and its value zero. A fee has no proceeds,
+ * so nothing is realized. See `replay.py`, `fee_leg` and `dispose`.
+ *
+ * It always comes with the two warnings {@link feeInNeverHeldAsset} builds.
+ */
+export function bgbFeeNeverHeld(
+  overrides: Partial<AccountingPositionResponse> = {},
+): AccountingPositionResponse {
+  return xrpClosed({
+    asset: 'BGB',
+    realized_pnl: ZERO,
+    flags: ['history_incomplete'],
+    ...overrides,
+  });
+}
+
+export interface FeeInNeverHeldAsset {
+  readonly asset?: string;
+  readonly quantity?: string;
+  readonly occurred_at?: string;
+  readonly source?: string;
+  /** The non-cash principal of the trade, or `null` for a conversion between stablecoins. */
+  readonly charged_to: string | null;
+}
+
+/**
+ * The two warnings one fee paid in a never-held asset leaves, in the order `apply_trade`
+ * emits them for one event: the shortfall, from `dispose`, then the unvalued fee, from
+ * `fee_leg`, both for the whole fee.
+ */
+export function feeInNeverHeldAsset(options: FeeInNeverHeldAsset): AccountingWarningResponse[] {
+  const common = {
+    occurred_at: options.occurred_at ?? FEE_OCCURRED_AT,
+    source: options.source ?? 'bingx',
+    asset: options.asset ?? 'BGB',
+    quantity: options.quantity ?? '0.002000000000000000',
+  };
+  return [
+    warning({ kind: 'negative_inventory', ...common, charged_to: null }),
+    warning({ kind: 'unattributed_fee', ...common, charged_to: options.charged_to }),
+  ];
 }
 
 /**
@@ -614,6 +727,7 @@ export function positionsResponse(overrides: PositionsInput = {}): PositionsResp
  *
  * | Asset | Counted? | Invested | Market value | Unrealized | Realized |
  * |---|---|---|---|---|---|
+ * | BGB | yes, holds nothing | 0 | 0 | 0 | 0 |
  * | BTC | yes | 52500 | 90000 | +37500 | +7500 |
  * | ETH | no, unpriced | 8154.845485377135705 | - | - | -250 |
  * | KAS | no, unknown basis | 100 | 120 | -20 | 0 |
@@ -622,14 +736,23 @@ export function positionsResponse(overrides: PositionsInput = {}): PositionsResp
  *
  * - invested 52500 + 0 = 52500; market value 90000 + 0 = 90000; unrealized 37500 + 0 = 37500;
  * - return 37500 / 52500 x 100 = 71.4286;
- * - realized 7500 - 250 + 0 + 0 + 125.5 = 7375.5, over every position.
+ * - realized 0 + 7500 - 250 + 0 + 0 + 125.5 = 7375.5, over every position.
  *
+ * The warnings are ETH's short sale, which flagged it, and a SOL buy's fee paid in BGB, which
+ * the history never held: a BGB shortfall and an unvalued fee charged to SOL.
  * `unallocated_costs` is a stablecoin conversion's 0.1 fee.
  */
 export function investedPortfolio(overrides: PositionsInput = {}): PositionsResponse {
   return positionsResponse({
     event_count: 312,
-    positions: [position(), ethUnpriced(), kasUnknownBasis(), solUnknownAndUnpriced(), xrpClosed()],
+    positions: [
+      bgbFeeNeverHeld(),
+      position(),
+      ethUnpriced(),
+      kasUnknownBasis(),
+      solUnknownAndUnpriced(),
+      xrpClosed(),
+    ],
     totals: totals({
       total_invested: '52500.000000000000000000',
       market_value: '90000.000000000000000000',
@@ -638,17 +761,7 @@ export function investedPortfolio(overrides: PositionsInput = {}): PositionsResp
       realized_pnl: '7375.500000000000000000',
     }),
     unallocated_costs: '0.100000000000000000',
-    warnings: [
-      warning(),
-      warning({
-        kind: 'unattributed_fee',
-        occurred_at: '2026-05-02T16:20:00Z',
-        source: 'bingx',
-        asset: 'BGB',
-        quantity: '0.002000000000000000',
-        charged_to: 'SOL',
-      }),
-    ],
+    warnings: [warning(), ...feeInNeverHeldAsset({ charged_to: 'SOL' })],
     ...overrides,
   });
 }
@@ -672,6 +785,7 @@ export function everyHeldPositionExcluded(): PositionsResponse {
   return positionsResponse({
     positions: [ethUnpriced(), kasUnknownBasis(), xrpClosed()],
     totals: totals({ realized_pnl: '-124.500000000000000000' }),
+    warnings: [warning()],
   });
 }
 
