@@ -45,17 +45,21 @@ interface PositionRowProps {
 /**
  * The market value cell: the amount, or the sentence for why there is none. A holding with
  * no value is never a `0.00` - it is a holding nobody could value.
+ *
+ * No fallback for a missing value with a missing reason: the backend pairs the two by
+ * construction (`valuation.py`, "never one without the other"), so that shape is not one it
+ * can write, and inventing a reason for it would be inventing a fact (spec 022, R1).
  */
 function marketValueCell(position: Position) {
+  const reason = position.market_value_unavailable_reason;
+
   if (position.market_value !== null) {
     return <Money value={money(position.market_value)} options={AMOUNT_FORMAT} />;
   }
 
-  return position.market_value_unavailable_reason === null ? (
-    '—'
-  ) : (
+  return (
     <span className="unavailable">
-      {MARKET_VALUE_UNAVAILABLE_MESSAGES[position.market_value_unavailable_reason]}
+      {reason !== null && MARKET_VALUE_UNAVAILABLE_MESSAGES[reason]}
     </span>
   );
 }

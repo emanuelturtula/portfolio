@@ -116,6 +116,8 @@ function EmptyPositionsState({ state }: { readonly state: EmptyPositions }) {
 
 interface PositionsViewProps {
   readonly data: Positions;
+  /** When the snapshot was written. The section shows positions only for a written one. */
+  readonly computedAt: string;
   /** Venues whose last sync failed, so these figures may miss their latest trades. */
   readonly failedVenues: readonly ExchangeKey[];
 }
@@ -124,21 +126,14 @@ interface PositionsViewProps {
  * The section when there are positions: how the figures were computed, what to distrust
  * about them, the summary, the held positions and what the history could not account for.
  */
-function PositionsView({ data, failedVenues }: PositionsViewProps) {
+function PositionsView({ data, computedAt, failedVenues }: PositionsViewProps) {
   const held = data.positions.filter(isHeld);
   const closed = data.positions.filter((position) => !isHeld(position));
 
   return (
     <>
       <p>
-        Weighted average cost in {data.quote_currency}
-        {data.computed_at === null ? (
-          ', not computed yet'
-        ) : (
-          <>
-            , computed <RelativeTime value={data.computed_at} />
-          </>
-        )}
+        Weighted average cost in {data.quote_currency}, computed <RelativeTime value={computedAt} />
         . Not a tax figure.
       </p>
 
@@ -208,7 +203,12 @@ function InvestedContent({ positions, exchanges }: InvestedContentProps) {
   // rule the value section applies to the run log (`runsKnown`).
   const exchangeList = exchanges.isSuccess ? exchanges.data : undefined;
   const failedVenues = exchangeList === undefined ? [] : venuesWithFailedSync(exchangeList);
-  const empty = data.positions.length === 0;
+  const computedAt = data.computed_at;
+  // No snapshot is `computed_at === null` by the endpoint's own definition, and it comes with
+  // no positions (spec 021), so the two cannot disagree. Narrowing here, once, is what lets
+  // the positions path take `computedAt` as a string instead of carrying a fallback for a
+  // response the backend cannot write (spec 022, R1).
+  const empty = computedAt === null || data.positions.length === 0;
 
   return (
     <>
@@ -227,7 +227,7 @@ function InvestedContent({ positions, exchanges }: InvestedContentProps) {
         </p>
       )}
 
-      {!empty && <PositionsView data={data} failedVenues={failedVenues} />}
+      {!empty && <PositionsView data={data} computedAt={computedAt} failedVenues={failedVenues} />}
       {/* Which of the empty states applies depends on the exchanges query, so until it has
           answered the section cannot tell "no trades yet" from "the sync failed". */}
       {empty && exchanges.isPending && <Skeleton label="Loading invested per asset…" />}

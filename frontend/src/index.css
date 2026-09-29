@@ -400,6 +400,12 @@ td {
   margin-top: 0.25rem;
 }
 
+/* An asset with no flag renders the container with nothing in it; without this its margin
+   alone would make that row taller than it needs to be. */
+.row-badges:empty {
+  display: none;
+}
+
 /* A badge in a narrow first column wraps onto two lines, and a pill that wraps looks like a
    blob: a smaller radius and a tighter line height keep it a label. */
 .row-badges .badge {
