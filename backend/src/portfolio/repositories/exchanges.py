@@ -664,11 +664,14 @@ class ExchangeFillRepository:
         """The rows `select_fills_for_view` reads, fetched in full, before they become records.
 
         The half of `list_fills_for_view` that needs the session, and so the half that stays on
-        the event loop. **What it returns holds no session, connection or cursor**: an
+        the event loop. The rows are SQLAlchemy `Row`s -- sequences in the statement's column
+        order, not builtin tuples -- and **they hold no session, connection or cursor**: an
         `AsyncSession` fetches every row before it returns, and SQLAlchemy applies each column's
         result processing -- `NumericText` to a `Decimal`, `UtcDateTime` to an aware
         `datetime` -- as it builds each row. So the rows can cross to a worker thread as plain
-        data, and `decode_fill_view_rows` needs nothing but them.
+        data, and `decode_fill_view_rows` needs nothing but them. Checked when this was written:
+        rows fetched and then decoded in a worker thread, after the session had closed and the
+        engine had been disposed, gave the same records, and no column processor ran again.
 
         That processing is therefore the part of the read that stays on the loop, with the query
         itself: spec 024, R5, records what it costs.
@@ -680,10 +683,11 @@ class ExchangeFillRepository:
 def decode_fill_view_rows(rows: Iterable[Sequence[Any]]) -> list[FillViewRecord]:
     """Turn the rows `fetch_fill_view_rows` returns into `FillViewRecord`s. Pure.
 
-    No session, no I/O, no clock: it reads the tuples it is handed and nothing else, which is
-    what lets the service run it in a worker thread.
+    No session, no I/O, no clock: it reads the rows it is handed -- the `Row`s
+    `fetch_fill_view_rows` returns, or any sequences in the same column order -- and nothing
+    else, which is what lets the service run it in a worker thread.
 
-    **Each row is unpacked as a tuple, and the two enums are looked up in a dict**, because this
+    **Each row is unpacked by position, and the two enums are looked up in a dict**, because this
     loop runs once per fill in the history and was half the endpoint's time: a `Row`'s attribute
     access resolves each name, and `ExchangeKey(...)` and `FillSide(...)` each cost a call into
     `EnumType.__call__`. Measured at 20,000 fills, the load went from 0.199 s to 0.122 s. The
