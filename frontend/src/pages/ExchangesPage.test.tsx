@@ -2575,7 +2575,9 @@ describe('ExchangesPage: empty, loading and failure', () => {
     expect(screen.queryByText('Loading exchanges…')).not.toBeInTheDocument();
   });
 
-  it('a failed first load is a page error with retry', async () => {
+  it('a failed first load is an error inside Accounts, with retry', async () => {
+    // Spec 024 changed this from a whole-page error: the list failing no longer blanks the
+    // page. The error sits in the Accounts section and Transactions still render.
     const { user, fake } = openExchanges();
     fake.fail('list', () => problem(503, 'Service Unavailable', 'The database is restarting.'));
 
@@ -2584,7 +2586,10 @@ describe('ExchangesPage: empty, loading and failure', () => {
       within(alert).getByRole('heading', { name: 'Could not load exchanges' }),
     ).toBeInTheDocument();
     expect(alert).toHaveTextContent('The database is restarting.');
-    expect(screen.queryByRole('heading', { name: 'Accounts' })).not.toBeInTheDocument();
+    const accounts = await accountsSection();
+    expect(accounts).toContainElement(alert);
+    expect(within(accounts).queryByRole('listitem')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 3, name: 'Transactions' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Sync now' })).not.toBeInTheDocument();
     // Nothing loaded is not the same as nothing configured.
     expect(screen.queryByRole('heading', { name: EMPTY_TITLE })).not.toBeInTheDocument();

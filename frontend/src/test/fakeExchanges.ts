@@ -2,37 +2,72 @@ import { http, HttpResponse, type HttpHandler } from 'msw';
 
 import {
   accountSucceeded,
+  ALL_EXCHANGE_KEYS,
   assertWritableExchange,
   exchangeList,
   finishedRun,
   syncTriggered,
+  type ExchangeKey,
   type ExchangeResponse,
   type ExchangeSyncRunResponse,
   type ExchangeSyncTriggeredResponse,
 } from './exchangeFixtures';
 import type { RecordedRequest } from './fakePortfolio';
-import { refuseNonJsonWrite, unauthorized } from './server';
+import {
+  assertWritableFills,
+  DEFAULT_FILLS_LIMIT,
+  fillsPage,
+  MAX_FILLS_LIMIT,
+  type ExchangeFill,
+  type FillQuery,
+} from './fillFixtures';
+import { problem, refuseNonJsonWrite, unauthorized } from './server';
 
 export const EXCHANGES_PATH = '/api/exchanges';
 export const EXCHANGE_RUNS_PATH = '/api/exchanges/runs';
 export const EXCHANGE_SYNC_PATH = '/api/exchanges/sync';
+export const EXCHANGE_FILLS_PATH = '/api/exchanges/fills';
 
 /** The backend's default page size for the run log, and its ceiling. */
 const DEFAULT_RUNS_LIMIT = 20;
 const MAX_RUNS_LIMIT = 100;
 
 /** A route a test can hold open, or make fail, to observe the page meanwhile. */
-export type ExchangeRoute = 'list' | 'runs' | 'sync';
+export type ExchangeRoute = 'list' | 'runs' | 'sync' | 'fills';
 
 const ROUTE_PATHS: Readonly<Record<ExchangeRoute, string>> = {
   list: EXCHANGES_PATH,
   runs: EXCHANGE_RUNS_PATH,
   sync: EXCHANGE_SYNC_PATH,
+  fills: EXCHANGE_FILLS_PATH,
 };
+
+/** `2**63 - 1`, the offset's upper bound (spec 024, "Offset bound"). */
+const MAX_OFFSET = 9_223_372_036_854_775_807n;
+
+/**
+ * An instant as `datetime.fromisoformat` reads it **with an offset**. A bound without one is
+ * naive, and naive is a 422; so is a bare date or a digit string, which parse as naive.
+ */
+const AWARE_INSTANT =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+const FILL_QUERY_PARAMS: readonly string[] = ['exchange', 'from', 'to', 'limit', 'offset'];
 
 export interface FakeExchangesOptions {
   readonly exchanges?: readonly ExchangeResponse[];
   readonly runs?: readonly ExchangeSyncRunResponse[];
+  /**
+   * The owner's stored fills, served by `GET /api/exchanges/fills`.
+   *
+   * **When given, the list is held to them**: every listed venue's `fills_stored` is the
+   * number of rows of that venue, and every row belongs to a listed venue, because both are
+   * `COUNT(*)`s of one table. When omitted, the endpoint answers an empty set and the list
+   * is not checked against it. The page tests written before spec 024 never look at the
+   * transactions, and an empty answer beside a non-zero count is what a sync committing
+   * between the two reads produces.
+   */
+  readonly fills?: readonly ExchangeFill[];
   /**
    * What `POST /api/exchanges/sync` does once released. Receives the fake so
    * it can move the list and the run log the way a real run would. The
@@ -59,6 +94,14 @@ export interface FakeExchanges {
   /** Replaces one venue's entry, checked against the backend's writer rules. */
   patchExchange(key: ExchangeResponse['exchange_key'], patch: Partial<ExchangeResponse>): void;
   setRuns(next: readonly ExchangeSyncRunResponse[]): void;
+  fills(): readonly ExchangeFill[];
+  /**
+   * Stores `added` as a sync would: the rows, and each venue's `fills_stored` moving by the
+   * number of its rows, together.
+   */
+  addFills(added: readonly ExchangeFill[]): void;
+  /** The query string of every `GET /api/exchanges/fills` that arrived, oldest first. */
+  fillQueries(): URLSearchParams[];
   /**
    * Holds every request to `route` until the returned function is called. The
    * request is recorded when it arrives, not when it is released.
@@ -91,6 +134,8 @@ export function fakeExchanges(options: FakeExchangesOptions = {}): FakeExchanges
     assertWritableExchange(entry),
   );
   let runs: ExchangeSyncRunResponse[] = [...(options.runs ?? [])];
+  const modelsFills = options.fills !== undefined;
+  let fills: readonly ExchangeFill[] = assertWritableFills([...(options.fills ?? [])]);
   const holds = new Map<ExchangeRoute, Promise<void>>();
   const failures = new Map<ExchangeRoute, () => Response>();
   const requests: RecordedRequest[] = [];
@@ -117,6 +162,33 @@ export function fakeExchanges(options: FakeExchangesOptions = {}): FakeExchanges
     );
   }
 
+  /** Throws unless the list and the fills are counts of one table (see `options.fills`). */
+  function assertFillsMatchList(): void {
+    if (!modelsFills) {
+      return;
+    }
+    for (const entry of exchanges) {
+      const held = fills.filter((row) => row.exchange_key === entry.exchange_key).length;
+      if (entry.fills_stored !== held) {
+        throw new Error(
+          `Impossible fake: ${entry.exchange_key} says fills_stored ${String(entry.fills_stored)} ` +
+            `and the fake holds ${String(held)} of its fills. Both are COUNT(*)s of one table.`,
+        );
+      }
+    }
+    const listed = new Set(exchanges.map((entry) => entry.exchange_key));
+    const orphan = fills.find((row) => !listed.has(row.exchange_key));
+    if (orphan !== undefined) {
+      throw new Error(
+        `Impossible fake: fill ${String(orphan.id)} is on ${orphan.exchange_key}, which has ` +
+          'no entry in the list. A fill is stored only under an account, and the list names ' +
+          'every venue with an account.',
+      );
+    }
+  }
+
+  assertFillsMatchList();
+
   function defaultSync(): ExchangeSyncTriggeredResponse {
     const nextId = runs.reduce((max, run) => Math.max(max, run.run_id), 0) + 1;
     const run = finishedRun({
@@ -138,15 +210,32 @@ export function fakeExchanges(options: FakeExchangesOptions = {}): FakeExchanges
     runs: () => runs,
     setExchanges: (next) => {
       exchanges = exchangeList(...next.map((entry) => assertWritableExchange(entry))).exchanges;
+      assertFillsMatchList();
     },
     patchExchange: (key, patch) => {
       exchanges = exchanges.map((entry) =>
         entry.exchange_key === key ? assertWritableExchange({ ...entry, ...patch }) : entry,
       );
+      assertFillsMatchList();
     },
     setRuns: (next) => {
       runs = [...next];
     },
+    fills: () => fills,
+    addFills: (added) => {
+      fills = assertWritableFills([...fills, ...added]);
+      exchanges = exchanges.map((entry) => {
+        const count = added.filter((row) => row.exchange_key === entry.exchange_key).length;
+        return count === 0
+          ? entry
+          : assertWritableExchange({ ...entry, fills_stored: entry.fills_stored + count });
+      });
+      assertFillsMatchList();
+    },
+    fillQueries: () =>
+      requests
+        .filter((entry) => routeOf(entry) === 'fills')
+        .map((entry) => new URL(entry.url).searchParams),
     hold: (route) => {
       let release: () => void = () => undefined;
       holds.set(
@@ -206,6 +295,17 @@ export function fakeExchanges(options: FakeExchangesOptions = {}): FakeExchanges
       return HttpResponse.json({ runs: runs.slice(0, bounded) });
     }),
 
+    http.get(EXCHANGE_FILLS_PATH, async ({ request }) => {
+      const failure = await arrive('fills', request);
+      if (failure !== undefined) {
+        return failure;
+      }
+      const query = readFillQuery(new URL(request.url).searchParams);
+      return typeof query === 'string'
+        ? problem(422, 'Unprocessable Content', query)
+        : HttpResponse.json(fillsPage(fills, query));
+    }),
+
     http.post(EXCHANGE_SYNC_PATH, async ({ request }) => {
       const failure = await arrive('sync', request);
 
@@ -222,4 +322,67 @@ export function fakeExchanges(options: FakeExchangesOptions = {}): FakeExchanges
   );
 
   return fake;
+}
+
+/** A query parameter that must be a base-10 integer: `null` when absent. */
+function integerParam(params: URLSearchParams, name: string): bigint | null | 'invalid' {
+  const raw = params.get(name);
+  if (raw === null) {
+    return null;
+  }
+  return /^-?\d+$/.test(raw) ? BigInt(raw) : 'invalid';
+}
+
+/** A bound, in milliseconds: `null` when absent. */
+function instantParam(params: URLSearchParams, name: string): number | null | 'invalid' {
+  const raw = params.get(name);
+  if (raw === null) {
+    return null;
+  }
+  return AWARE_INSTANT.test(raw) ? Date.parse(raw.replace(/(\.\d{3})\d+/, '$1')) : 'invalid';
+}
+
+/**
+ * The endpoint's query rules (spec 024, "Endpoint"), or the reason for its 422.
+ *
+ * The page never means to send a refused query, so the fake refuses it as the backend
+ * would, and the test that caused it sees an error state rather than rows served as if the
+ * query had worked.
+ */
+function readFillQuery(params: URLSearchParams): FillQuery | string {
+  const known: readonly string[] = ALL_EXCHANGE_KEYS;
+  const venues = params.getAll('exchange');
+  const unknown = venues.find((value) => !known.includes(value));
+  if (unknown !== undefined) {
+    return `exchange: "${unknown}" is not an ExchangeKey.`;
+  }
+  const from = instantParam(params, 'from');
+  const to = instantParam(params, 'to');
+  if (from === 'invalid' || to === 'invalid') {
+    return 'from and to must be timezone-aware ISO 8601 datetimes.';
+  }
+  if (from !== null && to !== null && from >= to) {
+    return 'from must be before to.';
+  }
+  const limit = integerParam(params, 'limit');
+  if (limit === 'invalid' || (limit !== null && (limit < 1n || limit > BigInt(MAX_FILLS_LIMIT)))) {
+    return `limit must be an integer from 1 to ${String(MAX_FILLS_LIMIT)}.`;
+  }
+  const offset = integerParam(params, 'offset');
+  if (offset === 'invalid' || (offset !== null && (offset < 0n || offset > MAX_OFFSET))) {
+    return 'offset must be an integer from 0.';
+  }
+  const unexpected = [...params.keys()].find((name) => !FILL_QUERY_PARAMS.includes(name));
+  if (unexpected !== undefined) {
+    // FastAPI ignores an unknown parameter. The page sending one is still a defect: the
+    // filter it meant to apply is silently not applied.
+    return `"${unexpected}" is not a parameter of this endpoint.`;
+  }
+  return {
+    exchanges: [...new Set(venues)] as ExchangeKey[],
+    from,
+    to,
+    limit: limit === null ? DEFAULT_FILLS_LIMIT : Number(limit),
+    offset: offset === null ? 0 : Number(offset),
+  };
 }
