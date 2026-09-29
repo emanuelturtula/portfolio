@@ -294,7 +294,7 @@ No position exists, since both sides are cash. The fee has no asset to attach to
 | `positions` | One per non-cash asset any trade or adjustment touched, sorted by symbol. Each has the pool fields above and its flags. |
 | `warnings` | `NegativeInventory` and `UnattributedFee`, in event order. They are returned, never logged. |
 | `lots` | One per acquisition, with its cost as this method attributed it. #19 persists them, so that a FIFO pass can later sit beside this one. |
-| `unallocated_costs` | Known costs that belong to no position: conversion fees, and value given in a swap whose received quantity has no known-cost part. |
+| `unallocated_costs` | Known costs that belong to no position: conversion fees, value given in a swap whose received quantity has no known-cost part, and the share of a swap's fee that belongs to received units of unknown cost. |
 | `input_fingerprint` | A SHA-256 over the method, the engine version, the cash assets and every event. Equal fingerprints mean an equal answer, so #19 can skip a recompute. |
 
 Taken together, the figures always reconcile. Current basis, minus realized P&L, minus

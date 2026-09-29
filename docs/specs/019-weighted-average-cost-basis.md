@@ -445,3 +445,19 @@ The tester's oracle surfaced these. Each is binding on the engine and the oracle
 - **R10. Kind strings** are `"adjustment"`, `"trade"` and `"transfer"`, compared as strings in
   the tie-break. The fingerprint's JSON key names are the engine's to choose. Fingerprints are
   tested by their properties, not against a stored digest.
+- **R11. A swap splits its fee the way a sale does.** Before this ruling, a swap attached the
+  whole known fee value to `known_in`. When the given asset was mostly of unknown cost,
+  `known_in` could be a sliver carrying the full fee, with an inflated average. The average
+  also jumped discontinuously to the `known_in == 0` path, where all of the value goes to
+  `unallocated_costs`. A sale, by contrast, splits the fee proportionally through its
+  proceeds. So now:
+  - `fee_known = fee_value` when `uncovered == 0`;
+  - otherwise `fee_known = divide(multiply(fee_value, known_out), given, BASIS_SCALE)`;
+  - X's cost becomes `basis_out + fee_known`;
+  - the complement `fee_value - fee_known` goes to `unallocated_costs`, because it is known
+    value that belongs to units of unknown cost;
+  - the `known_in == 0` path is unchanged (all of `basis_out + fee_value` goes to
+    `unallocated_costs`), and it is now the limit of the general rule.
+
+  I8 is unchanged: the fee's value is still counted exactly once. `ENGINE_VERSION` stays 1,
+  since nothing has shipped.
