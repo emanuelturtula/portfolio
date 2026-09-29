@@ -2,8 +2,11 @@ import type { Position, PositionTotals } from '@/api/accounting';
 import { Money } from '@/components/Money';
 import {
   AMOUNT_FORMAT,
+  assetsWithUnreliableRealizedPnl,
   EXCLUSION_REASON_MESSAGES,
+  formatList,
   groupExclusions,
+  isHeld,
   SIGNED_FORMAT,
 } from '@/lib/accounting';
 import { isZeroMoney, money } from '@/lib/money';
@@ -11,8 +14,12 @@ import { ReturnPercent } from '@/pages/dashboard/ReturnPercent';
 
 interface InvestedSummaryProps {
   readonly totals: PositionTotals;
-  /** The held positions: what "every held position is excluded" is judged against. */
-  readonly held: readonly Position[];
+  /**
+   * Every position, held or not. The held ones are what "every held position is excluded" and
+   * the stale-price sentence are judged against; all of them are what the realized P&L caveat
+   * is, since realized P&L is summed over the closed ones too.
+   */
+  readonly positions: readonly Position[];
   readonly quoteCurrency: string;
   readonly unallocatedCosts: string;
 }
@@ -26,17 +33,29 @@ interface InvestedSummaryProps {
  * The three figures the exclusions bear on show "—" when **every** held position is left
  * out. `totals` is then a sum over nothing, and "0.00 invested" beside a table of holdings
  * that cost something is the fabricated zero this page exists to refuse. Realized P&L is
- * summed over every position, so it is a real figure in that case and keeps showing.
+ * summed over every position, so it is a real figure in that case and keeps showing. When
+ * **nothing** is held the totals are a genuine zero and are shown as one (spec 022, R7).
+ *
+ * Like `TotalSummary`, it says when a price it used is stale - a total is only as current
+ * as the prices under it - and, unlike it, when the history under a realized figure is
+ * known to be short.
  */
 export function InvestedSummary({
   totals,
-  held,
+  positions,
   quoteCurrency,
   unallocatedCosts,
 }: InvestedSummaryProps) {
+  const held = positions.filter(isHeld);
   const excludedAssets = new Set(totals.excluded.map((entry) => entry.asset));
   const nothingComparable =
     held.length > 0 && held.every((position) => excludedAssets.has(position.asset));
+  // Only the positions the totals are made of: an excluded position's stale price is not in
+  // any figure above, and saying so would blame the totals for a number they do not use.
+  const anyStalePrice = held.some(
+    (position) => !excludedAssets.has(position.asset) && position.price?.stale === true,
+  );
+  const unreliableRealized = assetsWithUnreliableRealizedPnl(positions);
 
   return (
     <>
@@ -90,6 +109,14 @@ export function InvestedSummary({
         </div>
       </dl>
 
+      {anyStalePrice && <p>These totals include at least one stale price.</p>}
+      {unreliableRealized.length > 0 && (
+        <p>
+          Realized P&amp;L may be inaccurate for {formatList(unreliableRealized)}: the imported
+          history is incomplete, or a fee could not be valued.
+        </p>
+      )}
+
       {totals.excluded.length > 0 && (
         <>
           <p>Left out of these totals:</p>
@@ -106,9 +133,9 @@ export function InvestedSummary({
 
       {!isZeroMoney(money(unallocatedCosts)) && (
         <p>
-          Fees not assigned to any asset:{' '}
-          <Money value={money(unallocatedCosts)} options={AMOUNT_FORMAT} /> {quoteCurrency}{' '}
-          (conversions between stablecoins).
+          Costs not assigned to any asset:{' '}
+          <Money value={money(unallocatedCosts)} options={AMOUNT_FORMAT} /> {quoteCurrency}, from
+          stablecoin conversions and from swaps into units with no known cost.
         </p>
       )}
     </>

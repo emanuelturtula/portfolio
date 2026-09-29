@@ -4,12 +4,13 @@ import { RelativeTime } from '@/components/RelativeTime';
 import {
   AMOUNT_FORMAT,
   FLAG_BADGES,
-  FLAG_EXPLANATIONS,
+  hasNoKnownCost,
   MARKET_VALUE_UNAVAILABLE_MESSAGES,
   SIGNED_FORMAT,
   UNIT_PRICE_FORMAT,
 } from '@/lib/accounting';
 import { isZeroMoney, money, type FormatMoneyOptions } from '@/lib/money';
+import { Badge } from '@/pages/dashboard/Badge';
 import { ReturnPercent } from '@/pages/dashboard/ReturnPercent';
 
 interface OptionalAmountProps {
@@ -20,20 +21,6 @@ interface OptionalAmountProps {
 /** An amount, or "—" for one the backend could not compute. Never a `0`. */
 function OptionalAmount({ value, options }: OptionalAmountProps) {
   return value === null ? '—' : <Money value={money(value)} options={options} />;
-}
-
-/**
- * A text badge. The trailing space is not decoration: the badges sit in a flex container,
- * where CSS ignores it, but the row header's accessible name is built from the text nodes,
- * and without it "Unknown cost" and "Not in totals" would run together as "Unknown costNot
- * in totals".
- */
-function Badge({ children }: { readonly children: string }) {
-  return (
-    <>
-      <span className="badge">{children}</span>{' '}
-    </>
-  );
 }
 
 interface PositionRowProps {
@@ -66,6 +53,9 @@ function marketValueCell(position: Position) {
 
 function PositionRow({ position, excluded }: PositionRowProps) {
   const hasUnknownBasis = !isZeroMoney(money(position.unknown_basis_quantity));
+  // Every unit arrived without a cost: there is nothing invested to show and no profit to
+  // compute, and the `0.00` the backend sends for both would read as break-even.
+  const noKnownCost = hasNoKnownCost(position);
 
   return (
     <tr>
@@ -91,7 +81,11 @@ function PositionRow({ position, excluded }: PositionRowProps) {
         <OptionalAmount value={position.average_cost} options={UNIT_PRICE_FORMAT} />
       </td>
       <td className="num">
-        <Money value={money(position.total_invested)} options={AMOUNT_FORMAT} />
+        {noKnownCost ? (
+          '—'
+        ) : (
+          <Money value={money(position.total_invested)} options={AMOUNT_FORMAT} />
+        )}
       </td>
       <td className="num">
         {position.price === null ? (
@@ -110,7 +104,11 @@ function PositionRow({ position, excluded }: PositionRowProps) {
       </td>
       <td className="num">{marketValueCell(position)}</td>
       <td className="num">
-        <OptionalAmount value={position.unrealized_pnl} options={SIGNED_FORMAT} />
+        {noKnownCost ? (
+          '—'
+        ) : (
+          <OptionalAmount value={position.unrealized_pnl} options={SIGNED_FORMAT} />
+        )}
       </td>
       <td className="num">
         <ReturnPercent value={position.unrealized_return_pct} />
@@ -127,19 +125,19 @@ interface PositionTableProps {
 }
 
 /**
- * One row per held asset, with the data-quality flags on their rows and a legend under the
- * table for each flag that appears in it.
+ * One row per held asset, with the data-quality flags on their rows. The legend that
+ * explains them is not here: it also has to explain the flags beside assets no longer held,
+ * which have no row (see `FlagLegend`).
  *
  * The currency is in the column headers rather than on every cell, which is what keeps
  * eight columns inside the `.app` column at 1280 px. Below that the table sits in a
  * focusable scroll container with its first column sticky, so the page itself never scrolls
- * sideways and a row stays readable while its figures are scrolled into view.
+ * sideways and a row stays readable while its figures are scrolled into view. The container
+ * is a labelled `region` so that a keyboard user can focus it and scroll a table wider than
+ * the screen; see the `no-noninteractive-tabindex` allowance in eslint.config.js.
  */
 export function PositionTable({ positions, excluded, quoteCurrency }: PositionTableProps) {
   const excludedAssets = new Set(excluded.map((entry) => entry.asset));
-  // Alphabetical, like the backend's own order for a position's flags, so the legend does
-  // not reshuffle when the first row that carries a flag changes.
-  const flags = Array.from(new Set(positions.flatMap((position) => position.flags))).sort();
 
   return (
     <>
@@ -147,66 +145,50 @@ export function PositionTable({ positions, excluded, quoteCurrency }: PositionTa
       {positions.length === 0 ? (
         <p>Nothing is held right now.</p>
       ) : (
-        <>
-          {/* A focusable region, so a keyboard user can scroll a table wider than the
-              screen. See the `no-noninteractive-tabindex` allowance in eslint.config.js. */}
-          <div
-            className="table-scroll"
-            role="region"
-            aria-labelledby="positions-heading"
-            tabIndex={0}
-          >
-            <table className="position-table">
-              <thead>
-                <tr>
-                  <th scope="col">Asset</th>
-                  <th scope="col" className="num">
-                    Quantity
-                  </th>
-                  <th scope="col" className="num">
-                    Average cost ({quoteCurrency})
-                  </th>
-                  <th scope="col" className="num">
-                    Invested ({quoteCurrency})
-                  </th>
-                  <th scope="col" className="num">
-                    Price ({quoteCurrency})
-                  </th>
-                  <th scope="col" className="num">
-                    Market value ({quoteCurrency})
-                  </th>
-                  <th scope="col" className="num">
-                    Unrealized P&amp;L ({quoteCurrency})
-                  </th>
-                  <th scope="col" className="num">
-                    Return
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {positions.map((position) => (
-                  <PositionRow
-                    key={position.asset}
-                    position={position}
-                    excluded={excludedAssets.has(position.asset)}
-                  />
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {flags.length > 0 && (
-            <dl className="flag-legend">
-              {flags.map((flag) => (
-                <div key={flag}>
-                  <dt>
-                    <Badge>{FLAG_BADGES[flag]}</Badge>
-                  </dt>
-                  <dd>{FLAG_EXPLANATIONS[flag]}</dd>
-                </div>
+        <div
+          className="table-scroll"
+          role="region"
+          aria-labelledby="positions-heading"
+          tabIndex={0}
+        >
+          <table className="position-table">
+            <thead>
+              <tr>
+                <th scope="col">Asset</th>
+                <th scope="col" className="num">
+                  Quantity
+                </th>
+                <th scope="col" className="num">
+                  Average cost ({quoteCurrency})
+                </th>
+                <th scope="col" className="num">
+                  Invested ({quoteCurrency})
+                </th>
+                <th scope="col" className="num">
+                  Price ({quoteCurrency})
+                </th>
+                <th scope="col" className="num">
+                  Market value ({quoteCurrency})
+                </th>
+                <th scope="col" className="num">
+                  Unrealized P&amp;L ({quoteCurrency})
+                </th>
+                <th scope="col" className="num">
+                  Return
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {positions.map((position) => (
+                <PositionRow
+                  key={position.asset}
+                  position={position}
+                  excluded={excludedAssets.has(position.asset)}
+                />
               ))}
-            </dl>
-          )}
-        </>
+            </tbody>
+          </table>
+        </div>
       )}
     </>
   );

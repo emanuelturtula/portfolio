@@ -12,12 +12,14 @@ import { Skeleton } from '@/components/Skeleton';
 import {
   describeClosedPositions,
   describeEmptyPositions,
+  flagsOf,
   formatVenues,
   isHeld,
   venuesWithFailedSync,
   type EmptyPositions,
 } from '@/lib/accounting';
 import type { ExchangeKey } from '@/lib/exchanges';
+import { FlagLegend } from '@/pages/dashboard/FlagLegend';
 import { HistoryWarnings } from '@/pages/dashboard/HistoryWarnings';
 import { InvestedSummary } from '@/pages/dashboard/InvestedSummary';
 import { PositionTable } from '@/pages/dashboard/PositionTable';
@@ -31,13 +33,17 @@ const POSITIONS_REFETCH_FALLBACK = 'The server could not be reached.';
  */
 const EXCHANGES_UNAVAILABLE_FALLBACK = 'The exchange list could not be read.';
 
+const LOADING_LABEL = 'Loading invested per asset…';
+
 const EXCHANGES_LINK = <Link to="/exchanges">Open exchanges</Link>;
 
 /**
  * "failed on Sep 29, 2026, 10:00 AM (UnconvertibleFillError)". The instant is absolute, not
  * a `<RelativeTime>`: both callers sit in a `role="alert"`, and a ticking phrase inside a
  * live region is re-announced every time it changes (spec 016). `error` is the exception's
- * class name, never its message; it is `null` only for a hand-edited row.
+ * class name, never its message. `last_recompute` lives in memory and the trigger records the
+ * class name for every failure, so a null one is a shape the backend cannot write: the type
+ * allows it, and it renders nothing rather than an invented name (spec 022, R1).
  */
 function FailedAttempt({ at, error }: { readonly at: string; readonly error: string | null }) {
   return (
@@ -46,6 +52,20 @@ function FailedAttempt({ at, error }: { readonly at: string; readonly error: str
       {error !== null && <> ({error})</>}
     </>
   );
+}
+
+/**
+ * What "no trades imported yet" adds: whether syncing can help. `undefined` is an exchange
+ * list that could not be read, where nothing can be said about what is configured.
+ */
+function noTradesDescription(anyConfigured: boolean | undefined): string {
+  if (anyConfigured === undefined) {
+    return 'Positions appear here once trades are imported from an exchange.';
+  }
+
+  return anyConfigured
+    ? 'Syncing the exchanges imports your trades.'
+    : 'An exchange must be configured on the server before trades can be imported.';
 }
 
 /**
@@ -87,11 +107,7 @@ function EmptyPositionsState({ state }: { readonly state: EmptyPositions }) {
         <EmptyState
           headingLevel={3}
           title="No trades imported yet"
-          description={
-            state.anyConfigured
-              ? 'Syncing the exchanges imports your trades.'
-              : 'An exchange must be configured on the server before trades can be imported.'
-          }
+          description={noTradesDescription(state.anyConfigured)}
           action={EXCHANGES_LINK}
         />
       );
@@ -153,7 +169,7 @@ function PositionsView({ data, computedAt, failedVenues }: PositionsViewProps) {
 
       <InvestedSummary
         totals={data.totals}
-        held={held}
+        positions={data.positions}
         quoteCurrency={data.quote_currency}
         unallocatedCosts={data.unallocated_costs}
       />
@@ -162,9 +178,8 @@ function PositionsView({ data, computedAt, failedVenues }: PositionsViewProps) {
         excluded={data.totals.excluded}
         quoteCurrency={data.quote_currency}
       />
-      {closed.length > 0 && (
-        <p>{describeClosedPositions(closed.map((position) => position.asset))}</p>
-      )}
+      {closed.length > 0 && <p>{describeClosedPositions(closed)}</p>}
+      <FlagLegend flags={flagsOf(data.positions)} />
       {data.warnings.length > 0 && <HistoryWarnings warnings={data.warnings} />}
     </>
   );
@@ -176,8 +191,11 @@ interface InvestedContentProps {
 }
 
 function InvestedContent({ positions, exchanges }: InvestedContentProps) {
+  // Both "loading" cases return this same element from the same place, so React keeps one
+  // `role="status"` region across the hand-over from the first to the second instead of
+  // removing it and adding another, which a screen reader announces twice (spec 022, N5).
   if (positions.isPending) {
-    return <Skeleton label="Loading invested per asset…" />;
+    return <Skeleton label={LOADING_LABEL} />;
   }
 
   // Whole-section only when there is nothing to show at all - see `isLoadingError` in the
@@ -210,6 +228,12 @@ function InvestedContent({ positions, exchanges }: InvestedContentProps) {
   // response the backend cannot write (spec 022, R1).
   const empty = computedAt === null || data.positions.length === 0;
 
+  // Which of the empty states applies depends on the exchanges query, so until it has
+  // answered the section cannot tell "no trades yet" from "the sync failed".
+  if (empty && exchanges.isPending) {
+    return <Skeleton label={LOADING_LABEL} />;
+  }
+
   return (
     <>
       {positions.isError && (
@@ -227,12 +251,10 @@ function InvestedContent({ positions, exchanges }: InvestedContentProps) {
         </p>
       )}
 
-      {!empty && <PositionsView data={data} computedAt={computedAt} failedVenues={failedVenues} />}
-      {/* Which of the empty states applies depends on the exchanges query, so until it has
-          answered the section cannot tell "no trades yet" from "the sync failed". */}
-      {empty && exchanges.isPending && <Skeleton label="Loading invested per asset…" />}
-      {empty && !exchanges.isPending && (
+      {empty ? (
         <EmptyPositionsState state={describeEmptyPositions(data, exchangeList)} />
+      ) : (
+        <PositionsView data={data} computedAt={computedAt} failedVenues={failedVenues} />
       )}
     </>
   );

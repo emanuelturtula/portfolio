@@ -232,3 +232,11 @@ export function addMoney(a: Money, b: Money): Money {
 export function isZeroMoney(value: Money): boolean {
   return new Decimal(value).isZero();
 }
+
+/**
+ * Whether `a` and `b` are the same amount, however each is spelled: `"5"` equals
+ * `"5.000000000000000000"`, which a comparison of the strings would call different.
+ */
+export function equalsMoney(a: Money, b: Money): boolean {
+  return new Decimal(a).equals(new Decimal(b));
+}
