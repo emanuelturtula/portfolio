@@ -267,3 +267,9 @@ is regenerated, because the drift job checks it.
   service's own constants (`NOTE_MAX_LENGTH`, the asset pattern). The service remains the
   only validator. This keeps its field-specific messages, and gives #111's form limits it can
   read.
+- **R7. No guard for a trigger that is always installed (tester).** `create_app` installs
+  `app.state.accounting_recompute` through `install_accounting_runtime`, whether or not the
+  lifespan runs. A `RuntimeError` for its absence could only be reached by a test that
+  deletes the attribute, so the dependency reads it directly (#20's R1 rule). The
+  coordinators' guards differ: an application whose lifespan never ran really has no
+  coordinator.
