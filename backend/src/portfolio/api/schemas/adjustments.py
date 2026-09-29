@@ -4,16 +4,29 @@
 all. Whether an amount is one the engine can replay, whether a symbol is spelled as a venue
 spells it, whether a note says anything: `services.adjustments.validate_draft` decides, by
 building the engine's own `Adjustment`, so that the API and the recompute cannot disagree about
-what an acceptable adjustment is (spec 023, *Validation*). A limit stated here as well would be
-a second copy of a rule, and a second message for it.
+what an acceptable adjustment is (spec 023, *Validation*).
+
+**Two limits are stated here, and neither is enforced here** (spec 023, R6). `note` carries
+`maxLength` and `asset` carries `pattern` as `json_schema_extra`: metadata in the OpenAPI
+document, taken from the service's own constants, that a form can read (#111). Pydantic does
+not validate `json_schema_extra`, so the service stays the only validator of both and keeps
+its field-specific messages -- the one for `asset` tells the owner to use the exchange's
+spelling, which Pydantic's "String should match pattern" would not.
 
 ## Money arrives as a JSON string, and only as one
 
 `MoneyStr` already refuses a JSON float, which is inexact before anything reads it. An
-adjustment's amounts refuse **every** JSON number, integers included (spec 023, criterion 9):
-the owner's figures cross the wire one way, and a client that sends `1` today sends `0.1`
-tomorrow. `MoneyInput` is `MoneyStr` with that refusal in front of it. On the way out every
-amount is a string at eighteen places, as `GET /api/accounting/positions` sends them.
+adjustment's amounts refuse **every** JSON number, integers included (spec 023, criterion 9
+and R5): the owner's figures cross the wire one way, and a client that sends `1` today sends
+`0.1` tomorrow. `MoneyInput` is `MoneyStr` with that refusal in front of it. On the way out
+every amount is a string at eighteen places, as `GET /api/accounting/positions` sends them.
+
+## `occurred_at` is a string too
+
+Pydantic reads a JSON number for a `datetime` as a Unix timestamp, and accepts it. The contract
+is an ISO 8601 string with an offset (spec 023, R5), so `InstantInput` refuses a number before
+Pydantic sees it. What a string must then be -- aware, representable in UTC, not later than
+now -- is the service's to decide, as for every other rule.
 
 ## `unit_cost: null` is unknown, never zero
 
@@ -31,13 +44,22 @@ from typing import TYPE_CHECKING, Annotated, Final
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from portfolio.api.schemas.money import MoneyStr
-from portfolio.services.adjustments import NOTE_MAX_LENGTH, AdjustmentDraft
+from portfolio.services.adjustments import (
+    ASSET_SYMBOL_PATTERN,
+    NOTE_MAX_LENGTH,
+    AdjustmentDraft,
+)
 
 if TYPE_CHECKING:
     from portfolio.services.adjustments import AdjustmentView
 
 JSON_NUMBER_REFUSAL: Final = "a monetary value must arrive as a JSON string"
 """The refusal of a JSON number for an amount. Pydantic prefixes it with `Value error, `."""
+
+INSTANT_NUMBER_REFUSAL: Final = (
+    "occurred_at must arrive as an ISO 8601 string with a timezone, not as a JSON number"
+)
+"""The refusal of a JSON number for `occurred_at`. Pydantic prefixes it with `Value error, `."""
 
 
 def _require_a_json_string(value: object) -> object:
@@ -51,11 +73,26 @@ def _require_a_json_string(value: object) -> object:
     return value
 
 
+def _require_an_iso_string(value: object) -> object:
+    """Refuse a JSON number -- or a boolean -- for `occurred_at`, before Pydantic reads it.
+
+    Without this, `1767225600` is accepted as a Unix timestamp. Anything else goes on to
+    Pydantic's `datetime`, which parses a string -- or passes a `datetime` built in Python --
+    and refuses whatever does not parse, without quoting it.
+    """
+    if isinstance(value, int | float):
+        raise ValueError(INSTANT_NUMBER_REFUSAL)
+    return value
+
+
 MoneyInput = Annotated[MoneyStr, BeforeValidator(_require_a_json_string)]
 """An amount in a request body: a JSON string and nothing else, then `MoneyStr`'s checks.
 
 The validator is last in the annotation, and Pydantic runs before-validators last-first, so it
 sees the raw JSON value before `MoneyStr`'s own."""
+
+InstantInput = Annotated[datetime, BeforeValidator(_require_an_iso_string)]
+"""`occurred_at` in a request body: a string, never a Unix timestamp (spec 023, R5)."""
 
 _ASSET_DESCRIPTION: Final = (
     "The symbol exactly as the exchanges spell it: 1 to 20 upper-case letters or digits, such "
@@ -89,13 +126,21 @@ class _AdjustmentRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    asset: str = Field(description=_ASSET_DESCRIPTION)
+    # `pattern` and `maxLength` below are OpenAPI metadata only, never validated here: see the
+    # module docstring. `json_schema_extra` is the one `Field` argument Pydantic does not check.
+    asset: str = Field(
+        description=_ASSET_DESCRIPTION,
+        json_schema_extra={"pattern": ASSET_SYMBOL_PATTERN},
+    )
     quantity: MoneyInput = Field(description=_QUANTITY_DESCRIPTION)
     # Declared again on each subclass, which is where whether it may be omitted differs. Here
     # it fixes the field's place in the order: after `quantity`, as the wire shows it.
     unit_cost: MoneyInput | None = Field(description=_UNIT_COST_DESCRIPTION)
-    occurred_at: datetime = Field(description=_OCCURRED_AT_DESCRIPTION)
-    note: str = Field(description=_NOTE_DESCRIPTION)
+    occurred_at: InstantInput = Field(description=_OCCURRED_AT_DESCRIPTION)
+    note: str = Field(
+        description=_NOTE_DESCRIPTION,
+        json_schema_extra={"maxLength": NOTE_MAX_LENGTH},
+    )
 
     def to_draft(self) -> AdjustmentDraft:
         """The five fields as the service takes them. Nothing is changed on the way."""

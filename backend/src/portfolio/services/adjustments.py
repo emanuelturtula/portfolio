@@ -78,6 +78,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ADJUSTMENT_NOT_FOUND_DETAIL",
     "ADJUSTMENT_SOURCE",
+    "ASSET_SYMBOL_PATTERN",
     "ASSET_SYMBOL_RULE",
     "CASH_ASSET_RULE",
     "NOTE_BLANK_RULE",
@@ -112,9 +113,17 @@ NOTE_MAX_LENGTH: Final = 500
 ADJUSTMENT_NOT_FOUND_DETAIL: Final = "No adjustment with that id."
 """The 404's detail, for a missing id and for another owner's alike: it says neither."""
 
-_ASSET_SYMBOL: Final = re.compile(r"[A-Z0-9]{1,20}")
-"""What an asset symbol is, matched against the whole string. ASCII only, so it also refuses
-any text that is not UTF-8-encodable, which the engine would refuse too."""
+ASSET_SYMBOL_PATTERN: Final = r"^[A-Z0-9]{1,20}$"
+"""What an asset symbol is: 1 to 20 upper-case ASCII letters or digits, and nothing else.
+
+Public because the OpenAPI schema states it as `pattern` metadata for the UI (spec 023, R6);
+this module is still the only thing that validates it. Anchored, so that it means the same in
+JSON Schema's unanchored ECMA-262 dialect as under `re.fullmatch` here, where a trailing newline
+does not slip past the `$`. ASCII only, so it also refuses any text that is not
+UTF-8-encodable, which the engine would refuse too.
+"""
+
+_ASSET_SYMBOL: Final = re.compile(ASSET_SYMBOL_PATTERN)
 
 ASSET_SYMBOL_RULE: Final = (
     "asset must be the symbol exactly as the exchange spells it: 1 to 20 upper-case letters "
