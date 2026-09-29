@@ -29,7 +29,7 @@ missing is somewhere to keep adjustments, a way to enter them, and the recompute
 ## Non-goals
 
 - **A UI.** The owner enters adjustments through the authenticated API. `/api/docs` works for
-  that while signed in. A dashboard form is filed as a follow-up issue.
+  that while signed in. A dashboard form is filed as #111.
 - **Outflows**, such as a gift sent, a loss, or a withdrawal to a wallet not tracked. The
   engine's `Adjustment` is an inflow, and quantity must be above zero. Outflows are a
   separate question about what a disposal with no proceeds means for realized P&L. They are
