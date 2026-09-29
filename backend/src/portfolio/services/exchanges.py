@@ -31,6 +31,14 @@ totals are the same whatever `limit` and `offset` are, and no datetime or amount
 ordered or summed in SQL, where both are text. Spec 024 records what that costs at 5,000,
 20,000 and 50,000 fills.
 
+**Only the read runs on the event loop** (spec 024, R5). `fetch_fill_view_rows` goes through
+the session there; everything after it -- turning the rows into records, the range, the order,
+the totals and the page -- is `_fills_page`, a pure function of the rows and the parsed
+arguments, run by `anyio.to_thread.run_sync`, as the accounting recompute runs `replay`. At
+20,000 fills that work is most of the request, and on the loop every other request would wait
+for it. `abandon_on_cancel=True`: a cancelled request stops waiting at once, and the thread,
+which holds no session and reads no clock, finishes on its own and its page is discarded.
+
 **The range's rules are here, not in the router**: a bound must be timezone-aware and
 representable in UTC, and `from_` must be before `to`. A refusal is `InvalidFillRangeError`,
 naming the parameter and the rule and never the value, which the router turns into a 422.
@@ -40,7 +48,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
+
+from anyio import to_thread
 
 from portfolio.domain.exchanges import AccountSyncStatus, ExchangeKey, FillSide
 from portfolio.domain.fill_totals import FillLine, FillTotals, total_fills, usdt_value
@@ -57,10 +67,11 @@ from portfolio.repositories.exchanges import (
     ExchangeAccountRepository,
     ExchangeFillRepository,
     ExchangeSyncWindowRepository,
+    decode_fill_view_rows,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Collection, Sequence
     from datetime import datetime
     from decimal import Decimal
 
@@ -234,6 +245,36 @@ def _newest_first(record: FillViewRecord) -> tuple[datetime, int]:
     return (record.executed_at, record.id)
 
 
+def _fills_page(
+    rows: Sequence[Sequence[Any]],
+    since: datetime | None,
+    until: datetime | None,
+    limit: int,
+    offset: int,
+) -> FillsPage:
+    """Everything `list_fills` does after the read, **in a worker thread**, so pure.
+
+    It decodes the rows, keeps `[since, until)`, orders them newest first, totals the whole
+    filtered set, and slices `limit` fills from `offset`. The bounds are already in UTC and
+    checked, and `limit` and `offset` already clamped; the rows hold no session. So nothing here
+    touches a session, a clock or any state beyond its arguments, and the same arguments give the
+    same page on any thread. The amounts are summed by `money.add`, which evaluates in its own
+    explicit context rather than the thread's.
+    """
+    selected = [
+        record
+        for record in decode_fill_view_rows(rows)
+        if (since is None or record.executed_at >= since)
+        and (until is None or record.executed_at < until)
+    ]
+    selected.sort(key=_newest_first, reverse=True)
+    return FillsPage(
+        fills=tuple(_view_of(record) for record in selected[offset : offset + limit]),
+        total_count=len(selected),
+        totals=total_fills(_line_of(record) for record in selected),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class LastError:
     """Why the account's latest attempted sync failed: the kind, and the recorded detail."""
@@ -387,8 +428,14 @@ class ExchangeService:
           clamped to `1..200` and `offset` to `0..`; an offset past the end is an empty page
           with the same `total_count` and totals.
 
-        The bounds are checked before anything is read. See the module docstring for why the
-        range, the order and the totals are applied here rather than in SQL.
+        The bounds are checked before anything is read. The read runs on the event loop and the
+        rest, `_fills_page`, in a worker thread; see the module docstring for why, and for why
+        the range, the order and the totals are applied in Python rather than in SQL.
+
+        **Cancellation**: a request cancelled while `_fills_page` runs raises its cancellation
+        here at once (`abandon_on_cancel=True`). The thread runs to the end on its own, and its
+        page is discarded; it holds no session, so the session this call read through can
+        close under it.
 
         Raises:
             InvalidFillRangeError: a bound is naive or outside what UTC can represent, or
@@ -398,23 +445,17 @@ class ExchangeService:
         until = _bound("to", to)
         if since is not None and until is not None and since >= until:
             raise InvalidFillRangeError("to", INVERTED_RANGE_RULE)
-        records = await self._fills.list_fills_for_view(
+        rows = await self._fills.fetch_fill_view_rows(
             user_id, None if exchanges is None else frozenset(exchanges)
         )
-        selected = [
-            record
-            for record in records
-            if (since is None or record.executed_at >= since)
-            and (until is None or record.executed_at < until)
-        ]
-        selected.sort(key=_newest_first, reverse=True)
-        totals = total_fills(_line_of(record) for record in selected)
-        start = max(0, offset)
-        page = selected[start : start + max(1, min(limit, MAX_FILLS_LIMIT))]
-        return FillsPage(
-            fills=tuple(_view_of(record) for record in page),
-            total_count=len(selected),
-            totals=totals,
+        return await to_thread.run_sync(
+            _fills_page,
+            rows,
+            since,
+            until,
+            max(1, min(limit, MAX_FILLS_LIMIT)),
+            max(0, offset),
+            abandon_on_cancel=True,
         )
 
 

@@ -45,6 +45,11 @@ served, and a column never loaded cannot be served by mistake. The venues are fi
 -- an integer and an enum column -- and nothing else is: the view's date range and its order are
 applied by the service, in Python, for the reason given above.
 
+It is two halves, and the service calls them separately (spec 024, R5): `fetch_fill_view_rows`
+reads through the session, on the event loop, and `decode_fill_view_rows` -- a pure function
+of the rows -- builds the records, in the worker thread where the service filters, orders and
+totals them.
+
 ## This module cannot import `NormalizedFill`
 
 `repositories` and `providers` are siblings in the layers contract and may not import each
@@ -65,11 +70,11 @@ from portfolio.db.models import ExchangeAccount, ExchangeFill, ExchangeSyncWindo
 from portfolio.domain.exchanges import AccountSyncStatus, ExchangeKey, FillSide
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Sequence
+    from collections.abc import Collection, Iterable, Sequence
     from datetime import datetime
     from decimal import Decimal
 
-    from sqlalchemy import Select
+    from sqlalchemy import Row, Select
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = [
@@ -83,6 +88,7 @@ __all__ = [
     "FillRecord",
     "FillViewRecord",
     "SyncWindowRow",
+    "decode_fill_view_rows",
     "select_fills_for_accounting",
     "select_fills_for_view",
 ]
@@ -647,49 +653,78 @@ class ExchangeFillRepository:
         **Neither `raw_payload` nor `external_trade_id` is loaded**: the statement names its
         columns, and `select_fills_for_view` is public so that a test can compile it and see.
 
-        **Each row is unpacked as a tuple, and the two enums are looked up in a dict**, because
-        this loop runs once per fill in the history and was half the endpoint's time: a
-        `Row`'s attribute access resolves each name, and `ExchangeKey(...)` and `FillSide(...)`
-        each cost a call into `EnumType.__call__`. Measured at 20,000 fills, the load went from
-        0.199 s to 0.122 s. The unpacking follows `select_fills_for_view`'s column order, and a
-        test pins the two together. A value outside either enum is a `KeyError`, which
-        `ck_exchange_accounts_exchange_key` and `ck_exchange_fills_side` make unreachable.
+        `fetch_fill_view_rows` and then `decode_fill_view_rows`. The service calls the two
+        halves itself, so that the decode runs in a worker thread rather than on the event loop.
+        """
+        return decode_fill_view_rows(await self.fetch_fill_view_rows(user_id, exchanges))
+
+    async def fetch_fill_view_rows(
+        self, user_id: int, exchanges: Collection[ExchangeKey] | None
+    ) -> Sequence[Row[*tuple[Any, ...]]]:
+        """The rows `select_fills_for_view` reads, fetched in full, before they become records.
+
+        The half of `list_fills_for_view` that needs the session, and so the half that stays on
+        the event loop. **What it returns holds no session, connection or cursor**: an
+        `AsyncSession` fetches every row before it returns, and SQLAlchemy applies each column's
+        result processing -- `NumericText` to a `Decimal`, `UtcDateTime` to an aware
+        `datetime` -- as it builds each row. So the rows can cross to a worker thread as plain
+        data, and `decode_fill_view_rows` needs nothing but them.
+
+        That processing is therefore the part of the read that stays on the loop, with the query
+        itself: spec 024, R5, records what it costs.
         """
         result = await self._session.execute(select_fills_for_view(user_id, exchanges))
-        return [
-            FillViewRecord(
-                id=fill_id,
-                exchange_key=_EXCHANGE_KEYS[exchange_key],
-                external_order_id=external_order_id,
-                symbol=symbol,
-                base_asset=base_asset,
-                quote_asset=quote_asset,
-                side=_FILL_SIDES[side],
-                quantity=quantity,
-                price=price,
-                quote_quantity=quote_quantity,
-                quote_quantity_derived=quote_quantity_derived,
-                fee_amount=fee_amount,
-                fee_asset=fee_asset,
-                executed_at=executed_at,
-            )
-            for (
-                fill_id,
-                exchange_key,
-                external_order_id,
-                symbol,
-                base_asset,
-                quote_asset,
-                side,
-                quantity,
-                price,
-                quote_quantity,
-                quote_quantity_derived,
-                fee_amount,
-                fee_asset,
-                executed_at,
-            ) in result
-        ]
+        return result.all()
+
+
+def decode_fill_view_rows(rows: Iterable[Sequence[Any]]) -> list[FillViewRecord]:
+    """Turn the rows `fetch_fill_view_rows` returns into `FillViewRecord`s. Pure.
+
+    No session, no I/O, no clock: it reads the tuples it is handed and nothing else, which is
+    what lets the service run it in a worker thread.
+
+    **Each row is unpacked as a tuple, and the two enums are looked up in a dict**, because this
+    loop runs once per fill in the history and was half the endpoint's time: a `Row`'s attribute
+    access resolves each name, and `ExchangeKey(...)` and `FillSide(...)` each cost a call into
+    `EnumType.__call__`. Measured at 20,000 fills, the load went from 0.199 s to 0.122 s. The
+    unpacking follows `select_fills_for_view`'s column order, and a test pins the two together.
+    A value outside either enum is a `KeyError`, which `ck_exchange_accounts_exchange_key` and
+    `ck_exchange_fills_side` make unreachable.
+    """
+    return [
+        FillViewRecord(
+            id=fill_id,
+            exchange_key=_EXCHANGE_KEYS[exchange_key],
+            external_order_id=external_order_id,
+            symbol=symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            side=_FILL_SIDES[side],
+            quantity=quantity,
+            price=price,
+            quote_quantity=quote_quantity,
+            quote_quantity_derived=quote_quantity_derived,
+            fee_amount=fee_amount,
+            fee_asset=fee_asset,
+            executed_at=executed_at,
+        )
+        for (
+            fill_id,
+            exchange_key,
+            external_order_id,
+            symbol,
+            base_asset,
+            quote_asset,
+            side,
+            quantity,
+            price,
+            quote_quantity,
+            quote_quantity_derived,
+            fee_amount,
+            fee_asset,
+            executed_at,
+        ) in rows
+    ]
 
 
 @dataclass(frozen=True, slots=True)
