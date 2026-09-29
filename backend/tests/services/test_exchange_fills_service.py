@@ -21,7 +21,9 @@ What each block pins, against the issue's backend criteria:
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from itertools import pairwise
@@ -30,7 +32,9 @@ from typing import TYPE_CHECKING, Any, Final
 import pytest
 from sqlalchemy import event
 
+import portfolio.services.exchanges as exchanges_service
 from portfolio.domain.exchanges import ExchangeKey, FillSide
+from portfolio.repositories.exchanges import ExchangeFillRepository, decode_fill_view_rows
 from portfolio.services.exchanges import (
     DEFAULT_FILLS_LIMIT,
     INVERTED_RANGE_RULE,
@@ -56,7 +60,7 @@ from tests.fill_view_harness import (
 from tests.sqlite_harness import migrated_sessionmaker
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Collection
+    from collections.abc import AsyncIterator, Callable, Collection
     from pathlib import Path
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -65,6 +69,10 @@ if TYPE_CHECKING:
 
 #: The other user's fills: Bitget, like the owner's, and in the middle of the book's range.
 INTRUDER_FILLS: Final = (9001, 9002)
+
+#: How long a cancelled request may take to raise, and how long a held thread waits at most.
+CANCEL_BOUND: Final = 2
+HELD_THREAD_SECONDS: Final = 5
 
 #: Every book fill, as numbers.
 EVERY_FILL: Final = frozenset(BOOK_ORDER)
@@ -636,3 +644,136 @@ async def test_an_owner_with_nothing_imported_gets_an_empty_page(
 
 def test_the_page_sizes_are_the_specs() -> None:
     assert (DEFAULT_FILLS_LIMIT, MAX_FILLS_LIMIT) == (50, 200)
+
+
+# --------------------------------------------------------------------------------------
+# Spec 024, R5 (N3): only the read runs on the event loop; the rest in a worker thread
+# --------------------------------------------------------------------------------------
+
+
+async def test_the_rows_are_turned_into_the_page_in_a_worker_thread(
+    factory: async_sessionmaker[AsyncSession],
+    book: tuple[int, int, dict[int, int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_fills_page` -- decode, range, order, totals, slice -- runs off the event loop's thread.
+
+    At 20,000 fills that work is most of the request; on the loop, every other request would
+    wait for it. The page it builds is the page the caller gets, unchanged.
+    """
+    owner, _intruder, ids = book
+    loop_thread = threading.get_ident()
+    seen: list[tuple[str, int]] = []
+    build_page = exchanges_service._fills_page
+    decode = decode_fill_view_rows
+
+    def spied_page(*arguments: Any) -> FillsPage:
+        seen.append(("page", threading.get_ident()))
+        return build_page(*arguments)
+
+    def spied_decode(rows: Any) -> list[Any]:
+        seen.append(("decode", threading.get_ident()))
+        return decode(rows)
+
+    monkeypatch.setattr(exchanges_service, "_fills_page", spied_page)
+    monkeypatch.setattr(exchanges_service, "decode_fill_view_rows", spied_decode)
+
+    page = await list_fills(factory, owner)
+
+    assert [name for name, _thread in seen] == ["page", "decode"]
+    assert all(thread != loop_thread for _name, thread in seen), "the work ran on the loop"
+    assert numbers(page, ids) == list(BOOK_ORDER), "the control: the page is the book's"
+    assert plain(page.totals) == BOOK_TOTALS
+
+
+async def test_the_read_hands_the_thread_plain_values_that_outlive_the_session(
+    factory: async_sessionmaker[AsyncSession], book: tuple[int, int, dict[int, int]]
+) -> None:
+    """The fetched rows are tuples of converted values, decodable after the session closes.
+
+    `NumericText` and `UtcDateTime` have already run: an amount is a `Decimal` and an instant
+    an aware `datetime`, so nothing in the rows reaches back to a session, a connection or a
+    cursor from the worker thread.
+    """
+    owner, _intruder, _ids = book
+    async with factory() as session:
+        repository = ExchangeFillRepository(session)
+        rows = await repository.fetch_fill_view_rows(owner, None)
+        expected = await repository.list_fills_for_view(owner, None)
+
+    assert rows, "the control: the book was read"
+    assert all(len(row) == 14 for row in rows), "one value per selected column"
+    for row in rows:
+        assert all(isinstance(value, Decimal) for value in row[7:10]), row
+        assert isinstance(row[11], Decimal), row
+        assert isinstance(row[13], datetime), row
+        assert row[13].tzinfo is not None, row
+    assert decode_fill_view_rows(rows) == expected, "decoded after close, identical"
+
+
+async def test_the_page_built_in_the_thread_equals_the_one_built_from_the_records(
+    factory: async_sessionmaker[AsyncSession], book: tuple[int, int, dict[int, int]]
+) -> None:
+    """Moving the work changed nothing: the records, filtered and totalled by hand, agree."""
+    owner, _intruder, ids = book
+    async with factory() as session:
+        records = await ExchangeFillRepository(session).list_fills_for_view(
+            owner, frozenset({ExchangeKey.BITGET})
+        )
+    kept = sorted(
+        (record for record in records if minute(10) <= record.executed_at < minute(21)),
+        key=lambda record: (record.executed_at, record.id),
+        reverse=True,
+    )
+
+    page = await list_fills(
+        factory, owner, exchanges=[ExchangeKey.BITGET], from_=minute(10), to=minute(21), limit=2
+    )
+
+    assert [view.id for view in page.fills] == [record.id for record in kept][:2]
+    assert page.total_count == len(kept) == 3
+    assert numbers(page, ids) == [1004, 1003]
+
+
+async def test_a_cancelled_request_stops_waiting_while_the_thread_still_runs(
+    factory: async_sessionmaker[AsyncSession],
+    book: tuple[int, int, dict[int, int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation propagates at once: the caller is not held until the thread finishes.
+
+    The thread is held on an event the test controls; the request is cancelled while it is
+    held, and must raise its cancellation within `CANCEL_BOUND` seconds, with the thread still
+    held. The thread holds no session, so letting it finish afterwards is harmless.
+    """
+    owner, _intruder, _ids = book
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    build_page = exchanges_service._fills_page
+
+    def held_page(*arguments: Any) -> FillsPage:
+        entered.set()
+        release.wait(timeout=HELD_THREAD_SECONDS)
+        try:
+            return build_page(*arguments)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(exchanges_service, "_fills_page", held_page)
+    request = asyncio.create_task(list_fills(factory, owner))
+    try:
+        await asyncio.wait_for(until(entered.is_set), timeout=CANCEL_BOUND)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request, timeout=CANCEL_BOUND)
+        assert not finished.is_set(), "the cancellation waited for the thread"
+    finally:
+        release.set()
+    await asyncio.wait_for(until(finished.is_set), timeout=HELD_THREAD_SECONDS)
+
+
+async def until(condition: Callable[[], bool]) -> None:
+    """Wait until `condition` holds, polling every 10 ms. Every caller bounds it."""
+    while not condition():  # noqa: ASYNC110
+        await asyncio.sleep(0.01)
