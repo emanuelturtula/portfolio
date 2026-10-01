@@ -24,12 +24,14 @@ from sqlalchemy import Column, MetaData, Table, Text
 
 from portfolio.db.models import (
     ExchangeAccount,
+    ExchangeBalance,
     ExchangeFill,
     ExchangeSyncRun,
     ExchangeSyncRunAccount,
     ExchangeSyncWindow,
     metadata,
 )
+from portfolio.domain.accounting import AssetReconciliation
 from portfolio.domain.fill_totals import (
     AssetFillTotals,
     FeeTotal,
@@ -41,6 +43,7 @@ from portfolio.domain.fill_totals import (
 )
 from portfolio.logging import is_sensitive_key
 from portfolio.providers.exchanges.base import (
+    AssetBalance,
     ExchangeCapabilities,
     FillPage,
     FillWindow,
@@ -49,6 +52,7 @@ from portfolio.providers.exchanges.base import (
     RetentionClamp,
 )
 from portfolio.providers.exchanges.credentials import Credentials
+from portfolio.repositories.exchange_balances import AccountBalances, StoredBalance
 from portfolio.repositories.exchange_sync_runs import AccountOutcome, ExchangeSyncRunSummary
 from portfolio.repositories.exchanges import (
     ExchangeAccountState,
@@ -63,6 +67,11 @@ from portfolio.services.exchange_sync_plan import (
     Replacement,
 )
 from portfolio.services.exchanges import ExchangeView, FillsPage, FillView, LastError
+from portfolio.services.reconciliation import (
+    ExchangeBalanceSource,
+    ReconciliationView,
+    WalletSources,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -76,6 +85,9 @@ EXCHANGE_TABLES: Final = (
     "exchange_sync_windows",
     "exchange_sync_runs",
     "exchange_sync_run_accounts",
+    # #104: the last reading of an account's spot balances. What a venue holds is the
+    # owner's, and is stored; what opens the venue never is.
+    "exchange_balances",
 )
 MAPPED_CLASSES: Final = (
     ExchangeAccount,
@@ -83,6 +95,7 @@ MAPPED_CLASSES: Final = (
     ExchangeSyncWindow,
     ExchangeSyncRun,
     ExchangeSyncRunAccount,
+    ExchangeBalance,
 )
 PROVIDER_DATACLASSES: Final = (
     NormalizedFill,
@@ -114,6 +127,15 @@ PROVIDER_DATACLASSES: Final = (
     NotValuedInUsdtTotals,
     QuoteAssetFillTotals,
     FeeTotal,
+    # #104's holdings check: what a provider answers, what is stored, what the service
+    # compares and what it serves. Quantities and instants cross the API; a secret never may.
+    AssetBalance,
+    StoredBalance,
+    AccountBalances,
+    AssetReconciliation,
+    ExchangeBalanceSource,
+    WalletSources,
+    ReconciliationView,
 )
 
 #: The spellings of a secret-bearing type in an annotation. Annotations are strings under
@@ -145,6 +167,17 @@ MUST_BE_SCANNED: Final = frozenset(
         "FillLine.fee_asset",
         "AssetFillTotals.usdt_unvalued_fill_count",
         "FeeTotal.amount",
+        "exchange_balances.asset",
+        "exchange_balances.quantity",
+        "exchange_accounts.balances_read_at",
+        "exchange_accounts.balances_error",
+        "AssetBalance.quantity",
+        "StoredBalance.asset",
+        "AccountBalances.balances_error",
+        "AssetReconciliation.difference",
+        "ExchangeBalanceSource.balances_read_at",
+        "WalletSources.unread",
+        "ReconciliationView.exchanges",
     }
 )
 

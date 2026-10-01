@@ -998,7 +998,18 @@ describe('InvestedSection: how the figures were computed', () => {
     openDashboard({ positions: investedPortfolio({ last_recompute: failedRecompute() }) });
 
     const region = await loadedRegion();
-    const alert = await within(region).findByRole('alert');
+    // Two alerts say it, each about its own figures: the section's, and below it the holdings
+    // check's, which compares nothing against a history that is behind (spec 025, R9).
+    await waitFor(() => {
+      expect(within(region).getAllByRole('alert')).toHaveLength(2);
+    });
+    const [alert, holdingsAlert] = within(region).getAllByRole('alert');
+    if (alert === undefined) {
+      throw new Error('The section raised no alert.');
+    }
+    expect(holdingsAlert).toHaveTextContent(
+      /may be older than the balances and nothing is compared/,
+    );
     expect(alert).toHaveTextContent(
       /^The last recompute failed on .+ \(UnconvertibleFillError\)\./,
     );
@@ -1365,8 +1376,15 @@ describe('InvestedSection: empty states (criterion 7)', () => {
     expect(await within(region).findByRole('status')).toHaveTextContent(
       'Loading invested per asset…',
     );
-    // Neither "no trades" nor "sync failed" can be told yet, so neither is claimed.
-    expect(within(region).queryByRole('heading', { level: 3 })).toBeNull();
+    // Neither "no trades" nor "sync failed" can be told yet, so neither is claimed: the one
+    // heading under "Invested" is the holdings check's own, which reads its own query and
+    // does not wait for the exchange list (spec 025).
+    await within(region).findByRole('heading', { level: 3, name: 'Holdings check' });
+    expect(
+      within(region)
+        .getAllByRole('heading', { level: 3 })
+        .map((heading) => heading.textContent),
+    ).toEqual(['Holdings check']);
 
     release();
 

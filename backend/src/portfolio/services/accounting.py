@@ -46,11 +46,16 @@ row to an event; `services/adjustments.py` re-exports it.
 Reads on this engine are autocommit statements -- pysqlite opens no transaction for a
 `SELECT` -- and SQLite reuses the header's id when a snapshot is replaced. So a recompute that
 commits between reading the header and reading its positions would serve one snapshot's header
-over another's rows. `positions` therefore reads the header, the positions and the warnings,
-then reads the header again, and uses what it read only if the two headers are the same
-snapshot; otherwise it reads again, up to `SNAPSHOT_READ_ATTEMPTS` times (spec 021, R5). The
-prices are read afterwards: they are not part of the snapshot, and a price that moves between
-two reads is simply the newer price.
+over another's rows. `read_snapshot` therefore reads the header, the positions and the
+warnings, then reads the header again, and uses what it read only if the two headers are the
+same snapshot; otherwise it reads again, up to `SNAPSHOT_READ_ATTEMPTS` times (spec 021, R5).
+`positions` reads the prices afterwards: they are not part of the snapshot, and a price that
+moves between two reads is simply the newer price.
+
+**`read_snapshot` is public because it is the one implementation of that read.**
+`services/reconciliation.py` (#104) compares the snapshot's quantities with the balances
+held, and it reads them through the same method rather than through a second copy of the
+header-children-header loop.
 
 An explicit read transaction would do the same in one pass, but on this engine it would mean
 issuing `BEGIN` behind SQLAlchemy's back or changing the transaction mode of every
@@ -133,6 +138,7 @@ __all__ = [
     "RecomputeReport",
     "SnapshotReadError",
     "SnapshotWarning",
+    "StoredSnapshot",
     "UnconvertibleAdjustmentError",
     "UnconvertibleFillError",
     "adjustment_of",
@@ -158,7 +164,7 @@ spellings of the quote currencies are held together.
 """
 
 SNAPSHOT_READ_ATTEMPTS: Final = 3
-"""How many times `positions` reads the snapshot before giving up on a consistent one.
+"""How many times `read_snapshot` reads the snapshot before giving up on a consistent one.
 
 A read is retried only when a recompute committed in the middle of it, and a recompute writes
 at startup and after an exchange sync that stored a fill -- a few times a day, each commit a
@@ -314,8 +320,12 @@ class SnapshotReadError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class _StoredSnapshot:
-    """One snapshot as read: a header and the children read under it, checked to belong."""
+class StoredSnapshot:
+    """One snapshot as read: a header and the children read under it, checked to belong.
+
+    What `AccountingService.read_snapshot` returns: the figures as the last recompute stored
+    them, before any price is applied.
+    """
 
     header: SnapshotHeader
     positions: tuple[Position, ...]
@@ -496,7 +506,7 @@ class AccountingService:
 
     It holds the session, unlike the read-only `BalanceService`, because `recompute` commits:
     the snapshot's replacement is one transaction and this is the class that decides it.
-    `positions` only reads.
+    `positions` and `read_snapshot` only read.
     """
 
     def __init__(
@@ -570,7 +580,7 @@ class AccountingService:
         Raises:
             SnapshotReadError: the snapshot changed during every read attempt.
         """
-        snapshot = await self._read_snapshot(user_id)
+        snapshot = await self.read_snapshot(user_id)
         if snapshot is None:
             return PositionsView(
                 method=METHOD,
@@ -595,12 +605,15 @@ class AccountingService:
             warnings=snapshot.warnings,
         )
 
-    async def _read_snapshot(self, user_id: int) -> _StoredSnapshot | None:
+    async def read_snapshot(self, user_id: int) -> StoredSnapshot | None:
         """The owner's snapshot as one consistent read, or `None` when there is none.
 
         The header, then its positions and warnings, then the header again: if the second read
         is the same snapshot, nothing was replaced in between and the children belong to the
         header. Otherwise the whole read is repeated (spec 021, R5).
+
+        Reads only, and no price: `positions` values what this returns, and the reconciliation
+        (#104) compares its quantities with the balances held.
 
         Raises:
             SnapshotReadError: every one of `SNAPSHOT_READ_ATTEMPTS` reads was interrupted.
@@ -613,7 +626,7 @@ class AccountingService:
             warnings = await self._snapshots.list_warnings(header.id)
             again = await self._snapshots.get_header(user_id, METHOD)
             if _same_snapshot(header, again):
-                return _StoredSnapshot(header=header, positions=positions, warnings=warnings)
+                return StoredSnapshot(header=header, positions=positions, warnings=warnings)
         raise SnapshotReadError
 
     async def _priced(self, position: Position) -> PricedPosition:

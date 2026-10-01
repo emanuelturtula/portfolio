@@ -409,6 +409,9 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         # are strings both ways, and a JSON number is refused on the way in.
         "/api/accounting/adjustments",
         "/api/accounting/adjustments/{adjustment_id}",
+        # The holdings check (#104): each asset's replayed quantity beside the balances
+        # read. The one response that carries what a venue holds; every quantity a string.
+        "/api/accounting/reconciliation",
     }
 
 
@@ -448,6 +451,15 @@ MONEY_PROPERTIES: Final = frozenset(
         "usdt_net",
         "spent",
         "received",
+        # #104: the two sides of the holdings check, their parts and their difference. The
+        # tolerance is here too: it is the number a quantity is compared against, and it is
+        # served as the string `"1"`.
+        "history_quantity",
+        "wallet_quantity",
+        "exchange_quantity",
+        "held_quantity",
+        "difference",
+        "tolerance_pct",
     }
 )
 

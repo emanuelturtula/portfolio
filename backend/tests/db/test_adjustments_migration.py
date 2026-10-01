@@ -276,7 +276,11 @@ def test_the_downgrade_drops_the_table_and_nothing_else(
 
     command.downgrade(build_alembic_config(database_url), PARENT)
 
-    assert set(inspect(sync_engine).get_table_names()) == tables_before - {TABLE}
+    # #104's revision sits on top of this one and comes down with it.
+    assert set(inspect(sync_engine).get_table_names()) == tables_before - {
+        TABLE,
+        "exchange_balances",
+    }
     with sync_engine.connect() as connection:
         stamped = connection.scalar(text("SELECT version_num FROM alembic_version"))
         owners = connection.scalar(text("SELECT COUNT(*) FROM users"))

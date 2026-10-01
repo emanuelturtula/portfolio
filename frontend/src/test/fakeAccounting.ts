@@ -6,9 +6,24 @@ import {
   type PositionsResponse,
 } from './accountingFixtures';
 import type { RecordedRequest } from './fakePortfolio';
+import {
+  assertSameSnapshot,
+  assertWritableReconciliation,
+  matchingReconciliation,
+  type ReconciliationResponse,
+} from './reconciliationFixtures';
 import { unauthorized } from './server';
 
 export const POSITIONS_PATH = '/api/accounting/positions';
+export const RECONCILIATION_PATH = '/api/accounting/reconciliation';
+
+/** An accounting endpoint a test can hold open, or make fail. */
+export type AccountingRoute = 'positions' | 'reconciliation';
+
+const ROUTE_PATHS: Readonly<Record<AccountingRoute, string>> = {
+  positions: POSITIONS_PATH,
+  reconciliation: RECONCILIATION_PATH,
+};
 
 export interface FakeAccountingOptions {
   /**
@@ -16,6 +31,14 @@ export interface FakeAccountingOptions {
    * first-time owner, whose startup recompute ran over no events.
    */
   readonly positions?: PositionsResponse;
+  /**
+   * What `GET /api/accounting/reconciliation` answers. The default is
+   * {@link matchingReconciliation} over the positions: loaded, every held asset a match and
+   * no source missing, so a test that is not about the holdings check gets no notice, no
+   * table and no badge from it. A stated one must describe the same snapshot as the
+   * positions - see {@link assertSameSnapshot}.
+   */
+  readonly reconciliation?: ReconciliationResponse;
   /**
    * The session this endpoint belongs to. While it is signed out, every request is answered
    * `401`, as the backend's deny-by-default middleware answers it.
@@ -26,30 +49,61 @@ export interface FakeAccountingOptions {
 export interface FakeAccounting {
   /** Register these with `server.use(...fake.handlers)`. */
   readonly handlers: HttpHandler[];
-  /** Every request the handler saw, oldest first, recorded on arrival. */
+  /** Every request either handler saw, oldest first, recorded on arrival. */
   readonly requests: RecordedRequest[];
   positions(): PositionsResponse;
-  /** Replaces the snapshot, as a recompute on the server would, with no request from the page. */
-  setPositions(next: PositionsResponse): void;
-  /** Holds every request until the returned function is called. Recorded on arrival. */
-  hold(): () => void;
-  /** Answers every request with `respond()` until called again with `null`. Still recorded. */
-  fail(respond: (() => Response) | null): void;
-  /** How many requests reached the endpoint, including held and failed ones. */
-  count(): number;
+  reconciliation(): ReconciliationResponse;
+  /**
+   * Replaces the snapshot, as a recompute on the server would, with no request from the page.
+   * The reconciliation moves with it, because its history side is that snapshot: to
+   * `reconciliation` when given, and otherwise to the quiet {@link matchingReconciliation}.
+   */
+  setPositions(next: PositionsResponse, reconciliation?: ReconciliationResponse): void;
+  /** Replaces the comparison alone, as a balance read on the server would. Same snapshot. */
+  setReconciliation(next: ReconciliationResponse): void;
+  /**
+   * Holds every request to `route` until the returned function is called. Recorded on
+   * arrival. `route` defaults to the positions, the endpoint this fake had before spec 025.
+   */
+  hold(route?: AccountingRoute): () => void;
+  /** Answers every request to `route` with `respond()` until called again with `null`. */
+  fail(respond: (() => Response) | null, route?: AccountingRoute): void;
+  /** How many requests reached `route`, including held and failed ones. */
+  count(route?: AccountingRoute): number;
+  /** The requests that reached `route`. */
+  requestsTo(route: AccountingRoute): RecordedRequest[];
 }
 
 /**
- * A stateful fake of `GET /api/accounting/positions`, the one accounting endpoint.
+ * A stateful fake of the two accounting endpoints: `GET /api/accounting/positions` and
+ * `GET /api/accounting/reconciliation`.
  *
- * Every response it serves goes through {@link assertWritablePositions}, so a test cannot put
- * a snapshot on screen that the backend could not have served.
+ * Every response it serves goes through {@link assertWritablePositions} or
+ * {@link assertWritableReconciliation}, and the pair through {@link assertSameSnapshot}, so a
+ * test cannot put on screen a snapshot the backend could not have served, nor a comparison
+ * of some other snapshot than the one beside it.
+ *
+ * `hold`, `fail` and `count` act on one route, the positions unless stated: the two reads
+ * are separate requests, and the page is required to survive one failing without the other.
  */
 export function fakeAccounting(options: FakeAccountingOptions = {}): FakeAccounting {
   let positions = assertWritablePositions(options.positions ?? emptySnapshot());
-  let held: Promise<void> | undefined;
-  let failure: (() => Response) | undefined;
+  let reconciliation = checked(
+    options.reconciliation ?? matchingReconciliation(positions),
+    positions,
+  );
+  const holds = new Map<AccountingRoute, Promise<void>>();
+  const failures = new Map<AccountingRoute, () => Response>();
   const requests: RecordedRequest[] = [];
+
+  /** `next`, held to the backend's rules and to the snapshot it is served beside. */
+  function checked(
+    next: ReconciliationResponse,
+    beside: PositionsResponse,
+  ): ReconciliationResponse {
+    assertSameSnapshot(assertWritableReconciliation(next), beside);
+    return next;
+  }
 
   function record(request: Request): void {
     requests.push({
@@ -60,27 +114,54 @@ export function fakeAccounting(options: FakeAccountingOptions = {}): FakeAccount
     });
   }
 
+  function requestsTo(route: AccountingRoute): RecordedRequest[] {
+    return requests.filter((entry) => new URL(entry.url).pathname === ROUTE_PATHS[route]);
+  }
+
+  /** Records, waits out a hold, then answers a staged failure if there is one. */
+  async function arrive(route: AccountingRoute, request: Request): Promise<Response | undefined> {
+    record(request);
+    await holds.get(route);
+    return failures.get(route)?.();
+  }
+
   const fake: FakeAccounting = {
     handlers: [],
     requests,
     positions: () => positions,
-    setPositions: (next) => {
-      positions = assertWritablePositions(next);
+    reconciliation: () => reconciliation,
+    setPositions: (next, nextReconciliation) => {
+      // Both are checked before either is replaced: a refused pair leaves the fake as it was.
+      const snapshot = assertWritablePositions(next);
+      const comparison = checked(nextReconciliation ?? matchingReconciliation(snapshot), snapshot);
+      positions = snapshot;
+      reconciliation = comparison;
     },
-    hold: () => {
+    setReconciliation: (next) => {
+      reconciliation = checked(next, positions);
+    },
+    hold: (route = 'positions') => {
       let release: () => void = () => undefined;
-      held = new Promise<void>((resolve) => {
-        release = resolve;
-      });
+      holds.set(
+        route,
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      );
       return () => {
-        held = undefined;
+        holds.delete(route);
         release();
       };
     },
-    fail: (respond) => {
-      failure = respond ?? undefined;
+    fail: (respond, route = 'positions') => {
+      if (respond === null) {
+        failures.delete(route);
+      } else {
+        failures.set(route, respond);
+      }
     },
-    count: () => requests.length,
+    count: (route = 'positions') => requestsTo(route).length,
+    requestsTo,
   };
 
   fake.handlers.push(
@@ -92,9 +173,12 @@ export function fakeAccounting(options: FakeAccountingOptions = {}): FakeAccount
       return unauthorized();
     }),
     http.get(POSITIONS_PATH, async ({ request }) => {
-      record(request);
-      await held;
-      return failure?.() ?? HttpResponse.json(positions);
+      const failure = await arrive('positions', request);
+      return failure ?? HttpResponse.json(positions);
+    }),
+    http.get(RECONCILIATION_PATH, async ({ request }) => {
+      const failure = await arrive('reconciliation', request);
+      return failure ?? HttpResponse.json(reconciliation);
     }),
   );
 

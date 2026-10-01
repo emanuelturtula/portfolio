@@ -17,6 +17,10 @@ sweep interrupted runs -> open the run (committed)
      for each pending window, newest first:
          page loop: fetch -> insert fills + advance or delete the window (one commit per page)
      status ok + last_synced_at + outcome (committed)
+     balances, only after that success:
+         skip if the last balance read was refused for its key and the trigger is not manual
+         fetch -> replace the stored reading (committed)
+         or, on a failure: record its kind on the account (committed); the outcome stands
 -> close the run (committed)
 ```
 
@@ -49,13 +53,48 @@ being told to stop -- is not caught**: it is not a recorded failure, no outcome 
 and the run row stays `running` for the sweep, which is the one honest record of a run the
 process did not live to finish.
 
+## The balance read follows a successful account, and cannot fail it (#104)
+
+Once an account's fills are synced and its success outcome is committed, the venue is asked
+what the spot account holds now, and the answer replaces the stored reading in one commit.
+`services/reconciliation.py` compares it with the replayed history.
+
+**A failed balance read changes nothing else.** The account's outcome, its `sync_status` and
+the run's status describe the fills, and stay as they were committed: the failure is caught
+here, its kind is written to `exchange_accounts.balances_error`, and the rows and
+`balances_read_at` of the last good reading are kept. It is shown where it matters, by the
+reconciliation endpoint.
+
+**That isolation is absolute: it holds even when recording the failure fails** (spec 025, R5).
+The balance read is ancillary to a run whose fills are already imported and whose outcome is
+already committed, so an `Exception` out of the write that records the failure -- the
+database locked past its busy timeout, say -- is rolled back and logged as
+`exchange_balances_failure_not_recorded`, and nothing more: the account's committed outcome is
+returned, the next account is synced, and the run closes with the status its fills earned.
+What is lost is the kind. `balances_error` then still says what the attempt before left, so
+the reconciliation can show a reading as current that a failed read did not replace; the log
+line is the record, and the next successful fill sync reads the balances again. This is the
+one place in the module where a failed write of ours is not allowed to stop the run -- a
+failure to write a run row or an outcome still propagates, because those are the run.
+
+**No read happens for an account whose fill sync failed or was skipped.** Fresh balances
+beside a stale history would produce differences that mean nothing.
+
+**A read the venue refused for its key is not retried on a timer**, for the reason an
+`auth_failed` account is skipped: `auth` and `insufficient_scope` need a person, and asking
+again every interval is how a venue comes to ban an address. A manual sync retries it.
+
+The write-lock rule above holds here too: the success outcome is committed before the venue
+is asked, and nothing is written until it has answered.
+
 ## What reaches a log, a column and a response
 
 Counts, `exchange_key`, `error_kind` and the exception's type name. **Never a trade id, a
-cursor (a trade id at Bitget), a symbol or an amount.** A stored `detail` is `str()` of an
-exchange error -- a class summary, a status and a digits-only venue code, by construction --
-the fixed count-only message of a `FillConflictError`, or, for anything else, the type name
-alone: an arbitrary exception has made no promise about its message.
+cursor (a trade id at Bitget), a symbol, an asset or an amount.** A stored `detail` is
+`str()` of an exchange error -- a class summary, a status and a digits-only venue code, by
+construction -- the fixed count-only message of a `FillConflictError`, or, for anything else,
+the type name alone: an arbitrary exception has made no promise about its message. A failed
+balance read stores its kind and no detail at all.
 
 ## `float` is banned here, so the waits are whole seconds
 
@@ -88,6 +127,7 @@ from portfolio.providers.exchanges.errors import (
     ExchangeUnavailableError,
 )
 from portfolio.providers.http import monotonic_ms
+from portfolio.repositories.exchange_balances import ExchangeBalanceRepository
 from portfolio.repositories.exchange_sync_runs import (
     AccountOutcome,
     AccountOutcomeStatus,
@@ -151,6 +191,15 @@ _CURSOR_CYCLE_DETAIL: Final = "the venue's cursor returned to one already visite
 _UNSPLITTABLE_DETAIL: Final = (
     "a window shorter than two milliseconds still filled a whole page, so it cannot be split"
 )
+
+_KEY_REFUSED: Final = frozenset(
+    {ExchangeSyncErrorKind.AUTH, ExchangeSyncErrorKind.INSUFFICIENT_SCOPE}
+)
+"""The balance failures only a person can fix: the venue refused the key, or its permissions.
+
+A scheduled or startup run does not ask again after one of these; a manual sync does. They are
+the two kinds `_FAILURE_KINDS` maps to `AccountSyncStatus.AUTH_FAILED`, for the same reason.
+"""
 
 
 def utc_now() -> datetime:
@@ -284,6 +333,7 @@ class ExchangeSyncService:
         windows: ExchangeSyncWindowRepository,
         fills: ExchangeFillRepository,
         runs: ExchangeSyncRunRepository,
+        balances: ExchangeBalanceRepository,
         providers: Mapping[ExchangeKey, ExchangeProvider],
         clock: Callable[[], datetime] = utc_now,
         monotonic: Callable[[], int] = monotonic_ms,
@@ -296,6 +346,7 @@ class ExchangeSyncService:
         self._windows = windows
         self._fills = fills
         self._runs = runs
+        self._balances = balances
         self._providers = providers
         self._clock = clock
         self._monotonic = monotonic
@@ -315,14 +366,17 @@ class ExchangeSyncService:
            importing them.
         3. **One account row per configured venue is ensured and committed.** A venue with a
            row and no credentials any more is not synced, and is not counted.
-        4. **Each account is synced in turn**, its failure recorded as its outcome.
+        4. **Each account is synced in turn**, its failure recorded as its outcome. An
+           account that succeeded then has its spot balances read (#104); a failure there is
+           recorded on the account and is no part of its outcome.
         5. **The run is closed out**, its status computed over the accounts it attempted.
 
         Raises:
             Nothing for a venue's failure, a conflicting fill or a defect in one account's
-            sync -- each is an outcome. A failure to write the run row or an outcome itself
-            propagates and leaves a `running` row for the sweep, as does any `BaseException`
-            that is not an `Exception`.
+            sync -- each is an outcome -- and nothing for a failed balance read, which is
+            recorded on the account, or logged when even that write fails. A failure to write
+            the run row or an outcome itself propagates and leaves a `running` row for the
+            sweep, as does any `BaseException` that is not an `Exception`.
         """
         started_at = self._clock()
         started_ms = self._monotonic()
@@ -435,6 +489,10 @@ class ExchangeSyncService:
         On failure the page in flight is rolled back, and the status and the outcome are
         committed together, so an account's status and the outcome `last_error` is read from
         cannot disagree.
+
+        On success the outcome is committed **first**, and only then are the balances read
+        (`_read_balances`): whatever becomes of that read, the outcome returned is the one
+        already stored.
         """
         if (
             account.sync_status is AccountSyncStatus.AUTH_FAILED
@@ -476,7 +534,107 @@ class ExchangeSyncService:
             fills_seen=progress.fills_seen,
             fills_inserted=progress.fills_inserted,
         )
+        await self._read_balances(account, provider, trigger)
         return outcome
+
+    async def _read_balances(
+        self,
+        account: ExchangeAccountState,
+        provider: ExchangeProvider,
+        trigger: SyncTrigger,
+    ) -> None:
+        """Read the account's spot balances and replace the stored reading (spec 025).
+
+        Called only after the account's success outcome is committed, so no write is open
+        while the venue answers, and nothing here can change that outcome.
+
+        1. **Skipped** when the last balance read was refused for the key -- `auth` or
+           `insufficient_scope` -- and the trigger is not manual. `account` is the row as the
+           run found it, so the kind is the one the previous attempt left.
+        2. **Fetched**, with the page's rate-limit retry.
+        3. **On success** the stored rows are replaced, `balances_read_at` is set and
+           `balances_error` cleared, in one commit.
+        4. **On an `Exception`** -- the venue's, or ours while storing the answer -- the write
+           in flight is rolled back and the failure's kind is committed to the account. The
+           rows and `balances_read_at` of the last good reading stay. If that write fails too,
+           it is logged and dropped (`_record_balance_failure`).
+
+        **Raises nothing for an `Exception`, from the venue or from the database**, so the
+        caller always returns the outcome it committed. **Catches `Exception` only**, like
+        `_sync_account`: a cancellation propagates, and the account keeps whatever the last
+        committed reading was.
+        """
+        refused = account.balances_error
+        if refused is not None and refused in _KEY_REFUSED and trigger is not SyncTrigger.MANUAL:
+            _logger.info(
+                "exchange_balances_read_skipped",
+                exchange_key=account.exchange_key.value,
+                reason=refused.value,
+            )
+            return
+        try:
+            balances = await self._with_rate_limit_retry(account, provider.fetch_balances)
+            await self._balances.replace(account.id, balances, self._clock())
+            await self._session.commit()
+        except Exception as error:
+            await self._session.rollback()
+            failure = failure_of(error)
+            self._report_balance_failure(account, failure, error)
+            await self._record_balance_failure(account, failure)
+            return
+        _logger.info(
+            "exchange_balances_read",
+            exchange_key=account.exchange_key.value,
+            assets=len(balances),
+        )
+
+    async def _record_balance_failure(
+        self,
+        account: ExchangeAccountState,
+        failure: AccountFailure,
+    ) -> None:
+        """Commit the kind a balance read failed with, or log that it could not be (R5).
+
+        The one write in this module whose failure is swallowed, and the module docstring says
+        why: the fills are imported and the outcome is committed, and a balance read that
+        could not even be marked as failed must not stop the next account or leave the run
+        `running`. An `Exception` out of the write or its commit is rolled back and logged
+        with its traceback and its type name; `balances_error` keeps what the attempt before
+        left. Anything that is not an `Exception` propagates.
+        """
+        try:
+            await self._balances.record_failure(account.id, failure.error_kind)
+            await self._session.commit()
+        except Exception as error:
+            await self._session.rollback()
+            _logger.exception(
+                "exchange_balances_failure_not_recorded",
+                exchange_key=account.exchange_key.value,
+                error_type=type(error).__name__,
+            )
+
+    @staticmethod
+    def _report_balance_failure(
+        account: ExchangeAccountState,
+        failure: AccountFailure,
+        error: Exception,
+    ) -> None:
+        """Log a failed balance read: a warning for a known kind, a traceback for our defect.
+
+        One event either way, `exchange_balances_read_failed`, with the kind and the type
+        name -- and never an asset or an amount, which a balance answer is made of.
+        """
+        log = (
+            _logger.exception
+            if failure.error_kind is ExchangeSyncErrorKind.INTERNAL
+            else _logger.warning
+        )
+        log(
+            "exchange_balances_read_failed",
+            exchange_key=account.exchange_key.value,
+            error_kind=failure.error_kind.value,
+            error_type=type(error).__name__,
+        )
 
     @staticmethod
     def _report_failure(
@@ -927,6 +1085,7 @@ def build_exchange_sync_service(
         windows=ExchangeSyncWindowRepository(session),
         fills=ExchangeFillRepository(session),
         runs=ExchangeSyncRunRepository(session),
+        balances=ExchangeBalanceRepository(session),
         providers=providers,
         clock=clock,
         monotonic=monotonic,

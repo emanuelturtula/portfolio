@@ -1,9 +1,10 @@
-"""BingX spot fills, read through the spot v1 API with a signed, read-only key.
+"""BingX spot fills and balances, read through the spot v1 API with a signed, read-only key.
 
-The second venue behind the exchange seam. One signed endpoint,
-`GET /openApi/spot/v1/trade/myTrades`, pages the account's spot executions **forwards in
-time**. Every symbol comes back in one query, and each fill names its own symbol, spelled
-`BASE-QUOTE`, so there is no second endpoint to ask.
+The second venue behind the exchange seam. Two signed endpoints.
+`GET /openApi/spot/v1/trade/myTrades` pages the account's spot executions **forwards in
+time**: every symbol comes back in one query, and each fill names its own symbol, spelled
+`BASE-QUOTE`, so there is no symbol endpoint to ask. `GET /openApi/spot/v1/account/balance`
+says what the spot account holds now (#104).
 
 ## Three sources, and which one each fact rests on
 
@@ -60,25 +61,61 @@ fact below names its source:
 * **What the venue answers for a window older than it keeps.** Nothing maps to
   `ExchangeRetentionWindowError`.
 
+## The balance read, from the documentation alone
+
+Read on 2026-10-01 in the same V3 bundle, under "Query Assets" (Spot, Account Endpoints).
+**No probe has called this endpoint**, so nothing below has the standing the fills facts
+have. What V3 says, and what `fetch_balances` relies on:
+
+* `GET /openApi/spot/v1/account/balance`, signed, "API Key Permission: Read", for "Master
+  and Sub Accounts".
+* 5 requests a second per UID, and 3 a second per IP.
+* `timestamp` is required and `recvWindow` is optional. Nothing else is taken.
+* The envelope is the fills one, with `data.balances` an array. The response table lists
+  only `balances`; the entries' fields are the sample's, `{asset, free, locked}`, all three
+  strings. The vendor's own `BingX-API/api-ai-skills` reference types them `string` too.
+* **The amounts are formatted from doubles.** The sample's `locked` is
+  `"244.18616265388994"`: seventeen significant digits, the artefact `quoteQty` shows. So
+  `free` and `locked` are decoded with `from_binary_float`, as `quoteQty` is.
+* The sample lists an asset whose `free` and `locked` are both `"0"`, so zeros are sent.
+
+Not established, and designed around:
+
+* **Whether the spot account and the "fund account" are one account or two.** V3 also has
+  "Query Fund Account Assets", `GET /openApi/fund/v1/account/balance`, 2 a second, whose
+  sample response is this one's, digit for digit. Only the spot endpoint is read: reading
+  both could count the same units twice, and a balance read too low is the safe direction
+  for a comparison that treats what is held as a lower bound (spec 025).
+* **What a backend failure looks like here.** BingX has answered one on a sibling endpoint
+  with an empty success (`docs/providers.md`). A missing, `null` or non-array `balances` is
+  refused; `balances: []` cannot be told from an empty account, and reads as one. That
+  under-reads, which is the safe direction again.
+* **Whether a demo or virtual token can be listed with a balance.** The sample lists `VST`,
+  at zero. Nothing is excluded by name: an asset the venue reports is an asset reported.
+* **How a balance's asset relates to a fill's.** The name is taken as reported and held to
+  the rule a fill's base asset is, on the assumption that `KAS` in a balance is the `KAS`
+  of `KAS-USDT`. See `parse_balances`.
+
 ## Every failure is one of the seven classes
 
 `fetch_fill_page` raises `ValueError` for a caller's mistake, before any request, and one of
 the seven `providers.exchanges.errors` classes for everything the venue or the network did.
-Every vendor-supplied value passes a bound before the interpreter sees it: an id is a JSON
-integer compared with `2**63 - 1`, never converted from text; a symbol is at most 61
-characters, with an ASCII quote and no whitespace or control character in its base; an
-amount is at most a hundred digits written out; a fill object is at most 32
-levels deep. **No message carries a value**, and no log call exists in this module: the
-transport logs `https://open-api.bingx.com/exchange_fills`, never a path, a query or a
-header. That matters more here than for Bitget, because **the signature travels in the
-query string**.
+`fetch_balances` takes no argument, and raises only the seven for anything the venue or the
+network did. Every vendor-supplied value passes a bound before the interpreter sees it: an
+id is a JSON integer compared with `2**63 - 1`, never converted from text; a symbol is at
+most 61 characters, with an ASCII quote and no whitespace or control character in its base;
+an asset is at most 40 characters under the same rule; an amount is at most a hundred digits
+written out; a fill object is at most 32 levels deep. **No message carries a value**, and no
+log call exists in this module: the transport logs
+`https://open-api.bingx.com/exchange_fills` or `.../exchange_balances`, never a path, a
+query or a header. That matters more here than for Bitget, because **the signature travels
+in the query string**.
 """
 
 from __future__ import annotations
 
 import decimal
 import re
-import unicodedata
 from datetime import timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 from typing import TYPE_CHECKING, Final
@@ -87,18 +124,23 @@ import httpx
 
 from portfolio.config import is_header_safe
 from portfolio.domain.exchanges import ExchangeKey, FillSide
+from portfolio.domain.money import add
 from portfolio.providers.base import decode_json
 from portfolio.providers.errors import ProviderResponseError
 from portfolio.providers.exchanges.base import (
+    MAX_ASSET_NAME_LENGTH,
+    AssetBalance,
     CursorKind,
     ExchangeCapabilities,
     NormalizedFill,
     RateLimit,
+    assemble_balances,
     assemble_fill_page,
     datetime_from_epoch_ms,
     derive_quote_quantity,
     encode_raw_payload,
     epoch_ms,
+    is_asset_name,
     require_fill_amount,
 )
 from portfolio.providers.exchanges.credentials import Credentials
@@ -115,6 +157,7 @@ from portfolio.providers.exchanges.errors import (
 from portfolio.providers.exchanges.signing import hmac_sha256_hex
 from portfolio.providers.http import (
     ENDPOINT_EXTENSION,
+    EXCHANGE_BALANCES,
     EXCHANGE_FILLS,
     parse_retry_after,
     utc_now,
@@ -131,9 +174,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "API_KEY_HEADER",
+    "BALANCES_MEMBER",
+    "BALANCES_PATH",
     "BINGX_API_URL",
     "BINGX_CAPABILITIES",
     "BINGX_ERROR_MAP",
+    "FILLS_MEMBER",
     "FILLS_PATH",
     "MAX_TRADE_ID",
     "PAGE_LIMIT",
@@ -142,8 +188,10 @@ __all__ = [
     "SUCCESS_CODE",
     "BingXProvider",
     "bingx_credentials",
+    "build_balances_query",
     "build_fills_query",
     "from_binary_float",
+    "parse_balances",
     "parse_fill",
     "parse_fills_page",
     "unwrap_envelope",
@@ -159,6 +207,19 @@ domain is unavailable" and capped at 60 requests a minute. It is not used: an ou
 
 FILLS_PATH: Final = "/openApi/spot/v1/trade/myTrades"
 """Query transaction details, spot (V3, V1). Answered as documented in the probe."""
+
+BALANCES_PATH: Final = "/openApi/spot/v1/account/balance"
+"""Query Assets, spot (V3, read on 2026-10-01). The spot account only. Never probed.
+
+Not `/openApi/fund/v1/account/balance`, "Query Fund Account Assets": see the module
+docstring for why only one of the two is read.
+"""
+
+FILLS_MEMBER: Final = "fills"
+"""The member of `data` a fills answer carries its list in (V3, V1; probe)."""
+
+BALANCES_MEMBER: Final = "balances"
+"""The member of `data` a balance answer carries its list in (V3)."""
 
 API_KEY_HEADER: Final = "X-BX-APIKEY"
 """The one credential header (V3). The secret never leaves this process; the key goes here."""
@@ -225,8 +286,12 @@ does every quote `myTrades`' own validation message names: `USDT`, `USD1`, `USDT
 _MAX_QUOTE_LENGTH: Final = 20
 """The longest quote `_QUOTE` admits, for bounding a symbol's length before it is split."""
 
-MAX_BASE_LENGTH: Final = 40
-"""The longest base asset accepted: everything before a symbol's last hyphen.
+MAX_BASE_LENGTH: Final = MAX_ASSET_NAME_LENGTH
+"""The longest base asset accepted: everything before a symbol's last hyphen. Forty.
+
+The seam's `MAX_ASSET_NAME_LENGTH`, under this venue's name: the rule itself is
+`base.is_asset_name`, shared with the balance parsers of both venues since #104, and the
+evidence for how wide it has to be is this venue's.
 
 **The base is wide on purpose.** BingX renames a pair when its token migrates, and the old
 name takes forms like `STRK-OLD-USDT`, `H_OLD-USDT` and `PUMP_OLD-USDT`. The live list also
@@ -387,12 +452,26 @@ def build_fills_query(window: FillWindow, *, cursor: str | None, timestamp_ms: i
             window ends at or before the epoch, or `timestamp_ms` is not a non-negative
             `int`. Each is the caller's mistake.
     """
-    if isinstance(timestamp_ms, bool) or not isinstance(timestamp_ms, int) or timestamp_ms < 0:
-        message = "timestamp_ms must be a non-negative int number of epoch milliseconds."
-        raise ValueError(message)
+    _require_timestamp_ms(timestamp_ms)
     start_ms = _start_ms(window, cursor)
     end_ms = _end_ms(window)
     return f"endTime={end_ms}&limit={PAGE_LIMIT}&startTime={start_ms}&timestamp={timestamp_ms}"
+
+
+def build_balances_query(timestamp_ms: int) -> str:
+    """The balance query string, exactly as it is signed and exactly as it is sent.
+
+    `timestamp=<timestamp_ms>`, and nothing else. `timestamp` is the one parameter V3
+    requires. `recvWindow` is optional and not sent, so the venue's default applies, as it
+    does to a fills request; the endpoint takes no asset and no page. One key is trivially
+    in ASCII order, so the string is signed by the recipe a fills query is, and the caller
+    appends `&signature=<hex>` after it.
+
+    Raises:
+        ValueError: `timestamp_ms` is not a non-negative `int`. The caller's mistake.
+    """
+    _require_timestamp_ms(timestamp_ms)
+    return f"timestamp={timestamp_ms}"
 
 
 def from_binary_float(value: object) -> Decimal:
@@ -415,11 +494,13 @@ def from_binary_float(value: object) -> Decimal:
     artefact as the digits they replaced: `-0.00005820000000000001` becomes `-0.0000582`,
     not `-0.0000582000000000000`. The sign is kept; negating a fee is the caller's business.
 
-    **Applied to `commission` and `quoteQty` only**, never to `price` or `qty`: those are
-    strings the venue formats exactly, and a 19-digit quantity must survive them intact. A
-    value still finer than `FILL_SCALE` after rounding is refused by `NormalizedFill`, as
-    before. This is not "round rather than refuse": it is a documented decoding of the
-    venue's float encoding, applied to the two fields that carry one.
+    **Applied to a fill's `commission` and `quoteQty`, and to a balance's `free` and
+    `locked`** (#104, whose sample shows the same noise), and never to a fill's `price` or
+    `qty`: those are strings the venue formats exactly, and a 19-digit quantity must survive
+    them intact. A value still finer than `FILL_SCALE` after rounding is refused by
+    `NormalizedFill` or `AssetBalance`, as before. This is not "round rather than refuse":
+    it is a documented decoding of the venue's float encoding, applied to the four fields
+    that carry one.
 
     Takes `object` so the type check is not statically dead, for the reason
     `providers.base._require_base_units` gives.
@@ -447,13 +528,20 @@ def unwrap_envelope(
     status: int,
     body: str | bytes,
     *,
+    member: str = FILLS_MEMBER,
     retry_after_ms: int | None = None,
 ) -> object:
-    """The `data.fills` array of a successful BingX answer, or the exception its failure is.
+    """The `data.<member>` array of a successful BingX answer, or the exception its failure is.
+
+    `member` is which list the endpoint answers with: `FILLS_MEMBER`, the default, for a
+    fills answer and `BALANCES_MEMBER` for a balance answer. Both endpoints share the
+    envelope, the codes and the error map, so there is one function and not two that could
+    come to classify the same failure differently. It is a constant of this module, never a
+    value a venue sent, so naming it in a message discloses nothing.
 
     A success is **HTTP 200 and a JSON object whose `code` is the integer `0`** (not
-    `false`, not `"0"`), **whose `data` is an object holding a `fills` array**. Nothing else
-    is. Otherwise:
+    `false`, not `"0"`), **whose `data` is an object holding a `<member>` array**. Nothing
+    else is. Otherwise:
 
     | Answer | Raised |
     |---|---|
@@ -461,7 +549,7 @@ def unwrap_envelope(
     | 200, a body that is not JSON or not an object | `ExchangeSchemaError` |
     | 200, a `code` that is not the integer `0` | `exchange_error(200, code)` |
     | 200, code `0`, `data` absent, `null` or not an object | `ExchangeSchemaError` |
-    | 200, code `0`, `fills` absent or not an array | `ExchangeSchemaError` |
+    | 200, code `0`, `<member>` absent or not an array | `ExchangeSchemaError` |
 
     On a failing status the code is read from the body only if the body is a JSON object;
     otherwise the status decides alone, so a 502 carrying HTML is unavailable, not a schema
@@ -471,7 +559,8 @@ def unwrap_envelope(
     **A missing list is never read as "no fills".** It is spec 014's lesson: the place an
     undocumented shape is plausible is where the venue failed to answer, and an empty
     success there makes every window read as empty, the checkpoints advance past it, and the
-    history is lost once it ages out. The documented empty answer is `fills: []`.
+    history is lost once it ages out. The documented empty answer is `fills: []`. The same
+    holds for balances: a missing `balances` is never "the account holds nothing".
 
     **Nothing raised here has a cause or a context**, for the reason
     `bitget.unwrap_envelope` gives. `httpx.Response.raise_for_status` is never called: its
@@ -507,14 +596,14 @@ def unwrap_envelope(
     if not isinstance(data, dict):
         detail = "data must be a JSON object on a successful response"
         raise ExchangeSchemaError(detail, status=status)
-    if "fills" not in data:
-        detail = "data.fills is missing from a successful response"
+    if member not in data:
+        detail = f"data.{member} is missing from a successful response"
         raise ExchangeSchemaError(detail, status=status)
-    fills = data["fills"]
-    if not isinstance(fills, list):
-        detail = "data.fills must be an array"
+    items = data[member]
+    if not isinstance(items, list):
+        detail = f"data.{member} must be an array"
         raise ExchangeSchemaError(detail, status=status)
-    return fills
+    return items
 
 
 def parse_fill(item: object) -> NormalizedFill:
@@ -682,8 +771,62 @@ def parse_fills_page(fills: object, *, window: FillWindow, cursor: str | None) -
     )
 
 
+def parse_balances(balances: object) -> tuple[AssetBalance, ...]:
+    """A `data.balances` array as the balances the contract promises, or a refusal.
+
+    | `AssetBalance` | From | Rule |
+    |---|---|---|
+    | `asset` | `asset` | as reported, held to the rule a fill's base asset is |
+    | `quantity` | `free` + `locked` | each `require_fill_amount`, then `from_binary_float` |
+
+    **The asset is the venue's spelling, unchanged**, because the reconciliation joins a
+    balance to the fills by name and a fill's `base_asset` is the venue's spelling too: what
+    precedes the last hyphen of its symbol. It is held to the same rule (`is_asset_name`):
+    1 to `MAX_BASE_LENGTH` characters, no whitespace, no Unicode `C*` character. That rule
+    is as wide as it is because BingX's asset names are (`$U`, `D.O.G.E.`, `ATOM(ARC20)`),
+    and it is what makes the name encode as UTF-8. No case is changed: nothing documents a
+    second spelling, and folding one would be a guess about names like `MØTH`.
+
+    **The total is `free + locked`**, added with `domain.money.add`, which is exact and
+    consults no decimal context. Both are required: a missing one is not read as zero.
+
+    **Both parts are decoded from binary floats**, with the rule `quoteQty` is: BingX
+    formats these strings from doubles (V3's own sample is `"244.18616265388994"`), and
+    without the decode a small balance written with its float noise --
+    `0.000012340000000000001`, twenty-one places -- would be finer than `FILL_SCALE`, and
+    one such entry would fail the whole read on every run. Each part is decoded on its own,
+    before the sum, because the noise is each double's. The cost is `from_binary_float`'s: a
+    part that truly needed sixteen significant digits or more is moved by at most half a
+    unit in the fifteenth. **A part still finer than `FILL_SCALE` after the decode is
+    refused**, by `AssetBalance`; nothing here rounds to the column.
+
+    **A negative part is refused**, each on its own and before the sum.
+
+    `assemble_balances` refuses an asset named twice, drops the zeros -- the sample shows
+    the venue sends them -- and sorts.
+
+    Raises:
+        ExchangeSchemaError: `balances` is not an array of objects, a field is missing, of
+            the wrong type or negative, an asset is named twice, or the total breaks an
+            `AssetBalance` rule. The detail names the field and never the value.
+    """
+    if not isinstance(balances, list):
+        detail = "data.balances must be an array of balances"
+        raise ExchangeSchemaError(detail)
+    parsed: list[AssetBalance] = []
+    for entry in balances:
+        if not isinstance(entry, dict):
+            detail = "every element of data.balances must be a JSON object"
+            raise ExchangeSchemaError(detail)
+        asset = _require_asset(entry)
+        free = _require_held_amount(entry, "free")
+        locked = _require_held_amount(entry, "locked")
+        parsed.append(AssetBalance(asset=asset, quantity=add(free, locked)))
+    return assemble_balances(parsed)
+
+
 class BingXProvider:
-    """BingX spot fills over the spot v1 API. Satisfies `ExchangeProvider` structurally.
+    """BingX spot fills and balances over the spot v1 API. Satisfies `ExchangeProvider`.
 
     One instance per account, bound to the shared client. It holds the credentials as
     `SecretStr`s and reads the key out only while a request's header is built; the secret is
@@ -766,23 +909,59 @@ class BingXProvider:
         """
         _refuse_caller_mistakes(window, cursor=cursor, symbol=symbol)
         query = build_fills_query(window, cursor=cursor, timestamp_ms=epoch_ms(self._clock()))
-        fills = await self._read_fills(query)
+        fills = await self._read_signed(
+            FILLS_PATH, query, label=EXCHANGE_FILLS, member=FILLS_MEMBER
+        )
         return parse_fills_page(fills, window=window, cursor=cursor)
 
-    async def _read_fills(self, query: str) -> object:
-        """Sign `query` and send it, exactly as signed, with the signature last."""
-        signature = hmac_sha256_hex(self._api_secret, query)
-        url = f"{BINGX_API_URL}{FILLS_PATH}?{query}&{SIGNATURE_PARAM}={signature}"
-        headers = {API_KEY_HEADER: self._api_key.get_secret_value()}
-        return await self._get(url, headers)
+    async def fetch_balances(self) -> Sequence[AssetBalance]:
+        """What the spot account holds: one total per asset, zeros left out, sorted by asset.
 
-    async def _get(self, url: str, headers: Mapping[str, str]) -> object:
+        1. The query is built (`build_balances_query`), signed and sent to `BALANCES_PATH`
+           as a fills query is: the signature last, the key in the header, labelled
+           `exchange_balances`.
+        2. The answer is classified (`unwrap_envelope`), through the same error map, and
+           its `data.balances` taken.
+        3. The balances are parsed, totalled and assembled (`parse_balances`).
+
+        One request answers the whole account: the endpoint takes no page and documents
+        none. Only the spot account is read; the fund account's endpoint is not asked, and
+        neither is anything the owner holds in BingX's futures, earn or copy-trading
+        accounts.
+
+        Raises:
+            ExchangeError: one of the seven classes, and only those.
+            ValueError: the clock this provider was built with reads before the epoch,
+                which `fetch_fill_page` refuses too.
+        """
+        query = build_balances_query(epoch_ms(self._clock()))
+        balances = await self._read_signed(
+            BALANCES_PATH, query, label=EXCHANGE_BALANCES, member=BALANCES_MEMBER
+        )
+        return parse_balances(balances)
+
+    async def _read_signed(self, path: str, query: str, *, label: str, member: str) -> object:
+        """Sign `query` and send it to `path`, exactly as signed, with the signature last.
+
+        The one place a signature is made and the key is put in its header, so a fills
+        request and a balance request cannot come to be signed differently. `path`, `label`
+        and `member` are this module's constants; `query` is a query builder's output.
+        """
+        signature = hmac_sha256_hex(self._api_secret, query)
+        url = f"{BINGX_API_URL}{path}?{query}&{SIGNATURE_PARAM}={signature}"
+        headers = {API_KEY_HEADER: self._api_key.get_secret_value()}
+        return await self._get(url, headers, label=label, member=member)
+
+    async def _get(
+        self, url: str, headers: Mapping[str, str], *, label: str, member: str
+    ) -> object:
         """Send one GET through the shared client and classify the answer.
 
         The URL is passed whole, never through `params=`, so the query string sent is byte
-        for byte the one that was signed. The request is labelled `exchange_fills`, so the
-        transport logs `https://open-api.bingx.com/exchange_fills` and never the path or the
-        query, which here carries the signature.
+        for byte the one that was signed. The request carries `label` -- `exchange_fills` or
+        `exchange_balances` -- so the transport logs `https://open-api.bingx.com/<label>`
+        and never the path or the query, which here carries the signature. `member` is the
+        list `unwrap_envelope` takes from `data`.
 
         The three `except` arms are `BitgetProvider._get`'s, for its reasons: an
         `httpx.LocalProtocolError` quotes the refused header value, which here is the key,
@@ -801,7 +980,7 @@ class BingXProvider:
         undecodable = False
         try:
             response = await self._client.get(
-                url, headers=headers, extensions={ENDPOINT_EXTENSION: EXCHANGE_FILLS}
+                url, headers=headers, extensions={ENDPOINT_EXTENSION: label}
             )
         except httpx.LocalProtocolError:
             refused_locally = True
@@ -817,7 +996,10 @@ class BingXProvider:
         if response.status_code != HTTP_OK:
             retry_after_ms = parse_retry_after(response.headers.get("retry-after"), self._clock())
         return unwrap_envelope(
-            response.status_code, response.content, retry_after_ms=retry_after_ms
+            response.status_code,
+            response.content,
+            member=member,
+            retry_after_ms=retry_after_ms,
         )
 
 
@@ -830,6 +1012,17 @@ def _refuse_caller_mistakes(window: FillWindow, *, cursor: str | None, symbol: s
         message = "The window is longer than BingX's max_query_window."
         raise ValueError(message)
     _start_ms(window, cursor)
+
+
+def _require_timestamp_ms(timestamp_ms: object) -> None:
+    """Refuse a request timestamp that is not a non-negative `int`, a `bool` included.
+
+    Shared by both query builders, so `timestamp=` is written under one rule. Takes `object`
+    so the check is not statically dead, for the reason `from_binary_float` gives.
+    """
+    if isinstance(timestamp_ms, bool) or not isinstance(timestamp_ms, int) or timestamp_ms < 0:
+        message = "timestamp_ms must be a non-negative int number of epoch milliseconds."
+        raise ValueError(message)
 
 
 def _end_ms(window: FillWindow) -> int:
@@ -943,7 +1136,7 @@ def _require_symbol(item: Mapping[str, object]) -> tuple[str, str, str]:
     value = _required(item, "symbol")
     if isinstance(value, str) and len(value) <= MAX_BASE_LENGTH + 1 + _MAX_QUOTE_LENGTH:
         base, hyphen, quote = value.rpartition("-")
-        if hyphen and _QUOTE.match(quote) is not None and _is_base_asset(base):
+        if hyphen and _QUOTE.match(quote) is not None and is_asset_name(base):
             return value, base, quote
     detail = (
         "symbol must be BASE-QUOTE: a quote of 1 to 20 upper-case ASCII letters and digits "
@@ -953,20 +1146,30 @@ def _require_symbol(item: Mapping[str, object]) -> tuple[str, str, str]:
     raise ExchangeSchemaError(detail)
 
 
-def _is_base_asset(base: str) -> bool:
-    """Whether `base` is 1 to `MAX_BASE_LENGTH` characters a base asset may hold.
+def _require_asset(entry: Mapping[str, object]) -> str:
+    """A balance's `asset`, as reported, if it could be a fill's base asset."""
+    value = _required(entry, "asset")
+    if isinstance(value, str) and is_asset_name(value):
+        return value
+    detail = (
+        f"asset must be a string of 1 to {MAX_BASE_LENGTH} characters, with no whitespace or "
+        "control character"
+    )
+    raise ExchangeSchemaError(detail)
 
-    Refused: whitespace, and every character in a Unicode `C*` category -- control, format,
-    surrogate, private use, unassigned. Everything else is accepted, `$ . ( ) _ -` and
-    non-ASCII letters included, because the venue's own list holds all of them.
 
-    **Refusing `Cs` is what makes the base encode as UTF-8.** A `str` fails to encode only
-    through a lone surrogate, which is category `Cs`, so no separate UTF-8 check is needed
-    here, and `NormalizedFill` and the database driver get text they can encode.
+def _require_held_amount(entry: Mapping[str, object], key: str) -> Decimal:
+    """One part of an asset's balance: present, an amount, decoded, and not negative.
+
+    `require_fill_amount` bounds the amount to a hundred digits written out, so the two
+    parts `parse_balances` adds are never far enough apart for `domain.money.add` to refuse
+    them. The sign is read after the decode, which keeps it.
     """
-    if not 1 <= len(base) <= MAX_BASE_LENGTH:
-        return False
-    return not any(char.isspace() or unicodedata.category(char).startswith("C") for char in base)
+    amount = from_binary_float(require_fill_amount(_required(entry, key), field=key))
+    if amount < 0:
+        detail = f"{key} must not be negative"
+        raise ExchangeSchemaError(detail)
+    return amount
 
 
 def _require_id(value: object, *, field: str) -> str:

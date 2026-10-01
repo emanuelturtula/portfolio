@@ -1,4 +1,8 @@
-"""Response models for `GET /api/accounting/positions`: the owner's holdings, costs and returns.
+"""Response models for `/api/accounting`: the owner's holdings, costs, returns and balances.
+
+`GET /api/accounting/positions` serves the snapshot valued, and
+`GET /api/accounting/reconciliation` (#104) the same snapshot's quantities beside the balances
+read from the wallets and the venues.
 
 **This is the first schema module whose money fields are the owner's own position** -- what
 they hold, what it cost them, what they have gained -- rather than a price or a balance read
@@ -31,6 +35,18 @@ A position without a price has `market_value`, `unrealized_pnl` and `unrealized_
 (`PriceUnavailable`), or `value_out_of_range` when the price times the quantity is too large to
 represent (`ValueUnavailable`, spec 021, R6). With no snapshot yet, `computed_at` is `null` and
 the lists are empty: "not computed" rather than "holds nothing".
+
+## The reconciliation names every source it left out
+
+The balances the holdings check compares against are a lower bound on what the owner holds,
+and only a reading that is current is one (spec 025, R9). So beside the per-asset comparison
+the response says how each source stands: every exchange account with when its balances were
+last read, the kind its last attempt failed with, and the reason it was left out if it was;
+and how many wallets were compared, how many had a reading too old to compare, and how many
+were never read. A source that is left out is a reason or a count, never a quantity of zero.
+`last_recompute` is served for the reason the positions endpoint serves it: a failed recompute
+means the history compared is older than the balances beside it. It is the one response that
+carries what a venue holds, per asset and summed over the accounts; no log line does.
 """
 
 from __future__ import annotations
@@ -47,18 +63,30 @@ from portfolio.api.schemas.money import MoneyStr
 # class is created. The two storage enums come from the service, which re-exports them,
 # because the API layer may not import `portfolio.repositories`; the domain's own
 # vocabulary comes from `domain`, which every layer may import.
-from portfolio.domain.accounting import ExclusionReason, PositionFlag, ValueUnavailable
+from portfolio.domain.accounting import (
+    ExclusionReason,
+    PositionFlag,
+    ReconciliationStatus,
+    ValueUnavailable,
+)
 from portfolio.domain.currencies import QuoteCurrency
+from portfolio.domain.exchanges import ExchangeKey
 from portfolio.services.accounting import AccountingWarningKind, RecomputeOutcome
 from portfolio.services.prices import PriceUnavailable
+from portfolio.services.reconciliation import ExchangeSyncErrorKind, NotComparedReason
 
 if TYPE_CHECKING:
-    from portfolio.domain.accounting import Exclusion, PortfolioTotals
+    from portfolio.domain.accounting import AssetReconciliation, Exclusion, PortfolioTotals
     from portfolio.services.accounting import (
         AccountingStatus,
         PositionsView,
         PricedPosition,
         SnapshotWarning,
+    )
+    from portfolio.services.reconciliation import (
+        ExchangeBalanceSource,
+        ReconciliationView,
+        WalletSources,
     )
 
 
@@ -255,4 +283,144 @@ class PositionsResponse(BaseModel):
             totals=AccountingTotalsResponse.of(view.totals),
             unallocated_costs=view.unallocated_costs,
             warnings=[AccountingWarningResponse.of(warning) for warning in view.warnings],
+        )
+
+
+class AssetReconciliationResponse(BaseModel):
+    """One asset: what the history says is held, what was read as held, and how they compare.
+
+    * `history_quantity` is the replayed position's quantity.
+    * `wallet_quantity` and `exchange_quantity` are what the wallets and the exchange accounts
+      with a current reading were read as holding, and `held_quantity` their sum. A source
+      that was left out adds nothing to them.
+    * `difference` is `held_quantity - history_quantity`, signed.
+    * `status` is `match` when the difference is within `tolerance_pct` percent of the larger
+      side; otherwise `history_short` when more is held than the history accounts for --
+      usually buys missing from it, and for a while coins in transit between two readings --
+      and `history_over` when the history accounts for more than was read, which coins held
+      elsewhere, a withdrawal, an unrecorded fee and a sale the import did not see all
+      produce, and the check cannot tell apart.
+    """
+
+    asset: str
+    history_quantity: MoneyStr
+    wallet_quantity: MoneyStr
+    exchange_quantity: MoneyStr
+    held_quantity: MoneyStr
+    difference: MoneyStr
+    status: ReconciliationStatus
+
+    @classmethod
+    def of(cls, row: AssetReconciliation) -> AssetReconciliationResponse:
+        """Render one row of the comparison."""
+        return cls(
+            asset=row.asset,
+            history_quantity=row.history_quantity,
+            wallet_quantity=row.wallet_quantity,
+            exchange_quantity=row.exchange_quantity,
+            held_quantity=row.held_quantity,
+            difference=row.difference,
+            status=row.status,
+        )
+
+
+class ExchangeBalancesResponse(BaseModel):
+    """How one exchange account's balances stand as a source of the comparison.
+
+    `balances_read_at` is when a read last succeeded, `null` when none ever has.
+    `balances_error` is the kind the last attempt failed with, `null` when it succeeded or none
+    was made.
+
+    `not_compared_reason` is `null` when the account's balances are in the comparison. Otherwise
+    they are **not**, whatever was last read, and it says why: `read_failed` (the last read
+    failed), `never_read`, `sync_failed` (the account's fill sync is not `ok`, so nothing is
+    refreshing the reading) or `out_of_date` (the reading is older than
+    `max_reading_age_hours`). The first that applies, in that order.
+    """
+
+    exchange_key: ExchangeKey
+    balances_read_at: datetime | None
+    balances_error: ExchangeSyncErrorKind | None
+    not_compared_reason: NotComparedReason | None
+
+    @classmethod
+    def of(cls, source: ExchangeBalanceSource) -> ExchangeBalancesResponse:
+        """Render one account's state."""
+        return cls(
+            exchange_key=source.exchange_key,
+            balances_read_at=source.balances_read_at,
+            balances_error=source.balances_error,
+            not_compared_reason=source.not_compared_reason,
+        )
+
+
+class WalletsReadResponse(BaseModel):
+    """How the active wallets stand as a source of the comparison. The counts add up to all.
+
+    `compared` wallets have a reading at most `max_reading_age_hours` old, and are in the
+    comparison. `stale` ones have an older reading and `unread` ones have none; neither adds
+    anything, so their coins are missing from it. `oldest_observed_at` is the oldest reading
+    among the `compared` ones, `null` when none is compared.
+    """
+
+    compared: int
+    stale: int
+    unread: int
+    oldest_observed_at: datetime | None
+
+    @classmethod
+    def of(cls, sources: WalletSources) -> WalletsReadResponse:
+        """Render the wallets' state."""
+        return cls(
+            compared=sources.compared,
+            stale=sources.stale,
+            unread=sources.unread,
+            oldest_observed_at=sources.oldest_observed_at,
+        )
+
+
+class ReconciliationResponse(BaseModel):
+    """The replayed quantities beside the balances read, per asset, and every source's state.
+
+    `computed_at` is the cost-basis snapshot's, and `null` before the first one -- and then
+    `assets` is empty: nothing has been compared, which is not the same as nothing matching.
+    `exchanges` and `wallets` are answered either way. `tolerance_pct` is the percentage, as a
+    string, at or under which a difference counts as a match. `assets` is sorted by asset and
+    leaves the cash assets out; `exchanges` lists every account, by `exchange_key`, compared
+    or not.
+
+    `max_reading_age_hours` is how old a wallet's or a venue's reading may be and still be
+    compared. `last_recompute` is the last recompute attempt since the process started, exactly
+    as `GET /api/accounting/positions` serves it. It is `null` after a restart until the startup
+    recompute ends, and the stored snapshot is compared meanwhile. When its outcome is
+    `failed`, the snapshot compared here is older than the balances beside it, and an asset
+    bought since shows as missing from the history.
+    """
+
+    computed_at: datetime | None
+    tolerance_pct: MoneyStr
+    assets: list[AssetReconciliationResponse]
+    max_reading_age_hours: int
+    last_recompute: LastRecomputeResponse | None
+    exchanges: list[ExchangeBalancesResponse]
+    wallets: WalletsReadResponse
+
+    @classmethod
+    def of(
+        cls,
+        view: ReconciliationView,
+        *,
+        last_recompute: AccountingStatus | None,
+    ) -> ReconciliationResponse:
+        """Render the service's view, and the trigger's last outcome beside it."""
+        return cls(
+            computed_at=view.computed_at,
+            tolerance_pct=view.tolerance_pct,
+            assets=[AssetReconciliationResponse.of(row) for row in view.assets],
+            max_reading_age_hours=view.max_reading_age_hours,
+            last_recompute=(
+                None if last_recompute is None else LastRecomputeResponse.of(last_recompute)
+            ),
+            exchanges=[ExchangeBalancesResponse.of(source) for source in view.exchanges],
+            wallets=WalletsReadResponse.of(view.wallets),
         )

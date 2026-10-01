@@ -1,8 +1,10 @@
-"""The seam every exchange provider is on the other side of: fills, pages, capabilities.
+"""The seam every exchange provider is on the other side of: fills, pages, balances.
 
-An exchange provider answers one question -- which spot fills happened on this account in
-this window -- one page at a time, and declares what it can do so that the sync (#15) can
-plan its requests without knowing which venue it is talking to.
+An exchange provider answers two questions. Which spot fills happened on this account in
+this window -- one page at a time, declaring what it can do so that the sync (#15) can plan
+its requests without knowing which venue it is talking to. And, since #104, what the spot
+account holds now: one `AssetBalance` per asset, which is what the replayed history is
+compared against.
 
 ## A page, not a stream
 
@@ -26,6 +28,14 @@ finer than `FILL_SCALE`, because `NumericText` would round it and a fill is stor
 reported". **A value a column would transform is refused by the parser that received it**,
 which is the rule `docs/providers.md` already states for prices.
 
+## Balances are held to the same two rules
+
+A provider parses its balance answer into `AssetBalance`s and hands them to
+`assemble_balances`, so that "one entry per asset, no zeros, sorted" follows from the code
+as a page's rules do. `AssetBalance` refuses what `NumericText(FILL_SCALE)` would transform,
+exactly as `NormalizedFill` does and through the same check: a balance is compared with a
+quantity replayed from fills, and the two must be numbers of the same kind.
+
 ## Time is integer milliseconds, and never a float
 
 `datetime_from_epoch_ms` is `EPOCH + timedelta(milliseconds=value)`. The obvious
@@ -44,6 +54,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -60,16 +71,18 @@ from portfolio.domain.money import MONEY_PRECISION, multiply, quantize
 from portfolio.providers.exchanges.errors import ExchangeSchemaError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Iterable, Iterator, Mapping, Sequence
 
     from portfolio.domain.exchanges import ExchangeKey
 
 __all__ = [
     "EPOCH",
     "MAX_AMOUNT_DIGITS",
+    "MAX_ASSET_NAME_LENGTH",
     "MAX_FILL_INTEGER_DIGITS",
     "MAX_RAW_PAYLOAD_DEPTH",
     "RETENTION_MARGIN",
+    "AssetBalance",
     "CursorKind",
     "ExchangeCapabilities",
     "ExchangeProvider",
@@ -78,6 +91,7 @@ __all__ = [
     "NormalizedFill",
     "RateLimit",
     "RetentionClamp",
+    "assemble_balances",
     "assemble_fill_page",
     "clamp_to_retention",
     "datetime_from_epoch_ms",
@@ -85,6 +99,7 @@ __all__ = [
     "encode_raw_payload",
     "epoch_ms",
     "floor_to_millisecond",
+    "is_asset_name",
     "require_cursor_advanced",
     "require_fill_amount",
 ]
@@ -126,6 +141,15 @@ Counted written out rather than as significant digits, so the bound covers the e
 well: a single digit a billion places from the point is refused here, not in a `quantize`
 three layers later. And a hundred digits is far inside the interpreter's 4300-digit
 limit on converting an integer to or from a string, so no amount this admits can trip it.
+"""
+
+MAX_ASSET_NAME_LENGTH: Final = 40
+"""The longest asset name a venue's answer may carry where `is_asset_name` is the rule.
+
+A bound chosen here, not a venue's: more than twice the longest base asset in BingX's
+public symbol list, which is the widest set of names either venue is known to use
+(`bingx.MAX_BASE_LENGTH` has the evidence). It keeps a name of any length a venue might
+send from reaching a column, a join or a rendered page.
 """
 
 MAX_RAW_PAYLOAD_DEPTH: Final = 32
@@ -470,6 +494,59 @@ class FillPage:
 
 
 @dataclass(frozen=True, slots=True)
+class AssetBalance:
+    """How much of one asset a venue's spot account holds, in the shape every venue's is put in.
+
+    The total for the asset, whatever the venue splits it into -- available, frozen, locked
+    -- because what the reconciliation compares is what is held, not what can be traded
+    right now. Which of a venue's fields make up the total is that provider's decision and
+    is recorded in its module.
+
+    **It refuses what the column would transform**, as `NormalizedFill` does.
+    `__post_init__` raises `ExchangeSchemaError` for:
+
+    * an `asset` that is empty or whitespace, or that does not encode as UTF-8;
+    * a `quantity` that is not a `Decimal` (a `bool`, a `float` or an `int` included -- an
+      `int` goes through `require_fill_amount` first), or is not finite;
+    * a `quantity` with more than `MAX_FILL_INTEGER_DIGITS` digits before the point, or with
+      more than `FILL_SCALE` fractional digits. `NumericText(FILL_SCALE)` would round the
+      second silently, and a balance is stored as reported;
+    * a `quantity` below zero. A spot account does not hold a negative amount, and a venue
+      that says it does is describing something this application has no reading of.
+
+    **Zero is accepted here and dropped by `assemble_balances`**: a venue listing an asset
+    the account no longer holds is saying something true, and refusing it would fail the
+    whole read.
+
+    **No message quotes the asset or the amount**: both are the owner's holdings. Each names
+    the field and the rule.
+
+    `asset` is kept exactly as given. A provider whose venue spells an asset differently in
+    its balances than in its fills normalises before building one of these, because the
+    comparison joins the two by name.
+    """
+
+    asset: str
+    """The venue's name for the asset, spelled as that venue's fills spell it."""
+    quantity: Decimal
+    """The total held in the spot account. Zero or more."""
+
+    def __post_init__(self) -> None:
+        """Refuse a balance the column would change, or that is below zero.
+
+        Raises:
+            ExchangeSchemaError: any rule in the class docstring is broken. The detail
+                names the field and the rule, never the value.
+        """
+        _require_text(self.asset, field="asset")
+        # Before the sign: a NaN cannot be ordered, and this is what refuses one.
+        _require_storable_amount(self.quantity, field="quantity", positive=False)
+        if self.quantity < 0:
+            detail = "quantity must not be negative"
+            raise ExchangeSchemaError(detail)
+
+
+@dataclass(frozen=True, slots=True)
 class RetentionClamp:
     """What was asked for and what can actually be asked, and whether they differ."""
 
@@ -489,6 +566,11 @@ class ExchangeProvider(Protocol):
     runtime-checkable protocol compares attribute names and nothing else, so a class whose
     `fetch_fill_page` takes the wrong arguments, or is not a coroutine function, passes it.
     The real check is `mypy --strict` deciding assignability.
+
+    `fetch_balances` joined the protocol with #104, so every provider and every stand-in
+    for one has to offer it: a venue whose balances cannot be read is a venue the
+    reconciliation can say nothing about, and that is better found by `mypy` than at the
+    end of a sync.
 
     **Every failure is one of the seven classes in `providers.exchanges.errors`**, and
     nothing else: a `ProviderResponseError` out of `decode_json`, an `httpx.TransportError`
@@ -526,6 +608,25 @@ class ExchangeProvider(Protocol):
         endpoint, an order history -- is the venue's business. A venue that does not need
         it returns an empty sequence. In the protocol now so that #14 does not change a
         contract #13 already implements.
+
+        Raises:
+            ExchangeError: one of the seven classes, and only those.
+        """
+
+    async def fetch_balances(self) -> Sequence[AssetBalance]:
+        """Read what the account's spot account holds now.
+
+        **One entry per asset, the total held in the spot account, zero balances left out,
+        sorted by asset.** The result is built with `assemble_balances`, which enforces all
+        four. Each asset is named as this venue's fills name it, so the reconciliation can
+        join the two.
+
+        Only the spot account. What a venue holds elsewhere -- earn, futures, margin,
+        funding -- is not read, which makes the result a lower bound on what is held and
+        never an over-count (spec 025).
+
+        No window, no cursor and no symbol: a balance is a reading of the present, and both
+        target venues answer the whole account in one response.
 
         Raises:
             ExchangeError: one of the seven classes, and only those.
@@ -686,6 +787,85 @@ def assemble_fill_page(
         next_cursor=next_cursor,
         symbol=symbol,
     )
+
+
+def assemble_balances(items: Iterable[AssetBalance]) -> tuple[AssetBalance, ...]:
+    """Turn what a provider parsed into the balances the contract promises, or refuse them.
+
+    The `assemble_fill_page` of a balance read. Each row is a decision:
+
+    | Case | Outcome |
+    |---|---|
+    | two entries name the same asset | `ExchangeSchemaError` |
+    | an entry whose quantity is zero | dropped |
+    | everything else | kept, sorted by asset |
+
+    **A duplicate is refused rather than summed or the last one kept.** Whether a venue
+    naming an asset twice means two parts of one holding or the same holding listed twice is
+    not something this application can tell, and the two answers differ by the whole
+    balance. The check runs before zeros are dropped, so an asset named twice is refused
+    even when one of the two entries is empty: it is the answer's shape that is not
+    recognised, not its arithmetic.
+
+    The comparison is exact, on the name as the provider built it. A provider that
+    normalises a name -- Bitget's is upper-cased -- does so before this, so two spellings
+    of one asset meet here as a duplicate and are refused.
+
+    **Zeros are dropped** so that "the account holds nothing of it" has one spelling, the
+    absence of an entry, whichever way the venue lists its assets.
+
+    Sorted by `asset`, in code point order, so the same account reads the same way on every
+    run.
+
+    **The message names no asset and no amount**, and not how many there were either.
+
+    Raises:
+        ExchangeSchemaError: an asset is named more than once.
+    """
+    seen: set[str] = set()
+    held: list[AssetBalance] = []
+    for item in items:
+        if item.asset in seen:
+            detail = "the balances name an asset more than once"
+            raise ExchangeSchemaError(detail)
+        seen.add(item.asset)
+        if not item.quantity.is_zero():
+            held.append(item)
+    return tuple(sorted(held, key=_balance_asset))
+
+
+def _balance_asset(balance: AssetBalance) -> str:
+    """What `assemble_balances` sorts by."""
+    return balance.asset
+
+
+def is_asset_name(value: str) -> bool:
+    """Whether `value` is 1 to `MAX_ASSET_NAME_LENGTH` characters an asset's name may hold.
+
+    The one character rule for a name a venue reports and the reconciliation joins on: a
+    BingX fill's base asset, a BingX balance's `asset`, and a Bitget balance's `coin`. One
+    predicate rather than a copy per venue, so the venues cannot come to disagree about
+    which names are names.
+
+    Refused: whitespace **anywhere**, and every character in a Unicode `C*` category --
+    control, format, surrogate, private use, unassigned. Everything else is accepted,
+    `$ . ( ) _ -` and non-ASCII letters included, because BingX's own symbol list holds all
+    of them.
+
+    **Whitespace is refused, not stripped.** A name padded with a space is a name this
+    application does not recognise: kept, `" USDT "` joins nothing -- it is not the fills'
+    `USDT`, nor the cash asset of that name -- and the whole balance would surface as held
+    with no history. Stripping it would be a guess about what the venue meant.
+
+    **Refusing `Cs` is what makes the name encode as UTF-8.** A `str` fails to encode only
+    through a lone surrogate, which is category `Cs`, so no separate UTF-8 check is needed,
+    and `NormalizedFill`, `AssetBalance` and the database driver get text they can encode.
+
+    A predicate, so the caller's refusal names the venue's own field and has no context.
+    """
+    if not 1 <= len(value) <= MAX_ASSET_NAME_LENGTH:
+        return False
+    return not any(char.isspace() or unicodedata.category(char).startswith("C") for char in value)
 
 
 def require_cursor_advanced(cursor: str | None, next_cursor: str | None) -> None:
@@ -1034,15 +1214,31 @@ def _require_utf8(value: object, *, field: str) -> None:
     case of a cursor, halfway through signing a request. Refused here instead, as the
     schema error it is. The message names the field; the text itself is exactly what
     cannot be rendered.
+
+    **The refusal has no cause and no context.** A `UnicodeEncodeError` keeps the whole
+    string in its `args`, and `from None` only suppresses the context: it is still there for
+    a debugger or an error tracker to walk. Since #104 the string can be an asset the owner
+    holds, so the encoding is tested by a predicate and the refusal raised outside any
+    handler, as the venue modules already do.
     """
     if not isinstance(value, str):
         detail = f"{field} must be a string"
         raise ExchangeSchemaError(detail)
+    if not _encodes_as_utf8(value):
+        detail = f"{field} does not encode as UTF-8"
+        raise ExchangeSchemaError(detail)
+
+
+def _encodes_as_utf8(value: str) -> bool:
+    """Whether `value` encodes as UTF-8 -- in practice, whether it holds no lone surrogate.
+
+    A predicate rather than a raise, so the caller's refusal has no `__context__`.
+    """
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
-        detail = f"{field} does not encode as UTF-8"
-        raise ExchangeSchemaError(detail) from None
+        return False
+    return True
 
 
 def _is_aware(value: object) -> bool:

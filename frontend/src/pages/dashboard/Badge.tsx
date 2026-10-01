@@ -11,3 +11,24 @@ export function Badge({ children }: { readonly children: string }) {
     </>
   );
 }
+
+/**
+ * A badge that is a link, for the one marker that has somewhere to go: "Held exceeds history"
+ * takes the reader to the holdings check that lists the asset. Same trailing space, same
+ * reason as {@link Badge}.
+ */
+export function BadgeLink({
+  href,
+  children,
+}: {
+  readonly href: string;
+  readonly children: string;
+}) {
+  return (
+    <>
+      <a className="badge" href={href}>
+        {children}
+      </a>{' '}
+    </>
+  );
+}

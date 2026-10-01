@@ -5,12 +5,14 @@ import {
   AMOUNT_FORMAT,
   FLAG_BADGES,
   hasNoKnownCost,
+  HELD_EXCEEDS_HISTORY_BADGE,
+  HOLDINGS_CHECK_ID,
   MARKET_VALUE_UNAVAILABLE_MESSAGES,
   SIGNED_FORMAT,
   UNIT_PRICE_FORMAT,
 } from '@/lib/accounting';
 import { isZeroMoney, money, type FormatMoneyOptions } from '@/lib/money';
-import { Badge } from '@/pages/dashboard/Badge';
+import { Badge, BadgeLink } from '@/pages/dashboard/Badge';
 import { ReturnPercent } from '@/pages/dashboard/ReturnPercent';
 
 interface OptionalAmountProps {
@@ -27,6 +29,8 @@ interface PositionRowProps {
   readonly position: Position;
   /** Whether `totals.excluded` names this asset: its row is not in the totals above. */
   readonly excluded: boolean;
+  /** Whether the holdings check found more of this asset held than the history accounts for. */
+  readonly heldExceedsHistory: boolean;
 }
 
 /**
@@ -51,7 +55,7 @@ function marketValueCell(position: Position) {
   );
 }
 
-function PositionRow({ position, excluded }: PositionRowProps) {
+function PositionRow({ position, excluded, heldExceedsHistory }: PositionRowProps) {
   const hasUnknownBasis = !isZeroMoney(money(position.unknown_basis_quantity));
   // Every unit arrived without a cost: there is nothing invested to show and no profit to
   // compute, and the `0.00` the backend sends for both would read as break-even.
@@ -66,6 +70,9 @@ function PositionRow({ position, excluded }: PositionRowProps) {
             <Badge key={flag}>{FLAG_BADGES[flag]}</Badge>
           ))}
           {excluded && <Badge>Not in totals</Badge>}
+          {heldExceedsHistory && (
+            <BadgeLink href={`#${HOLDINGS_CHECK_ID}`}>{HELD_EXCEEDS_HISTORY_BADGE}</BadgeLink>
+          )}
         </span>
       </th>
       <td className="num">
@@ -122,6 +129,11 @@ interface PositionTableProps {
   readonly positions: readonly Position[];
   readonly excluded: readonly Exclusion[];
   readonly quoteCurrency: string;
+  /**
+   * The assets the holdings check found held in excess of their history. Empty while that
+   * check is loading or has failed: a badge is only drawn from a reading that exists.
+   */
+  readonly heldExceedsHistory: ReadonlySet<string>;
 }
 
 /**
@@ -136,7 +148,12 @@ interface PositionTableProps {
  * is a labelled `region` so that a keyboard user can focus it and scroll a table wider than
  * the screen; see the `no-noninteractive-tabindex` allowance in eslint.config.js.
  */
-export function PositionTable({ positions, excluded, quoteCurrency }: PositionTableProps) {
+export function PositionTable({
+  positions,
+  excluded,
+  quoteCurrency,
+  heldExceedsHistory,
+}: PositionTableProps) {
   const excludedAssets = new Set(excluded.map((entry) => entry.asset));
 
   return (
@@ -184,6 +201,7 @@ export function PositionTable({ positions, excluded, quoteCurrency }: PositionTa
                   key={position.asset}
                   position={position}
                   excluded={excludedAssets.has(position.asset)}
+                  heldExceedsHistory={heldExceedsHistory.has(position.asset)}
                 />
               ))}
             </tbody>

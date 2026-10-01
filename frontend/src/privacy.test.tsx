@@ -132,6 +132,8 @@ describe('privacy', () => {
     expect(paths).toContain('/api/balances/runs?limit=2');
     expect(paths).toContain('/api/balances/sync');
     expect(paths).toContain('/api/accounting/positions');
+    // The holdings check compares wallet balances, and names no wallet to ask for them.
+    expect(paths).toContain('/api/accounting/reconciliation');
     expect(fake.writes('POST', '/api/wallets')).toHaveLength(3);
 
     for (const url of urls) {

@@ -88,7 +88,17 @@ EXPECTED_NAMES = {
         "uq_exchange_accounts_user_exchange",
         "ck_exchange_accounts_exchange_key",
         "ck_exchange_accounts_sync_status",
+        # #104: the kind the last balance read failed with.
+        "ck_exchange_accounts_balances_error",
         "fk_exchange_accounts_user_id_users",
+    },
+    # #104. The unique constraint is named explicitly, as every other one here is: the
+    # convention would render `uq_exchange_balances_exchange_account_id_asset`. It leads
+    # with the account, so the table needs no index beside it, and has none.
+    "exchange_balances": {
+        "pk_exchange_balances",
+        "uq_exchange_balances_account_asset",
+        "fk_exchange_balances_exchange_account_id_exchange_accounts",
     },
     "exchange_fills": {
         "pk_exchange_fills",

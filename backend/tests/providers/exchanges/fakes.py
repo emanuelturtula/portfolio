@@ -10,6 +10,8 @@ is not: `isinstance` would compare names and nothing about their signatures.
 The fake answers from a script of pages keyed by the cursor that asks for them, and builds
 every page through `assemble_fill_page` -- so a script that repeats a cursor, overfills a
 page or answers outside the window is refused by the same code a real venue's parser uses.
+Its balances (#104) go through `assemble_balances` for the same reason: a script naming an
+asset twice is refused, and a zero is dropped, exactly as a real venue's answer would be.
 It lives in `tests/` so the production image never ships a fake venue.
 """
 
@@ -24,13 +26,19 @@ from portfolio.providers.exchanges.base import (
     ExchangeCapabilities,
     ExchangeProvider,
     RateLimit,
+    assemble_balances,
     assemble_fill_page,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from portfolio.providers.exchanges.base import FillPage, FillWindow, NormalizedFill
+    from portfolio.providers.exchanges.base import (
+        AssetBalance,
+        FillPage,
+        FillWindow,
+        NormalizedFill,
+    )
 
 #: Small, so a test can fill a page with three fills and overfill it with four.
 FAKE_PAGE_SIZE: Final = 3
@@ -52,7 +60,11 @@ class FakeExchangeProvider:
         *,
         requires_symbol: bool = False,
         symbols: Sequence[str] = (),
+        balances: Sequence[AssetBalance] = (),
     ) -> None:
+        self._balances = tuple(balances)
+        #: How many times `fetch_balances` was asked.
+        self.balance_calls = 0
         self._pages: dict[str | None, tuple[Sequence[NormalizedFill], str | None]] = dict(
             pages or {None: ((), None)}
         )
@@ -88,6 +100,10 @@ class FakeExchangeProvider:
 
     async def candidate_symbols(self) -> Sequence[str]:
         return self._symbols
+
+    async def fetch_balances(self) -> Sequence[AssetBalance]:
+        self.balance_calls += 1
+        return assemble_balances(self._balances)
 
 
 _CONFORMS: ExchangeProvider = FakeExchangeProvider()

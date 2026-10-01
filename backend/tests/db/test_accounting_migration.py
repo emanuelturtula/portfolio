@@ -445,8 +445,8 @@ def test_the_downgrade_drops_the_four_tables_and_keeps_the_fills(
     command.downgrade(build_alembic_config(database_url), PARENT)
 
     after_down = set(inspect(sync_engine).get_table_names())
-    # #18's revision sits on top of this one and comes down with it.
-    assert after_down == tables_before - NEW_TABLES - {"manual_adjustments"}
+    # #18's revision sits on top of this one and comes down with it, and so does #104's.
+    assert after_down == tables_before - NEW_TABLES - {"manual_adjustments", "exchange_balances"}
     assert fill_rows(sync_engine) == before
     with sync_engine.connect() as connection:
         stamped = connection.scalar(text("SELECT version_num FROM alembic_version"))

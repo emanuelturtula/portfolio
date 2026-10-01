@@ -1,9 +1,11 @@
-"""Bitget spot fills, read through the Classic (v2) API with a signed, read-only key.
+"""Bitget spot fills and balances, read through the Classic (v2) API with a signed, read-only key.
 
-The first venue behind the exchange seam. One signed endpoint, `GET /api/v2/spot/trade/fills`,
-pages the account's spot executions backwards by trade id; one public endpoint,
-`GET /api/v2/spot/public/symbols`, says which coin is the base and which the quote of a
-symbol. Everything else here is the discipline of reading both without trusting either.
+The first venue behind the exchange seam. Two signed endpoints:
+`GET /api/v2/spot/trade/fills` pages the account's spot executions backwards by trade id, and
+`GET /api/v2/spot/account/assets` says what the spot account holds now (#104). One public
+endpoint, `GET /api/v2/spot/public/symbols`, says which coin is the base and which the quote
+of a symbol. Everything else here is the discipline of reading all three without trusting
+any of them.
 
 ## Confirmed against Bitget's documentation on 2026-09-25
 
@@ -63,17 +65,49 @@ every guess below is written to fail loudly, as a typed error naming a field.
 * **Any golden signature vector.** The documentation's samples use an empty secret and print
   nothing; the tests compute theirs outside this code.
 
+## The balance read, confirmed against Bitget's documentation on 2026-10-01
+
+Source: Get Account Assets, Classic spot, static copy
+`https://www.bitget.com/legacy-docs/classic/spot/account/Get-Account-Assets`. What it says,
+and what `fetch_balances` relies on:
+
+* `GET /api/v2/spot/account/assets`. "Frequency limit: 10 times/1s (User ID)".
+* Parameters `coin` and `assetType`, both optional. `assetType` is `hold_only` ("Position
+  coin"), the default, or `all`.
+* The usual envelope; `data` is an array of `{coin, available, frozen, locked,
+  limitAvailable, uTime}`, every field a string. The sample's `coin` is lower-case, `"usdt"`.
+* `frozen` is "usually frozen when the limit order is placed or join the Launchpad",
+  `locked` is "required to become a fiat merchants", and `limitAvailable` is "restricted
+  availability. For spot copy trading".
+
+**It has not been called with a real key either.** Not documented, and designed around:
+
+* **Whether `limitAvailable` is part of `available` or beside it.** It is not added: adding
+  it could count the same units twice, and a balance read too low is the safe direction for
+  a comparison that treats what is held as a lower bound (spec 025).
+* **What this endpoint answers for a Unified Trading Account.** The owner's account is
+  Classic (#76). A `data` that is not an array -- `null` included -- is refused; an empty
+  array is read as "the spot account holds nothing", which is what `hold_only` is
+  expected to answer for an empty account, though the page shows no such sample.
+* **How a coin's name is spelled.** The sample is lower-case while the names on fills come
+  from symbol info for symbols that are `[A-Z0-9]`. The name is upper-cased, which is right
+  under either spelling. See `parse_balances`.
+* **Which key permission the endpoint needs.** The page does not say. A refusal arrives as
+  one of the mapped codes, as `ExchangeInsufficientScopeError`.
+
 ## Every failure is one of the seven classes
 
 `fetch_fill_page` raises `ValueError` for a caller's mistake -- before any request -- and one
 of the seven `providers.exchanges.errors` classes for everything the venue or the network
-did. Every vendor-supplied value passes a bound this module or `base` chooses before the
+did. `fetch_balances` takes no argument a caller could get wrong, and raises only the seven.
+Every vendor-supplied value passes a bound this module or `base` chooses before the
 interpreter sees it: a trade id is at most nineteen digits before `int()`, a symbol is
 matched against an ASCII pattern before a URL is built from it, an amount is at most a
 hundred digits written out before `Decimal` arithmetic, a fill object is at most 32 levels
 deep before it is rendered, and every text field is checked to encode as UTF-8. **No message
 carries a value**, and no log call exists in this module: the transport logs
-`https://api.bitget.com/exchange_fills`, never a path, a query or a header.
+`https://api.bitget.com/exchange_fills`, `.../exchange_balances` or `.../exchange_symbol`,
+never a path, a query or a header.
 """
 
 from __future__ import annotations
@@ -87,18 +121,23 @@ import httpx
 
 from portfolio.config import is_header_safe
 from portfolio.domain.exchanges import ExchangeKey, FillSide
+from portfolio.domain.money import add
 from portfolio.providers.base import decode_json
 from portfolio.providers.errors import ProviderResponseError
 from portfolio.providers.exchanges.base import (
+    MAX_ASSET_NAME_LENGTH,
+    AssetBalance,
     CursorKind,
     ExchangeCapabilities,
     NormalizedFill,
     RateLimit,
+    assemble_balances,
     assemble_fill_page,
     datetime_from_epoch_ms,
     derive_quote_quantity,
     encode_raw_payload,
     epoch_ms,
+    is_asset_name,
     require_fill_amount,
 )
 from portfolio.providers.exchanges.credentials import Credentials
@@ -116,6 +155,7 @@ from portfolio.providers.exchanges.errors import (
 from portfolio.providers.exchanges.signing import hmac_sha256_base64
 from portfolio.providers.http import (
     ENDPOINT_EXTENSION,
+    EXCHANGE_BALANCES,
     EXCHANGE_FILLS,
     EXCHANGE_SYMBOL,
     parse_retry_after,
@@ -137,6 +177,8 @@ __all__ = [
     "ACCESS_PASSPHRASE_HEADER",
     "ACCESS_SIGN_HEADER",
     "ACCESS_TIMESTAMP_HEADER",
+    "ASSETS_PATH",
+    "ASSETS_QUERY",
     "BITGET_API_URL",
     "BITGET_CAPABILITIES",
     "BITGET_ERROR_MAP",
@@ -153,6 +195,7 @@ __all__ = [
     "build_fills_query",
     "build_prehash",
     "fill_symbols",
+    "parse_balances",
     "parse_fill",
     "parse_fills_page",
     "parse_symbol_info",
@@ -172,6 +215,19 @@ FILLS_PATH: Final = "/api/v2/spot/trade/fills"
 
 SYMBOLS_PATH: Final = "/api/v2/spot/public/symbols"
 """Get Symbol Info, Classic spot, public. Confirmed on 2026-09-25."""
+
+ASSETS_PATH: Final = "/api/v2/spot/account/assets"
+"""Get Account Assets, Classic spot. Confirmed on 2026-10-01. The spot account only."""
+
+ASSETS_QUERY: Final = "assetType=hold_only"
+"""The whole query of a balance read: the coins the account holds, and nothing else.
+
+`hold_only` is the documented default, and it is written out anyway, so the query is never
+empty: `build_prehash` always writes the `?`, and a balance request is then signed exactly
+as a fills request is. A request with no query would need a second form of the pre-hash,
+one this provider has never sent. The other documented value, `all` ("All coins"), would
+add coins the account does not hold, which `assemble_balances` would only drop.
+"""
 
 ACCESS_KEY_HEADER: Final = "ACCESS-KEY"
 ACCESS_SIGN_HEADER: Final = "ACCESS-SIGN"
@@ -678,8 +734,70 @@ def parse_fills_page(
     )
 
 
+def parse_balances(data: object) -> tuple[AssetBalance, ...]:
+    """An assets answer's `data` as the balances the contract promises, or a refusal.
+
+    | `AssetBalance` | From | Rule |
+    |---|---|---|
+    | `asset` | `coin` | `is_asset_name`, checked as sent, then **upper-cased** |
+    | `quantity` | `available` + `frozen` + `locked` | each `require_fill_amount`, none negative |
+
+    **`data` must be an array.** `null` included, for the reason `_fill_items` gives: the
+    place an undocumented shape is plausible is where the venue failed to answer, and what
+    this endpoint answers for an account upgraded to UTA is not documented. An empty array
+    is the one way to say the account holds nothing.
+
+    **The total is `available + frozen + locked`**, added with `domain.money.add`, which is
+    exact and consults no decimal context. All three are required: a missing one is not
+    read as zero, because a total built from two of three parts is a number the venue never
+    gave. **`limitAvailable` is not read.** Whether it is part of `available` or beside it
+    is not documented, and adding it could count the same units twice; reading a balance
+    too low is the safe direction (spec 025). `uTime` is not read either.
+
+    **A negative part is refused**, each on its own and before the sum, so that a negative
+    `frozen` cannot hide inside a positive total.
+
+    **The coin is upper-cased.** The documentation's sample is `"usdt"`, and the names this
+    venue's fills carry come from symbol info, for symbols that are `[A-Z0-9]`. The
+    reconciliation joins the two by name, so one asset spelled two ways would be compared
+    as two. Upper-casing is right whichever spelling the venue really uses, and two entries
+    that are equal once upper-cased are refused by `assemble_balances` as a duplicate.
+
+    **Only the case is changed.** Before it is, the coin is held to `base.is_asset_name`,
+    the rule BingX's balance asset is held to: 1 to `MAX_ASSET_NAME_LENGTH` characters, no
+    whitespace anywhere, no Unicode `C*` character. A coin padded with a space is refused
+    rather than kept or stripped: kept, `" USDT "` joins nothing, and the whole balance
+    would be reported as held with no history; stripped, it would be a guess. This is
+    narrower than what `parse_symbol_info` asks of `baseCoin`, deliberately: a name that
+    passes there and fails here would have been compared as a different asset anyway.
+
+    `assemble_balances` drops the zeros -- `hold_only` should send none -- and sorts.
+
+    Raises:
+        ExchangeSchemaError: `data` is not an array of objects, a field is missing, of the
+            wrong type or negative, a coin is named twice, or the total breaks an
+            `AssetBalance` rule. The detail names the field and never the value.
+    """
+    if not isinstance(data, list):
+        detail = "data must be an array of assets"
+        raise ExchangeSchemaError(detail)
+    balances: list[AssetBalance] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            detail = "every element of data must be a JSON object"
+            raise ExchangeSchemaError(detail)
+        coin = _require_coin(entry)
+        available = _require_held_amount(entry, "available")
+        frozen = _require_held_amount(entry, "frozen")
+        locked = _require_held_amount(entry, "locked")
+        balances.append(
+            AssetBalance(asset=coin.upper(), quantity=add(add(available, frozen), locked))
+        )
+    return assemble_balances(balances)
+
+
 class BitgetProvider:
-    """Bitget spot fills over the Classic v2 API. Satisfies `ExchangeProvider` structurally.
+    """Bitget spot fills and balances over the Classic v2 API. Satisfies `ExchangeProvider`.
 
     One instance per account, bound to the shared client. It holds the credentials as
     `SecretStr`s and reads the key and the passphrase out of them only while a request's
@@ -774,18 +892,39 @@ class BitgetProvider:
         """
         _refuse_caller_mistakes(window, cursor=cursor, symbol=symbol)
         query = build_fills_query(window, cursor=cursor)
-        data = await self._read_fills(query)
+        data = await self._read_signed(FILLS_PATH, query, EXCHANGE_FILLS)
         for name in fill_symbols(data):
             if name not in self._symbols:
                 self._symbols[name] = await self._read_symbol(name)
         return parse_fills_page(data, window=window, cursor=cursor, symbols=self._symbols)
 
-    async def _read_fills(self, query: str) -> object:
-        """Sign `query` and send it, exactly as signed. The `data` of the answer."""
+    async def fetch_balances(self) -> Sequence[AssetBalance]:
+        """What the spot account holds: one total per coin, zeros left out, sorted by coin.
+
+        1. `ASSETS_QUERY` is signed and sent to `ASSETS_PATH`, exactly as a fills query is,
+           labelled `exchange_balances`.
+        2. The answer is classified (`unwrap_envelope`), through the same error map.
+        3. The assets are parsed, totalled and assembled (`parse_balances`).
+
+        One request answers the whole account: the endpoint has no paging, and none is
+        documented. Only the spot account is read; what the owner holds in Bitget's earn,
+        futures or margin accounts is not in the answer.
+
+        Raises:
+            ExchangeError: one of the seven classes, and only those.
+        """
+        data = await self._read_signed(ASSETS_PATH, ASSETS_QUERY, EXCHANGE_BALANCES)
+        return parse_balances(data)
+
+    async def _read_signed(self, path: str, query: str, label: str) -> object:
+        """Sign a GET of `path` with `query` and send it, exactly as signed. The answer's `data`.
+
+        The one place the four `ACCESS-*` headers are built, so a fills request and a
+        balance request cannot come to be signed differently. `path` and `query` are this
+        module's constants or `build_fills_query`'s output, never a value a venue sent.
+        """
         timestamp_ms = epoch_ms(self._clock())
-        signature = hmac_sha256_base64(
-            self._api_secret, build_prehash(timestamp_ms, FILLS_PATH, query)
-        )
+        signature = hmac_sha256_base64(self._api_secret, build_prehash(timestamp_ms, path, query))
         headers = {
             ACCESS_KEY_HEADER: self._api_key.get_secret_value(),
             ACCESS_SIGN_HEADER: signature,
@@ -794,7 +933,7 @@ class BitgetProvider:
             CONTENT_TYPE_HEADER: JSON_CONTENT_TYPE,
             LOCALE_HEADER: LOCALE,
         }
-        return await self._get(f"{BITGET_API_URL}{FILLS_PATH}?{query}", EXCHANGE_FILLS, headers)
+        return await self._get(f"{BITGET_API_URL}{path}?{query}", label, headers)
 
     async def _read_symbol(self, symbol: str) -> SymbolAssets:
         """Ask the public symbol endpoint what `symbol` is made of. No credential is sent.
@@ -984,6 +1123,35 @@ def _required(document: Mapping[str, object], key: str, *, field: str) -> object
         detail = f"{field} is missing"
         raise ExchangeSchemaError(detail)
     return document[key]
+
+
+def _require_coin(entry: Mapping[str, object]) -> str:
+    """A balance's `coin`, exactly as sent, if it is a name an asset may have.
+
+    Checked before the caller upper-cases it, so the rule is applied to what the venue sent.
+    """
+    value = _required(entry, "coin", field="coin")
+    if isinstance(value, str) and is_asset_name(value):
+        return value
+    detail = (
+        f"coin must be a string of 1 to {MAX_ASSET_NAME_LENGTH} characters, with no whitespace "
+        "or control character"
+    )
+    raise ExchangeSchemaError(detail)
+
+
+def _require_held_amount(entry: Mapping[str, object], key: str) -> Decimal:
+    """One part of a coin's balance: present, an amount, and not negative.
+
+    `require_fill_amount` bounds the amount to a hundred digits written out, so the three
+    parts `parse_balances` adds are never far enough apart for `domain.money.add` to refuse
+    them.
+    """
+    amount = require_fill_amount(_required(entry, key, field=key), field=key)
+    if amount < 0:
+        detail = f"{key} must not be negative"
+        raise ExchangeSchemaError(detail)
+    return amount
 
 
 def _require_symbol(item: Mapping[str, object]) -> str:

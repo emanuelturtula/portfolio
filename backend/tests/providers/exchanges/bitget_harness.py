@@ -40,6 +40,13 @@ injected too.
 No real credential appears anywhere. The three synthetic values are sentences, low in
 entropy and obviously fake, and none is assigned to a name containing the venue's name,
 which is the shape `.gitleaks.toml`'s `exchange-api-credential` rule refuses.
+
+**Since #104 the venue also answers Get Account Assets**, the balance read. Its path is a
+literal here like the other two, its requests are verified by the same
+`verification_failure` a fills request goes through, and its answer is rendered from
+hand-written entries (`asset_entry`, `assets_body`), each field a raw JSON fragment, so a
+test can send a JSON number where a string is documented, a `null`, a missing field or an
+extra one. The holdings in those entries are synthetic: no real account's are written here.
 """
 
 from __future__ import annotations
@@ -63,7 +70,7 @@ from tests.providers.harness import RecordingSleep, retrying_client
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
-    from portfolio.providers.exchanges.base import FillPage
+    from portfolio.providers.exchanges.base import AssetBalance, FillPage
 
 # --------------------------------------------------------------------------------------
 # What Bitget documents, written down rather than read off the provider
@@ -74,6 +81,15 @@ BITGET_HOST: Final = httpx.URL(BITGET_API_URL).host
 #: Get Fills and Get Symbol Info, from the Classic (v2) documentation read on 2026-09-25.
 DOCUMENTED_FILLS_PATH: Final = "/api/v2/spot/trade/fills"
 DOCUMENTED_SYMBOLS_PATH: Final = "/api/v2/spot/public/symbols"
+
+#: Get Account Assets, from the Classic (v2) documentation read on 2026-10-01 (#104).
+DOCUMENTED_ASSETS_PATH: Final = "/api/v2/spot/account/assets"
+
+#: The two parameters Get Account Assets documents, both optional, and the two values it
+#: documents for `assetType`. A request carrying anything else is not one the venue
+#: describes, and the fake refuses to guess what it would answer.
+DOCUMENTED_ASSET_PARAMETERS: Final = frozenset({"coin", "assetType"})
+DOCUMENTED_ASSET_TYPES: Final = frozenset({"hold_only", "all"})
 
 #: The four access headers, spelt as the REST introduction spells them. `httpx.Headers`
 #: matches case-insensitively, so the spelling asserted is the one on the wire only where a
@@ -271,6 +287,46 @@ def symbols_body(*entries: str) -> str:
     return envelope("[" + ",".join(entries) + "]")
 
 
+def asset_entry(
+    coin: str = "usdt",
+    *,
+    available: str = "0",
+    frozen: str = "0",
+    locked: str = "0",
+    limit_available: str = "0",
+    u_time: str = "1622697148",
+    overrides: Mapping[str, str | None] | None = None,
+) -> str:
+    """One Get Account Assets entry as text, its six documented fields in documented order.
+
+    The defaults are the shape of the documented sample: a lower-case `usdt` and every
+    amount the string `"0"`. The named arguments are placed between quotes, because the
+    documentation says every field is a string. `overrides` replaces a field with a raw
+    JSON fragment -- `{"available": "0.1"}` is a bare JSON number, `{"coin": "null"}` a
+    `null` -- or removes it with `None`, and a key the venue does not document is appended.
+    """
+    fields: dict[str, str] = {
+        "coin": f'"{coin}"',
+        "available": f'"{available}"',
+        "frozen": f'"{frozen}"',
+        "locked": f'"{locked}"',
+        "limitAvailable": f'"{limit_available}"',
+        "uTime": f'"{u_time}"',
+    }
+    for name, fragment in (overrides or {}).items():
+        _apply(fields, name, fragment)
+    return _render_object(fields)
+
+
+def assets_body(*entries: str) -> str:
+    """A successful Get Account Assets answer carrying exactly `entries`, in the order given.
+
+    Each entry is raw text -- usually an `asset_entry`, and anything else a test wants in
+    the array: `"null"`, `"7"`, `"[]"`.
+    """
+    return envelope("[" + ",".join(entries) + "]")
+
+
 #: The pairs the fake knows, as its own answer. `AB12CD` splits where no list of quote
 #: coins would guess, so a base and quote that come back right came from the venue.
 DEFAULT_SYMBOLS: Final[Mapping[str, tuple[str, str]]] = {
@@ -354,6 +410,12 @@ class FakeBitget:
     scripted sequence whose last entry repeats -- for statuses, refusals and bodies no
     honest venue would compute. Verification still runs first, so a scripted answer is only
     reached by a request that was correctly signed.
+
+    Get Account Assets (#104) is answered from `assets`, the raw entries the account is
+    scripted to hold, served whole and in the order given: the endpoint documents no paging
+    and no order. `asset_replies` scripts it the way `fill_replies` scripts the fills. An
+    assets request is verified exactly as a fills request is, and must ask only what the
+    page documents; one that does not is a bug the fake reports rather than answers.
     """
 
     def __init__(
@@ -369,7 +431,14 @@ class FakeBitget:
         signing_key: str = SIGNING_SENTINEL,
         access_key: str = ACCESS_KEY_SENTINEL,
         passphrase: str = PHRASE_SENTINEL,
+        assets: Sequence[str] = (),
+        asset_replies: Sequence[Reply] = (),
     ) -> None:
+        self.assets = tuple(assets)
+        self._asset_replies = tuple(asset_replies)
+        #: Every Get Account Assets request, in order, and the ones that verified.
+        self.asset_requests: list[httpx.Request] = []
+        self.verified_asset_requests: list[httpx.Request] = []
         self.fills = tuple(fills)
         self.bounds = bounds
         self.order = order
@@ -386,7 +455,7 @@ class FakeBitget:
         self.symbol_requests: list[httpx.Request] = []
         #: The fills requests that verified, in order.
         self.verified: list[httpx.Request] = []
-        #: What was wrong with each fills request that did not verify.
+        #: What was wrong with each signed request -- fills or assets -- that did not verify.
         self.signature_failures: list[str] = []
         #: The trade ids each computed fills answer carried, in the order served.
         self.served_trade_ids: list[tuple[int, ...]] = []
@@ -404,6 +473,9 @@ class FakeBitget:
         if request.url.path == DOCUMENTED_SYMBOLS_PATH:
             self.symbol_requests.append(request)
             return self._answer_symbols(request)
+        if request.url.path == DOCUMENTED_ASSETS_PATH:
+            self.asset_requests.append(request)
+            return self._answer_assets(request)
         message = f"the provider called an undocumented path: {request.url.path}"
         raise AssertionError(message)
 
@@ -496,6 +568,31 @@ class FakeBitget:
         base, quote = known
         return httpx.Response(200, content=symbols_body(symbol_entry(asked, base, quote)))
 
+    def _answer_assets(self, request: httpx.Request) -> httpx.Response:
+        """Verify, check the question is a documented one, then answer the script.
+
+        The signature failures land in the same `signature_failures` list the fills
+        requests use, so `signature_failures == []` means every signed request verified.
+        """
+        failure = self.verification_failure(request)
+        if failure is not None:
+            self.signature_failures.append(failure)
+            return httpx.Response(400, content=error_body("40009", "sign signature error"))
+        self.verified_asset_requests.append(request)
+        params = request.url.params
+        undocumented = sorted(set(params.keys()) - DOCUMENTED_ASSET_PARAMETERS)
+        if undocumented:
+            message = f"the provider sent undocumented assets parameter(s): {undocumented}"
+            raise AssertionError(message)
+        asset_type = params.get("assetType")
+        if asset_type is not None and asset_type not in DOCUMENTED_ASSET_TYPES:
+            message = "the provider sent an assetType the documentation does not list"
+            raise AssertionError(message)
+        if self._asset_replies:
+            index = min(len(self.verified_asset_requests), len(self._asset_replies)) - 1
+            return self._asset_replies[index].respond()
+        return httpx.Response(200, content=assets_body(*self.assets))
+
     # -- what a test reads ---------------------------------------------------------------
 
     def fill_queries(self) -> list[dict[str, str]]:
@@ -575,6 +672,18 @@ async def fetch_page(
     async with bitget_client(fake) as client:
         provider = bitget_provider(client, clock=clock)
         return await provider.fetch_fill_page(window, cursor=cursor, symbol=None)
+
+
+async def fetch_balances(
+    fake: FakeBitget,
+    *,
+    clock: Callable[[], datetime] | None = None,
+    sleep: RecordingSleep | None = None,
+) -> Sequence[AssetBalance]:
+    """One `fetch_balances` against the fake, on a client opened and closed around it."""
+    async with bitget_client(fake, sleep=sleep) as client:
+        provider = bitget_provider(client, clock=clock)
+        return await provider.fetch_balances()
 
 
 #: The most pages `walk` follows before calling the pagination a loop. Far above any walk a
