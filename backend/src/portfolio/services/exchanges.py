@@ -20,14 +20,40 @@ prove no response model does either.
 
 `effective_since > requested_since`, and `False` when either is unknown. It compares two
 aware datetimes in Python, as every datetime comparison in this application does.
+
+## The transactions view filters, orders and totals in Python (#93)
+
+`list_fills` reads every fill of the owner's accounts on the selected venues -- the one filter
+applied in SQL, on an enum column -- and then, here: keeps the half-open range `[from_, to)`,
+orders newest first by `executed_at` with ties broken by id descending, totals the **whole**
+filtered set with `domain.fill_totals.total_fills`, and only then slices the page. So the
+totals are the same whatever `limit` and `offset` are, and no datetime or amount is compared,
+ordered or summed in SQL, where both are text. Spec 024 records what that costs at 5,000,
+20,000 and 50,000 fills.
+
+**Only the read runs on the event loop** (spec 024, R5). `fetch_fill_view_rows` goes through
+the session there; everything after it -- turning the rows into records, the range, the order,
+the totals and the page -- is `_fills_page`, a pure function of the rows and the parsed
+arguments, run by `anyio.to_thread.run_sync`, as the accounting recompute runs `replay`. At
+20,000 fills that work is most of the request, and on the loop every other request would wait
+for it. `abandon_on_cancel=True`: a cancelled request stops waiting at once, and the thread,
+which holds no session and reads no clock, finishes on its own and its page is discarded.
+
+**The range's rules are here, not in the router**: a bound must be timezone-aware and
+representable in UTC, and `from_` must be before `to`. A refusal is `InvalidFillRangeError`,
+naming the parameter and the rule and never the value, which the router turns into a 422.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final
+from datetime import UTC
+from typing import TYPE_CHECKING, Any, Final, Literal
 
-from portfolio.domain.exchanges import AccountSyncStatus, ExchangeKey
+from anyio import to_thread
+
+from portfolio.domain.exchanges import AccountSyncStatus, ExchangeKey, FillSide
+from portfolio.domain.fill_totals import FillLine, FillTotals, total_fills, usdt_value
 from portfolio.repositories.exchange_sync_runs import (
     AccountOutcome,
     AccountOutcomeStatus,
@@ -41,19 +67,27 @@ from portfolio.repositories.exchanges import (
     ExchangeAccountRepository,
     ExchangeFillRepository,
     ExchangeSyncWindowRepository,
+    decode_fill_view_rows,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Collection, Sequence
     from datetime import datetime
+    from decimal import Decimal
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from portfolio.repositories.exchanges import ExchangeAccountState
+    from portfolio.repositories.exchanges import ExchangeAccountState, FillViewRecord
     from portfolio.services.auth import Principal
 
 __all__ = [
     "DEFAULT_EXCHANGE_RUNS_LIMIT",
+    "DEFAULT_FILLS_LIMIT",
+    "INVERTED_RANGE_RULE",
     "MAX_EXCHANGE_RUNS_LIMIT",
+    "MAX_FILLS_LIMIT",
+    "NAIVE_BOUND_RULE",
+    "UNREPRESENTABLE_BOUND_RULE",
     "AccountOutcome",
     "AccountOutcomeStatus",
     "AccountSyncStatus",
@@ -62,6 +96,10 @@ __all__ = [
     "ExchangeSyncErrorKind",
     "ExchangeSyncRunSummary",
     "ExchangeView",
+    "FillSide",
+    "FillView",
+    "FillsPage",
+    "InvalidFillRangeError",
     "LastError",
     "SyncRunStatus",
     "SyncTrigger",
@@ -76,6 +114,165 @@ DEFAULT_EXCHANGE_RUNS_LIMIT: Final = 20
 MAX_EXCHANGE_RUNS_LIMIT: Final = 100
 """`GET /api/exchanges/runs` page sizes. The schema refuses anything outside `1..100` with a
 422; `list_runs` clamps as well, for a caller that does not go through the schema."""
+
+DEFAULT_FILLS_LIMIT: Final = 50
+MAX_FILLS_LIMIT: Final = 200
+"""`GET /api/exchanges/fills` page sizes. The schema refuses anything outside `1..200` with a
+422; `list_fills` clamps as well, for a caller that does not go through the schema."""
+
+FillRangeField = Literal["from", "to"]
+"""The query parameter a range refusal is about, spelled as the API spells it."""
+
+NAIVE_BOUND_RULE: Final = (
+    "must carry a timezone offset, such as 2026-03-01T00:00:00Z or 2026-03-01T01:00:00+01:00; "
+    "a datetime without one is refused rather than assumed to be UTC"
+)
+"""Why a naive bound is refused. The message is the parameter's name, a space, and this."""
+
+UNREPRESENTABLE_BOUND_RULE: Final = "is outside the range of instants UTC can represent"
+"""Why a bound whose offset carries it past `datetime`'s range is refused. Prefixed like
+`NAIVE_BOUND_RULE`."""
+
+INVERTED_RANGE_RULE: Final = (
+    "to must be later than from: from is inclusive and to is exclusive, so this range is empty"
+)
+"""Why `from >= to` is refused. The whole message, reported against `to`."""
+
+
+class InvalidFillRangeError(ValueError):
+    """A date bound of the transactions view that the service refuses.
+
+    `field` is the query parameter it is about, `from` or `to`, and `rule` the whole sentence:
+    it names the parameter and what it must be, and **never quotes the value**.
+    """
+
+    def __init__(self, field: FillRangeField, rule: str) -> None:
+        """Carry the parameter and the rule it broke."""
+        self.field: FillRangeField = field
+        self.rule = rule
+        super().__init__(rule)
+
+
+@dataclass(frozen=True, slots=True)
+class FillView:
+    """One fill as `GET /api/exchanges/fills` renders it.
+
+    `id` is our row id, a stable key, and never the venue's trade id, which this view does not
+    load. `order_id` is the venue's order id, which the owner needs to find the trade at the
+    venue, or `None` when it sent none. `usdt_value` is `quote_quantity` for a USDT-quoted
+    fill and `None` otherwise (`domain.fill_totals.usdt_value`).
+    """
+
+    id: int
+    executed_at: datetime
+    exchange_key: ExchangeKey
+    symbol: str
+    base_asset: str
+    quote_asset: str
+    side: FillSide
+    quantity: Decimal
+    price: Decimal
+    quote_quantity: Decimal
+    quote_quantity_derived: bool
+    usdt_value: Decimal | None
+    fee_amount: Decimal
+    fee_asset: str | None
+    order_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FillsPage:
+    """One page of the filtered fills, how many matched, and the totals over all of them."""
+
+    fills: tuple[FillView, ...]
+    total_count: int
+    totals: FillTotals
+
+
+def _bound(field: FillRangeField, value: datetime | None) -> datetime | None:
+    """A range bound in UTC, or `None`, refusing a naive one and one UTC cannot represent.
+
+    `astimezone(UTC)` raises `OverflowError` for `0001-01-01T00:00:00+01:00`, an hour before
+    the first instant a `datetime` holds; that is re-raised as the refusal it is, since only a
+    `ValueError` becomes a 422.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise InvalidFillRangeError(field, f"{field} {NAIVE_BOUND_RULE}")
+    try:
+        return value.astimezone(UTC)
+    except OverflowError:
+        raise InvalidFillRangeError(field, f"{field} {UNREPRESENTABLE_BOUND_RULE}") from None
+
+
+def _line_of(record: FillViewRecord) -> FillLine:
+    """The fields of a stored fill that its totals need."""
+    return FillLine(
+        base_asset=record.base_asset,
+        quote_asset=record.quote_asset,
+        side=record.side,
+        quantity=record.quantity,
+        quote_quantity=record.quote_quantity,
+        fee_amount=record.fee_amount,
+        fee_asset=record.fee_asset,
+    )
+
+
+def _view_of(record: FillViewRecord) -> FillView:
+    """A stored fill as the view renders it."""
+    return FillView(
+        id=record.id,
+        executed_at=record.executed_at,
+        exchange_key=record.exchange_key,
+        symbol=record.symbol,
+        base_asset=record.base_asset,
+        quote_asset=record.quote_asset,
+        side=record.side,
+        quantity=record.quantity,
+        price=record.price,
+        quote_quantity=record.quote_quantity,
+        quote_quantity_derived=record.quote_quantity_derived,
+        usdt_value=usdt_value(record.quote_asset, record.quote_quantity),
+        fee_amount=record.fee_amount,
+        fee_asset=record.fee_asset,
+        order_id=record.external_order_id,
+    )
+
+
+def _newest_first(record: FillViewRecord) -> tuple[datetime, int]:
+    """The view's sort key, applied in reverse: `executed_at`, then id."""
+    return (record.executed_at, record.id)
+
+
+def _fills_page(
+    rows: Sequence[Sequence[Any]],
+    since: datetime | None,
+    until: datetime | None,
+    limit: int,
+    offset: int,
+) -> FillsPage:
+    """Everything `list_fills` does after the read, **in a worker thread**, so pure.
+
+    It decodes the rows, keeps `[since, until)`, orders them newest first, totals the whole
+    filtered set, and slices `limit` fills from `offset`. The bounds are already in UTC and
+    checked, and `limit` and `offset` already clamped; the rows hold no session. So nothing here
+    touches a session, a clock or any state beyond its arguments, and the same arguments give the
+    same page on any thread. The amounts are summed by `money.add`, which evaluates in its own
+    explicit context rather than the thread's.
+    """
+    selected = [
+        record
+        for record in decode_fill_view_rows(rows)
+        if (since is None or record.executed_at >= since)
+        and (until is None or record.executed_at < until)
+    ]
+    selected.sort(key=_newest_first, reverse=True)
+    return FillsPage(
+        fills=tuple(_view_of(record) for record in selected[offset : offset + limit]),
+        total_count=len(selected),
+        totals=total_fills(_line_of(record) for record in selected),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +407,56 @@ class ExchangeService:
         """The most recent exchange sync runs, newest first, `limit` clamped to `1..100`."""
         bounded = max(1, min(limit, MAX_EXCHANGE_RUNS_LIMIT))
         return await self._runs.list_runs(limit=bounded)
+
+    async def list_fills(
+        self,
+        user_id: int,
+        *,
+        exchanges: Collection[ExchangeKey] | None,
+        from_: datetime | None,
+        to: datetime | None,
+        limit: int,
+        offset: int,
+    ) -> FillsPage:
+        """One page of the owner's fills on `exchanges` in `[from_, to)`, and the totals of all.
+
+        * `exchanges` is `None` for every venue; a repeated venue counts once, and an empty
+          collection selects none.
+        * `from_` is inclusive and `to` exclusive, each optional, so a fill exactly on a
+          boundary lands in exactly one of two adjacent ranges.
+        * The page is newest first by `executed_at`, ties broken by id descending. `limit` is
+          clamped to `1..200` and `offset` to `0..`; an offset past the end is an empty page
+          with the same `total_count` and totals.
+
+        The bounds are checked before anything is read. The read runs on the event loop and the
+        rest, `_fills_page`, in a worker thread; see the module docstring for why, and for why
+        the range, the order and the totals are applied in Python rather than in SQL.
+
+        **Cancellation**: a request cancelled while `_fills_page` runs raises its cancellation
+        here at once (`abandon_on_cancel=True`). The thread runs to the end on its own, and its
+        page is discarded; it holds no session, so the session this call read through can
+        close under it.
+
+        Raises:
+            InvalidFillRangeError: a bound is naive or outside what UTC can represent, or
+                `from_` is not before `to`.
+        """
+        since = _bound("from", from_)
+        until = _bound("to", to)
+        if since is not None and until is not None and since >= until:
+            raise InvalidFillRangeError("to", INVERTED_RANGE_RULE)
+        rows = await self._fills.fetch_fill_view_rows(
+            user_id, None if exchanges is None else frozenset(exchanges)
+        )
+        return await to_thread.run_sync(
+            _fills_page,
+            rows,
+            since,
+            until,
+            max(1, min(limit, MAX_FILLS_LIMIT)),
+            max(0, offset),
+            abandon_on_cancel=True,
+        )
 
 
 def build_exchange_service(

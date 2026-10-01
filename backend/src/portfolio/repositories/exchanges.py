@@ -36,6 +36,20 @@ is no method here that could do either.
 them: it is the venue's own object, kept for forensics, and a column never loaded is a column
 that cannot reach a log or a snapshot.
 
+## The transactions view reads the owner's fills, and never `raw_payload` or the trade id
+
+`list_fills_for_view` (#93) returns every fill of the owner's accounts on the selected venues,
+as `FillViewRecord`s, from `select_fills_for_view`, which names its columns: the ones the view
+shows and totals, and **neither `raw_payload` nor `external_trade_id`**. The trade id is never
+served, and a column never loaded cannot be served by mistake. The venues are filtered in SQL
+-- an integer and an enum column -- and nothing else is: the view's date range and its order are
+applied by the service, in Python, for the reason given above.
+
+It is two halves, and the service calls them separately (spec 024, R5): `fetch_fill_view_rows`
+reads through the session, on the event loop, and `decode_fill_view_rows` -- a pure function
+of the rows -- builds the records, in the worker thread where the service filters, orders and
+totals them.
+
 ## This module cannot import `NormalizedFill`
 
 `repositories` and `providers` are siblings in the layers contract and may not import each
@@ -53,17 +67,15 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from portfolio.db.models import ExchangeAccount, ExchangeFill, ExchangeSyncWindow
-from portfolio.domain.exchanges import AccountSyncStatus, ExchangeKey
+from portfolio.domain.exchanges import AccountSyncStatus, ExchangeKey, FillSide
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Iterable, Sequence
     from datetime import datetime
     from decimal import Decimal
 
-    from sqlalchemy import Select
+    from sqlalchemy import Row, Select
     from sqlalchemy.ext.asyncio import AsyncSession
-
-    from portfolio.domain.exchanges import FillSide
 
 __all__ = [
     "AccountingFillRecord",
@@ -74,8 +86,11 @@ __all__ = [
     "FillConflictError",
     "FillInsertResult",
     "FillRecord",
+    "FillViewRecord",
     "SyncWindowRow",
+    "decode_fill_view_rows",
     "select_fills_for_accounting",
+    "select_fills_for_view",
 ]
 
 _COMPARED_FIELDS: Final = (
@@ -112,6 +127,11 @@ statement needs, arrived in 3.35 -- so any SQLite that can run the statement all
 Bitget page is 100 fills, so today every page is one statement; the loop is for a venue with
 a larger page.
 """
+
+
+_EXCHANGE_KEYS: Final = {key.value: key for key in ExchangeKey}
+_FILL_SIDES: Final = {side.value: side for side in FillSide}
+"""The column text to its enum member, for the per-row loop in `list_fills_for_view`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -619,6 +639,97 @@ class ExchangeFillRepository:
             for row in result
         ]
 
+    async def list_fills_for_view(
+        self, user_id: int, exchanges: Collection[ExchangeKey] | None
+    ) -> Sequence[FillViewRecord]:
+        """Every fill of `user_id`'s accounts on `exchanges`, as plain records, by fill id.
+
+        `exchanges` is `None` for every venue; a collection selects those venues, and an empty
+        one selects none. **The venue is the only filter here**: the service applies the date
+        range and the order in Python, because `executed_at` is text in SQLite (see the module
+        docstring), and so it reads the owner's whole history on those venues. For a personal
+        history that is thousands of rows; spec 024 records what 50,000 cost.
+
+        **Neither `raw_payload` nor `external_trade_id` is loaded**: the statement names its
+        columns, and `select_fills_for_view` is public so that a test can compile it and see.
+
+        `fetch_fill_view_rows` and then `decode_fill_view_rows`. The service calls the two
+        halves itself, so that the decode runs in a worker thread rather than on the event loop.
+        """
+        return decode_fill_view_rows(await self.fetch_fill_view_rows(user_id, exchanges))
+
+    async def fetch_fill_view_rows(
+        self, user_id: int, exchanges: Collection[ExchangeKey] | None
+    ) -> Sequence[Row[*tuple[Any, ...]]]:
+        """The rows `select_fills_for_view` reads, fetched in full, before they become records.
+
+        The half of `list_fills_for_view` that needs the session, and so the half that stays on
+        the event loop. The rows are SQLAlchemy `Row`s -- sequences in the statement's column
+        order, not builtin tuples -- and **they hold no session, connection or cursor**: an
+        `AsyncSession` fetches every row before it returns, and SQLAlchemy applies each column's
+        result processing -- `NumericText` to a `Decimal`, `UtcDateTime` to an aware
+        `datetime` -- as it builds each row. So the rows can cross to a worker thread as plain
+        data, and `decode_fill_view_rows` needs nothing but them. Checked when this was written:
+        rows fetched and then decoded in a worker thread, after the session had closed and the
+        engine had been disposed, gave the same records, and no column processor ran again.
+
+        That processing is therefore the part of the read that stays on the loop, with the query
+        itself: spec 024, R5, records what it costs.
+        """
+        result = await self._session.execute(select_fills_for_view(user_id, exchanges))
+        return result.all()
+
+
+def decode_fill_view_rows(rows: Iterable[Sequence[Any]]) -> list[FillViewRecord]:
+    """Turn the rows `fetch_fill_view_rows` returns into `FillViewRecord`s. Pure.
+
+    No session, no I/O, no clock: it reads the rows it is handed -- the `Row`s
+    `fetch_fill_view_rows` returns, or any sequences in the same column order -- and nothing
+    else, which is what lets the service run it in a worker thread.
+
+    **Each row is unpacked by position, and the two enums are looked up in a dict**, because this
+    loop runs once per fill in the history and was half the endpoint's time: a `Row`'s attribute
+    access resolves each name, and `ExchangeKey(...)` and `FillSide(...)` each cost a call into
+    `EnumType.__call__`. Measured at 20,000 fills, the load went from 0.199 s to 0.122 s. The
+    unpacking follows `select_fills_for_view`'s column order, and a test pins the two together.
+    A value outside either enum is a `KeyError`, which `ck_exchange_accounts_exchange_key` and
+    `ck_exchange_fills_side` make unreachable.
+    """
+    return [
+        FillViewRecord(
+            id=fill_id,
+            exchange_key=_EXCHANGE_KEYS[exchange_key],
+            external_order_id=external_order_id,
+            symbol=symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            side=_FILL_SIDES[side],
+            quantity=quantity,
+            price=price,
+            quote_quantity=quote_quantity,
+            quote_quantity_derived=quote_quantity_derived,
+            fee_amount=fee_amount,
+            fee_asset=fee_asset,
+            executed_at=executed_at,
+        )
+        for (
+            fill_id,
+            exchange_key,
+            external_order_id,
+            symbol,
+            base_asset,
+            quote_asset,
+            side,
+            quantity,
+            price,
+            quote_quantity,
+            quote_quantity_derived,
+            fee_amount,
+            fee_asset,
+            executed_at,
+        ) in rows
+    ]
+
 
 @dataclass(frozen=True, slots=True)
 class AccountingFillRecord:
@@ -682,3 +793,67 @@ def select_fills_for_accounting(user_id: int) -> Select[*tuple[Any, ...]]:
         .where(ExchangeAccount.user_id == user_id)
         .order_by(ExchangeFill.id)
     )
+
+
+@dataclass(frozen=True, slots=True)
+class FillViewRecord:
+    """One stored fill as the transactions view reads it: what it shows and what it totals.
+
+    Every column but `raw_payload`, `external_trade_id`, `exchange_account_id` and
+    `ingested_at`, plus the account's venue. `side` is a `FillSide` here, unlike
+    `AccountingFillRecord`'s: `ck_exchange_fills_side` admits nothing else, and the view has no
+    per-row error to report a stray value with.
+    """
+
+    id: int
+    exchange_key: ExchangeKey
+    external_order_id: str | None
+    symbol: str
+    base_asset: str
+    quote_asset: str
+    side: FillSide
+    quantity: Decimal
+    price: Decimal
+    quote_quantity: Decimal
+    quote_quantity_derived: bool
+    fee_amount: Decimal
+    fee_asset: str | None
+    executed_at: datetime
+
+
+def select_fills_for_view(
+    user_id: int, exchanges: Collection[ExchangeKey] | None
+) -> Select[*tuple[Any, ...]]:
+    """The statement `list_fills_for_view` runs, with every column it loads named.
+
+    Joined on the account, so a fill of another owner's account is never read. The venues are
+    an `IN` on `exchange_accounts.exchange_key`, sorted so the statement is the same for the
+    same set; `None` leaves the clause out. Ordered by `ExchangeFill.id`, an integer, so the
+    read is deterministic; the view's own order is the service's.
+    """
+    statement = (
+        select(
+            ExchangeFill.id,
+            ExchangeAccount.exchange_key,
+            ExchangeFill.external_order_id,
+            ExchangeFill.symbol,
+            ExchangeFill.base_asset,
+            ExchangeFill.quote_asset,
+            ExchangeFill.side,
+            ExchangeFill.quantity,
+            ExchangeFill.price,
+            ExchangeFill.quote_quantity,
+            ExchangeFill.quote_quantity_derived,
+            ExchangeFill.fee_amount,
+            ExchangeFill.fee_asset,
+            ExchangeFill.executed_at,
+        )
+        .join(ExchangeAccount, ExchangeAccount.id == ExchangeFill.exchange_account_id)
+        .where(ExchangeAccount.user_id == user_id)
+        .order_by(ExchangeFill.id)
+    )
+    if exchanges is not None:
+        statement = statement.where(
+            ExchangeAccount.exchange_key.in_(sorted({ExchangeKey(key) for key in exchanges}))
+        )
+    return statement

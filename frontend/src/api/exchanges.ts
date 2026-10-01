@@ -6,6 +6,7 @@
  * from the backend."
  */
 import {
+  hashKey,
   useMutation,
   useQuery,
   useQueryClient,
@@ -15,14 +16,23 @@ import {
 
 import { apiFetch } from '@/api/client';
 import type { components } from '@/api/generated/schema';
+import { fillsQuery, isInvertedRange, type FillFilters } from '@/lib/fillFilters';
 
 export type Exchange = components['schemas']['ExchangeResponse'];
 export type ExchangeRun = components['schemas']['ExchangeSyncRunResponse'];
 export type ExchangeSyncTriggered = components['schemas']['ExchangeSyncTriggeredResponse'];
+export type ExchangeFill = components['schemas']['ExchangeFillResponse'];
+export type ExchangeFillsPage = components['schemas']['ExchangeFillListResponse'];
+export type ExchangeFillTotals = components['schemas']['ExchangeFillTotalsResponse'];
+export type ExchangeFillAssetTotals = components['schemas']['ExchangeFillAssetTotalsResponse'];
+export type ExchangeFillQuoteAssetTotals =
+  components['schemas']['ExchangeFillQuoteAssetTotalsResponse'];
+export type FillSide = components['schemas']['FillSide'];
 
 const EXCHANGES_PATH = '/api/exchanges';
 const RUNS_PATH = '/api/exchanges/runs';
 const SYNC_PATH = '/api/exchanges/sync';
+const FILLS_PATH = '/api/exchanges/fills';
 
 /** How many runs `useExchangeRuns` asks for - the run log's own limit (spec: the last 20). */
 export const EXCHANGE_RUNS_LIMIT = 20;
@@ -39,6 +49,7 @@ export const SLOW_POLL_MS = 60_000;
 
 export const exchangesQueryKey = ['exchanges', 'list'] as const;
 export const exchangeRunsQueryKey = ['exchanges', 'runs'] as const;
+export const exchangeFillsQueryKey = ['exchanges', 'fills'] as const;
 
 /**
  * How fast `useExchanges` should poll: fast while any venue is `syncing`, or while this
@@ -121,6 +132,41 @@ export function useExchangeRuns(
       return response.runs;
     },
     refetchInterval: (query) => runsRefetchInterval(query.state.data, syncPending, anySyncing),
+  });
+}
+
+/**
+ * One page of the fills that match `filters`, newest first, with the totals over *all* of
+ * them (`GET /api/exchanges/fills`, spec 024).
+ *
+ * **No polling.** The query sits under `['exchanges']`, so the invalidation a settled sync
+ * already performs refreshes it: the fills change when a sync stores some, and at no other
+ * time.
+ *
+ * **A range the form refuses is never sent.** `enabled` is off for an inverted range, and
+ * the caller shows the refusal instead of reading this query.
+ *
+ * **Previous data is kept across a change of page and dropped across a change of filters.**
+ * Under new filters the old rows would be a lie about what was asked for, so the caller
+ * shows a skeleton. Under a new page the filters are the same, and keeping the last page
+ * until the next arrives is what keeps the pagination buttons mounted: a button that is
+ * replaced by a skeleton takes the keyboard's focus with it.
+ */
+export function useExchangeFills(
+  filters: FillFilters,
+  page: number,
+): UseQueryResult<ExchangeFillsPage> {
+  return useQuery({
+    queryKey: [...exchangeFillsQueryKey, filters, page] as const,
+    queryFn: ({ signal }) =>
+      apiFetch<ExchangeFillsPage>(`${FILLS_PATH}?${fillsQuery(filters, page).toString()}`, {
+        signal,
+      }),
+    enabled: !isInvertedRange(filters),
+    placeholderData: (previous, previousQuery) =>
+      previousQuery !== undefined && hashKey([previousQuery.queryKey[2]]) === hashKey([filters])
+        ? previous
+        : undefined,
   });
 }
 

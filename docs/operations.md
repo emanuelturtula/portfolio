@@ -793,8 +793,9 @@ own. Each attempt is one row in `exchange_sync_runs` plus one row per account in
 an update or a delete of a fill, and re-reading history the sync already holds inserts
 nothing.
 
-The signed-in `/exchanges` page shows all of this without a terminal: the account list, a
-banner for any venue whose retention window truncated its history, and the run log. The
+The signed-in `/exchanges` page shows all of this without a terminal: the imported fills with
+their totals, the account list, a banner for any venue whose retention window truncated its
+history, and the run log. The
 `curl` commands below still work, and are what a script needs, but a human recovering an
 `auth_failed` key can do the last step from the page - see step 4 below.
 
@@ -954,6 +955,39 @@ trade id, even when the retention edge has moved past the window's start in the 
 (BingX's cursor is a time, so there such a window is re-read from its first page, which
 costs requests and inserts nothing twice.) **Do not run an exchange sync from a second
 process while the server is up**, for the reason section 11 gives.
+
+### Reading the imported fills
+
+The Transactions section of the `/exchanges` page shows them, with filters and totals. The
+same read from a terminal:
+
+```bash
+curl -s -b "$COOKIE" -G https://<host>/api/exchanges/fills \
+  --data-urlencode exchange=bitget --data-urlencode exchange=bingx \
+  --data-urlencode from=2026-03-01T00:00:00Z --data-urlencode to=2026-04-01T00:00:00Z \
+  --data-urlencode limit=50 --data-urlencode offset=0 | jq .
+```
+
+Every parameter is optional:
+
+- `exchange` is repeatable, and leaving it out means every venue.
+- `from` is inclusive and `to` exclusive, each an ISO 8601 datetime **with an offset**. A
+  naive one is refused rather than read as UTC. Use `--data-urlencode`, because a literal
+  `+01:00` in a URL arrives as a space.
+- `limit` is 1 to 200 (default 50). `offset` counts from 0.
+
+The response has three parts:
+
+- `fills` is newest first. Each fill carries its **order id**, which is what finds the trade
+  at the venue, but never the venue's trade id.
+- `total_count` is how many fills matched.
+- `totals` covers **every** matching fill, whatever the page. It has per-asset quantities
+  bought and sold, USDT spent and received, and fees per asset with their sign. A fill quoted
+  in anything but USDT is summed in its own quote asset under `not_valued_in_usdt` and never
+  converted.
+
+Every amount is a string. The totals cover only what has been imported, so read them together
+with `history_truncated`, `pending_windows` and `status` from the account list above.
 
 ## 14. Connecting the BingX account
 

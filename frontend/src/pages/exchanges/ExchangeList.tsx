@@ -139,7 +139,7 @@ function ExchangeRow({ exchange, manualRunInFlight }: ExchangeRowProps) {
   const isManualRetry = exchange.status === 'auth_failed' && exchange.syncing && manualRunInFlight;
 
   return (
-    <li aria-labelledby={headingId}>
+    <li id={`exchange-${exchange.exchange_key}`} aria-labelledby={headingId}>
       <h4 id={headingId}>{venue}</h4>
       <p>{statusLabel(exchange, manualRunInFlight)}</p>
 

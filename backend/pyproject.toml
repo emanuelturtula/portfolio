@@ -135,11 +135,13 @@ pythonpath = ["src"]
 # `BaseException`. Finding the first took `-o faulthandler_timeout=12` by hand; this is
 # that, automated, plus the exit.
 #
-# 30 s is sized against the slowest tests and against the tests that wait on purpose. No
-# test has been measured above 2.2 s, with coverage or without. Which test is slowest
-# changes between runs: a cold mypy run in `tests/providers/test_protocol.py`, the
-# Hypothesis codec test in `tests/domain/test_addresses.py`, or one of the lifespan
-# tests. The tests that wait on purpose bound their own waits at 5 to 10 s, so they
+# 30 s is sized against the slowest tests and against the tests that wait on purpose. The
+# slowest is the 20,000-fill budget guard in
+# `tests/services/test_exchange_fills_performance.py` (#93): about 12 s with coverage and
+# about 3.5 s without, most of it planting the fills. No other test has been measured above
+# 2.2 s. Among those, which is slowest changes between runs: a cold mypy run in
+# `tests/providers/test_protocol.py`, the Hypothesis codec test in
+# `tests/domain/test_addresses.py`, or one of the lifespan tests. The tests that wait on purpose bound their own waits at 5 to 10 s, so they
 # still fail first, with a better message. The ceiling cuts a hang, not a slow runner.
 #
 # `thread`, on every platform, and never the `signal` default that Linux would otherwise
