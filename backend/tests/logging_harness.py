@@ -30,9 +30,11 @@ Everything `portfolio.logging.configure_logging` touches, and nothing it does no
 
 * structlog's global configuration, all five keys, from `structlog.get_config()`;
 * the root logger's handlers and level, which `logging.basicConfig(force=True)` replaces;
-* the level of each logger in `URL_LOGGING_LIBRARIES`, which `silence_vendor_url_logging`
+* the level of each logger in `SILENCED_VENDOR_LOGGERS`, which `silence_vendor_logging`
   raises. Every call raises them to the same floor today, so this half restores nothing in
-  practice -- it is here so that it keeps restoring the day that stops being true.
+  practice -- it is here so that it keeps restoring the day that stops being true, and so
+  that a control which lifts a floor on purpose cannot leave it lifted. The list is imported
+  rather than restated, so a logger added to it is restored without an edit here.
 
 `tests/test_logging_harness.py` drives each fixture's real teardown and compares the state
 afterwards with the state before, so a fourth fixture written the old way, or this one
@@ -47,7 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from portfolio.logging import URL_LOGGING_LIBRARIES
+from portfolio.logging import SILENCED_VENDOR_LOGGERS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -68,7 +70,7 @@ def logging_state() -> dict[str, Any]:
         "root_handlers": list(root.handlers),
         "root_level": root.level,
         "vendor_levels": {
-            library: logging.getLogger(library).level for library in URL_LOGGING_LIBRARIES
+            library: logging.getLogger(library).level for library in SILENCED_VENDOR_LOGGERS
         },
     }
 

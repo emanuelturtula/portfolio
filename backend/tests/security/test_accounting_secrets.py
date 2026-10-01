@@ -16,17 +16,23 @@ standard-library record, and every response body for the sentinels. What the tes
 writes to plant its rows is discarded before each search: it is the recompute and the
 endpoint that are under test. The positive companions come first, so an empty capture
 cannot pass: the recompute's own log lines must be there.
+
+It runs at DEBUG as well as at the production default, because DEBUG is where #106 was:
+`aiosqlite` logs every statement it runs with its bound parameters, so at DEBUG the
+recompute's own `INSERT INTO accounting_lots` put a lot's trade id on stdout. INFO alone
+could not see it, and an operator turning the level up to investigate a recompute is
+exactly when the log gets read.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import traceback
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
@@ -40,13 +46,11 @@ from tests.accounting_harness import (
 )
 from tests.auth.conftest import BASE_URL, sign_in
 from tests.exchange_sync_harness import make_fill
-from tests.security.conftest import assert_carried_something
+from tests.security.conftest import EveryRecord, assert_carried_something
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
-
-    import pytest
 
     from tests.security.conftest import ProductionLoggingInstaller
 
@@ -61,20 +65,6 @@ SENTINELS: Final = (
     WARNED_TRADE_SENTINEL,
     BAD_TRADE_SENTINEL,
 )
-
-
-class EveryRecord(logging.Handler):
-    """A root handler of this test's own: every standard-library record, rendered in full."""
-
-    def __init__(self) -> None:
-        super().__init__(level=logging.NOTSET)
-        self.rendered: list[str] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        parts = [record.name, record.getMessage(), repr(record.args), repr(record.__dict__)]
-        if record.exc_info:
-            parts.append("".join(traceback.format_exception(*record.exc_info)))
-        self.rendered.append(" ".join(parts))
 
 
 async def until(condition: Callable[[], bool]) -> None:
@@ -92,13 +82,15 @@ def leaks(searched: str) -> list[str]:
     return found
 
 
+@pytest.mark.parametrize("log_level", ["INFO", "DEBUG"])
 async def test_a_fills_payload_and_trade_ids_reach_no_log_line_and_no_response(
+    log_level: str,
     api_environment: Path,
     production_logging: ProductionLoggingInstaller,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """At the production log level, over a written recompute and a failed one."""
+    """At the production log level and at DEBUG, over a written recompute and a failed one."""
     del api_environment
     monkeypatch.setattr("portfolio.main.exchange_providers", lambda client, **_: {})
     now = datetime.now(UTC).replace(microsecond=0)
@@ -116,7 +108,7 @@ async def test_a_fills_payload_and_trade_ids_reach_no_log_line_and_no_response(
         external_trade_id=WARNED_TRADE_SENTINEL,
     )
     app = create_app()
-    production_logging()
+    production_logging(log_level)
     records = EveryRecord()
     logging.getLogger().addHandler(records)
     searched: list[str] = []
