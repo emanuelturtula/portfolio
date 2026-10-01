@@ -3,7 +3,12 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { positionsQueryKey, usePositions } from '@/api/accounting';
+import {
+  positionsQueryKey,
+  reconciliationQueryKey,
+  usePositions,
+  useReconciliation,
+} from '@/api/accounting';
 import {
   EXCHANGE_RUNS_LIMIT,
   exchangeFillsQueryKey,
@@ -34,6 +39,7 @@ import {
 import { fakeAccounting } from '@/test/fakeAccounting';
 import { fakeExchanges, type FakeExchanges } from '@/test/fakeExchanges';
 import { manyFills } from '@/test/fillFixtures';
+import { kasNeverTraded, reconciliation, walletReadings } from '@/test/reconciliationFixtures';
 import { settle } from '@/test/render';
 import { problem, server } from '@/test/server';
 import { inTimeZone } from '@/test/timeZone';
@@ -447,6 +453,103 @@ describe('the exchange sync and the invested figures', () => {
       expect(
         client.getQueryState(['accounting', 'positions', 'inactive-probe'])?.isInvalidated,
       ).toBe(true);
+    });
+  });
+});
+
+/**
+ * Spec 025: a venue's balances are read at the end of its successful fill sync, so the
+ * comparison the holdings check shows is worth re-reading at the moment the sync settles. It
+ * is keyed `['accounting', 'reconciliation']`, under the prefix the sync already invalidates.
+ */
+describe('the exchange sync and the holdings check', () => {
+  /** KAS read in a wallet and never traded: a comparison the first snapshot does not have. */
+  function afterTheBalanceRead() {
+    return reconciliation({ assets: [kasNeverTraded()], wallets: walletReadings(1) });
+  }
+
+  function setUp(options: { readonly failSync: boolean }) {
+    const exchanges = fakeExchanges({ exchanges: [exchange()] });
+    const accounting = fakeAccounting({ positions: emptySnapshot() });
+    if (options.failSync) {
+      exchanges.fail('sync', () => problem(504, 'Gateway Timeout', 'The upstream did not answer.'));
+    }
+    server.use(...exchanges.handlers, ...accounting.handlers);
+    const client = createQueryClient();
+
+    const hook = renderHook(
+      () => ({ reconciliation: useReconciliation(), sync: useSyncExchanges() }),
+      { wrapper: wrapperFor(client) },
+    );
+
+    return { accounting, client, hook };
+  }
+
+  it('re-reads the reconciliation when the sync succeeds, and shows the new comparison', async () => {
+    const { accounting, client, hook } = setUp({ failSync: false });
+    await waitFor(() => {
+      expect(hook.result.current.reconciliation.isSuccess).toBe(true);
+    });
+    expect(hook.result.current.reconciliation.data?.assets).toEqual([]);
+    const before = accounting.count('reconciliation');
+    // The sync reads the venue's balances after its fills; no fill is stored, so the snapshot
+    // - and with it the positions - does not move. Only the comparison does.
+    accounting.setReconciliation(afterTheBalanceRead());
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+
+    await waitFor(() => {
+      expect(hook.result.current.sync.isSuccess).toBe(true);
+    });
+    await waitFor(() => {
+      expect(accounting.count('reconciliation')).toBe(before + 1);
+    });
+    await waitFor(() => {
+      expect(hook.result.current.reconciliation.data).toEqual(afterTheBalanceRead());
+    });
+    expect(client.getQueryData(reconciliationQueryKey)).toEqual(afterTheBalanceRead());
+  });
+
+  it('re-reads the reconciliation when the sync fails, too', async () => {
+    // A cut-off request very often means the run is still going: it may yet read the balances.
+    const { accounting, hook } = setUp({ failSync: true });
+    await waitFor(() => {
+      expect(hook.result.current.reconciliation.isSuccess).toBe(true);
+    });
+    const before = accounting.count('reconciliation');
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+
+    await waitFor(() => {
+      expect(hook.result.current.sync.isError).toBe(true);
+    });
+    await waitFor(() => {
+      expect(accounting.count('reconciliation')).toBe(before + 1);
+    });
+  });
+
+  it('marks an inactive reconciliation query stale, so the dashboard re-reads it on return', async () => {
+    // On the exchanges page the dashboard is not mounted: nothing observes the reconciliation.
+    const exchanges = fakeExchanges({ exchanges: [exchange()] });
+    server.use(...exchanges.handlers);
+    const client = createQueryClient();
+    client.setQueryData(reconciliationQueryKey, reconciliation({ exchanges: [] }));
+    expect(client.getQueryState(reconciliationQueryKey)?.isInvalidated).toBe(false);
+    const hook = renderHook(() => useSyncExchanges(), { wrapper: wrapperFor(client) });
+
+    act(() => {
+      hook.result.current.mutate();
+    });
+    await waitFor(() => {
+      expect(hook.result.current.isSuccess).toBe(true);
+    });
+
+    await waitFor(() => {
+      expect(client.getQueryState(reconciliationQueryKey)?.isInvalidated).toBe(true);
     });
   });
 });

@@ -41,6 +41,7 @@ from portfolio.services.auth import (
 from portfolio.services.balances import BalanceService, build_balance_service
 from portfolio.services.exchanges import ExchangeService, build_exchange_service
 from portfolio.services.password_hasher import PasswordHasher
+from portfolio.services.reconciliation import ReconciliationService, build_reconciliation_service
 from portfolio.services.sync_coordinator import SyncCoordinator
 from portfolio.services.wallets import WalletService, build_wallet_service
 
@@ -213,6 +214,20 @@ async def get_accounting_service(request: Request) -> AsyncIterator[AccountingSe
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
     async with sessionmaker() as session:
         yield build_accounting_service(session)
+
+
+async def get_reconciliation_service(request: Request) -> AsyncIterator[ReconciliationService]:
+    """Open a session for this request and hand the router the reconciliation service.
+
+    Read-only, like `get_balance_service`: the service compares what the syncs and the
+    recompute stored, so the session is never committed here and closing it discards nothing.
+    **Nothing is built from the provider mapping**: the venue balances it reads are the rows
+    the exchange sync wrote, and no request path reaches a venue for them. The service's clock
+    is the default one: a reading's age is measured against the time the request is served.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_reconciliation_service(session)
 
 
 async def get_adjustment_service(request: Request) -> AsyncIterator[AdjustmentService]:

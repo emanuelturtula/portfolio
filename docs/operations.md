@@ -4,8 +4,8 @@ Day-two tasks on the running instance: creating the account, tuning the password
 hardware, changing the password, understanding when a session ends, pointing the application
 at the chain index it reads balances from, refreshing the prices that turn a balance into
 a value, connecting the Bitget and BingX accounts whose trades say what each asset cost,
-keeping the import of those trades running, and reading the cost-basis snapshot built from
-them.
+keeping the import of those trades running, reading the cost-basis snapshot built from
+them, and checking that history against the balances actually held.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -700,9 +700,10 @@ In Bitget's API management page, create a new API key:
 2. Set a **passphrase**. Bitget asks you to choose one when the key is created, and it is the
    third of the three values below, so keep it with the other two. Use printable ASCII with no
    space at either end -- the application refuses anything else at startup.
-3. Grant **read-only** permission and nothing else. The application only ever reads fills
-   and symbol information; it never places, cancels or transfers anything, and a key that
-   cannot is a key that cannot be misused. **Never grant trade, transfer or withdrawal.**
+3. Grant **read-only** permission and nothing else. The application only ever reads fills,
+   symbol information and, since #104, the spot account's balances (section 16); it never
+   places, cancels or transfers anything, and a key that cannot is a key that cannot be
+   misused. **Never grant trade, transfer or withdrawal.**
 4. An IP allowlist is optional. If you set one, it must include the address the host's
    requests reach the internet from, or every sync is refused as an auth error (venue code
    `40018` or `40038`). Do not write that address into this repository.
@@ -1003,8 +1004,9 @@ other.
 On the BingX website, under **User Center → API Management**, create a new API key:
 
 1. **Leave it read-only.** BingX creates new keys with read-only permission by default, and
-   that is exactly what this application needs: it only ever reads fills, and never places,
-   cancels or transfers anything. **Never enable trading, transfer or withdrawal.**
+   that is exactly what this application needs: it only ever reads fills and, since #104, the
+   spot account's balances (section 16), and never places, cancels or transfers anything.
+   **Never enable trading, transfer or withdrawal.**
 2. BingX keys have no passphrase. There are two values, not three.
 3. An IP whitelist is optional, and BingX recommends one. If you set one, it must include the
    address the host's requests reach the internet from, or every sync is refused with venue
@@ -1236,6 +1238,146 @@ reaches -- shows `value_out_of_range` and is left out of the totals the same way
 asset holding units of unknown cost is listed there as `unknown_basis`. The totals cover only
 what is left, so their percentage is the return on exactly the money in the total beside it.
 
+## 16. The holdings check: which balances are compared, and what a failed read means
+
+The cost-basis snapshot says what the imported history adds up to. The **holdings check**
+compares that, per asset, with the balances read: each wallet's latest balance and each
+venue's, for as long as those readings are current. More held than the history accounts for
+usually means buys are missing from it, which no warning in the snapshot can show.
+`docs/accounting.md`, "Checking the history against the balances held", explains the
+comparison and what each result means; the contract is spec
+`docs/specs/025-holdings-reconciliation.md`. The signed-in dashboard shows it as the
+**Holdings check** block of the Invested section.
+
+### What is read, and when
+
+- **Only the spot account of each venue is read.** Earn, futures, margin and funding accounts
+  are not. Coins held there are simply missing from the held side, which can make the history
+  look larger than the balances (`history_over`, shown and never an error) and can never make
+  it look smaller.
+- **After every successful fill sync of a venue**, inside the same run, the venue is asked
+  what its spot account holds, and the answer **replaces** the stored reading whole. One
+  reading per account is kept; there is no history of balances. The one exception is a venue
+  that refused the key on its last balance read: scheduled and startup runs do not ask it
+  again, and a manual sync does (see "What to do about a `balances_error`").
+- **Not after a failed or skipped fill sync.** Fresh balances beside a stale history would
+  show differences that mean nothing.
+- **Never on a read.** `GET /api/accounting/reconciliation` compares what is stored.
+
+### Which readings are compared: the 24-hour rule
+
+A reading that is out of date is worse than a missing one. Coins withdrawn from a venue to a
+wallet after the venue was last read would be counted in both, and the check would report
+units that do not exist as missing from the history. So a reading is compared only while it
+is **current**, and one that is not adds nothing:
+
+- **A venue** is compared when its last balance read succeeded, its fill sync is `ok`, and
+  the reading is at most **24 hours** old.
+- **A wallet** is compared when its latest reading is at most 24 hours old.
+
+The limit is served as `max_reading_age_hours` and is not configurable. Both syncs run every
+fifteen minutes by default, so a reading only reaches it when a source has stopped being
+read. The age is measured when the request is served.
+
+```bash
+curl -s -b "$COOKIE" https://<host>/api/accounting/reconciliation \
+  | jq '.max_reading_age_hours, .last_recompute, .exchanges, .wallets'
+```
+
+Each entry of `exchanges` has:
+
+| Field | Means |
+|---|---|
+| `balances_read_at` | when that venue's balances were last read **successfully**; `null` when they never have been |
+| `balances_error` | the kind the last attempt failed with, in the `error_kind` vocabulary of section 13; `null` when it succeeded or none was made |
+| `not_compared_reason` | `null` when the venue's balances are in the comparison; otherwise why they are not |
+
+`not_compared_reason` is the first of these that applies:
+
+| Reason | Means | What to do |
+|---|---|---|
+| `read_failed` | The last balance read failed. The rows of the reading before it stay in the database and are **not** compared. | Read `balances_error`; see below. |
+| `never_read` | No balance read has succeeded yet. | Nothing if the venue was just configured: the next successful fill sync reads it. If the venue shows `configured: false` on `GET /api/exchanges`, its credentials were removed and no sync will come. |
+| `sync_failed` | The venue's fill sync is not `ok` (`error`, `auth_failed` or `never_synced`). Balances are read only after a successful fill sync, so nothing is refreshing the reading. | Fix the fill sync: section 13, "What an account's status means". |
+| `out_of_date` | The reading is more than 24 hours old, although the last read succeeded and the account is `ok`. No balance read has succeeded for that venue since, which normally means no sync has run for it. | Check `PORTFOLIO_EXCHANGE_SYNC_ENABLED`, and whether the venue still shows `configured: true`. A manual sync of a configured venue refreshes it. |
+
+`wallets` has three counts that add up to the active wallets: `compared`, `stale` (a reading
+more than 24 hours old) and `unread` (no reading at all, section 11). A `stale` wallet is
+usually one whose chain has been failing on every balance run, or the balance timer being
+off; `GET /api/balances/runs` says which (section 11). `oldest_observed_at` is the oldest
+reading among the compared ones.
+
+A source that is left out adds nothing to the held side. That can hide a difference, and
+cannot produce one. What can still produce a false one is coins moved between two current
+readings, taken at different times by two different syncs: they are counted twice, or not at
+all, until both sources have been read again. Those readings are **minutes** apart while both
+syncs are running, and **up to 24 hours** apart when a source has stopped being read without
+a recorded failure: a wallet whose chain is failing on every balance run (#116 will leave such
+a wallet out), a venue whose credentials were removed or whose timer is off, and the double
+failure logged as `exchange_balances_failure_not_recorded` (below). The dashboard shows each
+reading's age. Treat a `history_short` as a prompt to look.
+
+`last_recompute` is the one `GET /api/accounting/positions` serves (section 15). It is `null`
+after a restart until the startup recompute ends, and the stored snapshot is compared
+meanwhile. When its outcome is `failed`, the snapshot compared is older than the balances,
+every asset bought since shows as missing from the history, and the dashboard shows no
+comparison until a recompute succeeds. A shorter window of the same kind opens on every run
+that stores a fill: between a sync's commits and its recompute, an asset bought in that sync
+can show as `history_short`, and with two venues that window spans the second venue's sync.
+
+### The read-only key should need no new permission (not verified with a real key)
+
+The balances are read with the key the fills are read with (sections 12 and 14). Nothing
+should have to be granted, and **nothing more should be**: trade, transfer and withdrawal
+stay off.
+
+What that rests on, read on 2026-10-01: BingX documents its spot balance endpoint as needing
+the **Read** permission, which the key already has. Bitget's page for its spot assets endpoint
+does not state a permission; the read-only permission is what its fills are read with.
+`docs/providers.md` records both. **Neither endpoint had been called with a real key when
+this was written.** If a venue does refuse the key for it, the fills keep syncing and the
+refusal shows as described below.
+
+### Where a failed balance read shows up
+
+**Not in the account's status, and not in the run log.** `status`, `last_error` and
+`GET /api/exchanges/runs` describe the fills, and a failed balance read changes none of them:
+the account stays `ok` and the run stays a `success`. It shows in two places.
+
+**In the holdings check itself**: the venue's entry has `balances_error` set and
+`not_compared_reason: "read_failed"`, and the dashboard names the venue and the reason. The
+rows of the last good reading are kept in the database, with their `balances_read_at`, and
+are not used: that venue's coins are missing from the comparison until a read succeeds.
+
+**In the container log**, one line per venue whose fills were synced, per run, and two when a
+failed read could not be recorded either:
+
+```bash
+~/portfolio-app/prod/compose.sh logs app | grep exchange_balances
+```
+
+| Event | Fields | Meaning |
+|---|---|---|
+| `exchange_balances_read` | `exchange_key`, `assets` | The balances were read and stored. `assets` is how many assets the spot account holds a balance of. |
+| `exchange_balances_read_failed` | `exchange_key`, `error_kind`, `error_type` | The read failed. `error_type` is the exception's class name. An `internal` kind is a defect of ours and the line carries the traceback. |
+| `exchange_balances_read_skipped` | `exchange_key`, `reason` | A scheduled or startup run did not ask, because the last read was refused for the key. `reason` is `auth` or `insufficient_scope`. |
+| `exchange_balances_failure_not_recorded` | `exchange_key`, `error_type` | The read failed **and** writing its kind to the account failed too, most likely "database is locked". It follows the `exchange_balances_read_failed` line of the same venue and carries the traceback. The run carries on and closes normally, and the fills are unaffected, but `balances_error` still shows what the attempt before left, so the endpoint does not show this failure: the two log lines are the only record. **The venue's previous reading then stays in the comparison** until a read succeeds or that reading is 24 hours old. Nothing to do unless it repeats; the next successful fill sync reads the balances again. |
+
+A venue whose fill sync failed or was skipped has no line here: its balances were not asked
+for. None of these fields carries an asset or an amount, and the reconciliation endpoint is
+the only place a venue's balances are served.
+
+### What to do about a `balances_error`
+
+| Kind | What happens next |
+|---|---|
+| `unavailable`, `rate_limited` | Nothing to do. The next successful fill sync of that venue asks again, and the venue is left out of the comparison until a read succeeds. |
+| `auth`, `insufficient_scope` | The venue refused the key for this read. **Scheduled and startup runs stop asking**, for the reason an `auth_failed` account is skipped (section 13), so the venue stays out of the comparison until you act. Fix the key at the venue, put the corrected values in `secrets.env`, recreate the container, and trigger a sync by hand: **a manual sync is the one that asks again**. If the response says `"joined": true`, wait and send it again, as in section 13. |
+| `schema`, `invalid_request` | The venue answered something the parser does not recognise, or refused the request. The parsers refuse whatever they do not recognise rather than store a guess, so this is a missing reading and never a wrong number. Every run asks again. Report it with the venue and the kind. |
+| `internal` | A defect of ours. The container log has the traceback. Every run asks again. Report it. |
+
+The fills are untouched by any of these, and so are the positions.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -1255,6 +1397,11 @@ what is left, so their percentage is the return on exactly the money in the tota
 | An exchange account stays `auth_failed` after fixing the key | Scheduled runs skip it: recreate the container, then trigger a sync by hand, and again if the first POST says `"joined": true` — section 13 |
 | Exchange syncs fail `unavailable` with venue code `40008` | The host clock is off by more than 30 seconds — section 13, "The host clock must be synchronised" |
 | An exchange account fails with `conflict` on every run | A stored fill changed under the same id; it needs a person — section 13 |
+| The holdings check says a venue's balances could not be read, while the account is `ok` | A failed balance read never changes the account's status. Read `balances_error` — section 16 |
+| A venue's `balances_error` stays `auth` or `insufficient_scope` after fixing the key | Scheduled runs do not ask again: recreate the container, then trigger a sync by hand — section 16 |
+| The holdings check shows the history above the balances for an asset | Not a finding: only the spot account is read, so coins in Earn, futures or an unregistered wallet are not counted. A sale the import did not see looks the same, and the check cannot tell them apart — section 16 |
+| The holdings check leaves a venue or a wallet out although nothing failed today | Its reading is more than 24 hours old, or the venue's fill sync is not `ok`. Read `not_compared_reason` and `wallets.stale` — section 16 |
+| The dashboard shows no holdings comparison at all | The last recompute failed, so the history is older than the balances. Read `last_recompute` — sections 15 and 16 |
 | A Bitcoin wallet reports "the address is on a different network" | `PORTFOLIO_BITCOIN_NETWORK` does not match the address — section 8 |
 | Bitcoin balances stop updating and the log shows 429 | The public index is throttling us. Lengthen nothing by hand; run your own Esplora — section 8 |
 | Reading many Bitcoin addresses takes a minute | Working as intended: one request per second per host — section 8 |

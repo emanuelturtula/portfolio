@@ -461,6 +461,41 @@ td {
   cursor: pointer;
 }
 
+/* "Held exceeds history" on a position takes the reader to the holdings check: it keeps the
+   badge's look and says it is a link by being underlined, with or without a pointer. */
+a.badge {
+  color: inherit;
+  text-decoration: underline;
+}
+
+/* Holdings check (spec 025). The finding - balances above the history - has a box and a
+   heading of its own so it cannot be read past; the quiet list is a closed disclosure. The
+   weight is in the border and the words, colour is only on top. */
+.holdings-short {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--color-warning);
+  border-radius: 0.25rem;
+}
+
+.holdings-short h4 {
+  margin-top: 0;
+  color: var(--color-warning);
+}
+
+.holdings-over {
+  margin: 1rem 0;
+}
+
+.holdings-over summary {
+  cursor: pointer;
+}
+
+.holdings-readings {
+  margin: 0.25rem 0 1rem;
+  padding-left: 1.25rem;
+}
+
 /* Transactions (spec 024). */
 
 .fill-filters {

@@ -45,6 +45,7 @@ from portfolio.db.base import NAMING_CONVENTION
 from portfolio.db.models import (
     _ASSET_KIND_CHECK,
     _BALANCE_SNAPSHOT_CONFIRMED_CHECK,
+    _EXCHANGE_ACCOUNT_BALANCES_ERROR_CHECK,
     _EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK,
     _EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK,
     _EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK,
@@ -95,6 +96,9 @@ APPLICATION_TABLES = frozenset(
         # #18. The owner's manual adjustments: opening balances and off-exchange
         # acquisitions. Owner data, not derived, so it is not one of #19's tables.
         "manual_adjustments",
+        # #104. The last reading of each exchange account's spot balances, replaced whole
+        # by every successful read. Derived data: the venue is the source.
+        "exchange_balances",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -144,6 +148,10 @@ ACCOUNTING_TABLES = frozenset(
 #: #18's one. Its revision sits on top of #19's, so every single-step reversal below
 #: `0009_manual_adjustments` takes it down as well, and each test subtracts it.
 ADJUSTMENT_TABLES = frozenset({"manual_adjustments"})
+
+#: #104's one. Its revision sits on top of #18's, so every single-step reversal below
+#: `0010_exchange_balances` takes it down as well, and each test subtracts it.
+EXCHANGE_BALANCE_TABLES = frozenset({"exchange_balances"})
 
 EXPECTED_SEED_ROWS = [
     ("BTC", "Bitcoin", 8, "crypto"),
@@ -207,6 +215,9 @@ EXPECTED_CONSTRAINT_NAMES = {
         "ck_exchange_accounts_exchange_key",
         # #15: the batch rebuild that added the sync state has to keep every name above.
         "ck_exchange_accounts_sync_status",
+        # #104: a second batch rebuild, for the two balance columns. It has to keep every
+        # name above too, and it adds this one.
+        "ck_exchange_accounts_balances_error",
         "fk_exchange_accounts_user_id_users",
     },
     "exchange_fills": {
@@ -275,6 +286,14 @@ EXPECTED_CONSTRAINT_NAMES = {
         None,
         "ck_manual_adjustments_note_not_blank",
         "fk_manual_adjustments_user_id_users",
+    },
+    # #104. No CHECK, and the absence is part of the pin: `quantity` is a `TEXT` money
+    # column, and a sign check on one is a numeric-affinity comparison. Compared in full in
+    # `tests/db/test_exchange_balances_migration.py`.
+    "exchange_balances": {
+        "pk_exchange_balances",
+        "uq_exchange_balances_account_asset",
+        "fk_exchange_balances_exchange_account_id_exchange_accounts",
     },
 }
 
@@ -461,6 +480,7 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
         - EXCHANGE_SYNC_TABLES
         - ACCOUNTING_TABLES
         - ADJUSTMENT_TABLES
+        - EXCHANGE_BALANCE_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -497,6 +517,7 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
         - EXCHANGE_SYNC_TABLES
         - ACCOUNTING_TABLES
         - ADJUSTMENT_TABLES
+        - EXCHANGE_BALANCE_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -567,6 +588,7 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
         - EXCHANGE_SYNC_TABLES
         - ACCOUNTING_TABLES
         - ADJUSTMENT_TABLES
+        - EXCHANGE_BALANCE_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:
@@ -814,6 +836,8 @@ def test_the_exchange_check_constraints_match_the_models(
         "exchange_accounts": {
             "ck_exchange_accounts_exchange_key": _EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK,
             "ck_exchange_accounts_sync_status": _EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK,
+            # #104, added by a second rebuild of the table.
+            "ck_exchange_accounts_balances_error": _EXCHANGE_ACCOUNT_BALANCES_ERROR_CHECK,
         },
         "exchange_fills": {
             "ck_exchange_fills_external_trade_id": _EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK,

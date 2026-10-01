@@ -320,11 +320,12 @@ of a residual #6 recorded and #7 closed: the gate used to be a *pattern*, and a 
 address is lower-case, alphanumeric and under 32 characters, so it matched the pattern and
 reached the log. Membership in a frozen set cannot be satisfied by accident.
 
-The set this release ships is exactly eight: `address_balance` for a single balance read,
+The set this release ships is exactly nine: `address_balance` for a single balance read,
 `address_balances` for Kaspa's batch read, `block_tip_height` for the tip-height call
 Esplora's `health()` makes, `node_health` for the health document Kaspa's reads,
-`asset_price` and `asset_prices` for the price reads (#9), and `exchange_fills` and
-`exchange_symbol` for Bitget's signed fills read and its public symbol lookup (#13).
+`asset_price` and `asset_prices` for the price reads (#9), `exchange_fills` and
+`exchange_symbol` for Bitget's signed fills read and its public symbol lookup (#13), and
+`exchange_balances` for either venue's signed read of its spot balances (#104).
 
 So a new endpoint is two lines, not one: the constant, and its name in `ENDPOINT_LABELS`.
 The same shape as `PUBLIC_API_PATHS` in rule 8 -- the default says nothing, and saying more
@@ -919,13 +920,14 @@ An exchange differs from the other two kinds in the ways that shape everything b
 
 ### The shape
 
-`ExchangeProvider` in `portfolio.providers.exchanges.base`, three members:
+`ExchangeProvider` in `portfolio.providers.exchanges.base`, four members:
 
 | Member | Kind | What it must do |
 |---|---|---|
 | `capabilities` | property | Return an `ExchangeCapabilities`. Constant for the life of the instance. |
 | `fetch_fill_page` | async method | Read one page of fills inside a `FillWindow`, from a cursor, for a symbol when the venue requires one. Returns a `FillPage` built with `assemble_fill_page`. |
 | `candidate_symbols` | async method | The symbols worth asking about, for a venue with `requires_symbol`; an empty sequence otherwise. |
+| `fetch_balances` | async method | Read what the spot account holds now (#104). Returns the `AssetBalance`s built with `assemble_balances`: one per asset, zeros left out, sorted. |
 
 **Not `@runtime_checkable`**, for the reason `ChainProvider` is not. A fake proves
 conformance with a module-level `_CONFORMS: ExchangeProvider = FakeExchangeProvider()` that
@@ -1072,6 +1074,43 @@ request older than retention**; surfacing both dates is #13's criterion, decided
 `RETENTION_MARGIN` is five minutes and **a guess**: without it the oldest window is at the
 edge when computed and past it when the request lands.
 
+### The balance contract, enforced the same way (#104)
+
+`fetch_balances()` answers what the venue's **spot account** holds now: one `AssetBalance`
+per asset, the total held, zeros left out, sorted by asset. It exists so that the quantity
+the accounting engine replays from fills can be compared with what is actually held
+(`docs/specs/025-holdings-reconciliation.md`). The sync calls it after an account's fills
+have synced; no request path does.
+
+`AssetBalance(asset, quantity)` refuses, as `NormalizedFill` does and through the same
+check, what `NumericText(FILL_SCALE)` would transform: a `quantity` that is not a finite
+`Decimal`, has more than `MAX_FILL_INTEGER_DIGITS` digits before the point, or more than
+`FILL_SCALE` after it. It also refuses a negative `quantity`, and an `asset` that is blank
+or does not encode as UTF-8. Zero is accepted. `asset` is kept exactly as given: a provider
+whose venue spells an asset differently in its balances than in its fills normalises before
+building one, because the comparison joins the two by name.
+
+A provider hands what it parsed to `assemble_balances(items)`:
+
+| Case | Outcome |
+|---|---|
+| two entries name the same asset | `ExchangeSchemaError` |
+| an entry whose quantity is zero | dropped |
+| everything else | kept, sorted by asset |
+
+**A duplicate is refused, not summed.** Whether a venue naming an asset twice means two
+parts of one holding or one holding listed twice cannot be told, and the two answers differ
+by the whole balance. The check runs before the zeros are dropped. The message names no
+asset, no amount and no count.
+
+**The total is the provider's decision**, recorded in its section below: which of a venue's
+fields are added. The rule for a field that may or may not overlap another is to leave it
+out. The comparison treats what is held as a lower bound, so a balance read too low can
+hide a finding and can never invent one.
+
+**Only the spot account is read.** Earn, futures, margin and funding accounts are not, at
+either venue.
+
 ### The error taxonomy sits inside the existing hierarchy
 
 Seven classes in `providers/exchanges/errors.py`, each also the `ProviderError` subclass
@@ -1211,6 +1250,8 @@ value while the type only held prices, and a fill quantity is the owner's holdin
 through Bitget's **Classic (v2) API** with a signed, read-only key, and
 `providers/exchanges/registry.py` holds `exchange_providers(client, *, settings=None)`, the
 table of configured venues. The module docstring is the reasoning; this section is the record.
+Since #104 it reads the spot account's balances as well; "The balance read", at the end of
+this section, is that record.
 
 #### Confirmed against Bitget's documentation on 2026-09-25
 
@@ -1420,7 +1461,8 @@ passphrase out of their `SecretStr` only while the headers are built; the secret
 only inside `signing.py`.
 
 **Logging.** The provider has no log call. The transport logs
-`https://api.bitget.com/exchange_fills` or `.../exchange_symbol`, never a path, a query or a
+`https://api.bitget.com/exchange_fills`, `.../exchange_balances` or `.../exchange_symbol`,
+never a path, a query or a
 header, and every exception the provider raises is built by the taxonomy, which carries no
 body, no URL and no header. **No exception it raises has a cause or a context that could hold
 one**: an `httpx.LocalProtocolError` -- whose message is the illegal header value, which here
@@ -1456,12 +1498,72 @@ itself -- and `parse_rate_limit` runs on **every** response:
   absent;
 - a credential with an illegal header character, above.
 
+#### The balance read (#104)
+
+`BitgetProvider.fetch_balances()` reads the Classic spot account's balances with the same
+key, and `bitget.parse_balances(data)` is the pure function behind it.
+
+**Confirmed against Bitget's documentation on 2026-10-01. Nobody has called this endpoint
+with a real key**: not this project, not the owner with a probe. Every fact below is the
+page's, and the parser refuses what the page does not describe.
+
+| Fact | Documented as | Source |
+|---|---|---|
+| endpoint | `GET /api/v2/spot/account/assets` on `https://api.bitget.com` | Get Account Assets |
+| rate limit | "Frequency limit: 10 times/1s (User ID)" | Get Account Assets |
+| key permission | **not stated on the page** | -- |
+| parameters | `coin` and `assetType`, both optional. `coin` narrows the answer to one coin. `assetType` is `hold_only` (the coins held), which is the default, or `all`. With both, `coin` wins | Get Account Assets |
+| envelope | the usual one, `code` `"00000"`; `data` is an **array**, with no cursor and no paging parameter | Get Account Assets |
+| entry fields | `coin`, `available`, `frozen`, `locked`, `limitAvailable`, `uTime`, **all strings** | Get Account Assets |
+| `frozen` | frozen assets, usually by a limit order or a Launchpad subscription | Get Account Assets |
+| `locked` | locked assets, required of a fiat merchant | Get Account Assets |
+| `limitAvailable` | restricted availability, for spot copy trading | Get Account Assets |
+| the sample | one entry, its `coin` spelled **lower-case**, `"usdt"`, and every amount `"0"` | Get Account Assets |
+| signing | the fills request's headers and pre-hash; nothing endpoint-specific | REST intro, read on 2026-09-25 |
+
+Source, read on 2026-10-01:
+
+- Get Account Assets, static copy:
+  https://www.bitget.com/legacy-docs/classic/spot/account/Get-Account-Assets
+
+**Not documented, and designed around:**
+
+| Not documented | What the provider does |
+|---|---|
+| whether `limitAvailable` is part of `available` or beside it | **does not add it.** Adding it could count the same units twice; leaving it out can only read the balance too low, which is the safe side |
+| what the endpoint answers for a **Unified Trading Account** | the owner's account is Classic (#76). A `data` of `null`, or anything that is not an array, is refused; an empty array is "the spot account holds nothing" |
+| what `hold_only` answers for an account that holds nothing | read as an empty array, above. The page shows no such sample |
+| how a coin's name is spelled: the sample is lower-case, and the names on fills come from symbol info for symbols that are `[A-Z0-9]` | **upper-cases `coin`**, which is right under either spelling. Two entries equal once upper-cased are refused as a duplicate |
+| which key permission the endpoint needs | a refusal arrives as one of the mapped codes and is `ExchangeInsufficientScopeError`; nothing is assumed |
+| `uTime`'s unit: described as milliseconds, and the sample's value has ten digits | not read |
+
+**Decisions.**
+
+- **The request** is `GET /api/v2/spot/account/assets?assetType=hold_only`. `hold_only` is
+  the default and is written out anyway, so that the query is never empty and the request is
+  signed exactly as a fills request is: the pre-hash always has its `?`. `coin` is not sent.
+  It is labelled `exchange_balances`.
+- **`coin` is held to `base.is_asset_name`, the rule BingX's balance `asset` is held to, before it is upper-cased**: 1 to 40 characters, no whitespace anywhere, no Unicode `C*` character. A padded or otherwise unrecognised name is refused, never stripped: kept, `" USDT "` would join nothing and report the whole balance as held with no history.
+- **The total is `available + frozen + locked`**, added with `domain.money.add`, which is
+  exact. All three are required, and a missing one is not read as zero. Each goes through
+  `require_fill_amount`, so a JSON number is accepted as a string is, and a `bool`, a
+  `null` or anything else is refused.
+- **A negative part is refused**, each on its own, before the sum.
+- **No decoding and no rounding.** A total with a nineteenth decimal place is refused by
+  `AssetBalance`.
+- **Classification is the fills call's**: `unwrap_envelope` and `BITGET_ERROR_MAP`, so a
+  revoked key, a missing permission, a throttle and an outage are the classes they are for
+  fills. The three `httpx` arms are `_get`'s, shared by all three calls.
+- **Logging.** `https://api.bitget.com/exchange_balances`, and nothing else. No message
+  names a coin or an amount.
+
 ### BingX, the second venue (#14)
 
 `providers/exchanges/bingx.py` holds `BingXProvider`, which reads the owner's spot fills
 through BingX's **spot v1 API** with a signed, read-only key, and the registry builds it when
 both of its variables are set. The module docstring is the reasoning, and it separates each
-fact by source; this section is the record.
+fact by source; this section is the record. Since #104 it reads the spot account's balances
+as well; "The balance read", at the end of this section, is that record.
 
 **BingX is the venue where the documentation was not enough.** Read in full, it contradicts
 itself on whether `symbol` is required and on the largest page. A live probe then contradicted
@@ -1672,9 +1774,11 @@ rounding leaves:
 | `1.000000000000005` | `1` -- the tie goes to the even digit |
 
 Without it a fee like `-0.00005820000000000001` has 20 fractional digits, `NormalizedFill`
-refuses it (`FILL_SCALE` is 18), and every page holding one fails on every run. **It is applied
-to those two fields and never to `price` or `qty`**, which are strings the venue formats
-exactly: a 19-digit KAS quantity must survive intact. It does not contradict "refuse, never
+refuses it (`FILL_SCALE` is 18), and every page holding one fails on every run. **On a fill
+it is applied to those two fields and never to `price` or `qty`**, which are strings the
+venue formats exactly: a 19-digit KAS quantity must survive intact. Since #104 it is also
+applied to a balance's `free` and `locked`, for the same reason; "The balance read", below,
+is that record. It does not contradict "refuse, never
 round": that rule is about a column rounding silently, and this is a documented decoding of a
 venue's float encoding. A value still finer than `FILL_SCALE` after it is refused as before.
 The risk is stated where it lives: a `commission` or `quoteQty` that genuinely needed 16 or
@@ -1729,7 +1833,8 @@ passphrase, and `BingXProvider` refuses `Credentials` carrying one: a set one me
 is confused. With neither set, `exchange_providers` holds no BingX provider at all.
 
 **Logging.** The provider has no log call. The transport logs
-`https://open-api.bingx.com/exchange_fills`, never a path, a query or a header -- which is the
+`https://open-api.bingx.com/exchange_fills` or `.../exchange_balances`, never a path, a query
+or a header -- which is the
 control that keeps the signature, carried in the query string, out of the log. Every
 exception is built by the taxonomy; the `httpx.LocalProtocolError`, `httpx.DecodingError` and
 `httpx.TransportError` arms are Bitget's, for Bitget's reasons.
@@ -1738,6 +1843,79 @@ exception is built by the taxonomy; the `httpx.LocalProtocolError`, `httpx.Decod
 outside this code with `openssl dgst -sha256 -hmac 'SECRET_KEY' -hex`: V3's own recipe run
 verbatim, and the exact request this provider sends for a fixed clock and window. The fake venue
 in the tests also re-verifies every request's signature over the bytes it received.
+
+#### The balance read (#104)
+
+`BingXProvider.fetch_balances()` reads the spot account's balances with the same key, and
+`bingx.parse_balances(balances)` is the pure function behind it.
+
+**Confirmed against BingX's documentation on 2026-10-01, and against nothing else. Nobody
+has called this endpoint with a real key**: the owner's probes of 2026-09-26 and 2026-09-27
+asked about fills only. So this subsection has one source column where the fills table has
+two, and none of it has the standing of a fact the probe saw.
+
+| Fact | Documentation | Used here |
+|---|---|---|
+| endpoint | `GET /openApi/spot/v1/account/balance` on `https://open-api.bingx.com`, "Query Assets", signed, for master and sub accounts (V3) | yes |
+| key permission | "API Key Permission: Read" (V3) | the key's default |
+| rate limit | `5/second` per UID, and an IP limit of `3` (V3: the bundle's `rate-limitation` and `ip-rate-limitation`). The vendor's reference: "5/s per UID; 3/s per IP" | the transport's one request a second per host is under both |
+| parameters | `timestamp` required, `recvWindow` optional (V3). The page's two descriptions are swapped, and its sample sends a `recvWindow` of `60000` where the vendor's reference caps it at 5000 | `timestamp` alone; no `recvWindow`, as for fills |
+| envelope | `{code, msg, debugMsg, data: {balances: [...]}}`, code 0 on success (V3) | the fills envelope, with `balances` for `fills` |
+| entry fields | the response table lists only `balances`, an array; the entries are the sample's, `{asset, free, locked}`, **all three strings** (V3). The vendor's reference types all three `string`: `free` the available balance, `locked` the locked one | `free + locked` |
+| the amounts | the sample's `locked` is `"244.18616265388994"`: **seventeen significant digits, float noise**, as `quoteQty`'s sample is. Its integers reach fifteen digits | decoded, below |
+| zero balances | the sample lists an asset whose `free` and `locked` are both `"0"` | dropped |
+| the fund account | "Query Fund Account Assets", `GET /openApi/fund/v1/account/balance`, 2 a second, an optional `asset`, and **the same sample response, digit for digit** (V3) | **not read**, below |
+
+Sources, each read on 2026-10-01:
+
+- V3, "Query Assets" (Spot, Account Endpoints):
+  https://bingx-api.github.io/docs-v3/#/en/Spot/Account%20Endpoints/Query%20Assets , in the
+  bundle `static/js/app.8bc50bc0c8a6a308c3e4.js` of https://github.com/BingX-API/docs-v3 --
+  the bundle the fills section was read from, last committed on 2026-09-19. The bundle holds
+  the page twice, alike except for which error-code table each links.
+- V3, "Query Fund Account Assets": the same bundle.
+- The vendor's reference, https://github.com/BingX-API/api-ai-skills ,
+  `skills/spot-account/api-reference.md` and `skills/fund-account/api-reference.md`. It is
+  BingX's own repository, and it is cited for the two things the V3 page leaves out: the
+  entry fields' types, and the IP limit's unit.
+
+**Not established, and designed around:**
+
+| Not established | What the provider does |
+|---|---|
+| whether the **spot account and the fund account are one account or two** | **reads the spot endpoint only.** The two pages show the same sample, and the vendor's reference calls the spot endpoint's account "the fund (spot) account", which suggests one. Nothing states it. Reading both could count the same units twice; reading one can only read too low, which is the safe side |
+| that **the venue holds no balance finer than 18 decimal places** | decodes the float noise away, below, and refuses what is still finer. A balance held to 18 places or coarser is always recovered: below `0.0001` it has at most fourteen significant digits, and the decode keeps fifteen. One the venue really holds finer -- below `0.0001` with fifteen real significant digits, which is nineteen places or more -- **fails the whole balance read with `schema`**, on every run, until a rule is written from a real answer. The provider does not round to the column |
+| whether a backend failure can arrive as **an empty success** | a missing, `null` or non-array `balances` is refused. `balances: []` cannot be told from an empty account and reads as one. The 2026-09-05 changelog entry above is why this is listed; it under-reads, which is the safe side |
+| whether a **demo or virtual token** can be listed with a balance | the sample lists `VST`, at zero. Nothing is excluded by name. If a real account reports one above zero, it shows in the holdings check as held with no history, and the first real case gets a rule |
+| that a balance's `asset` is spelled as a fill's base asset is | takes it as reported, no case changed, and holds it to the base-asset rule. A different spelling would split one asset in two in the comparison, visibly |
+| which error codes are specific to this endpoint | none is added. One copy of the page links the Spot error table, which the map was built from; the other links the Account / Wallet / Agent table, which was not read for this section. An unmapped code on a 200 is a `schema` error, which is loud |
+
+**Decisions.**
+
+- **The request** is `GET /openApi/spot/v1/account/balance?timestamp=<ms>&signature=<hex>`:
+  `timestamp` is the only key, so it is trivially in ASCII order, the signature is
+  `hmac_sha256_hex(secret, "timestamp=<ms>")` appended last, and the key goes in
+  `X-BX-APIKEY`. It is the fills recipe with nothing changed, built by the same method. It
+  is labelled `exchange_balances`.
+- **The asset is the venue's spelling**, held to the rule a fill's base asset is: 1 to 40
+  characters, no whitespace, no Unicode `C*` character. A fill's `base_asset` is what
+  precedes the last hyphen of its symbol, as reported, so the two meet under one name.
+- **`free` and `locked` are decoded from binary floats**, each on its own, with
+  `from_binary_float`: the rule and the reason are `quoteQty`'s, above. Without it one
+  entry such as `"0.000012340000000000001"` -- twenty-one places -- is finer than
+  `FILL_SCALE` and fails the whole read, every run. With it that entry is `0.00001234`. The
+  cost is the stated one: a part that truly needed sixteen significant digits is moved by at
+  most half a unit in the fifteenth, which is twelve orders of magnitude inside the one
+  percent the comparison tolerates. Bitget's amounts are exact strings and are not decoded.
+- **The total is `free + locked`**, added with `domain.money.add`, which is exact. Both are
+  required. Each goes through `require_fill_amount`, so a JSON number is accepted as a
+  string is.
+- **A negative part is refused**, each on its own, after the decode and before the sum.
+- **Classification is the fills call's.** `unwrap_envelope` takes a `member` -- `"fills"` by
+  default, `"balances"` here -- and is otherwise the same function, with the same map: a
+  success is HTTP 200, code `0`, and a `data` object holding that array.
+- **Logging.** `https://open-api.bingx.com/exchange_balances`, and nothing else: the
+  signature is in the query string here too. No message names an asset or an amount.
 
 ### Not confirmed, and who confirms it
 
@@ -1761,7 +1939,7 @@ owner's first sync with #15 is the first run of the provider itself against the 
 | `RETENTION_MARGIN` of five minutes is enough | **not measurable without a key.** "The last three months" in `40704` may be 89 days; if so the oldest window is refused as `ExchangeRetentionWindowError` and #15 steps it a day later (`RETENTION_STEP`, itself a guess) | not measured: what BingX answers past its retention is unknown, and nothing maps to the retention error | the owner's first sync |
 | whether `startTime` and `endTime` are inclusive, and the order within a page | **not documented**, and made not to matter: the window is widened and filtered, the cursor is the smallest id | **both inclusive**, by the probe, with and without a symbol; ascending by time. The cursor is the newest fill by value, so the order within a page does not matter. Which fills a capped page keeps does matter, and it is the oldest in range (the third probe, 2026-09-27) | -- |
 | the sign of a fee, and the fields of a fee paid in BGB | **not documented**. A positive fee and a BGB deduction are refused loudly | negative for a fee paid, by the sample and the probe; a positive `commission` is refused loudly | the first real fill that shows either |
-| `FILL_SCALE` of 18 covers every fee a venue reports; a 19th place fails its page loudly | unmeasured | float noise past it is expected, and `from_binary_float` removes it from `commission` and `quoteQty` | whichever venue meets it |
+| `FILL_SCALE` of 18 covers every fee a venue reports; a 19th place fails its page loudly | unmeasured | float noise past it is expected, and `from_binary_float` removes it from a fill's `commission` and `quoteQty`, and from a balance's `free` and `locked` | whichever venue meets it |
 | a zero `quote_quantity` for a dust trade never happens; if it does, the page fails loudly | unmeasured | unmeasured | whichever venue meets it |
 
 ### The exchange sync (#15)
@@ -1951,6 +2129,14 @@ it by returning a stale number that looks exactly like a fresh one, which is the
   history older than the probe's two weeks. The owner's first sync after trading a second symbol is
   the check, and `docs/operations.md` section 14 says how to make it. BingX reuses the
   `exchange_fills` label; it has no public endpoint, so it needs no second one.
+- **Neither balance endpoint has been called with a real key.** #104 wrote both balance
+  reads from documentation alone: Bitget's `GET /api/v2/spot/account/assets` and BingX's
+  `GET /openApi/spot/v1/account/balance`. The owner's first sync after #104 is the first
+  measurement. A surprise is a `schema` failure recorded on the balance read, which leaves
+  the fills and the account's status as they were; it is the evidence to act on. What is
+  most likely to need a rule: the float noise in BingX's amounts, whether Bitget's
+  `limitAvailable` belongs in the total, and whether BingX's fund account holds units its
+  spot answer does not. Each has a row in its venue's section.
 - **BingX's empty success.** The provider refuses every malformed empty answer, but cannot
   tell `fills: []` from a quiet window, and BingX's own changelog shows a sibling endpoint
   answering a backend failure that way until 2026-09-05. If it ever happens on `myTrades`,

@@ -68,6 +68,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from portfolio.db.models import ExchangeAccount, ExchangeFill, ExchangeSyncWindow
 from portfolio.domain.exchanges import AccountSyncStatus, ExchangeKey, FillSide
+from portfolio.repositories.exchange_sync_runs import ExchangeSyncErrorKind
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable, Sequence
@@ -136,7 +137,13 @@ _FILL_SIDES: Final = {side.value: side for side in FillSide}
 
 @dataclass(frozen=True, slots=True)
 class ExchangeAccountState:
-    """One `exchange_accounts` row, copied out of the session. See the module docstring."""
+    """One `exchange_accounts` row, copied out of the session. See the module docstring.
+
+    `balances_read_at` and `balances_error` (#104) describe the account's last balance
+    reading, not its fills: when a read last succeeded, and the kind the last attempt failed
+    with. The sync reads `balances_error` to decide whether a scheduled run may ask again;
+    `repositories/exchange_balances.py` is what writes both.
+    """
 
     id: int
     user_id: int
@@ -147,6 +154,8 @@ class ExchangeAccountState:
     planned_until: datetime | None
     last_synced_at: datetime | None
     created_at: datetime
+    balances_read_at: datetime | None
+    balances_error: ExchangeSyncErrorKind | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +282,10 @@ def _state_of(row: ExchangeAccount) -> ExchangeAccountState:
         planned_until=row.planned_until,
         last_synced_at=row.last_synced_at,
         created_at=row.created_at,
+        balances_read_at=row.balances_read_at,
+        balances_error=(
+            None if row.balances_error is None else ExchangeSyncErrorKind(row.balances_error)
+        ),
     )
 
 

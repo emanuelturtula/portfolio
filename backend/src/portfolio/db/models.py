@@ -154,6 +154,18 @@ _EXCHANGE_SYNC_RUN_ACCOUNT_ERROR_KIND_CHECK: Final = (
     "'rate_limited', 'retention_window', 'schema', 'unavailable')"
 )
 
+# Why the last attempt to read an account's balances failed (#104): the
+# `repositories.exchange_sync_runs.ExchangeSyncErrorKind` members, the vocabulary an account's
+# failed fill sync is recorded in, so that one failure means one thing wherever it is shown.
+# Nullable, because the last attempt succeeded or none was made. The same duplication hazard as
+# every constant above -- repeated verbatim in `0010_exchange_balances` -- and the same
+# reflection test.
+_EXCHANGE_ACCOUNT_BALANCES_ERROR_CHECK: Final = (
+    "balances_error IS NULL OR "
+    "balances_error IN ('auth', 'conflict', 'insufficient_scope', 'internal', "
+    "'invalid_request', 'rate_limited', 'retention_window', 'schema', 'unavailable')"
+)
+
 # The two warnings `replay` returns (#19): `NegativeInventory` and `UnattributedFee`, as the
 # `repositories.accounting.AccountingWarningKind` members, alphabetical. The same duplication
 # hazard as every constant above -- repeated verbatim in `0008_accounting` -- and the same
@@ -586,6 +598,21 @@ class ExchangeAccount(Base):
 
     None of these is compared in SQL: they are `TEXT` in SQLite, and the sync reads them into
     Python and compares there.
+
+    ## The balance reading (#104)
+
+    Two columns describe the account's rows in `exchange_balances`, and they answer different
+    questions:
+
+    * `balances_read_at` -- when a read last **succeeded**, on our clock. `NULL` until one has.
+    * `balances_error` -- the `ExchangeSyncErrorKind` the last attempt failed with, and `NULL`
+      when the last attempt succeeded or none was made.
+
+    **A failed read keeps the rows and `balances_read_at` of the last good one**, so both
+    columns can be set at once. Keeping them is a storage rule only: the reconciliation
+    compares a reading only while it is current, and a failed read's is not (spec 025, R9). They
+    are separate from `sync_status`, which describes the fills and which a failed balance read
+    never changes.
     """
 
     __tablename__ = "exchange_accounts"
@@ -594,6 +621,7 @@ class ExchangeAccount(Base):
         # Named, because a batch rebuild cannot re-create an anonymous CHECK.
         CheckConstraint(_EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK, name="exchange_key"),
         CheckConstraint(_EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK, name="sync_status"),
+        CheckConstraint(_EXCHANGE_ACCOUNT_BALANCES_ERROR_CHECK, name="balances_error"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -615,6 +643,55 @@ class ExchangeAccount(Base):
     effective_since: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     planned_until: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     last_synced_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    balances_read_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    balances_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ExchangeBalance(Base):
+    """What one exchange account's spot account held of one asset, at its last good reading.
+
+    **One reading per account, replaced whole** (#104). A successful balance read deletes the
+    account's rows and inserts the new ones in one transaction, so the rows of an account are
+    always one answer from the venue and never a mix of two. There is no history of balances:
+    `exchange_accounts.balances_read_at` says when the rows were read, and that is all the
+    comparison with the replayed history needs.
+
+    **Derived data, like a snapshot**: the venue is the source and the next sync reads it
+    again, so the rows cascade from the account. The fills are the history, and they
+    `RESTRICT`.
+
+    `quantity` is the total the venue reports for the asset in its **spot** account, at
+    `NumericText(FILL_SCALE)` -- the scale of the fills it is compared against, and one
+    `providers.exchanges.base.AssetBalance` refuses to exceed, so nothing is rounded on the way
+    in. A zero balance has no row. **It carries no `CHECK` and is never summed, compared or
+    ordered in SQL**, for the reason `ExchangeFill` gives: the column is `TEXT`, and SQLite
+    would compare it by numeric affinity. The sums are `domain.money.add`'s, in Python.
+
+    `asset` is the venue's name for it, spelled as that venue's fills spell it, which is what
+    lets a balance and a position meet under one key.
+
+    `UNIQUE (exchange_account_id, asset)`: one total per asset. It leads with the account, so
+    it also serves the only read there is and the cascade.
+    """
+
+    __tablename__ = "exchange_balances"
+    __table_args__ = (
+        UniqueConstraint(
+            "exchange_account_id",
+            "asset",
+            name="uq_exchange_balances_account_asset",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No index of its own: the unique constraint leads with it.
+    exchange_account_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("exchange_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    asset: Mapped[str] = mapped_column(Text, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(NumericText(FILL_SCALE), nullable=False)
 
 
 class ExchangeFill(Base):

@@ -42,6 +42,18 @@ provider has to undo, and the test's expectation would share it.
 `BTC-USDT` and gives the two fills of each pair the same `id`, because spec 017 infers ids are
 per symbol and a provider that did not namespace them would silently merge two fills.
 
+**The balance endpoint is a second route on the same fake (#104, spec 025).** Its path is
+the documented one, written here as a literal; a balance request is verified exactly as a
+fills request is, by the same function over the bytes it carried, and is recorded apart from
+the fills requests, so `requests`, `queries()` and `params()` still mean the fills requests
+and a test can say "no fills request was made" or "exactly one balance request was". The
+answer is rendered by hand too: an entry is a `VenueBalance` whose fields are overridden
+with raw JSON fragments, or a raw fragment itself, so a test can send a bare number, a
+`null`, a `true`, an entry with a field missing, or an element that is not an object.
+**The fund-account endpoint is not answered**: spec 025 reads the spot account only, and a
+request to `/openApi/fund/v1/account/balance` is an `AssertionError` out of the handler,
+which no provider code catches, so it fails whatever test caused it.
+
 **Nothing here sleeps, and nothing reads a clock.** The provider's clock is injected
 (`FixedClock`), and the client is `tests/providers/harness.py`'s, whose sleep and jitter are
 injected too.
@@ -71,7 +83,7 @@ from tests.providers.harness import RecordingSleep, retrying_client
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
-    from portfolio.providers.exchanges.base import FillPage
+    from portfolio.providers.exchanges.base import AssetBalance, FillPage
 
 # --------------------------------------------------------------------------------------
 # What BingX documents, written down rather than read off the provider
@@ -81,6 +93,13 @@ BINGX_HOST: Final = httpx.URL(BINGX_API_URL).host
 
 #: Query transaction details, V3 and V1 alike (read 2026-09-26).
 DOCUMENTED_FILLS_PATH: Final = "/openApi/spot/v1/trade/myTrades"
+
+#: Query Assets, spot account (V3, read 2026-10-01; spec 025). The one balance endpoint read.
+DOCUMENTED_BALANCES_PATH: Final = "/openApi/spot/v1/account/balance"
+
+#: Query Fund Account Assets (V3). Documented, and deliberately **not** answered here: only
+#: the spot account is read, because reading both could count the same units twice.
+FUND_ACCOUNT_BALANCES_PATH: Final = "/openApi/fund/v1/account/balance"
 
 #: The one credential header, as the V3 signature page spells it.
 KEY_HEADER: Final = "X-BX-APIKEY"
@@ -253,6 +272,57 @@ HTML_BODY: Final = "<html><head><title>502 Bad Gateway</title></head><body>nginx
 
 
 # --------------------------------------------------------------------------------------
+# Balances, rendered by hand
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class VenueBalance:
+    """One entry of `data.balances`, rendered in the documented field order.
+
+    The three documented fields are JSON strings (V3: `{asset, free, locked}`, all strings),
+    so each is written between quotes exactly as given: an `asset` holding a JSON escape,
+    such as a backslash followed by `u0001`, reaches the parser as that escape and the body
+    stays ASCII. `overrides` replaces a field with a raw JSON fragment -- `{"free": "1.5"}`
+    is the bare number, `{"free": "null"}` a null -- or removes it with `None`, and a key
+    the venue does not document is appended. No amount is ever a Python number: a body
+    built by serialising a `float` would have been through the conversion the provider has
+    to undo.
+    """
+
+    asset: str = "BTC"
+    free: str = "0"
+    locked: str = "0"
+    overrides: Mapping[str, str | None] = field(default_factory=dict)
+
+
+def render_balance(balance: VenueBalance) -> str:
+    """The balance entry as the documented sample lays one out, as text."""
+    fields: dict[str, str] = {
+        "asset": f'"{balance.asset}"',
+        "free": f'"{balance.free}"',
+        "locked": f'"{balance.locked}"',
+    }
+    for name, fragment in balance.overrides.items():
+        if fragment is None:
+            fields.pop(name, None)
+        else:
+            fields[name] = fragment
+    return _render_object(fields)
+
+
+def balances_fragment(entries: Sequence[VenueBalance | str]) -> str:
+    """The `data.balances` array as text. A `str` entry is a raw JSON fragment, sent as it is."""
+    rendered = [entry if isinstance(entry, str) else render_balance(entry) for entry in entries]
+    return "[" + ",".join(rendered) + "]"
+
+
+def balances_body(entries: Sequence[VenueBalance | str]) -> str:
+    """A successful balance answer carrying exactly `entries`, in the order given."""
+    return envelope('{"balances":' + balances_fragment(entries) + "}")
+
+
+# --------------------------------------------------------------------------------------
 # The venue
 # --------------------------------------------------------------------------------------
 
@@ -305,6 +375,12 @@ class FakeBingX:
     entry repeats -- for statuses, refusals and bodies no honest venue would compute.
     Verification still runs first, so a scripted answer is only reached by a request that
     was correctly signed.
+
+    **Query Assets is answered too** (#104): from `balances`, the entries the spot account
+    is said to hold, or from `balance_replies`, a scripted sequence with the same rules as
+    `replies`. The two endpoints keep separate scripts and separate records, so a sync that
+    reads fills and then balances through one fake has each answered on its own terms. A
+    fake built with neither answers an empty account, which is the documented shape of one.
     """
 
     def __init__(
@@ -316,6 +392,8 @@ class FakeBingX:
         replies: Sequence[Reply] = (),
         signing_key: str = SIGNING_SENTINEL,
         access_key: str = ACCESS_KEY_SENTINEL,
+        balances: Sequence[VenueBalance | str] = (),
+        balance_replies: Sequence[Reply] = (),
     ) -> None:
         self.fills = tuple(fills)
         self.silent_cap = silent_cap
@@ -323,10 +401,18 @@ class FakeBingX:
         self._replies = tuple(replies)
         self._signing_key = signing_key
         self._access_key = access_key
-        #: Every request, in order.
+        self.balances = tuple(balances)
+        self._balance_replies = tuple(balance_replies)
+        #: Every request to either endpoint, in order: the fills and the balance requests.
+        self.all_requests: list[httpx.Request] = []
+        #: Every fills request, in order. A balance request is never in this list.
         self.requests: list[httpx.Request] = []
-        #: The requests that verified, in order.
+        #: The fills requests that verified, in order.
         self.verified: list[httpx.Request] = []
+        #: Every balance request, in order. A fills request is never in this list.
+        self.balance_requests: list[httpx.Request] = []
+        #: The balance requests that verified, in order.
+        self.balance_verified: list[httpx.Request] = []
         #: What was wrong with each request that did not verify.
         self.signature_failures: list[str] = []
         #: The fills each computed answer carried, in the order served.
@@ -335,6 +421,16 @@ class FakeBingX:
     # -- routing -------------------------------------------------------------------------
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        self.all_requests.append(request)
+        if request.url.host == BINGX_HOST:
+            if request.url.path == FUND_ACCOUNT_BALANCES_PATH:
+                message = (
+                    "the provider called the fund-account balance endpoint, which is not "
+                    "read: only the spot account is (spec 025)"
+                )
+                raise AssertionError(message)
+            if request.url.path == DOCUMENTED_BALANCES_PATH:
+                return self._answer_balances(request)
         self.requests.append(request)
         if request.url.host != BINGX_HOST:  # pragma: no cover - a bug in a test or the source
             message = f"the provider called an unscripted host: {request.url.host}"
@@ -353,6 +449,19 @@ class FakeBingX:
         page = self._page_for(request.url.params)
         self.served.append(tuple(page))
         return httpx.Response(200, content=fills_body(page))
+
+    def _answer_balances(self, request: httpx.Request) -> httpx.Response:
+        """Query Assets: verified exactly as a fills request is, then scripted or computed."""
+        self.balance_requests.append(request)
+        failure = self.verification_failure(request)
+        if failure is not None:
+            self.signature_failures.append(failure)
+            return httpx.Response(200, content=error_body(100001, "Signature verification failed"))
+        self.balance_verified.append(request)
+        if self._balance_replies:
+            index = min(len(self.balance_verified), len(self._balance_replies)) - 1
+            return self._balance_replies[index].respond()
+        return httpx.Response(200, content=balances_body(self.balances))
 
     # -- verification --------------------------------------------------------------------
 
@@ -414,12 +523,16 @@ class FakeBingX:
     # -- what a test reads ---------------------------------------------------------------
 
     def queries(self) -> list[str]:
-        """The raw query of every request, as the bytes arrived, in order."""
+        """The raw query of every fills request, as the bytes arrived, in order."""
         return [request.url.query.decode("ascii") for request in self.requests]
 
     def params(self) -> list[dict[str, str]]:
-        """The query of every request, parsed, in order."""
+        """The query of every fills request, parsed, in order."""
         return [dict(request.url.params) for request in self.requests]
+
+    def balance_queries(self) -> list[str]:
+        """The raw query of every balance request, as the bytes arrived, in order."""
+        return [request.url.query.decode("ascii") for request in self.balance_requests]
 
     def start_times(self) -> list[int]:
         return [int(params["startTime"]) for params in self.params()]
@@ -494,6 +607,18 @@ async def fetch_page(
     async with bingx_client(fake) as client:
         provider = bingx_provider(client, clock=clock, credentials=credentials)
         return await provider.fetch_fill_page(window, cursor=cursor, symbol=None)
+
+
+async def fetch_balances(
+    fake: FakeBingX,
+    *,
+    clock: Callable[[], datetime] | None = None,
+    credentials: Credentials | None = None,
+) -> Sequence[AssetBalance]:
+    """One `fetch_balances` against the fake, on a client opened and closed around it."""
+    async with bingx_client(fake) as client:
+        provider = bingx_provider(client, clock=clock, credentials=credentials)
+        return await provider.fetch_balances()
 
 
 #: The most pages `walk` follows before calling the pagination a loop. Far above any walk a

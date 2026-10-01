@@ -106,6 +106,7 @@ __all__ = [
     "ENDPOINT_EXTENSION",
     "ENDPOINT_LABEL",
     "ENDPOINT_LABELS",
+    "EXCHANGE_BALANCES",
     "EXCHANGE_FILLS",
     "EXCHANGE_SYMBOL",
     "HTTP_ERROR_FLOOR",
@@ -280,6 +281,25 @@ operator needs to tell a sync failure from a market-data failure -- and nothing 
 account it was or which page.
 """
 
+EXCHANGE_BALANCES: Final = "exchange_balances"
+"""A signed read of what an account's spot account holds, at either venue.
+
+Bitget's `GET /api/v2/spot/account/assets` and BingX's `GET /openApi/spot/v1/account/balance`
+both use it, for the reason `EXCHANGE_FILLS` is one label for both: the host already says
+which venue it was.
+
+Separate from `EXCHANGE_FILLS` because the two fail separately and mean different things
+when they do. A failed fills read stops an account's sync. A failed balance read stops
+nothing: the sync's outcome stands, and the holdings check goes without that venue (#104).
+An operator reading `https://<host>/exchange_balances` beside a failure knows which of the
+two it was.
+
+It is signed exactly as a fills request is, so everything `EXCHANGE_FILLS` says about what
+must not reach a log holds here: BingX's signature is in the query string, and the label is
+all that is logged of either request. It says nothing of which assets were answered, or how
+many.
+"""
+
 EXCHANGE_SYMBOL: Final = "exchange_symbol"
 """An unsigned read of what one pair is made of: Bitget's `GET /api/v2/spot/public/symbols`.
 
@@ -296,6 +316,7 @@ ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
         ASSET_PRICE,
         ASSET_PRICES,
         BLOCK_TIP_HEIGHT,
+        EXCHANGE_BALANCES,
         EXCHANGE_FILLS,
         EXCHANGE_SYMBOL,
         NODE_HEALTH,
@@ -312,7 +333,8 @@ well it is shaped.
 
 Two labels on #7; four since #8 added Kaspa's batch read and its health report; six since
 #9 added the two price reads; eight since #13 added the exchange fills read and the symbol
-lookup beside it. The set grows one deliberate line at a time, which is the whole mechanism.
+lookup beside it; nine since #104 added the exchange balances read. The set grows one
+deliberate line at a time, which is the whole mechanism.
 
 Same shape as `PUBLIC_API_PATHS`: adding an endpoint protects it, and saying more about
 one is a visible edit to a named constant rather than a value computed at a call site.

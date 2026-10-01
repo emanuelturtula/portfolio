@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom';
 import type { UseQueryResult } from '@tanstack/react-query';
 
-import { usePositions, type Positions } from '@/api/accounting';
+import { usePositions, useReconciliation, type Positions } from '@/api/accounting';
 import { describeApiError } from '@/api/client';
 import { useExchanges, type Exchange } from '@/api/exchanges';
 import { AbsoluteTime } from '@/components/AbsoluteTime';
@@ -14,6 +14,7 @@ import {
   describeEmptyPositions,
   flagsOf,
   formatVenues,
+  heldExceedsHistoryAssets,
   isHeld,
   venuesWithFailedSync,
   type EmptyPositions,
@@ -21,6 +22,7 @@ import {
 import type { ExchangeKey } from '@/lib/exchanges';
 import { FlagLegend } from '@/pages/dashboard/FlagLegend';
 import { HistoryWarnings } from '@/pages/dashboard/HistoryWarnings';
+import { HoldingsCheck } from '@/pages/dashboard/HoldingsCheck';
 import { InvestedSummary } from '@/pages/dashboard/InvestedSummary';
 import { PositionTable } from '@/pages/dashboard/PositionTable';
 
@@ -141,10 +143,17 @@ interface PositionsViewProps {
 /**
  * The section when there are positions: how the figures were computed, what to distrust
  * about them, the summary, the held positions and what the history could not account for.
+ *
+ * It reads the holdings check as well, only to mark the positions whose balances exceed their
+ * history: a badge on a held row, and a label in the line for those no longer held. The query
+ * is the block's own - one request, shared - and until it has an answer the set is empty and
+ * nothing is marked: a marker is never drawn from a reading that is not there.
  */
 function PositionsView({ data, computedAt, failedVenues }: PositionsViewProps) {
+  const reconciliation = useReconciliation();
   const held = data.positions.filter(isHeld);
   const closed = data.positions.filter((position) => !isHeld(position));
+  const heldExceedsHistory = heldExceedsHistoryAssets(reconciliation.data);
 
   return (
     <>
@@ -177,9 +186,15 @@ function PositionsView({ data, computedAt, failedVenues }: PositionsViewProps) {
         positions={held}
         excluded={data.totals.excluded}
         quoteCurrency={data.quote_currency}
+        heldExceedsHistory={heldExceedsHistory}
       />
-      {closed.length > 0 && <p>{describeClosedPositions(closed)}</p>}
-      <FlagLegend flags={flagsOf(data.positions)} />
+      {closed.length > 0 && <p>{describeClosedPositions(closed, heldExceedsHistory)}</p>}
+      <FlagLegend
+        flags={flagsOf(data.positions)}
+        heldExceedsHistory={data.positions.some((position) =>
+          heldExceedsHistory.has(position.asset),
+        )}
+      />
       {data.warnings.length > 0 && <HistoryWarnings warnings={data.warnings} />}
     </>
   );
@@ -278,6 +293,7 @@ export function InvestedSection() {
     <section aria-labelledby="invested-heading">
       <h2 id="invested-heading">Invested</h2>
       <InvestedContent positions={positions} exchanges={exchanges} />
+      <HoldingsCheck />
     </section>
   );
 }

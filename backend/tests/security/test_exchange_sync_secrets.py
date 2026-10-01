@@ -337,18 +337,21 @@ async def test_sentinel_credentials_reach_no_response_and_no_log_line(
         logging.getLogger().removeHandler(records)
 
     written = capsys.readouterr().out
-    signatures = [
-        request.headers["ACCESS-SIGN"] for fake in switching.all for request in fake.fill_requests
+    # Since #104 a successful account is followed by a balance read, signed the same way:
+    # its signature is searched for with the fills' ones.
+    signed_requests = [
+        request for fake in switching.all for request in (*fake.fill_requests, *fake.asset_requests)
     ]
+    signatures = [request.headers["ACCESS-SIGN"] for request in signed_requests]
+    balance_requests = [request for fake in switching.all for request in fake.asset_requests]
 
     # The positive companions: the credentials were really used, the scenarios really
     # happened, and the logs under search are the logs the application wrote.
     assert signatures, "no signed request reached the venue"
+    assert balance_requests, "no balance read was signed and sent, so none was searched for"
     for fake in switching.all:
         assert fake.signature_failures == [], "a request did not verify against the sentinels"
-        assert all(
-            request.headers["ACCESS-KEY"] == ACCESS_SENTINEL for request in fake.fill_requests
-        )
+    assert all(request.headers["ACCESS-KEY"] == ACCESS_SENTINEL for request in signed_requests)
     outcomes = [summary["accounts"][0] for summary in summaries]
     assert [outcome["status"] for outcome in outcomes] == [
         "success",

@@ -196,14 +196,21 @@ async def test_sentinel_bingx_credentials_reach_no_response_and_no_log_line(
         logging.getLogger().removeHandler(records)
 
     written = capsys.readouterr().out
+    # Since #104 a successful account is followed by a balance read, signed the same way:
+    # its signature is in the query string too, and is searched for with the fills' ones.
     signatures = [
-        query.rpartition("&signature=")[2] for fake in switching.all for query in fake.queries()
+        query.rpartition("&signature=")[2]
+        for fake in switching.all
+        for query in (*fake.queries(), *fake.balance_queries())
     ]
+    balance_requests = [request for fake in switching.all for request in fake.balance_requests]
 
     # The positive companions: the credentials were really used, the scenarios really
     # happened, and the logs under search are the logs the application wrote.
     assert signatures, "no signed request reached the venue"
     assert all(len(signature) == 64 for signature in signatures)
+    assert balance_requests, "no balance read was signed and sent, so none was searched for"
+    assert all(request.headers["X-BX-APIKEY"] == ACCESS_SENTINEL for request in balance_requests)
     for fake in switching.all:
         assert fake.requests, "a scenario's venue was never asked"
         assert fake.signature_failures == [], "a request did not verify against the sentinels"
@@ -243,5 +250,5 @@ async def test_sentinel_bingx_credentials_reach_no_response_and_no_log_line(
         assert_no_window(text, list(SENTINELS), where=where)
         assert_no_window(text, signatures, where=where, size=SIGNATURE_WINDOW)
         assert ECHO not in text
-        for fragment in ("myTrades", "signature=", "startTime="):
+        for fragment in ("myTrades", "signature=", "startTime=", "account/balance", "timestamp="):
             assert fragment not in text, f"{fragment!r} of a request reached {where}"

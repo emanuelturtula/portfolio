@@ -102,6 +102,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/accounting/reconciliation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Each asset's replayed quantity beside the balances held, and the sources read
+         * @description Compare what the history says is held with the balances read, per asset.
+         *
+         *     **Per asset**: the quantity the cost-basis snapshot holds, the quantity read from the
+         *     wallets and from the exchange accounts, their difference, and whether it is a `match`, a
+         *     `history_short` -- more is held than the history accounts for, which usually means buys
+         *     are missing from it -- or a `history_over`. **Per source**: when each exchange account's
+         *     balances were last read, why the last attempt failed, and why the account was left out if
+         *     it was; and how many wallets were compared, how many had a reading too old, and how many
+         *     were never read. Only a reading at most `max_reading_age_hours` old is compared. Every
+         *     quantity is a JSON string.
+         *
+         *     The balances are the ones the syncs stored: nothing is read from a chain or a venue here.
+         *     With no snapshot yet the answer is still `200`, with `computed_at: null` and no assets.
+         *     `last_recompute` says whether the snapshot compared is current, as on the positions.
+         */
+        get: operations["readReconciliation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/login": {
         parameters: {
             query?: never;
@@ -757,6 +790,52 @@ export interface components {
             updated_at: string;
         };
         /**
+         * AssetReconciliationResponse
+         * @description One asset: what the history says is held, what was read as held, and how they compare.
+         *
+         *     * `history_quantity` is the replayed position's quantity.
+         *     * `wallet_quantity` and `exchange_quantity` are what the wallets and the exchange accounts
+         *       with a current reading were read as holding, and `held_quantity` their sum. A source
+         *       that was left out adds nothing to them.
+         *     * `difference` is `held_quantity - history_quantity`, signed.
+         *     * `status` is `match` when the difference is within `tolerance_pct` percent of the larger
+         *       side; otherwise `history_short` when more is held than the history accounts for --
+         *       usually buys missing from it, and for a while coins in transit between two readings --
+         *       and `history_over` when the history accounts for more than was read, which coins held
+         *       elsewhere, a withdrawal, an unrecorded fee and a sale the import did not see all
+         *       produce, and the check cannot tell apart.
+         */
+        AssetReconciliationResponse: {
+            /** Asset */
+            asset: string;
+            /**
+             * Difference
+             * @example 1234.56789012
+             */
+            difference: string;
+            /**
+             * Exchange Quantity
+             * @example 1234.56789012
+             */
+            exchange_quantity: string;
+            /**
+             * Held Quantity
+             * @example 1234.56789012
+             */
+            held_quantity: string;
+            /**
+             * History Quantity
+             * @example 1234.56789012
+             */
+            history_quantity: string;
+            status: components["schemas"]["ReconciliationStatus"];
+            /**
+             * Wallet Quantity
+             * @example 1234.56789012
+             */
+            wallet_quantity: string;
+        };
+        /**
          * ChainKey
          * @description Every chain balances can be read from.
          *
@@ -831,6 +910,27 @@ export interface components {
             status: components["schemas"]["AccountOutcomeStatus"];
             /** Windows Completed */
             windows_completed: number;
+        };
+        /**
+         * ExchangeBalancesResponse
+         * @description How one exchange account's balances stand as a source of the comparison.
+         *
+         *     `balances_read_at` is when a read last succeeded, `null` when none ever has.
+         *     `balances_error` is the kind the last attempt failed with, `null` when it succeeded or none
+         *     was made.
+         *
+         *     `not_compared_reason` is `null` when the account's balances are in the comparison. Otherwise
+         *     they are **not**, whatever was last read, and it says why: `read_failed` (the last read
+         *     failed), `never_read`, `sync_failed` (the account's fill sync is not `ok`, so nothing is
+         *     refreshing the reading) or `out_of_date` (the reading is older than
+         *     `max_reading_age_hours`). The first that applies, in that order.
+         */
+        ExchangeBalancesResponse: {
+            balances_error: components["schemas"]["ExchangeSyncErrorKind"] | null;
+            /** Balances Read At */
+            balances_read_at: string | null;
+            exchange_key: components["schemas"]["ExchangeKey"];
+            not_compared_reason: components["schemas"]["NotComparedReason"] | null;
         };
         /**
          * ExchangeFillAssetTotalsResponse
@@ -1307,6 +1407,23 @@ export interface components {
             username: string;
         };
         /**
+         * NotComparedReason
+         * @description Why an exchange account's balances are left out of the comparison. Its wire form.
+         *
+         *     Declared in the order they are tested, and the first that applies is the answer:
+         *
+         *     * `READ_FAILED` -- the last balance read failed (`balances_error` is set). The rows kept
+         *       are the reading before the failure, and nothing says the coins are still there.
+         *     * `NEVER_READ` -- no balance read has ever succeeded, so there are no rows.
+         *     * `SYNC_FAILED` -- the account's fill sync is not `ok`: it failed, or the key was refused
+         *       and scheduled runs skip the account. Balances are read only after a successful fill
+         *       sync, so the reading has stopped being refreshed.
+         *     * `OUT_OF_DATE` -- the reading is more than `MAX_READING_AGE` old with nothing above to
+         *       explain it: the timer is off, or the credentials were removed after the read.
+         * @enum {string}
+         */
+        NotComparedReason: "read_failed" | "never_read" | "sync_failed" | "out_of_date";
+        /**
          * PasswordChangeRequest
          * @description A password change, which revokes every session including the caller's own.
          */
@@ -1436,6 +1553,53 @@ export interface components {
          * @enum {string}
          */
         RecomputeOutcome: "unchanged" | "written" | "failed";
+        /**
+         * ReconciliationResponse
+         * @description The replayed quantities beside the balances read, per asset, and every source's state.
+         *
+         *     `computed_at` is the cost-basis snapshot's, and `null` before the first one -- and then
+         *     `assets` is empty: nothing has been compared, which is not the same as nothing matching.
+         *     `exchanges` and `wallets` are answered either way. `tolerance_pct` is the percentage, as a
+         *     string, at or under which a difference counts as a match. `assets` is sorted by asset and
+         *     leaves the cash assets out; `exchanges` lists every account, by `exchange_key`, compared
+         *     or not.
+         *
+         *     `max_reading_age_hours` is how old a wallet's or a venue's reading may be and still be
+         *     compared. `last_recompute` is the last recompute attempt since the process started, exactly
+         *     as `GET /api/accounting/positions` serves it. It is `null` after a restart until the startup
+         *     recompute ends, and the stored snapshot is compared meanwhile. When its outcome is
+         *     `failed`, the snapshot compared here is older than the balances beside it, and an asset
+         *     bought since shows as missing from the history.
+         */
+        ReconciliationResponse: {
+            /** Assets */
+            assets: components["schemas"]["AssetReconciliationResponse"][];
+            /** Computed At */
+            computed_at: string | null;
+            /** Exchanges */
+            exchanges: components["schemas"]["ExchangeBalancesResponse"][];
+            last_recompute: components["schemas"]["LastRecomputeResponse"] | null;
+            /** Max Reading Age Hours */
+            max_reading_age_hours: number;
+            /**
+             * Tolerance Pct
+             * @example 1234.56789012
+             */
+            tolerance_pct: string;
+            wallets: components["schemas"]["WalletsReadResponse"];
+        };
+        /**
+         * ReconciliationStatus
+         * @description How one asset's history compares with what was read as held. The member is its wire form.
+         *
+         *     * `MATCH` -- the two agree within `RECONCILIATION_TOLERANCE_PCT`.
+         *     * `HISTORY_SHORT` -- more is held than the history accounts for: a finding.
+         *     * `HISTORY_OVER` -- the history accounts for more than was read as held: shown, and not a
+         *       finding, because coins held elsewhere produce it as readily as a sale the import did not
+         *       see. See the module docstring for why the two are not symmetric.
+         * @enum {string}
+         */
+        ReconciliationStatus: "match" | "history_short" | "history_over";
         /**
          * SessionResponse
          * @description Who the caller is. Deliberately the only thing a session read discloses.
@@ -1778,6 +1942,25 @@ export interface components {
             /** Label */
             label?: string | null;
         };
+        /**
+         * WalletsReadResponse
+         * @description How the active wallets stand as a source of the comparison. The counts add up to all.
+         *
+         *     `compared` wallets have a reading at most `max_reading_age_hours` old, and are in the
+         *     comparison. `stale` ones have an older reading and `unread` ones have none; neither adds
+         *     anything, so their coins are missing from it. `oldest_observed_at` is the oldest reading
+         *     among the `compared` ones, `null` when none is compared.
+         */
+        WalletsReadResponse: {
+            /** Compared */
+            compared: number;
+            /** Oldest Observed At */
+            oldest_observed_at: string | null;
+            /** Stale */
+            stale: number;
+            /** Unread */
+            unread: number;
+        };
     };
     responses: never;
     parameters: never;
@@ -1922,6 +2105,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PositionsResponse"];
+                };
+            };
+        };
+    };
+    readReconciliation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReconciliationResponse"];
                 };
             };
         };

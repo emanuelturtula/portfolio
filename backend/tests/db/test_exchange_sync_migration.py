@@ -39,6 +39,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from portfolio.db.alembic_config import MIGRATIONS_DIR, build_alembic_config, upgrade_to_head
 from portfolio.db.migrations.versions import v0007_exchange_sync
 from portfolio.db.models import (
+    _EXCHANGE_ACCOUNT_BALANCES_ERROR_CHECK,
     _EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK,
     _EXCHANGE_SYNC_RUN_ACCOUNT_ERROR_KIND_CHECK,
     _EXCHANGE_SYNC_RUN_ACCOUNT_STATUS_CHECK,
@@ -376,6 +377,9 @@ def test_the_new_check_constraints_match_the_models(database_url: str, sync_engi
         "exchange_accounts": {
             "ck_exchange_accounts_exchange_key": "exchange_key IN ('bingx', 'bitget')",
             "ck_exchange_accounts_sync_status": _EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK,
+            # #104 rebuilt the table again for the balance columns. The two above survived
+            # that rebuild, which is what this entry being the only new one shows.
+            "ck_exchange_accounts_balances_error": _EXCHANGE_ACCOUNT_BALANCES_ERROR_CHECK,
         },
         "exchange_sync_runs": {
             "ck_exchange_sync_runs_trigger": _SYNC_RUN_TRIGGER_CHECK,

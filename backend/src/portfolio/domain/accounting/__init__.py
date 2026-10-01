@@ -13,6 +13,9 @@ configuration always give the same result, and the same `input_fingerprint`.
 `value_position` and `value_portfolio` (#19) combine a position with a current price. They
 are here rather than in the service that looks the price up so that the arithmetic is held to
 the engine's exactness rules and its coverage floor; see `valuation`.
+
+`reconcile` (#104) compares the replayed quantities with the balances read from the wallets
+and the venues, which is what shows a buy the history never held; see `reconciliation`.
 """
 
 from portfolio.domain.accounting.constants import (
@@ -33,6 +36,12 @@ from portfolio.domain.accounting.events import (
     trade_shape_problem,
 )
 from portfolio.domain.accounting.fingerprint import event_kind
+from portfolio.domain.accounting.reconciliation import (
+    RECONCILIATION_TOLERANCE_PCT,
+    AssetReconciliation,
+    ReconciliationStatus,
+    reconcile,
+)
 from portfolio.domain.accounting.replay import ConflictingEventError, replay
 from portfolio.domain.accounting.results import (
     AccountingResult,
@@ -61,11 +70,13 @@ __all__ = [
     "ENGINE_VERSION",
     "METHOD",
     "QUANTITY_SCALE",
+    "RECONCILIATION_TOLERANCE_PCT",
     "RETURN_PCT_SCALE",
     "VALUE_SCALE",
     "AccountingConfig",
     "AccountingResult",
     "Adjustment",
+    "AssetReconciliation",
     "ConflictingEventError",
     "EventKey",
     "Exclusion",
@@ -76,12 +87,14 @@ __all__ = [
     "Position",
     "PositionFlag",
     "PositionValue",
+    "ReconciliationStatus",
     "Trade",
     "TradeShapeProblem",
     "Transfer",
     "UnattributedFee",
     "ValueUnavailable",
     "event_kind",
+    "reconcile",
     "replay",
     "trade_shape_problem",
     "value_portfolio",

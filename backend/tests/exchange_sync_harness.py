@@ -28,6 +28,16 @@ statement about.
 `SimulatedPowerLoss` is a `BaseException` that is not an `Exception`: the stand-in for the
 Raspberry Pi losing power, which no `except Exception` in the application may catch.
 
+## Balances are a second, separate question (#104)
+
+`fetch_balances` answers from `balances`, through `assemble_balances`, so the venue cannot
+hand the sync a reading a real provider would be refused for. It has its own call count,
+`balance_calls`, its own fault -- `balance_fault(call_number)`, with `balance_faults_on` and
+`always_balances` for the common cases -- and its own hook, `on_balances`, run after the call
+is recorded and before it answers or fails. `page_calls_before_balances` records how many
+fill pages the venue had served when each balance read arrived, which is what "the balances
+are read after the fills" is a statement about.
+
 ## Nothing here is a real credential, address or hostname
 
 Trade ids are small integers, symbols are the documented examples, and no address appears.
@@ -44,11 +54,13 @@ from sqlalchemy import text
 
 from portfolio.domain.exchanges import ExchangeKey, FillSide
 from portfolio.providers.exchanges.base import (
+    AssetBalance,
     CursorKind,
     ExchangeCapabilities,
     ExchangeProvider,
     NormalizedFill,
     RateLimit,
+    assemble_balances,
     assemble_fill_page,
 )
 
@@ -116,6 +128,30 @@ def always(error: BaseException) -> Fault:
         return error
 
     return fault
+
+
+type BalanceFault = Callable[[int], BaseException | None]
+"""`(balance_call_number) -> exception to raise, or None`. Call numbers start at 1."""
+
+
+def balance_faults_on(by_call: Mapping[int, BaseException]) -> BalanceFault:
+    """A balance fault that raises the given exception on the given calls, and nothing else."""
+    return by_call.get
+
+
+def always_balances(error: BaseException) -> BalanceFault:
+    """A balance fault that raises `error` on every call."""
+
+    def fault(call_number: int) -> BaseException | None:
+        del call_number
+        return error
+
+    return fault
+
+
+def held(asset: str, quantity: str) -> AssetBalance:
+    """One `AssetBalance`, valid by construction. Synthetic: nobody's holdings."""
+    return AssetBalance(asset=asset, quantity=Decimal(quantity))
 
 
 def make_fill(
@@ -199,8 +235,21 @@ class SimulatedVenue:
         symbols_fault: BaseException | None = None,
         symbols_fault_times: int | None = None,
         next_cursors: Mapping[str | None, str | None] | None = None,
+        balances: Iterable[AssetBalance] = (),
+        balance_fault: BalanceFault | None = None,
     ) -> None:
         self.fills: list[NormalizedFill] = list(fills)
+        #: What the spot account holds: what `fetch_balances` answers from.
+        self.balances: list[AssetBalance] = list(balances)
+        self.balance_fault = balance_fault
+        #: How many times `fetch_balances` was asked, faults included.
+        self.balance_calls = 0
+        #: `len(self.calls)` at the moment each balance read arrived.
+        self.page_calls_before_balances: list[int] = []
+        #: A plain callable run inside every `fetch_balances` call, after it is counted and
+        #: before it answers or fails -- for a test that needs to see what the database
+        #: holds, or allows, while the venue is being asked.
+        self.on_balances: Callable[[], None] | None = None
         self.fault = fault
         self.symbols_fault = symbols_fault
         #: How many discovery calls fail before it answers; `None` is every one.
@@ -291,6 +340,20 @@ class SimulatedVenue:
             raise self.symbols_fault
         return self._symbols
 
+    async def fetch_balances(self) -> Sequence[AssetBalance]:
+        self.balance_calls += 1
+        self.page_calls_before_balances.append(len(self.calls))
+        if self.balance_calls > MAX_VENUE_CALLS:
+            message = f"the sync asked this venue for its balances {MAX_VENUE_CALLS} times"
+            raise VenueCallBudgetExceededError(message)
+        if self.on_balances is not None:
+            self.on_balances()
+        if self.balance_fault is not None:
+            error = self.balance_fault(self.balance_calls)
+            if error is not None:
+                raise error
+        return assemble_balances(self.balances)
+
     # -- what a test reads ---------------------------------------------------------------
 
     def cursors(self) -> list[str | None]:
@@ -370,6 +433,16 @@ WINDOWS_SQL: Final = (
 RUNS_SQL: Final = (
     "SELECT id, trigger, status, started_at, finished_at, duration_ms, accounts_total, "
     "accounts_succeeded, accounts_failed, accounts_skipped FROM exchange_sync_runs ORDER BY id"
+)
+BALANCES_SQL: Final = (
+    "SELECT a.exchange_key, b.asset, b.quantity FROM exchange_balances b "
+    "JOIN exchange_accounts a ON a.id = b.exchange_account_id "
+    "ORDER BY a.exchange_key, b.asset"
+)
+"""Ordered by the two text columns only: nothing here sorts or compares `quantity`."""
+BALANCE_STATE_SQL: Final = (
+    "SELECT exchange_key, sync_status, balances_read_at, balances_error "
+    "FROM exchange_accounts ORDER BY exchange_key"
 )
 OUTCOMES_SQL: Final = (
     "SELECT o.exchange_sync_run_id, a.exchange_key, o.status, o.windows_completed, o.pages, "
