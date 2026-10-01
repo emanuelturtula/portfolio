@@ -6,11 +6,14 @@ import {
   EXCHANGES,
   formatCount,
   formatRunDuration,
+  hasFailedSync,
+  isTruncated,
   OUTCOME_LABELS,
   remediationFor,
   RUN_STATUS_LABELS,
   STATUS_LABELS,
   statusLabel,
+  syncHistoryNeedsAttention,
   TRIGGER_LABELS,
   UNKNOWN_ACCOUNT_FAILURE_MESSAGE,
 } from '@/lib/exchanges';
@@ -26,6 +29,7 @@ import {
   erroredExchange,
   exchange,
   NON_AUTH_ERROR_KINDS,
+  truncatedExchange,
   unsyncedExchange,
   VENUE_NAMES,
   VENUE_VARIABLES,
@@ -411,5 +415,72 @@ describe('formatCount', () => {
     [1_234_567, '1,234,567'],
   ])('renders %i as %j', (count, expected) => {
     expect(formatCount(count)).toBe(expected);
+  });
+});
+
+describe('isTruncated', () => {
+  it('is a venue whose retention cut the requested history short', () => {
+    expect(isTruncated(truncatedExchange())).toBe(true);
+    expect(isTruncated(authFailedExchange('auth'))).toBe(true);
+  });
+
+  it('is not a venue holding its whole request, nor one with no plan yet', () => {
+    expect(isTruncated(exchange())).toBe(false);
+    expect(isTruncated(unsyncedExchange())).toBe(false);
+  });
+});
+
+describe('hasFailedSync', () => {
+  // Spec 024: error and auth_failed are failing; a venue that never synced, or is syncing,
+  // has not failed.
+  const FAILING: Readonly<Record<AccountSyncStatus, boolean>> = {
+    auth_failed: true,
+    error: true,
+    never_synced: false,
+    ok: false,
+  };
+
+  it.each(ALL_ACCOUNT_STATUSES)('%s', (status) => {
+    expect(hasFailedSync({ status })).toBe(FAILING[status]);
+  });
+});
+
+describe('syncHistoryNeedsAttention', () => {
+  // Spec 024: open when the newest run is partial, failed or interrupted, or an account is
+  // error or auth_failed; closed otherwise.
+  const NEEDS_ATTENTION: Readonly<Record<SyncRunStatus, boolean>> = {
+    failed: true,
+    interrupted: true,
+    partial: true,
+    running: false,
+    success: false,
+  };
+
+  it.each(ALL_RUN_STATUSES)('a newest run that is %s, with every account healthy', (status) => {
+    expect(syncHistoryNeedsAttention({ status }, [exchange()])).toBe(NEEDS_ATTENTION[status]);
+  });
+
+  it.each(ALL_ACCOUNT_STATUSES)('an account that is %s, under a run that succeeded', (status) => {
+    expect(syncHistoryNeedsAttention({ status: 'success' }, [{ status }])).toBe(
+      status === 'error' || status === 'auth_failed',
+    );
+  });
+
+  it('one failing account of two is enough', () => {
+    expect(
+      syncHistoryNeedsAttention({ status: 'success' }, [
+        exchange({ exchange_key: 'bingx' }),
+        erroredExchange('unavailable'),
+      ]),
+    ).toBe(true);
+  });
+
+  it('what is not known is no reason to open', () => {
+    expect(syncHistoryNeedsAttention(undefined, undefined)).toBe(false);
+    expect(syncHistoryNeedsAttention(undefined, [exchange()])).toBe(false);
+    expect(syncHistoryNeedsAttention({ status: 'success' }, undefined)).toBe(false);
+    // Either one known and bad is enough on its own.
+    expect(syncHistoryNeedsAttention({ status: 'failed' }, undefined)).toBe(true);
+    expect(syncHistoryNeedsAttention(undefined, [authFailedExchange('auth')])).toBe(true);
   });
 });

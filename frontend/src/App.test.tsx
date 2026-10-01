@@ -4,6 +4,7 @@ import { http, HttpResponse } from 'msw';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { exchange } from '@/test/exchangeFixtures';
+import { fakeAccounting } from '@/test/fakeAccounting';
 import { fakeExchanges } from '@/test/fakeExchanges';
 import { fakePortfolio, recordRequestUrls } from '@/test/fakePortfolio';
 import { currentPath, renderApp, settle, visitedPaths } from '@/test/render';
@@ -25,8 +26,13 @@ function loginFormIsShown(): boolean {
 beforeEach(() => {
   // The dashboard reads the portfolio as soon as a session exists. An empty
   // one is the first-time owner; tests that need data register their own.
-  // The exchanges page likewise, with no exchange configured.
-  server.use(...fakePortfolio().handlers, ...fakeExchanges().handlers);
+  // The exchanges page likewise, with no exchange configured, and the dashboard's invested
+  // section with a snapshot over no events.
+  server.use(
+    ...fakePortfolio().handlers,
+    ...fakeExchanges().handlers,
+    ...fakeAccounting().handlers,
+  );
 });
 
 describe('App', () => {
@@ -67,6 +73,11 @@ describe('App', () => {
     const main = await screen.findByRole('main');
     expect(
       await within(main).findByRole('heading', { name: /no wallets yet/i }),
+    ).toBeInTheDocument();
+    // The invested section below settles to its own empty state; until it has, its skeleton
+    // is a `status` of its own, and the assertion below would be about a race.
+    expect(
+      await within(main).findByRole('heading', { name: 'No trades imported yet' }),
     ).toBeInTheDocument();
     // An empty state, not a failure and not a permanent loading state.
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();

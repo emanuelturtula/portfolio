@@ -62,6 +62,7 @@ if TYPE_CHECKING:
 EXCHANGES: Final = "/api/exchanges"
 SYNC: Final = "/api/exchanges/sync"
 RUNS: Final = "/api/exchanges/runs"
+FILLS: Final = "/api/exchanges/fills"
 
 #: Words a response field may not contain, and the one field allowed to contain `key`.
 CREDENTIAL_WORDS: Final = ("key", "secret", "passphrase", "credential", "token", "signature")
@@ -188,14 +189,18 @@ def test_the_field_walk_finds_a_credential_field_in_a_planted_document() -> None
 
 
 def test_no_response_model_has_a_credential_field(app: FastAPI) -> None:
-    """The three exchange endpoints: `configured` and a status, never a key."""
+    """The four exchange endpoints: `configured` and a status, never a key.
+
+    #93 added the fourth, which serves fills: money and an order id, and no credential.
+    """
     document = app.openapi()
     exchange_paths = [path for path in document["paths"] if path.startswith(EXCHANGES)]
-    assert sorted(exchange_paths) == [EXCHANGES, RUNS, SYNC]
+    assert sorted(exchange_paths) == [EXCHANGES, FILLS, RUNS, SYNC]
 
     names = response_field_names(document, iter(exchange_paths))
 
     assert {"exchange_key", "configured", "status", "last_error", "detail", "joined"} <= names
+    assert {"order_id", "fee_asset", "usdt_unvalued_fill_count"} <= names, "the fills walked"
     assert credential_like(names, ALLOWED_EXCHANGE_FIELDS) == set()
 
 

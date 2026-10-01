@@ -258,6 +258,9 @@ money fields are the owner's holdings and returns.
    measured time. After the deploy, the startup recompute's `duration_ms` in the Pi's log
    is the measurement on the real hardware. The tech lead reads it, with the owner's
    permission, and records it in this spec.
+   *Measured on the Pi*: **53 ms**. This was the startup recompute of the image built from
+   `9fb2bfb`, on 2026-09-29, with outcome `written`, over the real fill log. The event count
+   is account detail, so it stays out of this public spec.
 9. **The endpoint requires authentication**, proved by the contract test that walks every
    route, plus a direct `401` test. `PUBLIC_API_PATHS` is unchanged.
 

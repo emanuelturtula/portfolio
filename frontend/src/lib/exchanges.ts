@@ -209,3 +209,47 @@ export function accountFailureSentence(
 ): string {
   return errorKind === null ? UNKNOWN_ACCOUNT_FAILURE_MESSAGE : errorSentence(errorKind, venue);
 }
+
+type ExchangeResponse = components['schemas']['ExchangeResponse'];
+
+/**
+ * Which venues get a truncation banner, and a truncation sentence beside the transactions:
+ * `history_truncated` with a known `effective_since`. A type guard rather than a plain
+ * predicate, so a caller can declare `effective_since: string` and never re-check a `null`
+ * this already ruled out - a second check would be a branch no fixture can reach.
+ */
+export function isTruncated(
+  exchange: ExchangeResponse,
+): exchange is ExchangeResponse & { effective_since: string } {
+  return exchange.history_truncated && exchange.effective_since !== null;
+}
+
+/**
+ * Whether the venue's last sync failed - `error` or `auth_failed` - so its latest trades may
+ * be missing. A venue that has never synced, or is syncing, has not failed.
+ */
+export function hasFailedSync(exchange: { readonly status: AccountSyncStatus }): boolean {
+  return exchange.status === 'error' || exchange.status === 'auth_failed';
+}
+
+/** The run outcomes the owner has to look at, whatever the accounts say. */
+const RUN_STATUSES_NEEDING_ATTENTION: readonly SyncRunStatus[] = [
+  'partial',
+  'failed',
+  'interrupted',
+];
+
+/**
+ * Whether the sync history should start open: the newest run ended badly, or an account is
+ * failing. `undefined` for either is "not known", which is no reason to open it. The
+ * owner's own toggle wins over this once they have made one (spec 024).
+ */
+export function syncHistoryNeedsAttention(
+  newestRun: { readonly status: SyncRunStatus } | undefined,
+  exchanges: readonly { readonly status: AccountSyncStatus }[] | undefined,
+): boolean {
+  return (
+    (newestRun !== undefined && RUN_STATUSES_NEEDING_ATTENTION.includes(newestRun.status)) ||
+    exchanges?.some(hasFailedSync) === true
+  );
+}

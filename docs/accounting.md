@@ -312,12 +312,14 @@ The engine computes; #19 keeps and serves the result (spec
   the method, the engine version, the input fingerprint, the event count, the unallocated costs
   and `computed_at`. `accounting_positions`, `accounting_lots` and `accounting_warnings` hold
   the result's three lists, every amount at eighteen places as the engine returns it. It is
-  derived data: deleting it loses nothing that a recompute cannot rebuild from the fills.
-- **Recomputed at startup and after every exchange sync that stored a fill**, and skipped when
-  the fingerprint is unchanged. A new engine version changes every fingerprint, so an upgrade
-  always recomputes. A stored fill that cannot become a trade fails the recompute and leaves
-  the previous snapshot in place, rather than being skipped. `docs/operations.md`, section 15,
-  covers the log lines and what a failure means.
+  derived data: deleting it loses nothing that a recompute cannot rebuild from the fills and
+  the manual adjustments.
+- **Recomputed at startup, after every exchange sync that stored a fill, and after every
+  change to a manual adjustment**, and skipped when the fingerprint is unchanged. A new engine
+  version changes every fingerprint, so an upgrade always recomputes. A stored fill or
+  adjustment that cannot become an event fails the recompute and leaves the previous snapshot
+  in place, rather than being skipped. `docs/operations.md`, section 15, covers the log lines
+  and what a failure means.
 - **Served by `GET /api/accounting/positions`**, valued at the cached **USD** price of each
   asset. The unit of account is USDT/USDC pinned at 1, so USD is the currency the figures are
   already in.
@@ -328,3 +330,96 @@ The engine computes; #19 keeps and serves the result (spec
   - The totals leave out any position with unknown-cost units or no price, and name it.
   - The arithmetic is `portfolio.domain.accounting.value_position`, pure and exact like the
     engine.
+
+## Recording what the history does not show
+
+The venues keep only a window of history (Bitget: 90 days). Coins bought before that window
+are held, but no event says so. Selling them then oversells the pool, and the engine reports
+it: a `negative_inventory` warning, and the `history_incomplete` flag on the asset. A **manual
+adjustment** is how the owner fixes that (spec `docs/specs/023-manual-adjustments.md`).
+
+### What an adjustment is
+
+An adjustment is an **inflow**: `quantity` of `asset` acquired at `occurred_at`, at a
+`unit_cost` in USD or at an unknown cost. It is the engine's `Adjustment` event, stored in
+`manual_adjustments` and replayed with the fills in one list. It covers an opening balance and
+any acquisition off the exchanges, such as a purchase from a person. It records no outflow: a
+gift sent or coins lost are not adjustments.
+
+Every adjustment carries a note, in the owner's words, saying why it exists. The note is never
+logged.
+
+The owner enters adjustments through the authenticated API under
+`/api/accounting/adjustments`. While signed in, `/api/docs` works for listing, creating and
+replacing them. It cannot delete one: every write must carry `Content-Type: application/json`,
+and Swagger UI sends no content type for a request without a body, so the delete gets a 403.
+To delete one, run this in the browser console on a page of the signed-in application, with
+the adjustment's id in place of `<id>`:
+
+```js
+await fetch('/api/accounting/adjustments/<id>', {method: 'DELETE', headers: {'Content-Type': 'application/json'}})
+```
+
+The browser adds the `Origin` header and the session cookie itself, and a `204` means it is
+gone. Creating, replacing or deleting an adjustment recomputes the positions before the
+response returns.
+
+### Dating an opening balance
+
+An adjustment takes its place among the fills by `occurred_at`. At the same instant as a fill,
+it replays **after** the fill, because its source, `manual`, sorts after every venue's. So date
+an opening balance **before the first sale it has to cover**, not at the moment of that sale.
+The date of the first imported fill, minus a day, is a safe choice.
+
+Two adjustments at the same instant replay in the order they were entered. An adjustment's id
+is its identity in the replay, and ids are never reused.
+
+### Unknown cost is not zero
+
+- **Without a `unit_cost`** (omitted, or `null`), the quantity counts toward the position but
+  not toward its cost. While those units are held, the asset shows the `unknown_basis` flag and
+  the quantity in `unknown_basis_quantity`, and the totals leave the asset out and name it. A
+  later sale of those units realizes nothing, and its proceeds go to `unmatched_proceeds`
+  (example 8).
+- **With a `unit_cost` of zero**, the cost is known to be nothing, as for an airdrop recorded
+  that way. A later sale reports its whole proceeds as profit.
+
+Enter zero only when the coins really cost nothing. When the cost is not known, leave it out:
+the position then says that it does not know, rather than reporting a profit that did not
+happen.
+
+The API refuses what the engine could not replay, and stores nothing: a quantity that is not
+above zero, a negative cost, more than 18 decimal places, a cost times a quantity too large to
+represent, a date later than now or without a time zone, and a symbol that is not the venue's
+own spelling (`BTC`, never `btc`). The cash assets USDC and USDT are refused too: they are the
+unit of account, and an adjustment of one changes nothing. The error names the field and the
+rule, never the value.
+
+### Example: resolving a `negative_inventory` warning
+
+The imported history is example 5: a buy of 1 BTC at 10:00 for 30,000 USDT, and a sale of
+1.5 BTC at 12:00 for 60,000 USDT. Nothing records the other 0.5 BTC, which was bought before
+the history begins, at 25,000. The positions say so:
+
+```json
+"warnings": [{"kind": "negative_inventory", "asset": "BTC", "quantity": "0.500000000000000000", ...}]
+```
+
+The BTC position carries `history_incomplete`, 10,000 of realized P&L and 20,000 of unmatched
+proceeds. The owner records the opening balance, dated before the buy:
+
+```bash
+curl -s -b "$COOKIE" -H "Origin: https://<host>" -H "Content-Type: application/json" \
+  -X POST https://<host>/api/accounting/adjustments \
+  -d '{"asset": "BTC", "quantity": "0.5", "unit_cost": "25000",
+       "occurred_at": "2026-01-01T09:00:00Z",
+       "note": "Bought before the Bitget history begins"}'
+```
+
+The response arrives after the recompute. The events are now example 9's. The warning and the
+flag are gone, the sale is matched against a basis of 42,500, and the realized P&L is 17,500
+with no unmatched proceeds. Recorded without a `unit_cost`, the same adjustment would remove
+the warning and the flag too. The realized P&L would stay at 10,000, and the 20,000 the
+unknown-cost half brought in would stay in `unmatched_proceeds` rather than become profit.
+While units of unknown cost are still held, the asset carries `unknown_basis`. This sale
+emptied the pool, so none remain here.

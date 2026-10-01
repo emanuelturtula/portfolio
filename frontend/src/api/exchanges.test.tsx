@@ -3,19 +3,24 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { positionsQueryKey, usePositions } from '@/api/accounting';
 import {
   EXCHANGE_RUNS_LIMIT,
+  exchangeFillsQueryKey,
   exchangeRunsQueryKey,
   exchangesQueryKey,
   FAST_POLL_MS,
   listRefetchInterval,
   runsRefetchInterval,
   SLOW_POLL_MS,
+  useExchangeFills,
   useExchangeRuns,
   useExchanges,
   useSyncExchanges,
 } from '@/api/exchanges';
+import { NO_FILTERS, type FillFilters } from '@/lib/fillFilters';
 import { createQueryClient } from '@/lib/queryClient';
+import { emptySnapshot, investedPortfolio } from '@/test/accountingFixtures';
 import {
   accountFailed,
   authFailedExchange,
@@ -26,9 +31,12 @@ import {
   runningExchangeRun,
   unsyncedExchange,
 } from '@/test/exchangeFixtures';
+import { fakeAccounting } from '@/test/fakeAccounting';
 import { fakeExchanges, type FakeExchanges } from '@/test/fakeExchanges';
+import { manyFills } from '@/test/fillFixtures';
 import { settle } from '@/test/render';
 import { problem, server } from '@/test/server';
+import { inTimeZone } from '@/test/timeZone';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -348,5 +356,208 @@ describe('the exchange hooks: polling', () => {
     await advance(SLOW_POLL_MS - FAST_POLL_MS);
     expect(fake.count('list')).toBe(list + 1);
     expect(fake.count('runs')).toBe(runs + 1);
+  });
+});
+
+/**
+ * Spec 022: a sync that stored a fill has already recomputed the position snapshot by the
+ * time it answers (spec 021), so settling it re-reads `['accounting', ...]` as well as
+ * `['exchanges', ...]`, success or failure.
+ */
+describe('the exchange sync and the invested figures', () => {
+  function setUp(options: { readonly failSync: boolean }) {
+    const exchanges = fakeExchanges({ exchanges: [exchange()] });
+    const accounting = fakeAccounting({ positions: emptySnapshot() });
+    if (options.failSync) {
+      exchanges.fail('sync', () => problem(504, 'Gateway Timeout', 'The upstream did not answer.'));
+    }
+    server.use(...exchanges.handlers, ...accounting.handlers);
+    const client = createQueryClient();
+
+    const hook = renderHook(() => ({ positions: usePositions(), sync: useSyncExchanges() }), {
+      wrapper: wrapperFor(client),
+    });
+
+    return { exchanges, accounting, client, hook };
+  }
+
+  it('re-reads the positions when the sync succeeds, and shows the new snapshot', async () => {
+    const { accounting, client, hook } = setUp({ failSync: false });
+    await waitFor(() => {
+      expect(hook.result.current.positions.isSuccess).toBe(true);
+    });
+    const before = accounting.count();
+    // The sync stores fills; the server recomputes before it answers.
+    const recomputed = investedPortfolio();
+    accounting.setPositions(recomputed);
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+
+    await waitFor(() => {
+      expect(hook.result.current.sync.isSuccess).toBe(true);
+    });
+    await waitFor(() => {
+      expect(accounting.count()).toBe(before + 1);
+    });
+    await waitFor(() => {
+      expect(hook.result.current.positions.data).toEqual(recomputed);
+    });
+    expect(client.getQueryData(positionsQueryKey)).toEqual(recomputed);
+  });
+
+  it('re-reads the positions when the sync fails, too', async () => {
+    // A cut-off request very often means the run is still going: it may yet store a fill.
+    const { accounting, hook } = setUp({ failSync: true });
+    await waitFor(() => {
+      expect(hook.result.current.positions.isSuccess).toBe(true);
+    });
+    const before = accounting.count();
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+
+    await waitFor(() => {
+      expect(hook.result.current.sync.isError).toBe(true);
+    });
+    await waitFor(() => {
+      expect(accounting.count()).toBe(before + 1);
+    });
+  });
+
+  it('marks an inactive positions query stale, so the dashboard re-reads it on return', async () => {
+    // On the exchanges page the dashboard is not mounted: nothing observes the positions.
+    // The invalidation still reaches the cached entry, so it is not served as fresh later.
+    const { client, hook } = setUp({ failSync: false });
+    client.setQueryData(['accounting', 'positions', 'inactive-probe'], emptySnapshot());
+    await waitFor(() => {
+      expect(hook.result.current.positions.isSuccess).toBe(true);
+    });
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+    await waitFor(() => {
+      expect(hook.result.current.sync.isSuccess).toBe(true);
+    });
+
+    await waitFor(() => {
+      expect(
+        client.getQueryState(['accounting', 'positions', 'inactive-probe'])?.isInvalidated,
+      ).toBe(true);
+    });
+  });
+});
+
+/**
+ * Spec 024: the fills query is keyed `['exchanges', 'fills', filters, page]`, so the
+ * invalidation a settled sync already makes reaches it, and it has no poll of its own.
+ */
+describe('useExchangeFills', () => {
+  const MARCH: FillFilters = { exchanges: ['bitget'], fromDay: '2026-03-01', toDay: '2026-03-31' };
+
+  function setUp(filters: FillFilters, page: number) {
+    const rows = manyFills(60);
+    const fake = fakeExchanges({ exchanges: [exchange({ fills_stored: 60 })], fills: rows });
+    server.use(...fake.handlers);
+    const client = createQueryClient();
+    const hook = renderHook(
+      ({ current, at }) => ({ fills: useExchangeFills(current, at), sync: useSyncExchanges() }),
+      { wrapper: wrapperFor(client), initialProps: { current: filters, at: page } },
+    );
+    return { fake, client, hook };
+  }
+
+  it('is keyed under exchanges, with the filters and the page', async () => {
+    const { client, hook } = setUp(MARCH, 2);
+    await waitFor(() => {
+      expect(hook.result.current.fills.isFetched).toBe(true);
+    });
+
+    expect(exchangeFillsQueryKey).toEqual(['exchanges', 'fills']);
+    const queries = client.getQueryCache().findAll({ queryKey: ['exchanges', 'fills'] });
+    expect(queries.map((query) => query.queryKey)).toEqual([['exchanges', 'fills', MARCH, 2]]);
+  });
+
+  it('asks for the page the filters and the page number name', async () => {
+    inTimeZone('UTC');
+    const { fake, hook } = setUp(MARCH, 2);
+    await waitFor(() => {
+      expect(hook.result.current.fills.isSuccess).toBe(true);
+    });
+
+    const [query] = fake.fillQueries();
+    expect(query?.toString()).toBe(
+      'exchange=bitget&from=2026-03-01T00%3A00%3A00.000Z&to=2026-04-01T00%3A00%3A00.000Z' +
+        '&limit=50&offset=50',
+    );
+  });
+
+  it('has no poll of its own', async () => {
+    const { client, hook } = setUp(NO_FILTERS, 1);
+    await waitFor(() => {
+      expect(hook.result.current.fills.isSuccess).toBe(true);
+    });
+
+    const [query] = client.getQueryCache().findAll({ queryKey: ['exchanges', 'fills'] });
+    expect(query?.options).not.toHaveProperty('refetchInterval');
+  });
+
+  it('is re-read when a sync settles', async () => {
+    const { fake, hook } = setUp(NO_FILTERS, 1);
+    await waitFor(() => {
+      expect(hook.result.current.fills.isSuccess).toBe(true);
+    });
+    const before = fake.count('fills');
+
+    act(() => {
+      hook.result.current.sync.mutate();
+    });
+
+    await waitFor(() => {
+      expect(fake.count('fills')).toBe(before + 1);
+    });
+  });
+
+  it('sends nothing for a range whose end is before its start', async () => {
+    const { fake, hook } = setUp({ ...NO_FILTERS, fromDay: '2026-03-31', toDay: '2026-03-01' }, 1);
+    await settle();
+
+    expect(fake.count('fills')).toBe(0);
+    expect(hook.result.current.fills.fetchStatus).toBe('idle');
+    expect(hook.result.current.fills.data).toBeUndefined();
+  });
+
+  it('keeps the last page while the next loads, and nothing across a change of filters', async () => {
+    const { fake, hook } = setUp(NO_FILTERS, 1);
+    await waitFor(() => {
+      expect(hook.result.current.fills.isSuccess).toBe(true);
+    });
+    const first = hook.result.current.fills.data;
+
+    const release = fake.hold('fills');
+    hook.rerender({ current: NO_FILTERS, at: 2 });
+    await waitFor(() => {
+      expect(fake.count('fills')).toBe(2);
+    });
+    expect(hook.result.current.fills.isPlaceholderData).toBe(true);
+    expect(hook.result.current.fills.data).toBe(first);
+
+    // Equal filters in a new object are the same filters.
+    hook.rerender({ current: { ...NO_FILTERS }, at: 3 });
+    await waitFor(() => {
+      expect(fake.count('fills')).toBe(3);
+    });
+    expect(hook.result.current.fills.data).toBe(first);
+
+    hook.rerender({ current: { ...NO_FILTERS, exchanges: ['bitget'] }, at: 1 });
+    await waitFor(() => {
+      expect(fake.count('fills')).toBe(4);
+    });
+    expect(hook.result.current.fills.isPending).toBe(true);
+    expect(hook.result.current.fills.data).toBeUndefined();
+    release();
   });
 });

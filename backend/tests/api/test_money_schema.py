@@ -399,9 +399,16 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         "/api/exchanges",
         "/api/exchanges/sync",
         "/api/exchanges/runs",
+        # The transactions view (#93): the owner's fills and what they add up to. Money crosses
+        # this one, every amount a string, and the venue's trade id never does.
+        "/api/exchanges/fills",
         # Positions, cost and returns (#19): the owner's holdings and what they are worth,
         # every amount a string.
         "/api/accounting/positions",
+        # Manual adjustments (#18): opening balances and off-exchange acquisitions. Amounts
+        # are strings both ways, and a JSON number is refused on the way in.
+        "/api/accounting/adjustments",
+        "/api/accounting/adjustments/{adjustment_id}",
     }
 
 
@@ -428,6 +435,19 @@ MONEY_PROPERTIES: Final = frozenset(
         "unrealized_pnl",
         "unrealized_return_pct",
         "unallocated_costs",
+        # #93: a fill's quote and fee, and what a set of fills adds up to. `price` is not here:
+        # a position's `price` is an object, and a fill's is covered by the fills tests.
+        "quote_quantity",
+        "usdt_value",
+        "fee_amount",
+        "bought",
+        "sold",
+        "net",
+        "usdt_spent",
+        "usdt_received",
+        "usdt_net",
+        "spent",
+        "received",
     }
 )
 

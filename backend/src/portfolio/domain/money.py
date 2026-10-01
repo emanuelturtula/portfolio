@@ -79,6 +79,29 @@ configure_decimal_context()
 # this module's own answers rest on.
 _MONEY_CONTEXT: Final = decimal.Context(prec=MONEY_PRECISION, rounding=MONEY_ROUNDING)
 
+# The context `add` and `subtract` evaluate in, passed explicitly: the one place in this module
+# where an arithmetic operation is allowed no rounding at all. See `_exact_sum`.
+#
+# * `prec=MAX_PREC` (999999999999999999 on a 64-bit build) is a precision no sum of two amounts
+#   reaches, so the exact result always fits. libmpdec sizes the result by its digits, not by
+#   `prec`, so the precision costs nothing.
+# * `Emax=MAX_EMAX` and `Emin=MIN_EMIN` so that no exponent a `Decimal` can hold is clamped.
+# * **`Inexact`, `Rounded`, `Overflow` and `InvalidOperation` are traps**, so a result that
+#   would be rounded, or could not be represented, raises instead of being returned: the traps
+#   are what make "never rounded" a guarantee rather than an assumption about the bounds. Only
+#   the very edge of `Decimal`'s own range reaches one -- see `add`'s *Raises*.
+# * `rounding=ROUND_HALF_EVEN`, spelled here rather than taken from `MONEY_ROUNDING`, because an
+#   exact sum is never rounded and the mode then decides one thing only: the sign of a zero.
+#   `1 + -1` is `0` under every mode but `ROUND_FLOOR`, where it is `-0`, and that must not
+#   change with the rounding rule for money.
+_EXACT_SUM_CONTEXT: Final = decimal.Context(
+    prec=decimal.MAX_PREC,
+    rounding=ROUND_HALF_EVEN,
+    Emax=decimal.MAX_EMAX,
+    Emin=decimal.MIN_EMIN,
+    traps=[decimal.Inexact, decimal.Rounded, decimal.Overflow, decimal.InvalidOperation],
+)
+
 
 def require_amount(value: object, *, subject: str) -> Decimal:
     """Return `value` as a finite `Decimal`, or refuse it.
@@ -200,27 +223,44 @@ def add(left: Decimal, right: Decimal) -> Decimal:
     `decimal.localcontext()`, a sum of a large basis and an 18-place fee is rounded before
     anybody asked for a rounding, silently. **Adding under a 38-digit context** fixes the
     thread dependence and still rounds any sum longer than 38 digits, and whatever rounds
-    it next is then a second rounding. So the operands are aligned to the smaller exponent
-    and summed as integers, and the result carries every digit.
+    it next is then a second rounding.
+
+    **So the sum is evaluated in one explicit, module-level context, never the ambient one**
+    -- `_EXACT_SUM_CONTEXT`, whose precision no sum reaches and which **traps** `Inexact`,
+    `Rounded`, `Overflow` and `InvalidOperation`. The result is therefore exact at any
+    length, the guarantee this function has always made and the accounting engine's
+    conservation invariant (I8) rests on; and if a sum ever could not be exact, it would
+    raise rather than come back rounded. `_exact_sum` says why that context is safe to share.
 
     **The shape of the answer is `Decimal`'s own**, so this is a drop-in for an exact `+`:
     the exponent is the smaller of the two, and a zero result is negative only when both
     operands are (`-0 + -0` is `-0`; `1 + -1` is `0`), which is the rule `Decimal` applies
     under every rounding mode but `ROUND_FLOOR`.
 
-    **Built from integers like `multiply`, and with the same care**: `int(Decimal)` and
-    `Decimal(int)` rather than any `str` round trip, which the interpreter refuses beyond
-    4300 digits, and the alignment spelled as a `Decimal` exponent rather than as `10**k`,
-    which typeshed types as `Any`. **The work grows with the gap between the exponents**,
-    because an exact sum of `1E+100000` and `1E-100000` has two hundred thousand digits and
-    converting them is quadratic -- measured at about a fifth of a second for a gap of a
-    hundred thousand places. Every amount the accounting engine adds has exactly eighteen
-    places, so its gaps are zero; a caller summing amounts from anywhere else should bound
-    their exponents first, as `NormalizedFill` does.
+    **Neither the digit count nor the exponent gap is bounded, and neither is expensive.**
+    Nothing converts between `int` and `str`, so the interpreter's 4300-digit conversion
+    limit does not apply: two 5000-digit coefficients add exactly. The work grows with the
+    digits of the result, which for `1E+100000` and `1E-100000` is two hundred thousand of
+    them -- measured at about 20 microseconds. Every amount the accounting engine adds has
+    exactly eighteen places, so its gaps are zero.
+
+    Until #93 this aligned the operands and summed their coefficients as Python integers.
+    That gave the same answers -- a Hypothesis property in `tests/domain/test_money.py`
+    compares the two on `as_tuple()`, signed zeros and exponents included -- and cost about
+    2.6 microseconds a call against 0.1, which at the tens of thousands of sums one
+    transactions request makes was most of the request (spec 024, R1). **The two differ only
+    at the edge of `Decimal`'s own range**, below: where this raises `Overflow` or
+    `MemoryError`, the integer version raised `decimal.InvalidOperation`.
 
     Raises:
         TypeError: either operand is not a `Decimal` (a `bool` or a `float` included).
         ValueError: either operand is a NaN or an infinity.
+        decimal.Overflow: the sum's exponent is past `decimal.MAX_EMAX`, the largest a
+            `Decimal` holds at all -- `9E+999999999999999999` added to itself.
+        MemoryError: the operands' exponents are so far apart -- close to 10**18 places --
+            that the exact sum's digits cannot be allocated. Raised at once, not after an
+            attempt. No amount this application stores or derives is within 10**17 places of
+            either edge.
     """
     require_amount(left, subject="add")
     require_amount(right, subject="add")
@@ -232,13 +272,17 @@ def subtract(left: Decimal, right: Decimal) -> Decimal:
 
     `add` of `right` negated, and negated with `copy_negate`, which only flips the sign bit:
     unary `-right` is an arithmetic operation in `decimal`, and it rounds `right` to the
-    calling thread's precision on the way. Everything `add` says about exactness, the shape
-    of the result and the cost of a wide exponent gap holds here too, and so does the sign of
-    a zero: `x - x` is `0`, and `-0 - 0` is `-0`.
+    calling thread's precision on the way. Everything `add` says holds here too: one
+    explicit module-level context and never the ambient one, `Inexact`, `Rounded`,
+    `Overflow` and `InvalidOperation` trapped so that a rounding raises instead of passing
+    silently, a result exact at any length, and the shape of the result -- including the
+    sign of a zero: `x - x` is `0`, and `-0 - 0` is `-0`.
 
     Raises:
         TypeError: either operand is not a `Decimal` (a `bool` or a `float` included).
         ValueError: either operand is a NaN or an infinity.
+        decimal.Overflow: as for `add`.
+        MemoryError: as for `add`.
     """
     require_amount(left, subject="subtract")
     require_amount(right, subject="subtract")
@@ -333,19 +377,24 @@ def divide(dividend: Decimal, divisor: Decimal, scale: int) -> Decimal:
 
 
 def _exact_sum(left: Decimal, right: Decimal) -> Decimal:
-    """The exact sum of two finite amounts, aligned to the smaller exponent. See `add`."""
-    left_sign, left_digits, left_exponent = left.as_tuple()
-    right_sign, right_digits, right_exponent = right.as_tuple()
-    # Both exponents are `int` on a finite Decimal; `require_amount` has refused the rest.
-    exponent = min(int(left_exponent), int(right_exponent))
-    left_value = _scaled_coefficient(left_digits, int(left_exponent) - exponent)
-    right_value = _scaled_coefficient(right_digits, int(right_exponent) - exponent)
-    total = (-left_value if left_sign else left_value) + (
-        -right_value if right_sign else right_value
-    )
-    if total == 0:
-        return Decimal((left_sign & right_sign, (0,), exponent))
-    return Decimal((int(total < 0), Decimal(abs(total)).as_tuple().digits, exponent))
+    """The exact sum of two finite amounts, in `_EXACT_SUM_CONTEXT`. See `add`.
+
+    **One explicit context, never the ambient one**: `Context.add` evaluates in the context it
+    is called on, so neither the thread's precision nor anyone's `localcontext()` reaches it.
+    **A rounding raises**: `Inexact`, `Rounded`, `Overflow` and `InvalidOperation` are traps
+    there, and at `MAX_PREC` digits and the widest exponent range none of them fires, so the
+    result is exact at any length.
+
+    **Sharing the context between threads is safe on the standard, GIL build of CPython.** The
+    recompute runs the accounting engine in a worker thread while requests add on the event
+    loop's, and all of them use this one object. Each `Context.add` is a single call into the C
+    `_decimal` module, made while holding the GIL, and the only state it writes on the context
+    is its sticky flag bits -- and none of those is ever read here: a trap raises from the
+    operation that signalled it, whatever an earlier one left set. `quantize` shares
+    `_MONEY_CONTEXT` the same way. **A free-threaded build (PEP 703) removes that premise**, and
+    this should be revisited before the application runs on one.
+    """
+    return _EXACT_SUM_CONTEXT.add(left, right)
 
 
 def _coefficient(digits: tuple[int, ...]) -> int:

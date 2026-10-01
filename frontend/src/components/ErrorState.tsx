@@ -1,10 +1,18 @@
+import type { ReactNode } from 'react';
+
 import { HEADING_TAGS, type HeadingLevel } from '@/components/EmptyState';
 
 interface ErrorStateProps {
   readonly title?: string;
-  readonly description: string;
+  /**
+   * A string, or inline content when the sentence needs an element in it - a `<time>`, for
+   * the invested section's "the last attempt failed on ...". Rendered inside a single `<p>`.
+   */
+  readonly description: ReactNode;
   readonly onRetry?: () => void;
   readonly retryLabel?: string;
+  /** A link or control to offer next to the retry button, e.g. the way to the fix. */
+  readonly action?: ReactNode;
   /**
    * The heading's level, defaulting to `h2`. See {@link HeadingLevel} and the same prop on
    * `EmptyState` - both states are reused inside sections already headed by an `h3`.
@@ -25,6 +33,7 @@ export function ErrorState({
   description,
   onRetry,
   retryLabel = 'Try again',
+  action,
   headingLevel = 2,
 }: ErrorStateProps) {
   const Heading = HEADING_TAGS[headingLevel];
@@ -38,6 +47,7 @@ export function ErrorState({
           {retryLabel}
         </button>
       )}
+      {action}
     </div>
   );
 }

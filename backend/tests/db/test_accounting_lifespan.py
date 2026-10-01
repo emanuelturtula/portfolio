@@ -66,6 +66,7 @@ from tests.accounting_harness import (
     plant_unconvertible_fill,
     rows,
 )
+from tests.adjustments_harness import plant_adjustment
 from tests.exchange_sync_harness import make_fill
 from tests.offline_http import use_an_offline_http_client
 
@@ -772,3 +773,139 @@ def test_the_lock_and_the_status_exist_without_the_lifespan() -> None:
 
     assert isinstance(app.state.accounting_lock, asyncio.Lock)
     assert app.state.accounting_status is None
+
+
+# --------------------------------------------------------------------------------------
+# #18: the trigger published for a request, `app.state.accounting_recompute`
+# --------------------------------------------------------------------------------------
+
+
+def test_the_published_trigger_exists_without_the_lifespan() -> None:
+    """Installed by `create_app` beside the lock, so the adjustment dependency always finds it."""
+    app = create_app()
+
+    assert callable(app.state.accounting_recompute)
+    assert create_app().state.accounting_recompute is not app.state.accounting_recompute, (
+        "each application gets a trigger bound to itself"
+    )
+
+
+async def test_the_published_trigger_is_the_real_one_for_its_application(
+    accounting_database: Path,
+) -> None:
+    """It recomputes, records to `accounting_status` and logs the reason it was given."""
+    user_id = await plant_owner_with_fills(accounting_database)
+
+    async with settled_app(accounting_database) as app:
+        async with own_factory(accounting_database) as factory, factory() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO manual_adjustments (user_id, asset, quantity, unit_cost, "
+                    "occurred_at, note, created_at, updated_at) VALUES (:user, 'KAS', "
+                    "'5.000000000000000000', NULL, '2026-03-01 08:00:00.000000', 'Opening', "
+                    "'2026-09-29 10:00:00.000000', '2026-09-29 10:00:00.000000')"
+                ),
+                {"user": user_id},
+            )
+            await session.commit()
+        with capture_logs() as captured:
+            returned = await app.state.accounting_recompute(RecomputeReason.ADJUSTMENT)
+        recorded = status_of(app)
+
+    assert isinstance(returned, AccountingStatus)
+    assert recorded is returned
+    assert (returned.outcome, returned.error) == (RecomputeOutcome.WRITTEN, None)
+    (finished,) = events_named(captured, "accounting_recompute_finished")
+    assert finished["reason"] == "adjustment"
+    assert finished["event_count"] == 4, "three fills and the adjustment"
+
+
+async def test_the_published_trigger_waits_for_the_same_lock(
+    accounting_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request's recompute is serialised with a sync's: one lock, not one each."""
+    await plant_owner_with_fills(accounting_database)
+
+    async with settled_app(accounting_database) as app:
+        calls = RecomputeCalls(monkeypatch)
+        lock: asyncio.Lock = app.state.accounting_lock
+        await lock.acquire()
+        try:
+            pending = asyncio.create_task(
+                app.state.accounting_recompute(RecomputeReason.ADJUSTMENT)
+            )
+            await asyncio.sleep(0.1)
+            assert calls.users == [], "the recompute started while the lock was held"
+            assert not pending.done()
+        finally:
+            lock.release()
+        status = await asyncio.wait_for(pending, timeout=BOUND)
+
+    assert len(calls.users) == 1
+    assert status.outcome is RecomputeOutcome.UNCHANGED
+
+
+#: A distinctive id, note and asset for the failed-recompute log line below.
+BAD_ADJUSTMENT_ID: Final = 604_217
+BAD_ADJUSTMENT_NOTE: Final = "note-sentinel-" + "Hd5" * 5
+BAD_ADJUSTMENT_ASSET: Final = "QW" + "ZX" * 3
+
+
+async def test_a_recompute_stopped_by_an_adjustment_logs_which_one(
+    accounting_database: Path,
+) -> None:
+    """The operator can find the row: `adjustment_id` is on the failure line, and nothing else.
+
+    The row is one the service refuses -- a zero quantity -- written by SQL, as a hand-edited
+    database would hold it. The failure names the class and the id; never the asset, the
+    note, or the message.
+    """
+    user_id = await plant_owner_with_fills(accounting_database)
+    async with own_factory(accounting_database) as factory, factory() as session:
+        await plant_adjustment(
+            session,
+            user_id,
+            adjustment_id=BAD_ADJUSTMENT_ID,
+            asset=BAD_ADJUSTMENT_ASSET,
+            raw_quantity="0.000000000000000000",
+            occurred_at=at(0),
+            note=BAD_ADJUSTMENT_NOTE,
+        )
+
+    async with settled_app(accounting_database) as app:
+        with capture_logs() as captured:
+            status = await run_accounting_recompute(app, RecomputeReason.ADJUSTMENT)
+
+    assert (status.outcome, status.error) == (
+        RecomputeOutcome.FAILED,
+        "UnconvertibleAdjustmentError",
+    )
+    (failed,) = events_named(captured, "accounting_recompute_failed")
+    assert failed["adjustment_id"] == BAD_ADJUSTMENT_ID
+    assert (failed["reason"], failed["error"]) == ("adjustment", "UnconvertibleAdjustmentError")
+    rendered = repr(captured)
+    assert BAD_ADJUSTMENT_NOTE not in rendered
+    assert BAD_ADJUSTMENT_ASSET not in rendered
+
+
+async def test_a_recompute_stopped_by_anything_else_names_no_adjustment(
+    accounting_database: Path,
+) -> None:
+    """The companion: a fill that does not convert is not an adjustment, and says no id."""
+    user_id = await plant_owner_with_fills(accounting_database)
+    async with own_factory(accounting_database) as factory, factory() as session:
+        account = await session.scalar(
+            text("SELECT id FROM exchange_accounts WHERE user_id = :user"), {"user": user_id}
+        )
+        await plant_unconvertible_fill(
+            session, int(account), trade_id=LEAKY_TRADE_ID, shape="same_asset"
+        )
+
+    async with settled_app(accounting_database) as app:
+        with capture_logs() as captured:
+            status = await run_accounting_recompute(app, RecomputeReason.EXCHANGE_SYNC)
+
+    assert status.error == "UnconvertibleFillError"
+    (failed,) = events_named(captured, "accounting_recompute_failed")
+    assert "adjustment_id" not in failed
+    assert LEAKY_TRADE_ID not in repr(captured)

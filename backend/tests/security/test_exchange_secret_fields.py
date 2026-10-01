@@ -30,6 +30,15 @@ from portfolio.db.models import (
     ExchangeSyncWindow,
     metadata,
 )
+from portfolio.domain.fill_totals import (
+    AssetFillTotals,
+    FeeTotal,
+    FillLine,
+    FillTotals,
+    NotValuedInUsdtTotals,
+    QuoteAssetFillTotals,
+    UsdtFillTotals,
+)
 from portfolio.logging import is_sensitive_key
 from portfolio.providers.exchanges.base import (
     ExchangeCapabilities,
@@ -44,6 +53,7 @@ from portfolio.repositories.exchange_sync_runs import AccountOutcome, ExchangeSy
 from portfolio.repositories.exchanges import (
     ExchangeAccountState,
     FillInsertResult,
+    FillViewRecord,
     SyncWindowRow,
 )
 from portfolio.services.exchange_sync_plan import (
@@ -52,7 +62,7 @@ from portfolio.services.exchange_sync_plan import (
     PendingWindow,
     Replacement,
 )
-from portfolio.services.exchanges import ExchangeView, LastError
+from portfolio.services.exchanges import ExchangeView, FillsPage, FillView, LastError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -92,6 +102,18 @@ PROVIDER_DATACLASSES: Final = (
     NormalisedQueue,
     ExchangeView,
     LastError,
+    # #93's transactions view: the record it reads, the rows and page it serves, and the
+    # totals it adds up. Money and an order id cross the API now; a secret never may.
+    FillViewRecord,
+    FillView,
+    FillsPage,
+    FillLine,
+    FillTotals,
+    AssetFillTotals,
+    UsdtFillTotals,
+    NotValuedInUsdtTotals,
+    QuoteAssetFillTotals,
+    FeeTotal,
 )
 
 #: The spellings of a secret-bearing type in an annotation. Annotations are strings under
@@ -117,6 +139,12 @@ MUST_BE_SCANNED: Final = frozenset(
         "ExchangeView.configured",
         "LastError.detail",
         "AccountOutcome.detail",
+        "FillViewRecord.external_order_id",
+        "FillView.order_id",
+        "FillsPage.totals",
+        "FillLine.fee_asset",
+        "AssetFillTotals.usdt_unvalued_fill_count",
+        "FeeTotal.amount",
     }
 )
 

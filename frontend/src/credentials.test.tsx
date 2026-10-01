@@ -14,6 +14,7 @@ import {
   syncTriggered,
   truncatedExchange,
 } from '@/test/exchangeFixtures';
+import { fakeAccounting } from '@/test/fakeAccounting';
 import { fakeExchanges, type FakeExchangesOptions } from '@/test/fakeExchanges';
 import { fakePortfolio } from '@/test/fakePortfolio';
 import { healthyPortfolio } from '@/test/fixtures';
@@ -100,6 +101,38 @@ function expectNoCredentialControl(): number {
   }
 
   return controls.length;
+}
+
+/**
+ * The transaction filters of spec 024: a checkbox per venue and two day pickers, each named
+ * by its label. The only controls the exchanges page has, and each one's type and name is
+ * pinned, so a field added anywhere on the page, or a filter that changes into something a
+ * value could be typed into, fails here.
+ */
+const TRANSACTION_FILTERS: readonly string[] = [
+  'checkbox BingX',
+  'checkbox Bitget',
+  'date From',
+  'date To',
+];
+
+function expectOnlyTheTransactionFilters(main: HTMLElement): void {
+  const filters = within(main).getByRole('group', { name: 'Transaction filters' });
+  const controls = Array.from(main.querySelectorAll(CONTROL_SELECTOR));
+
+  for (const control of controls) {
+    expect(filters.contains(control), `a ${control.tagName} outside the filters`).toBe(true);
+  }
+  expect(
+    controls.map((control) =>
+      control instanceof HTMLInputElement
+        ? `${control.type} ${Array.from(control.labels ?? [])
+            .map((label) => label.textContent.trim())
+            .join(' ')}`
+        : control.tagName.toLowerCase(),
+    ),
+  ).toEqual(TRANSACTION_FILTERS);
+  expectNoCredentialControl();
 }
 
 function passwordInputs(): Element[] {
@@ -200,6 +233,7 @@ function serve(signedIn: boolean, exchanges: FakeExchangesOptions = EXCHANGES_SC
     ...session.handlers,
     ...fakePortfolio({ ...scenario, session }).handlers,
     ...fakeExchanges({ ...exchanges, session }).handlers,
+    ...fakeAccounting({ session }).handlers,
   );
 }
 
@@ -225,7 +259,7 @@ describe('credentials', () => {
     },
   );
 
-  it('the exchanges page has no form control but its buttons', async () => {
+  it('the exchanges page has no form control but its buttons and the transaction filters', async () => {
     const user = userEvent.setup();
     serve(true);
 
@@ -236,7 +270,7 @@ describe('credentials', () => {
     // act on a refused key, offers nowhere to type one.
     expect(bitget).toHaveTextContent('PORTFOLIO_BITGET_API_SECRET');
     const main = screen.getByRole('main');
-    expect(main.querySelectorAll(CONTROL_SELECTOR)).toHaveLength(0);
+    expectOnlyTheTransactionFilters(main);
     expect(main.querySelector('form')).toBeNull();
     expect(within(main).queryAllByRole('textbox')).toHaveLength(0);
 
@@ -244,7 +278,7 @@ describe('credentials', () => {
     await user.click(screen.getByRole('button', { name: 'Sync now' }));
     await screen.findByText(/^The sync /);
 
-    expect(main.querySelectorAll(CONTROL_SELECTOR)).toHaveLength(0);
+    expectOnlyTheTransactionFilters(main);
     expect(main.querySelector('form')).toBeNull();
     expect(passwordInputs()).toHaveLength(0);
   });
@@ -260,13 +294,13 @@ describe('credentials', () => {
     expect(main.querySelector('form')).toBeNull();
   });
 
-  it('an error venue with a remediation-free entry offers no control either', async () => {
+  it('an error venue with a remediation-free entry offers no other control either', async () => {
     serve(true, { exchanges: [erroredExchange('unavailable')], runs: [] });
 
     renderApp(['/exchanges']);
     await screen.findByRole('listitem', { name: 'Bitget' });
 
-    expect(screen.getByRole('main').querySelectorAll(CONTROL_SELECTOR)).toHaveLength(0);
+    expectOnlyTheTransactionFilters(screen.getByRole('main'));
   });
 
   it('the check itself fires on a control named like a key', () => {

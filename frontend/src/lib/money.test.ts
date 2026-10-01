@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { addMoney, formatMoney, fromBaseUnits, money } from '@/lib/money';
+import {
+  addMoney,
+  equalsMoney,
+  formatMoney,
+  fromBaseUnits,
+  isZeroMoney,
+  money,
+  type FormatMoneyOptions,
+} from '@/lib/money';
 
 describe('money', () => {
   it('keeps all eighteen decimals of a base-unit amount', () => {
@@ -308,4 +316,137 @@ describe('fromBaseUnits', () => {
       expect(() => fromBaseUnits(units, 8)).toThrow(TypeError);
     },
   );
+});
+
+/**
+ * The sign of a profit or a loss (spec 022, "The sign of P&L").
+ *
+ * The sign is a symbol in the text, so that a gain and a loss read differently without
+ * colour. Every expected string is written out by hand.
+ */
+describe('formatMoney: signDisplay', () => {
+  const SIGNED: FormatMoneyOptions = {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+    signDisplay: 'exceptZero',
+  };
+
+  it.each([
+    ['37500.000000000000000000', '+37,500.00'],
+    ['0.010000000000000000', '+0.01'],
+    ['71.4286', '+71.43'],
+    ['1234567.891', '+1,234,567.89'],
+  ])('prefixes a positive amount %j with a plus: %j', (value, expected) => {
+    expect(formatMoney(money(value), SIGNED)).toBe(expected);
+  });
+
+  it.each([
+    ['-20.000000000000000000', '-20.00'],
+    ['-33.3333', '-33.33'],
+    ['-1234567.891', '-1,234,567.89'],
+  ])('keeps the minus of a negative amount %j, and adds nothing: %j', (value, expected) => {
+    const formatted = formatMoney(money(value), SIGNED);
+
+    expect(formatted).toBe(expected);
+    expect(formatted).not.toMatch(/\+/);
+  });
+
+  it.each([
+    ['0', '0.00'],
+    ['0.000000000000000000', '0.00'],
+    ['0.0000', '0.00'],
+    ['-0', '0.00'],
+    ['-0.000000000000000000', '0.00'],
+  ])('leaves zero %j unsigned: %j', (value, expected) => {
+    // A break-even position has made nothing. "+0.00" would claim a gain and "-0.00" a loss.
+    expect(formatMoney(money(value), SIGNED)).toBe(expected);
+  });
+
+  it('leaves a zero unsigned at every precision', () => {
+    expect(formatMoney(money('0'), { signDisplay: 'exceptZero' })).toBe('0');
+    expect(formatMoney(money('-0'), { signDisplay: 'exceptZero' })).toBe('0');
+  });
+
+  it('signs a tiny gain inside the boundary, and keeps the tiny loss as it was', () => {
+    // Rule 1 keeps its sign: the exact value is not zero, so neither is what is shown.
+    expect(formatMoney(money('0.000000004000000000'), SIGNED)).toBe('< +0.01');
+    expect(formatMoney(money('-0.003000000000000000'), SIGNED)).toBe('> -0.01');
+    expect(formatMoney(money('0.000000000000000001'), { signDisplay: 'exceptZero' })).toBe(
+      '< +0.00000001',
+    );
+  });
+
+  it('follows the exact value, not the rounded one', () => {
+    // 0.005 rounds half away from zero to 0.01, a gain; -0.005 to -0.01. Neither is the
+    // boundary, because neither rounds away to nothing.
+    expect(formatMoney(money('0.005'), SIGNED)).toBe('+0.01');
+    expect(formatMoney(money('-0.005'), SIGNED)).toBe('-0.01');
+    // 0.0049 rounds away to nothing at two places: the boundary, still signed.
+    expect(formatMoney(money('0.0049'), SIGNED)).toBe('< +0.01');
+  });
+
+  it.each([
+    ['1234.5'],
+    ['-1234.5'],
+    ['0'],
+    ['-0'],
+    ['0.000000000000000001'],
+    ['-0.000000000000000001'],
+    ['0.005'],
+  ])("renders %j under 'auto' exactly as with no option at all", (value) => {
+    // 'auto' is today's behaviour, and the default: no existing output changes.
+    for (const digits of [{}, { minimumFractionDigits: 2, maximumFractionDigits: 2 }]) {
+      expect(formatMoney(money(value), { ...digits, signDisplay: 'auto' })).toBe(
+        formatMoney(money(value), digits),
+      );
+    }
+  });
+
+  it("never signs a positive amount under 'auto'", () => {
+    expect(formatMoney(money('37500'), { signDisplay: 'auto' })).toBe('37,500');
+    expect(formatMoney(money('0.001'), { maximumFractionDigits: 2, signDisplay: 'auto' })).toBe(
+      '< 0.01',
+    );
+    expect(formatMoney(money('-37500'), { signDisplay: 'auto' })).toBe('-37,500');
+  });
+});
+
+describe('isZeroMoney', () => {
+  it.each(['0', '0.00', '-0', '-0.0', '0.000000000000000000', '-0.000000000000000000'])(
+    'calls %j zero, however the wire spells it',
+    (value) => {
+      expect(isZeroMoney(money(value))).toBe(true);
+    },
+  );
+
+  it.each(['0.000000000000000001', '-0.000000000000000001', '1', '-1', '10.000000000000000000'])(
+    'calls %j not zero',
+    (value) => {
+      // The smallest amount the engine carries is still something held.
+      expect(isZeroMoney(money(value))).toBe(false);
+    },
+  );
+});
+
+describe('equalsMoney', () => {
+  it.each([
+    ['5', '5.000000000000000000'],
+    ['0', '-0.000000000000000000'],
+    ['10.5', '10.500000000000000000'],
+    ['28700000000.00000123', '28700000000.000001230000000000'],
+  ])('calls %j and %j the same amount', (a, b) => {
+    // The wire spells amounts at their own scale; two spellings of one amount are equal.
+    expect(equalsMoney(money(a), money(b))).toBe(true);
+    expect(equalsMoney(money(b), money(a))).toBe(true);
+  });
+
+  it.each([
+    ['10.000000000000000000', '9.999999999999999999'],
+    ['0.000000000000000001', '0'],
+    ['-1', '1'],
+    // Past a double's precision: as numbers these two would compare equal.
+    ['9007199254740993', '9007199254740992'],
+  ])('tells %j and %j apart', (a, b) => {
+    expect(equalsMoney(money(a), money(b))).toBe(false);
+  });
 });

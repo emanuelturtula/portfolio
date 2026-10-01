@@ -4,6 +4,8 @@ import { delay, http, HttpResponse } from 'msw';
 import { useNavigate } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { fakeAccounting } from '@/test/fakeAccounting';
+import { fakeExchanges } from '@/test/fakeExchanges';
 import { fakePortfolio } from '@/test/fakePortfolio';
 import { currentPath, renderApp, settle, visitedPaths } from '@/test/render';
 import {
@@ -60,7 +62,12 @@ beforeEach(() => {
   // Signing in lands on the dashboard, which reads the portfolio. An empty one
   // is the first-time owner, and it keeps those reads answered rather than
   // failing as unhandled requests that put a second alert on the page.
-  server.use(...fakePortfolio().handlers);
+  // The same goes for the invested section's positions and exchange list (spec 022).
+  server.use(
+    ...fakePortfolio().handlers,
+    ...fakeAccounting().handlers,
+    ...fakeExchanges().handlers,
+  );
 });
 
 const PROBE_LABEL = 'probe: navigate imperatively';
