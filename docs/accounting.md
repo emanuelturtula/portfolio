@@ -26,7 +26,7 @@ and never runs short.
 | `average_cost` | `cost_basis ÷ known quantity`, rounded for display. Never fed back into the basis. Absent when no known-cost quantity is held, and when the quotient would be 10²⁰ or more per unit, since it is a display figure and not a reason for replay to fail. |
 | `unknown_basis_quantity` | Units held whose cost nobody recorded, such as an opening balance entered without a cost. They are kept out of the average rather than valued at zero, because zero would report a fictitious profit on the next sale. |
 | `realized_pnl` | Proceeds minus basis, over every sale of known-cost units for cash. |
-| `unmatched_proceeds` | Proceeds from units whose cost is unknown: unknown-basis units, or units sold beyond what the history holds. Kept out of realized P&L for the same reason. |
+| `unmatched_proceeds` | Proceeds from units whose cost is unknown: unknown-basis units, or units sold beyond what the history holds. Kept out of realized P&L for the same reason. Net of fees, and so signed: a fee paid in a third asset can cost more than the sale brought in. `GET /api/accounting/positions` also serves its total over every position, and the dashboard shows that total beside realized P&L. |
 
 **The events are replayed in one total order**: time, then source, then id, then kind (trade,
 adjustment or transfer) for the rare tie between kinds. Same-millisecond fills therefore
@@ -329,6 +329,14 @@ The engine computes; #19 keeps and serves the result (spec
     with a cost to compare against.
   - `realized_pnl` is reported beside them, never added in.
   - The totals leave out any position with unknown-cost units or no price, and name it.
+  - `totals.realized_pnl` and `totals.unmatched_proceeds` are the exception: each covers
+    **every** position, held or closed, comparable or left out, because neither depends on
+    a current price. `totals.unmatched_proceeds` is signed, like the per-position figure it
+    sums.
+  - The dashboard shows the unmatched proceeds beside realized P&L whenever a position
+    carries any, and names the assets they come from. An asset held only as unknown-cost
+    units and then sold in full is left with no flag and a realized P&L of zero, so this
+    figure is the only place on the dashboard where its sales show.
   - The arithmetic is `portfolio.domain.accounting.value_position`, pure and exact like the
     engine.
 

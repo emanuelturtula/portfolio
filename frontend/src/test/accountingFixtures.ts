@@ -346,6 +346,15 @@ export function assertWritablePositions(response: PositionsResponse): PositionsR
     sum(response.positions, (entry) => entry.realized_pnl),
     AMOUNT_SCALE,
   );
+  // Spec 026: summed like realized P&L, over every position - held or not, counted or left
+  // out - and signed, so two positions may cancel to a total of exactly zero. A total with no
+  // position behind it, or a position the total leaves out, is a response no backend writes.
+  sameValue(
+    'totals.unmatched_proceeds',
+    totals.unmatched_proceeds,
+    sum(response.positions, (entry) => entry.unmatched_proceeds),
+    AMOUNT_SCALE,
+  );
   const pct = returnPct(pnl, invested);
   if (pct === null) {
     if (totals.unrealized_return_pct !== null) {
@@ -482,10 +491,12 @@ export const BTC_GAIN = {
 
 /**
  * ETH: a chain does not price it, so it is `unsupported_pair`, and `history_incomplete`
- * because a sale was larger than the history held. Hand-worked:
+ * because a disposal was larger than the history held. Hand-worked:
  *
  * - 2.718281828459045235 held at an average of 3000: invested 8154.845485377135705000;
- * - that sale realized -250.
+ * - an earlier sale, inside the history, realized -250;
+ * - the disposal that ran short was a swap out of ETH, which has no proceeds, so nothing is
+ *   unmatched (spec 026). A sale for cash that ran short would carry a figure.
  *
  * The quantity uses every one of its 18 places, so a page that parsed it into a double
  * (2.718281828459045) would show in its `<data value>`.
@@ -658,6 +669,7 @@ export function totals(overrides: Partial<TotalsInput> = {}): TotalsInput {
     unrealized_pnl: ZERO,
     unrealized_return_pct: null,
     realized_pnl: ZERO,
+    unmatched_proceeds: ZERO,
     ...overrides,
   };
 }
@@ -871,6 +883,153 @@ export function tinyPnlPortfolio(): PositionsResponse {
       unrealized_return_pct: '0.0000',
       realized_pnl: '-0.003000000000000000',
     }),
+  });
+}
+
+/*
+ * Unmatched proceeds (spec 026): what sales of units with no known cost brought in.
+ *
+ * What the engine can write (`replay.py`, `_book_sale`): a sale for cash books to
+ * `unmatched_proceeds` the share of its proceeds that sold units of unknown cost, or units the
+ * history never held. So a position carries a figure with no flag at all when the units were
+ * of unknown cost and are gone (`unknown_basis` is not sticky), with `history_incomplete` when
+ * the sale was larger than the history, and with `unknown_basis` while some such units are
+ * still held. The proceeds are net of every fee, and a fee paid in a third asset is worth its
+ * carried cost - or its amount, when that asset is the other stablecoin - so the figure can be
+ * negative. The negative figures below are of that second kind: a fee in cash opens no pool,
+ * so no position stands behind it. `history_incomplete` with no figure is writable too - a
+ * swap or a fee has no proceeds - which is what every fixture above is.
+ */
+
+/**
+ * ETH: the sharpest case of spec 026. Every unit held had an unknown cost - an opening balance
+ * entered without one - and every unit was sold. The position is closed, carries no flag, and
+ * realized nothing: 1234.567890123456789012 came in, and only this figure says so.
+ *
+ * The amount uses every one of its 18 places, so a page that parsed it into a double
+ * (1234.567890123457) would show in its `<data value>`. To the cent it is 1,234.57.
+ */
+export function ethSoldAtUnknownCost(
+  overrides: Partial<AccountingPositionResponse> = {},
+): AccountingPositionResponse {
+  return xrpClosed({
+    asset: 'ETH',
+    realized_pnl: ZERO,
+    unmatched_proceeds: '1234.567890123456789012',
+    ...overrides,
+  });
+}
+
+/** When a sale of XRP was larger than the history held: 2026-04-11, on Bitget. */
+export const XRP_SHORT_SALE_AT = '2026-04-11T07:15:00Z';
+
+/**
+ * Every way a position carries unmatched proceeds, and one closed position that carries none.
+ * In the endpoint's order, which is by asset:
+ *
+ * | Asset | Held? | Flags | Counted? | Realized | Unmatched |
+ * |---|---|---|---|---|---|
+ * | ADA | no | - | yes, holds nothing | +12.25 | 0 |
+ * | BTC | yes | - | yes | +7500 | 20000 |
+ * | ETH | no | - | yes, holds nothing | 0 | 1234.567890123456789012 |
+ * | KAS | yes | unknown_basis | no | 0 | -50.25 |
+ * | XRP | no | history_incomplete | yes, holds nothing | +125.5 | 310.1 |
+ *
+ * - BTC: an opening balance without a cost, sold in full for 20000 before the 1.5 held now
+ *   were bought. Held and comparable, and no flag is left.
+ * - KAS: 500 of unknown cost are still held. More of them were sold, before any KAS of known
+ *   cost was bought, for less than the fee paid on that sale in the other stablecoin: -50.25,
+ *   and nothing realized, because no unit sold had a known cost.
+ * - XRP: a sale larger than the history held. The matched share realized +125.5 and the rest,
+ *   310.1, is unmatched; the shortfall is the one warning.
+ *
+ * Totals, by hand:
+ *
+ * - invested, market value and unrealized are BTC's alone: 52500, 90000, +37500, 71.4286;
+ * - realized 12.25 + 7500 + 0 + 0 + 125.5 = 7637.75, over every position;
+ * - unmatched 0 + 20000 + 1234.567890123456789012 - 50.25 + 310.1 =
+ *   21494.417890123456789012, over every position too. To the cent: 21,494.42.
+ */
+export function unmatchedProceedsPortfolio(overrides: PositionsInput = {}): PositionsResponse {
+  return positionsResponse({
+    positions: [
+      xrpClosed({ asset: 'ADA', realized_pnl: '12.250000000000000000' }),
+      position({ unmatched_proceeds: '20000.000000000000000000' }),
+      ethSoldAtUnknownCost(),
+      kasUnknownBasis({ unmatched_proceeds: '-50.250000000000000000' }),
+      xrpClosed({ flags: ['history_incomplete'], unmatched_proceeds: '310.100000000000000000' }),
+    ],
+    totals: totals({
+      total_invested: '52500.000000000000000000',
+      market_value: '90000.000000000000000000',
+      unrealized_pnl: '37500.000000000000000000',
+      unrealized_return_pct: '71.4286',
+      realized_pnl: '7637.750000000000000000',
+      unmatched_proceeds: '21494.417890123456789012',
+    }),
+    warnings: [
+      warning({
+        asset: 'XRP',
+        occurred_at: XRP_SHORT_SALE_AT,
+        quantity: '40.000000000000000000',
+      }),
+    ],
+    ...overrides,
+  });
+}
+
+/** Exactly the unmatched figures of {@link unmatchedProceedsPortfolio}, as sent. */
+export const UNMATCHED = {
+  total: '21494.417890123456789012',
+  btc: '20000.000000000000000000',
+  eth: '1234.567890123456789012',
+  kas: '-50.250000000000000000',
+  xrp: '310.100000000000000000',
+} as const;
+
+/**
+ * Two closed positions whose unmatched proceeds cancel, beside BTC, which carries none. ETH
+ * sold for less than the fee paid on the sale in the other stablecoin, -50.25; LTC sold for
+ * 50.25. The total is
+ * exactly zero while two positions each carry a figure: the response spec 026's "when it
+ * shows" rule is written for. Realized is BTC's 7500 alone.
+ */
+export function cancellingUnmatchedProceeds(): PositionsResponse {
+  return positionsResponse({
+    positions: [
+      position(),
+      ethSoldAtUnknownCost({ unmatched_proceeds: '-50.250000000000000000' }),
+      ethSoldAtUnknownCost({ asset: 'LTC', unmatched_proceeds: '50.250000000000000000' }),
+    ],
+    totals: totals({
+      total_invested: '52500.000000000000000000',
+      market_value: '90000.000000000000000000',
+      unrealized_pnl: '37500.000000000000000000',
+      unrealized_return_pct: '71.4286',
+      realized_pnl: '7500.000000000000000000',
+      unmatched_proceeds: ZERO,
+    }),
+  });
+}
+
+/**
+ * {@link everyHeldPositionExcluded}, with unmatched proceeds on a held position that is left
+ * out and on the closed one: ETH (unpriced, its short sale's unmatched share) 0.1 and XRP
+ * (closed) 0.2, which is 0.3 exactly and 0.30000000000000004 in doubles. KAS, left out as
+ * unknown-basis, carries none. Realized is unchanged: -250 + 0 + 125.5 = -124.5.
+ */
+export function everyHeldPositionExcludedWithUnmatched(): PositionsResponse {
+  return positionsResponse({
+    positions: [
+      ethUnpriced({ unmatched_proceeds: '0.100000000000000000' }),
+      kasUnknownBasis(),
+      xrpClosed({ unmatched_proceeds: '0.200000000000000000' }),
+    ],
+    totals: totals({
+      realized_pnl: '-124.500000000000000000',
+      unmatched_proceeds: '0.300000000000000000',
+    }),
+    warnings: [warning()],
   });
 }
 

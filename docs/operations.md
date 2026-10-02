@@ -1238,6 +1238,14 @@ reaches -- shows `value_out_of_range` and is left out of the totals the same way
 asset holding units of unknown cost is listed there as `unknown_basis`. The totals cover only
 what is left, so their percentage is the return on exactly the money in the total beside it.
 
+Two totals are the exception and cover **every** position, held or closed, comparable or
+excluded: `totals.realized_pnl` and `totals.unmatched_proceeds`. The second is what sales
+brought in for units with no known cost -- units that arrived without a cost, or units sold
+beyond what the imported history held -- kept out of realized P&L because there is no cost to
+compare it with. It is signed: proceeds are net of fees, and a fee paid in a third asset can
+cost more than the sale brought in. The dashboard shows it beside realized P&L whenever a
+position carries any, with the assets it comes from.
+
 ## 16. The holdings check: which balances are compared, and what a failed read means
 
 The cost-basis snapshot says what the imported history adds up to. The **holdings check**
