@@ -15,7 +15,10 @@ spec's valuation table has a test here, named after it:
 
 The totals cover only the **fully comparable** positions -- priced (or holding nothing) and
 without `UNKNOWN_BASIS` -- and name the rest with a reason; realized P&L is summed over
-every position.
+every position, and so are the unmatched proceeds (spec 026, criteria 1 and 2): held or
+closed, comparable or left out, the total is the exact, signed sum of what each carries.
+That sum has its own section at the end, with a property that holds it to an oracle written
+in integers and `fractions.Fraction`, which shares no code with `money`.
 
 Every expected figure is worked out by hand in the test's docstring or beside the literal,
 never by calling the function under test or `money`: a test that computed its expectation
@@ -26,9 +29,12 @@ from __future__ import annotations
 
 import decimal
 from decimal import Decimal
+from fractions import Fraction
 from typing import Final
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from portfolio.domain.accounting import Position, PositionFlag
 from portfolio.domain.accounting.valuation import (
@@ -435,6 +441,7 @@ def test_no_positions_are_zero_totals_and_no_percentage() -> None:
         totals.market_value,
         totals.unrealized_pnl,
         totals.realized_pnl,
+        totals.unmatched_proceeds,
     ):
         assert_exact(figure, "0")
     assert totals.unrealized_return_pct is None
@@ -635,3 +642,419 @@ def test_the_hostile_inputs_are_worked_by_hand() -> None:
     assert_exact(value.market_value, "12345678901246913569.024691356902469135")
     # The known part is all of it, so the P&L is the value minus C.
     assert_exact(value.unrealized_pnl, "1234567790135802457.913580245791358024")
+
+
+# --------------------------------------------------------------------------------------
+# Unmatched proceeds: the exact, signed sum over every position (spec 026)
+# --------------------------------------------------------------------------------------
+
+KINDS: Final = (
+    "comparable",
+    "closed",
+    "unknown_basis",
+    "unpriced",
+    "unknown_basis_and_unpriced",
+    "out_of_range",
+)
+"""Every way a position can stand towards the totals: two that are counted, four left out."""
+
+EXCLUDED_AS: Final[dict[str, str | None]] = {
+    "comparable": None,
+    "closed": None,
+    "unknown_basis": "unknown_basis",
+    "unpriced": "unpriced",
+    "unknown_basis_and_unpriced": "unknown_basis",
+    "out_of_range": "unpriced",
+}
+"""What `value_portfolio` says of each kind: the reason it is left out, or `None`."""
+
+
+def carrying(kind: str, asset: str, *, unmatched: str, realized: str = "0") -> PositionValue:
+    """One position of `kind`, carrying `unmatched` of unmatched proceeds.
+
+    * `comparable` -- 1.5 held at a basis of 52500, priced at 60000.
+    * `closed` -- nothing held, and no price: it is counted, as zeros.
+    * `unknown_basis` -- 3 held, 1 of them of unknown cost, priced: left out.
+    * `unpriced` -- 100 held and no price: left out.
+    * `unknown_basis_and_unpriced` -- both: left out once, as `unknown_basis`.
+    * `out_of_range` -- 1E19 held at 10, a value no figure holds: left out as `unpriced`.
+    """
+    unknown_basis = frozenset({PositionFlag.UNKNOWN_BASIS})
+    if kind == "comparable":
+        return priced(held(asset, realized=realized, unmatched=unmatched), "60000")
+    if kind == "closed":
+        emptied = held(
+            asset,
+            quantity="0",
+            cost_basis="0",
+            average_cost=None,
+            realized=realized,
+            unmatched=unmatched,
+        )
+        return unpriced(emptied, UNSUPPORTED_PAIR)
+    if kind in ("unknown_basis", "unknown_basis_and_unpriced"):
+        partly_unknown = held(
+            asset,
+            quantity="3",
+            unknown="1",
+            cost_basis="0.16",
+            average_cost="0.08",
+            realized=realized,
+            unmatched=unmatched,
+            flags=unknown_basis,
+        )
+        if kind == "unknown_basis":
+            return priced(partly_unknown, "0.10")
+        return unpriced(partly_unknown, NEVER_FETCHED)
+    if kind == "unpriced":
+        return unpriced(
+            held(
+                asset,
+                quantity="100",
+                cost_basis="10",
+                average_cost="0.1",
+                realized=realized,
+                unmatched=unmatched,
+            ),
+            NEVER_FETCHED,
+        )
+    assert kind == "out_of_range", kind
+    huge = held(
+        asset,
+        quantity="10000000000000000000",
+        cost_basis="1",
+        average_cost="0",
+        realized=realized,
+        unmatched=unmatched,
+    )
+    return priced(huge, "10")
+
+
+def seven_positions_carrying_unmatched_proceeds() -> list[PositionValue]:
+    """One position of every kind, and a second closed one whose figure is negative.
+
+    | Asset | Kind | Unmatched | Realized |
+    |---|---|---|---|
+    | ADA | closed | 1234.5 | 29.9 |
+    | BTC | comparable | 10000 | 7500 |
+    | DOGE | unpriced | 300 | 3 |
+    | ETH | closed | -50 | -200 |
+    | KAS | unknown basis | 20.25 | 1.25 |
+    | SOL | unknown basis and unpriced | 0.125 | 0 |
+    | XMR | out of range | 7 | 3 |
+
+    No two figures are equal, and no unmatched figure equals a realized one, so a total that
+    read the wrong field, or skipped a row, cannot land on the right number by accident.
+    """
+    return [
+        carrying("closed", "ADA", unmatched="1234.5", realized="29.9"),
+        carrying("comparable", "BTC", unmatched="10000", realized="7500"),
+        carrying("unpriced", "DOGE", unmatched="300", realized="3"),
+        carrying("closed", "ETH", unmatched="-50", realized="-200"),
+        carrying("unknown_basis", "KAS", unmatched="20.25", realized="1.25"),
+        carrying("unknown_basis_and_unpriced", "SOL", unmatched="0.125"),
+        carrying("out_of_range", "XMR", unmatched="7", realized="3"),
+    ]
+
+
+def test_unmatched_proceeds_are_summed_over_every_position() -> None:
+    """Criterion 1: held and closed, comparable and left out, by hand.
+
+    1234.5 + 10000 + 300 - 50 + 20.25 + 0.125 + 7 = 11511.875. Four of the seven are left
+    out of the other totals, and what they carry is in this one all the same.
+    """
+    totals = value_portfolio(seven_positions_carrying_unmatched_proceeds())
+
+    assert_exact(totals.unmatched_proceeds, "11511.875")
+    assert excluded_of(totals) == [
+        ("DOGE", "unpriced"),
+        ("KAS", "unknown_basis"),
+        ("SOL", "unknown_basis"),
+        ("XMR", "unpriced"),
+    ]
+
+
+def test_unmatched_proceeds_and_realized_pnl_are_two_sums_that_do_not_mix() -> None:
+    """The realized figures of the same seven: 29.9 + 7500 + 3 - 200 + 1.25 + 0 + 3 = 7337.15.
+
+    Neither total is the other's, and the comparable figures -- BTC alone holds anything --
+    are what they were before this total existed: no proceeds are added to a value or a cost.
+    """
+    totals = value_portfolio(seven_positions_carrying_unmatched_proceeds())
+
+    assert_exact(totals.realized_pnl, "7337.15")
+    assert_exact(totals.unmatched_proceeds, "11511.875")
+    assert_exact(totals.total_invested, "52500")
+    assert_exact(totals.market_value, "90000")
+    assert_exact(totals.unrealized_pnl, "37500")
+    assert_exact(totals.unrealized_return_pct, "71.4286")
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_a_position_of_any_kind_counts_in_the_unmatched_total(kind: str) -> None:
+    """Each kind alone: what it carries is the total, whether or not it is left out.
+
+    The realized figure is a different number, so a total summed from the wrong field, or
+    summed only for the positions that are counted, fails for the kinds it gets wrong.
+    """
+    totals = value_portfolio([carrying(kind, "KAS", unmatched="40000.5", realized="5000.25")])
+
+    assert_exact(totals.unmatched_proceeds, "40000.5")
+    assert_exact(totals.realized_pnl, "5000.25")
+    reason = EXCLUDED_AS[kind]
+    assert excluded_of(totals) == ([] if reason is None else [("KAS", reason)])
+
+
+def test_the_kinds_cover_every_exclusion_reason_and_both_ways_of_being_counted() -> None:
+    """The control on the parametrization above: it means something only if the kinds differ."""
+    assert set(EXCLUDED_AS) == set(KINDS)
+    assert {reason for reason in EXCLUDED_AS.values() if reason is not None} == {
+        str(reason) for reason in ExclusionReason
+    }
+    assert [kind for kind, reason in EXCLUDED_AS.items() if reason is None] == [
+        "comparable",
+        "closed",
+    ]
+
+
+def test_no_unmatched_proceeds_is_a_zero_like_the_other_zero_totals() -> None:
+    """Positions that carry none, and no positions at all: zero, a `Decimal`, at 18 places.
+
+    The same zero as `realized_pnl`'s, digit for digit, so the endpoint spells both alike.
+    """
+    carrying_none = value_portfolio(four_positions())
+    empty = value_portfolio([])
+
+    for totals in (carrying_none, empty):
+        assert_exact(totals.unmatched_proceeds, "0")
+        assert totals.unmatched_proceeds.as_tuple().exponent == -18
+    assert empty.unmatched_proceeds.as_tuple() == empty.realized_pnl.as_tuple()
+
+
+def test_a_negative_unmatched_total_is_kept_negative() -> None:
+    """The sum is signed and not clamped (spec 026, *The sign*): 10 - 60.5 = -50.5.
+
+    A sale's proceeds are net of every fee, and a fee paid in a third asset can cost more
+    than the sale brought in.
+    """
+    alone = value_portfolio([carrying("closed", "ETH", unmatched="-50")])
+    mixed = value_portfolio(
+        [
+            carrying("comparable", "BTC", unmatched="10"),
+            carrying("unpriced", "ETH", unmatched="-60.5"),
+        ]
+    )
+
+    assert_exact(alone.unmatched_proceeds, "-50")
+    assert_exact(mixed.unmatched_proceeds, "-50.5")
+
+
+def test_two_positions_that_cancel_sum_to_exactly_zero() -> None:
+    """1234.567890123456789012 and its negative: zero, with nothing left in the last place."""
+    totals = value_portfolio(
+        [
+            carrying("comparable", "BTC", unmatched="1234.567890123456789012"),
+            carrying("closed", "ETH", unmatched="-1234.567890123456789012"),
+        ]
+    )
+
+    assert_exact(totals.unmatched_proceeds, "0")
+    assert totals.unmatched_proceeds.is_zero()
+    assert not totals.unmatched_proceeds.is_signed(), "a zero total is not a negative zero"
+
+
+def test_the_unmatched_total_is_exact_where_binary_floats_are_not() -> None:
+    """Ten tenths are one, and a tenth and two tenths are three tenths.
+
+    In doubles the first is 0.9999999999999999 and the second 0.30000000000000004.
+    """
+    ten_tenths = value_portfolio(
+        [carrying("closed", f"A{index}", unmatched="0.1") for index in range(10)]
+    )
+    three_tenths = value_portfolio(
+        [
+            carrying("comparable", "BTC", unmatched="0.1"),
+            carrying("unknown_basis", "KAS", unmatched="0.2"),
+        ]
+    )
+
+    assert_exact(ten_tenths.unmatched_proceeds, "1")
+    assert_exact(three_tenths.unmatched_proceeds, "0.3")
+
+
+def test_the_unmatched_total_keeps_every_one_of_eighteen_places() -> None:
+    """A 38-digit figure plus three units in the last place, and a difference of one unit.
+
+    12345678901234567890.123456789012345678 + 3 x 1E-18 ends ...345681: at the
+    interpreter's default of 28 digits the three units vanish. 1E-18 - 2E-18 is -1E-18.
+    """
+    large = value_portfolio(
+        [
+            carrying("comparable", "BTC", unmatched="12345678901234567890.123456789012345678"),
+            carrying("closed", "ADA", unmatched="0.000000000000000001"),
+            carrying("unpriced", "DOGE", unmatched="0.000000000000000001"),
+            carrying("unknown_basis", "KAS", unmatched="0.000000000000000001"),
+        ]
+    )
+    dust = value_portfolio(
+        [
+            carrying("closed", "ADA", unmatched="0.000000000000000001"),
+            carrying("closed", "ETH", unmatched="-0.000000000000000002"),
+        ]
+    )
+
+    assert_exact(large.unmatched_proceeds, "12345678901234567890.123456789012345681")
+    assert_exact(dust.unmatched_proceeds, "-0.000000000000000001")
+
+
+def test_an_unmatched_total_past_38_digits_is_summed_exactly() -> None:
+    """Each figure fits a column; their sum needs 39 digits, and gets them.
+
+    60000000000000000000.000000000000000001 twice is
+    120000000000000000000.000000000000000002. A sum rounded to the application's 38 digits
+    loses the final 2.
+    """
+    amount = "60000000000000000000.000000000000000001"
+
+    totals = value_portfolio(
+        [
+            carrying("comparable", "BTC", unmatched=amount),
+            carrying("out_of_range", "XMR", unmatched=amount),
+        ]
+    )
+
+    assert_exact(totals.unmatched_proceeds, "120000000000000000000.000000000000000002")
+
+
+def test_the_unmatched_total_ignores_a_hostile_ambient_context() -> None:
+    """Criterion 2: `money.add`, never a bare `+` in whatever context the caller is in.
+
+    12345678901234567890.123456789012345678 + 7777777777.777777777777777777
+    = 12345678909012345667.901234566790123455, and minus 0.333333333333333333 that is
+    12345678909012345667.567901233456790122. With `prec=6` a bare sum keeps six digits of
+    it; with `Inexact` and `Rounded` trapped as well, it raises.
+    """
+
+    def total() -> Decimal:
+        return value_portfolio(
+            [
+                carrying("comparable", "BTC", unmatched="12345678901234567890.123456789012345678"),
+                carrying("unpriced", "DOGE", unmatched="7777777777.777777777777777777"),
+                carrying("unknown_basis", "KAS", unmatched="-0.333333333333333333"),
+            ]
+        ).unmatched_proceeds
+
+    with decimal.localcontext() as context:
+        context.prec = 6
+        context.rounding = decimal.ROUND_UP
+        narrowed = total()
+    with decimal.localcontext() as context:
+        context.prec = 6
+        context.rounding = decimal.ROUND_UP
+        context.traps[decimal.Inexact] = True
+        context.traps[decimal.Rounded] = True
+        trapped = total()
+
+    for found in (total(), narrowed, trapped):
+        assert_exact(found, "12345678909012345667.567901233456790122")
+
+
+def test_an_unmatched_figure_that_is_not_a_decimal_is_refused_as_money_add_refuses_it() -> None:
+    """Criterion 2, from the other side: `money.add` takes a `Decimal` and nothing else.
+
+    A bare `+` would add an `int` to a `Decimal` without a word, and a total could then be
+    built from a figure nobody parsed.
+    """
+    position = held(quantity="0", cost_basis="0", average_cost=None)
+    not_a_decimal = Position(
+        asset=position.asset,
+        quantity=position.quantity,
+        unknown_basis_quantity=position.unknown_basis_quantity,
+        cost_basis=position.cost_basis,
+        average_cost=position.average_cost,
+        realized_pnl=position.realized_pnl,
+        unmatched_proceeds=10,  # type: ignore[arg-type]
+        flags=position.flags,
+    )
+
+    with pytest.raises(TypeError, match="Decimal"):
+        value_portfolio([unpriced(not_a_decimal, UNSUPPORTED_PAIR)])
+
+
+def test_the_unmatched_total_is_read_from_any_iterable() -> None:
+    """`value_portfolio` takes an iterable: a generator is summed like a list."""
+    values = seven_positions_carrying_unmatched_proceeds()
+
+    totals = value_portfolio(value for value in values)
+
+    assert_exact(totals.unmatched_proceeds, "11511.875")
+
+
+# The oracle: integers, and one `Fraction` at the end. It imports nothing from `portfolio`,
+# builds no `Decimal`, and was written from spec 026 -- "the exact sum of every position's
+# `unmatched_proceeds`: held and closed, comparable and excluded" -- so a disagreement is a
+# place where `value_portfolio` rounds, skips a position, or reads another field.
+
+UNITS_PER_ONE: Final = 10**18
+
+AMOUNT_IN_UNITS: Final = st.integers(min_value=-(10**38 - 1), max_value=10**38 - 1)
+"""A figure as a count of units at eighteen places, either sign: everything a
+`NumericText(18)` column holds, from -99999999999999999999.999999999999999999 up."""
+
+
+def at_eighteen_places(units: int) -> str:
+    """`units` x 1E-18 written out as a plain decimal, by integer division alone."""
+    whole, fraction = divmod(abs(units), UNITS_PER_ONE)
+    return f"{'-' if units < 0 else ''}{whole}.{fraction:018d}"
+
+
+def test_the_oracles_spelling_of_an_amount_is_the_amount() -> None:
+    """The control on the oracle's own helper: four amounts spelled by hand."""
+    assert at_eighteen_places(0) == "0.000000000000000000"
+    assert at_eighteen_places(-1) == "-0.000000000000000001"
+    assert at_eighteen_places(10**38 - 1) == "99999999999999999999.999999999999999999"
+    assert at_eighteen_places(-1_500_000_000_000_000_000) == "-1.500000000000000000"
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    entries=st.lists(
+        st.tuples(st.sampled_from(KINDS), AMOUNT_IN_UNITS, AMOUNT_IN_UNITS), max_size=12
+    )
+)
+def test_the_unmatched_total_agrees_with_an_exact_oracle(
+    entries: list[tuple[str, int, int]],
+) -> None:
+    """Criterion 2: for any positions, of any kind, in any order, the total is the exact sum.
+
+    Each entry is a kind, an unmatched figure and a realized one, both in units at eighteen
+    places. The expected total is the integer sum of the units over 10**18.
+    """
+    values = [
+        carrying(
+            kind,
+            f"A{index:02d}",
+            unmatched=at_eighteen_places(unmatched),
+            realized=at_eighteen_places(realized),
+        )
+        for index, (kind, unmatched, realized) in enumerate(entries)
+    ]
+
+    totals = value_portfolio(values)
+    backwards = value_portfolio(reversed(values))
+
+    expected = Fraction(sum(unmatched for _kind, unmatched, _realized in entries), UNITS_PER_ONE)
+    assert isinstance(totals.unmatched_proceeds, Decimal)
+    assert Fraction(totals.unmatched_proceeds) == expected
+    assert totals.unmatched_proceeds.as_tuple().exponent == -18
+    assert backwards.unmatched_proceeds == totals.unmatched_proceeds
+    # The other sum over every position is untouched by this one, and the kinds are what
+    # they claim to be: each left-out position is named, with its reason, in the order given.
+    assert Fraction(totals.realized_pnl) == Fraction(
+        sum(realized for _kind, _unmatched, realized in entries), UNITS_PER_ONE
+    )
+    assert excluded_of(totals) == [
+        (f"A{index:02d}", reason)
+        for index, (kind, _unmatched, _realized) in enumerate(entries)
+        if (reason := EXCLUDED_AS[kind]) is not None
+    ]

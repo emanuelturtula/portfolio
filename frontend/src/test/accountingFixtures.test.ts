@@ -1,11 +1,15 @@
+import Decimal from 'decimal.js';
 import { describe, expect, it } from 'vitest';
 
 import {
   bgbFeeNeverHeld,
   breakEvenPortfolio,
+  cancellingUnmatchedProceeds,
   emptySnapshot,
+  ethSoldAtUnknownCost,
   ethUnpriced,
   everyHeldPositionExcluded,
+  everyHeldPositionExcludedWithUnmatched,
   failedFirstRecompute,
   FEE_OCCURRED_AT,
   feeInNeverHeldAsset,
@@ -20,10 +24,35 @@ import {
   stablecoinOnlySnapshot,
   tinyPnlPortfolio,
   totals,
+  UNMATCHED,
+  unmatchedProceedsPortfolio,
   warning,
   xrpClosed,
   ZERO,
+  type PositionsResponse,
 } from './accountingFixtures';
+
+/** Every scenario the page tests use: the guard is silent on each, and that is checked. */
+const SCENARIOS: readonly (() => PositionsResponse)[] = [
+  investedPortfolio,
+  everyHeldPositionExcluded,
+  kasLossPortfolio,
+  breakEvenPortfolio,
+  tinyPnlPortfolio,
+  unmatchedProceedsPortfolio,
+  cancellingUnmatchedProceeds,
+  everyHeldPositionExcludedWithUnmatched,
+  emptySnapshot,
+  stablecoinOnlySnapshot,
+  noSnapshot,
+  failedFirstRecompute,
+];
+
+/**
+ * A `decimal.js` of this file's own, wide enough to add 18-place amounts exactly: the default
+ * precision of 20 would round the 23 digits of a total like 21494.417890123456789012.
+ */
+const Exact = Decimal.clone({ precision: 60 });
 
 /**
  * The control on the accounting fixture guard. Its silence on every scenario the page tests
@@ -31,17 +60,7 @@ import {
  */
 describe('the accounting fixture guard', () => {
   it('accepts every scenario the page tests use', () => {
-    for (const build of [
-      investedPortfolio,
-      everyHeldPositionExcluded,
-      kasLossPortfolio,
-      breakEvenPortfolio,
-      tinyPnlPortfolio,
-      emptySnapshot,
-      stablecoinOnlySnapshot,
-      noSnapshot,
-      failedFirstRecompute,
-    ]) {
+    for (const build of SCENARIOS) {
       expect(build).not.toThrow();
     }
   });
@@ -76,6 +95,103 @@ describe('the accounting fixture guard', () => {
         totals: totals({ total_invested: '52500.000000000000000000' }),
       }),
     ).toThrow('totals.market_value');
+  });
+
+  it("holds every scenario's unmatched total to the sum of its positions' own (spec 026)", () => {
+    // Summed here, apart from the guard, so the guard is not the only thing that says so.
+    for (const build of SCENARIOS) {
+      const response = build();
+      const sum = response.positions.reduce(
+        (total, entry) => total.plus(entry.unmatched_proceeds),
+        new Exact(0),
+      );
+      expect(new Exact(response.totals.unmatched_proceeds).eq(sum)).toBe(true);
+    }
+    // The control: the scenarios do carry figures, a negative one and a pair that cancels.
+    expect(unmatchedProceedsPortfolio().totals.unmatched_proceeds).toBe(UNMATCHED.total);
+    expect(UNMATCHED.total).toBe('21494.417890123456789012');
+    expect(unmatchedProceedsPortfolio().positions.map((entry) => entry.unmatched_proceeds)).toEqual(
+      [ZERO, UNMATCHED.btc, UNMATCHED.eth, UNMATCHED.kas, UNMATCHED.xrp],
+    );
+    expect(cancellingUnmatchedProceeds().totals.unmatched_proceeds).toBe(ZERO);
+    expect(
+      cancellingUnmatchedProceeds().positions.map((entry) => entry.unmatched_proceeds),
+    ).toEqual([ZERO, '-50.250000000000000000', '50.250000000000000000']);
+  });
+
+  it('refuses an unmatched total of zero while a position carries a figure', () => {
+    expect(() => positionsResponse({ positions: [ethSoldAtUnknownCost()] })).toThrow(
+      'totals.unmatched_proceeds is 0.000000000000000000; it works out to 1234.567890123456789012',
+    );
+  });
+
+  it('refuses an unmatched total no position stands behind', () => {
+    // The response the page has no branch for: spec 026 calls it one the backend cannot write.
+    expect(() =>
+      positionsResponse({
+        positions: [xrpClosed()],
+        totals: totals({
+          realized_pnl: '125.500000000000000000',
+          unmatched_proceeds: '10.000000000000000000',
+        }),
+      }),
+    ).toThrow('totals.unmatched_proceeds is 10.000000000000000000; it works out to 0.0');
+  });
+
+  it('refuses an unmatched total that leaves out a position left out of the other totals', () => {
+    // 21494.417890123456789012 without KAS's -50.25 is 21544.667890123456789012: the sum over
+    // the counted positions only, which is how the other totals are summed and this one is not.
+    const stated = unmatchedProceedsPortfolio().totals;
+    expect(() =>
+      unmatchedProceedsPortfolio({
+        totals: { ...stated, unmatched_proceeds: '21544.667890123456789012' },
+      }),
+    ).toThrow(
+      `totals.unmatched_proceeds is 21544.667890123456789012; it works out to ${UNMATCHED.total}`,
+    );
+  });
+
+  it('refuses an unmatched total that leaves out the positions no longer held', () => {
+    // BTC's 20000 and KAS's -50.25 alone: 19949.75, the sum over the held positions.
+    const stated = unmatchedProceedsPortfolio().totals;
+    expect(() =>
+      unmatchedProceedsPortfolio({
+        totals: { ...stated, unmatched_proceeds: '19949.750000000000000000' },
+      }),
+    ).toThrow('totals.unmatched_proceeds');
+  });
+
+  it('refuses an unmatched total that is off by one unit in the last place', () => {
+    const stated = unmatchedProceedsPortfolio().totals;
+    expect(() =>
+      unmatchedProceedsPortfolio({
+        totals: { ...stated, unmatched_proceeds: '21494.417890123456789013' },
+      }),
+    ).toThrow('totals.unmatched_proceeds');
+  });
+
+  it('refuses an unmatched figure at the wrong scale, on a position or in the totals', () => {
+    expect(() =>
+      positionsResponse({ positions: [ethSoldAtUnknownCost({ unmatched_proceeds: '1234.5' })] }),
+    ).toThrow('ETH unmatched_proceeds "1234.5" has 1 places; the backend sends 18');
+    expect(() => positionsResponse({ totals: totals({ unmatched_proceeds: '0' }) })).toThrow(
+      'totals.unmatched_proceeds "0" has 0 places; the backend sends 18',
+    );
+  });
+
+  it('accepts a closed position that carries unmatched proceeds and no flag', () => {
+    // The sharpest case of spec 026: `unknown_basis` is not sticky, so nothing else marks it.
+    const eth = ethSoldAtUnknownCost();
+
+    expect(eth.flags).toEqual([]);
+    expect(eth.quantity).toBe(ZERO);
+    expect(eth.realized_pnl).toBe(ZERO);
+    expect(() =>
+      positionsResponse({
+        positions: [eth],
+        totals: totals({ unmatched_proceeds: eth.unmatched_proceeds }),
+      }),
+    ).not.toThrow();
   });
 
   it('refuses stated exclusions the positions do not give', () => {

@@ -13,10 +13,13 @@ import {
   accountingPrice,
   bgbFeeNeverHeld,
   breakEvenPortfolio,
+  cancellingUnmatchedProceeds,
   COMPUTED_AT,
   emptySnapshot,
+  ethSoldAtUnknownCost,
   ethUnpriced,
   everyHeldPositionExcluded,
+  everyHeldPositionExcludedWithUnmatched,
   failedFirstRecompute,
   failedRecompute,
   FEE_OCCURRED_AT,
@@ -33,8 +36,11 @@ import {
   stablecoinOnlySnapshot,
   tinyPnlPortfolio,
   totals,
+  UNMATCHED,
+  unmatchedProceedsPortfolio,
   warning,
   WARNING_OCCURRED_AT,
+  XRP_SHORT_SALE_AT,
   xrpClosed,
   ZERO,
   type PositionsResponse,
@@ -62,6 +68,12 @@ import {
   type FakePortfolioOptions,
 } from '@/test/fakePortfolio';
 import { emptyPortfolio, healthyPortfolio, HEALTHY, NOW, STALE_PRICE_AS_OF } from '@/test/fixtures';
+import {
+  matchedAsset,
+  reconciliation,
+  xrpLeftOnExchange,
+  type ReconciliationResponse,
+} from '@/test/reconciliationFixtures';
 import { currentPath, renderApp, settle } from '@/test/render';
 import { fakeSession, problem, server, TEST_USERNAME } from '@/test/server';
 
@@ -88,6 +100,11 @@ afterEach(() => {
 
 interface OpenOptions {
   readonly positions?: PositionsResponse;
+  /**
+   * The comparison of that snapshot with the balances read (spec 025). Defaults to the quiet
+   * one, in which everything matches and nothing is marked "Held exceeds history".
+   */
+  readonly reconciliation?: ReconciliationResponse;
   /** The exchange list. Defaults to one venue that has imported trades and is fine. */
   readonly exchanges?: readonly ExchangeResponse[];
   readonly portfolio?: FakePortfolioOptions;
@@ -105,7 +122,10 @@ interface Setup {
 
 function openDashboard(options: OpenOptions = {}): Setup {
   const user = userEvent.setup();
-  const accounting = fakeAccounting({ positions: options.positions ?? investedPortfolio() });
+  const accounting = fakeAccounting({
+    positions: options.positions ?? investedPortfolio(),
+    ...(options.reconciliation === undefined ? {} : { reconciliation: options.reconciliation }),
+  });
   const exchanges = fakeExchanges({
     exchanges: options.exchanges ?? [exchange()],
     ...(options.onExchangeSync === undefined ? {} : { onSync: options.onExchangeSync }),
@@ -968,6 +988,550 @@ describe('InvestedSection: closed positions', () => {
 
     await positionsTable();
     expect(within(await loadedRegion()).queryByText(/no longer held/)).not.toBeInTheDocument();
+  });
+});
+
+/*
+ * Unmatched proceeds (spec 026): what sales brought in for units with no known cost. The
+ * figure, its explanation, its list and the mark in the closed line follow one condition - at
+ * least one position carries a non-zero figure - and every amount is rendered as sent.
+ */
+
+const UNMATCHED_TERM = 'Unmatched proceeds';
+
+/** Written out, not imported: a statement to the owner, and a change to it is a diff here. */
+const UNMATCHED_EXPLANATION =
+  'Unmatched proceeds are what sales brought in, net of fees, for units with no known cost: ' +
+  'units that arrived without one, or units sold beyond what the imported history held. ' +
+  'They are kept out of realized P&L, because there is no cost to compare them with. Like ' +
+  'realized P&L, the figure covers every position, held or not.';
+
+const FOUR_TERMS = ['Invested', 'Market value', 'Unrealized P&L', 'Realized P&L'];
+
+/** The summary itself: the `<dl>` every entry sits in. */
+async function summaryList(): Promise<HTMLElement> {
+  const summary = (await summaryValue('Invested')).closest('dl');
+  if (summary === null) {
+    throw new Error('The summary is not a <dl>.');
+  }
+  return summary;
+}
+
+/** The summary's terms, in the order they are shown. */
+async function summaryTerms(): Promise<string[]> {
+  return Array.from((await summaryList()).querySelectorAll('dt')).map((term) =>
+    term.textContent.trim(),
+  );
+}
+
+interface UnmatchedBlock {
+  readonly explanation: HTMLElement;
+  readonly list: HTMLElement;
+  readonly items: HTMLElement[];
+}
+
+/** The explanation under the summary and the list right after it. Throws without either. */
+function unmatchedBlock(region: HTMLElement): UnmatchedBlock {
+  const explanation = within(region).getByText(UNMATCHED_EXPLANATION);
+  const list = explanation.nextElementSibling;
+  if (!(list instanceof HTMLUListElement)) {
+    throw new Error('No list follows the unmatched proceeds explanation.');
+  }
+  return { explanation, list, items: within(list).getAllByRole('listitem') };
+}
+
+/** BTC held and comparable, beside one closed position that carries `amount`. */
+function btcBesideClosedCarrier(amount: string): PositionsResponse {
+  return positionsResponse({
+    positions: [position(), ethSoldAtUnknownCost({ unmatched_proceeds: amount })],
+    totals: totals({ ...BTC_ONLY_TOTALS, unmatched_proceeds: amount }),
+  });
+}
+
+describe('InvestedSection: unmatched proceeds (spec 026)', () => {
+  describe('when no position carries any (criterion 4)', () => {
+    it('shows no entry, no explanation, no list and no mark, with the zero as the wire spells it', async () => {
+      // Every position of the full table sends "0.000000000000000000", and so does the total:
+      // eighteen places, which is not the string "0".
+      const response = investedPortfolio();
+      expect(response.positions.every((entry) => entry.unmatched_proceeds === ZERO)).toBe(true);
+      expect(response.totals.unmatched_proceeds).toBe(ZERO);
+      openDashboard({ positions: response });
+
+      expect(await summaryTerms()).toEqual(FOUR_TERMS);
+      const region = await loadedRegion();
+      await positionsTable();
+      expect(region.textContent).not.toMatch(/unmatched/i);
+      // The one list under the summary is the exclusions' own.
+      expect(region.querySelectorAll('ul.excluded-list')).toHaveLength(1);
+      // The summary carries the amounts it carried before this figure existed, and no other.
+      expect(dataValues(await summaryList())).toEqual([
+        INVESTED_TOTALS.invested,
+        INVESTED_TOTALS.marketValue,
+        INVESTED_TOTALS.unrealizedPnl,
+        INVESTED_TOTALS.returnPct,
+        INVESTED_TOTALS.realizedPnl,
+      ]);
+      expect(
+        within(region).getByText(
+          '2 assets no longer held are not listed: BGB (History incomplete), XRP. ' +
+            'Their realized P&L is in the total.',
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('adds no list at all to a summary that had none', async () => {
+      openDashboard({ positions: breakEvenPortfolio() });
+
+      expect(await summaryTerms()).toEqual(FOUR_TERMS);
+      const region = await loadedRegion();
+      await positionsTable();
+      expect(region.textContent).not.toMatch(/unmatched/i);
+      expect(region.querySelectorAll('ul.excluded-list')).toHaveLength(0);
+    });
+  });
+
+  describe('when at least one does (criterion 5)', () => {
+    it('adds the entry after Realized P&L, with the total exactly as sent and no plus', async () => {
+      openDashboard({ positions: unmatchedProceedsPortfolio() });
+
+      expect(await summaryTerms()).toEqual([...FOUR_TERMS, UNMATCHED_TERM]);
+      const unmatched = await summaryValue(UNMATCHED_TERM);
+      // 21494.417890123456789012: every one of 18 places, where a double keeps 21494.417890123456.
+      expect(dataValues(unmatched)).toEqual([UNMATCHED.total]);
+      expect(unmatched).toHaveTextContent(/^21,494\.42 USD$/);
+      // An amount that came in, not a gain: no plus, although it is positive.
+      expect(unmatched.textContent).not.toMatch(/\+/);
+
+      // Realized P&L beside it is its own figure, signed as before: 12.25 + 7500 + 125.5.
+      const realized = await summaryValue('Realized P&L');
+      expect(dataValues(realized)).toEqual(['7637.750000000000000000']);
+      expect(realized).toHaveTextContent(/^\+7,637\.75 USD$/);
+      // "Beside": the entry right after Realized P&L's, and the last of the summary.
+      expect(realized.parentElement?.nextElementSibling).toBe(unmatched.parentElement);
+      expect(unmatched.parentElement?.nextElementSibling).toBeNull();
+    });
+
+    it("explains the figure in the spec's words, after the realized caveat and before the exclusions", async () => {
+      openDashboard({ positions: unmatchedProceedsPortfolio() });
+
+      const region = await loadedRegion();
+      await positionsTable();
+      const { explanation, list } = unmatchedBlock(region);
+      expect(explanation.tagName).toBe('P');
+      expect(within(region).getAllByText(UNMATCHED_EXPLANATION)).toHaveLength(1);
+
+      // XRP is history_incomplete, so realized P&L is qualified; KAS is left out of the totals.
+      const caveat = within(region).getByText(realizedCaveat('XRP'));
+      const leftOut = within(region).getByText('Left out of these totals:');
+      expect(caveat.nextElementSibling).toBe(explanation);
+      expect(list.nextElementSibling).toBe(leftOut);
+      // The exclusions keep their own list, as it was.
+      expect(leftOut.nextElementSibling?.textContent).toBe(
+        `KAS: ${EXCLUSION_REASON_MESSAGES.unknown_basis}`,
+      );
+      expect(region.querySelectorAll('ul.excluded-list')).toHaveLength(2);
+      // A sentence, not an announcement.
+      expect(explanation.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
+    });
+
+    it('lists each carrying asset with its own amount as sent, in the endpoint order', async () => {
+      openDashboard({ positions: unmatchedProceedsPortfolio() });
+
+      const region = await loadedRegion();
+      await positionsTable();
+      const { list, items } = unmatchedBlock(region);
+      // By asset, as the endpoint sends them - which is neither ascending nor descending by
+      // amount. ADA is closed and carries none: not an item.
+      expect(items.map((item) => item.textContent)).toEqual([
+        'BTC: 20,000.00 USD',
+        'ETH: 1,234.57 USD',
+        'KAS: -50.25 USD',
+        'XRP: 310.10 USD',
+      ]);
+      expect(items.map((item) => dataValues(item))).toEqual([
+        [UNMATCHED.btc],
+        [UNMATCHED.eth],
+        [UNMATCHED.kas],
+        [UNMATCHED.xrp],
+      ]);
+      expect(items.map((item) => item.querySelector('strong')?.textContent)).toEqual([
+        'BTC',
+        'ETH',
+        'KAS',
+        'XRP',
+      ]);
+      expect(list.textContent).not.toMatch(/ADA/);
+      expect(list.textContent).not.toMatch(/\+/);
+      expect(list).toHaveClass('excluded-list');
+    });
+
+    it('renders the total it was sent and adds nothing up', async () => {
+      // A response no backend writes, on purpose, served past the fixture guard: the total
+      // disagrees with the positions. A page that summed them would show 21,494.42.
+      const response = unmatchedProceedsPortfolio();
+      const stated = '999.990000000000000000';
+      openDashboard({
+        positions: response,
+        overrides: [
+          http.get(POSITIONS_PATH, () =>
+            HttpResponse.json({
+              ...response,
+              totals: { ...response.totals, unmatched_proceeds: stated },
+            }),
+          ),
+        ],
+      });
+
+      const unmatched = await summaryValue(UNMATCHED_TERM);
+      expect(dataValues(unmatched)).toEqual([stated]);
+      expect(unmatched).toHaveTextContent(/^999\.99 USD$/);
+      // And each item is its position's own figure, not a share of the total.
+      const { items } = unmatchedBlock(await loadedRegion());
+      expect(items.map((item) => dataValues(item))).toEqual([
+        [UNMATCHED.btc],
+        [UNMATCHED.eth],
+        [UNMATCHED.kas],
+        [UNMATCHED.xrp],
+      ]);
+    });
+
+    it('shows the list for one asset as well: it is what says where the total is from', async () => {
+      // The sharpest case: ETH arrived with no cost and was sold in full. Closed, no flag,
+      // nothing realized - and 1234.567890123456789012 came in.
+      openDashboard({ positions: btcBesideClosedCarrier(UNMATCHED.eth) });
+
+      const region = await loadedRegion();
+      await positionsTable();
+      const unmatched = await summaryValue(UNMATCHED_TERM);
+      expect(dataValues(unmatched)).toEqual(['1234.567890123456789012']);
+      expect(unmatched).toHaveTextContent(/^1,234\.57 USD$/);
+
+      const { explanation, items } = unmatchedBlock(region);
+      expect(items.map((item) => item.textContent)).toEqual(['ETH: 1,234.57 USD']);
+      expect(items.map((item) => dataValues(item))).toEqual([['1234.567890123456789012']]);
+      // No caveat and no exclusion here: the explanation follows the summary directly, and
+      // its list is the only one.
+      expect(within(region).queryByText(/Realized P&L may be inaccurate/)).not.toBeInTheDocument();
+      expect((await summaryList()).nextElementSibling).toBe(explanation);
+      expect(region.querySelectorAll('ul.excluded-list')).toHaveLength(1);
+      // No flag anywhere, so no legend: the sentence under the summary explains the mark.
+      expect(legend(region)).toEqual([]);
+    });
+
+    it('puts only wire strings in every <data value>, the unmatched ones among them', async () => {
+      const response = unmatchedProceedsPortfolio();
+      openDashboard({ positions: response });
+
+      const region = await loadedRegion();
+      await positionsTable();
+      const sent = wireStrings(response);
+      const values = dataValues(region);
+
+      for (const value of values) {
+        expect(sent).toContain(value);
+      }
+      for (const amount of Object.values(UNMATCHED)) {
+        expect(values).toContain(amount);
+      }
+    });
+  });
+
+  describe('the mark in the line for assets no longer held (criterion 6)', () => {
+    it('marks one closed asset that carries it, in the singular', async () => {
+      openDashboard({ positions: btcBesideClosedCarrier(UNMATCHED.eth) });
+
+      const line = within(await loadedRegion()).getByText(
+        '1 asset no longer held is not listed: ETH (Unmatched proceeds). ' +
+          'Its realized P&L is in the total.',
+      );
+      // The label and never an amount: an amount on this page is a <data> element.
+      expect(line.tagName).toBe('P');
+      expect(line.querySelector('data')).toBeNull();
+    });
+
+    it('marks the closed assets that carry it and no other, after their flags', async () => {
+      // ADA is closed and carries none; ETH carries it and no flag; XRP carries it after
+      // "History incomplete". BTC and KAS carry it too, and are held: not in this line.
+      openDashboard({ positions: unmatchedProceedsPortfolio() });
+
+      const line = within(await loadedRegion()).getByText(
+        '3 assets no longer held are not listed: ADA, ETH (Unmatched proceeds), ' +
+          'XRP (History incomplete, Unmatched proceeds). Their realized P&L is in the total.',
+      );
+      expect(line.textContent).not.toMatch(/BTC|KAS/);
+      expect(line.querySelector('data')).toBeNull();
+    });
+
+    it('puts it before "Held exceeds history", which stays last, with or without a flag', async () => {
+      // The history says ETH and XRP are gone while an exchange still holds 12.5 of each.
+      openDashboard({
+        positions: unmatchedProceedsPortfolio(),
+        reconciliation: reconciliation({
+          assets: [
+            matchedAsset('BTC', '1.500000000000000000'),
+            { ...xrpLeftOnExchange(), asset: 'ETH' },
+            matchedAsset('KAS', '1500.000000000000000000'),
+            xrpLeftOnExchange(),
+          ],
+        }),
+      });
+
+      const region = await loadedRegion();
+      expect(
+        await within(region).findByText(
+          '3 assets no longer held are not listed: ADA, ' +
+            'ETH (Unmatched proceeds, Held exceeds history), ' +
+            'XRP (History incomplete, Unmatched proceeds, Held exceeds history). ' +
+            'Their realized P&L is in the total.',
+        ),
+      ).toBeInTheDocument();
+    });
+  });
+
+  describe('a held position that carries it (criterion 7)', () => {
+    it('is in the list, and its row gains no badge and no column', async () => {
+      // BTC alone: an opening balance without a cost was sold in full for 20000 before the
+      // 1.5 held now were bought. Held, comparable, and no flag is left.
+      openDashboard({
+        positions: positionsResponse({
+          positions: [position({ unmatched_proceeds: UNMATCHED.btc })],
+          totals: totals({ ...BTC_ONLY_TOTALS, unmatched_proceeds: UNMATCHED.btc }),
+        }),
+      });
+
+      const region = await loadedRegion();
+      const table = await positionsTable();
+      const btc = await positionRow('BTC');
+      expect(btc.querySelector('th')).toHaveAccessibleName('BTC');
+      expect(table.textContent).not.toMatch(/unmatched/i);
+      expect(
+        Array.from(table.querySelectorAll('thead th')).map((header) => header.textContent.trim()),
+      ).toEqual(COLUMNS);
+      // The row's figures are the ones it has without this one: seven, and no eighth.
+      expect(dataValues(btc)).toEqual([
+        '1.500000000000000000',
+        '35000.000000000000000000',
+        '52500.000000000000000000',
+        '60000.000000000000',
+        '90000.000000000000000000',
+        '37500.000000000000000000',
+        '71.4286',
+      ]);
+
+      expect(await summaryValue(UNMATCHED_TERM)).toHaveTextContent(/^20,000\.00 USD$/);
+      const { items } = unmatchedBlock(region);
+      expect(items.map((item) => item.textContent)).toEqual(['BTC: 20,000.00 USD']);
+      expect(items.map((item) => dataValues(item))).toEqual([[UNMATCHED.btc]]);
+
+      // The words are on screen twice: the summary's term and the opening of the explanation.
+      // No badge, no legend entry, and no line about closed assets.
+      expect(region.textContent.match(/Unmatched proceeds/g)).toHaveLength(2);
+      expect(
+        within(region)
+          .getAllByText(UNMATCHED_TERM)
+          .map((found) => found.tagName),
+      ).toEqual(['DT']);
+      expect(within(region).queryByText(/no longer held/)).not.toBeInTheDocument();
+      expect(legend(region)).toEqual([]);
+    });
+
+    it('keeps the badges a held carrier already has, and explains no new one in the legend', async () => {
+      openDashboard({ positions: unmatchedProceedsPortfolio() });
+
+      expect((await positionRow('BTC')).querySelector('th')).toHaveAccessibleName('BTC');
+      expect((await positionRow('KAS')).querySelector('th')).toHaveAccessibleName(
+        'KAS Unknown cost Not in totals',
+      );
+      expect(await rowSymbols()).toEqual(['BTC', 'KAS']);
+      expect((await positionsTable()).textContent).not.toMatch(/unmatched/i);
+
+      const region = await loadedRegion();
+      // XRP's flag and KAS's: the two the page showed before, and nothing for the mark.
+      expect(legend(region)).toEqual([
+        { badge: 'History incomplete', explanation: FLAG_EXPLANATIONS.history_incomplete },
+        { badge: 'Unknown cost', explanation: FLAG_EXPLANATIONS.unknown_basis },
+      ]);
+      expect(
+        within(region)
+          .getAllByRole('term')
+          .filter((term) => term.textContent.trim() === UNMATCHED_TERM),
+      ).toHaveLength(1);
+    });
+  });
+
+  describe('the sign (criterion 8)', () => {
+    it('shows a negative total and a negative amount with a minus and no plus', async () => {
+      // ETH sold for less than the fee paid on the sale in the other stablecoin: -50.25.
+      openDashboard({ positions: btcBesideClosedCarrier(UNMATCHED.kas) });
+
+      const unmatched = await summaryValue(UNMATCHED_TERM);
+      expect(dataValues(unmatched)).toEqual(['-50.250000000000000000']);
+      expect(unmatched).toHaveTextContent(/^-50\.25 USD$/);
+
+      const region = await loadedRegion();
+      const { list, items } = unmatchedBlock(region);
+      expect(items.map((item) => item.textContent)).toEqual(['ETH: -50.25 USD']);
+      expect(items.map((item) => dataValues(item))).toEqual([['-50.250000000000000000']]);
+      expect(list.textContent).not.toMatch(/\+/);
+      // Negative is still "carries it": the closed line marks the asset.
+      expect(
+        within(region).getByText(
+          '1 asset no longer held is not listed: ETH (Unmatched proceeds). ' +
+            'Its realized P&L is in the total.',
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('shows a total of exactly zero, both items and both marks when two positions cancel', async () => {
+      // ETH -50.25 and LTC +50.25: the total is 0 while two positions each carry a figure. A
+      // rule on the total would mark both below and hide what the mark refers to.
+      const response = cancellingUnmatchedProceeds();
+      expect(response.totals.unmatched_proceeds).toBe(ZERO);
+      openDashboard({ positions: response });
+
+      expect(await summaryTerms()).toEqual([...FOUR_TERMS, UNMATCHED_TERM]);
+      const unmatched = await summaryValue(UNMATCHED_TERM);
+      expect(dataValues(unmatched)).toEqual([ZERO]);
+      expect(unmatched).toHaveTextContent(/^0\.00 USD$/);
+      expect(unmatched.textContent).not.toMatch(/[+-]/);
+
+      const region = await loadedRegion();
+      const { list, items } = unmatchedBlock(region);
+      expect(items.map((item) => item.textContent)).toEqual(['ETH: -50.25 USD', 'LTC: 50.25 USD']);
+      expect(items.map((item) => dataValues(item))).toEqual([
+        ['-50.250000000000000000'],
+        ['50.250000000000000000'],
+      ]);
+      expect(list.textContent).not.toMatch(/\+/);
+      expect(
+        within(region).getByText(
+          '2 assets no longer held are not listed: ETH (Unmatched proceeds), ' +
+            'LTC (Unmatched proceeds). Their realized P&L is in the total.',
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it.each([
+      ['a sale a hair larger than the pool', '0.000599999994000000', '< 0.01'],
+      ['a fee a hair larger than such a sale', '-0.000599999994000000', '> -0.01'],
+      ['one unit in the eighteenth place', '0.000000000000000001', '< 0.01'],
+      ['one unit in the eighteenth place, negative', '-0.000000000000000001', '> -0.01'],
+    ])(
+      'shows an amount too small for a cent as a boundary, never as 0.00: %s',
+      async (_label, dust, shown) => {
+        // The likeliest real shape: XRP's last sale was a hair larger than the pool, so the
+        // position is closed and history_incomplete, and what the hair sold for is unmatched.
+        // Rounded to the cent before it was tested, it would be a zero: no entry and no mark.
+        openDashboard({
+          positions: positionsResponse({
+            positions: [
+              position(),
+              xrpClosed({ flags: ['history_incomplete'], unmatched_proceeds: dust }),
+            ],
+            totals: totals({
+              ...BTC_ONLY_TOTALS,
+              realized_pnl: '7625.500000000000000000',
+              unmatched_proceeds: dust,
+            }),
+            warnings: [
+              warning({
+                asset: 'XRP',
+                occurred_at: XRP_SHORT_SALE_AT,
+                quantity: '0.000001000000000000',
+              }),
+            ],
+          }),
+        });
+
+        const unmatched = await summaryValue(UNMATCHED_TERM);
+        expect(unmatched.textContent.trim()).toBe(`${shown} USD`);
+        expect(dataValues(unmatched)).toEqual([dust]);
+        expect(unmatched.textContent).not.toMatch(/\+|0\.00/);
+
+        const region = await loadedRegion();
+        const { items } = unmatchedBlock(region);
+        expect(items.map((item) => item.textContent)).toEqual([`XRP: ${shown} USD`]);
+        expect(items.map((item) => dataValues(item))).toEqual([[dust]]);
+        expect(
+          within(region).getByText(
+            '1 asset no longer held is not listed: XRP (History incomplete, Unmatched proceeds). ' +
+              'Its realized P&L is in the total.',
+          ),
+        ).toBeInTheDocument();
+      },
+    );
+  });
+
+  describe('when the totals above it are not figures (criterion 9)', () => {
+    it('keeps the entry, the explanation and the list when every held position is excluded', async () => {
+      // ETH is unpriced and KAS has units of no known cost; XRP is closed. Invested, market
+      // value and unrealized P&L are sums over nothing held. Unmatched proceeds, like realized
+      // P&L, cover every position: 0.1 (ETH, left out) + 0.2 (XRP, closed) = 0.3.
+      openDashboard({ positions: everyHeldPositionExcludedWithUnmatched() });
+
+      for (const term of ['Invested', 'Market value', 'Unrealized P&L']) {
+        expectDash(await summaryValue(term));
+      }
+      expect(await summaryTerms()).toEqual([...FOUR_TERMS, UNMATCHED_TERM]);
+      const realized = await summaryValue('Realized P&L');
+      expect(dataValues(realized)).toEqual(['-124.500000000000000000']);
+      expect(realized).toHaveTextContent(/^-124\.50 USD$/);
+      const unmatched = await summaryValue(UNMATCHED_TERM);
+      expect(dataValues(unmatched)).toEqual(['0.300000000000000000']);
+      expect(unmatched).toHaveTextContent(/^0\.30 USD$/);
+      expectNoRenderedZero(await summaryList());
+
+      const region = await loadedRegion();
+      const { explanation, list, items } = unmatchedBlock(region);
+      expect(items.map((item) => item.textContent)).toEqual(['ETH: 0.10 USD', 'XRP: 0.20 USD']);
+      expect(items.map((item) => dataValues(item))).toEqual([
+        ['0.100000000000000000'],
+        ['0.200000000000000000'],
+      ]);
+      // Between the caveat about ETH's short history and the exclusions.
+      expect(within(region).getByText(realizedCaveat('ETH')).nextElementSibling).toBe(explanation);
+      expect(list.nextElementSibling).toBe(within(region).getByText('Left out of these totals:'));
+      // ETH is held: in the list, and its row is as it was.
+      expect((await positionRow('ETH')).querySelector('th')).toHaveAccessibleName(
+        'ETH History incomplete Not in totals',
+      );
+      expect(
+        within(region).getByText(
+          '1 asset no longer held is not listed: XRP (Unmatched proceeds). ' +
+            'Its realized P&L is in the total.',
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('shows it beside genuine zeros when nothing is held at all (spec 022, R7)', async () => {
+      // Every unit ETH ever held had no known cost and was sold. Nothing is held, so the
+      // totals are a true 0.00 - and the only money this history shows is the unmatched figure.
+      openDashboard({
+        positions: positionsResponse({
+          positions: [ethSoldAtUnknownCost()],
+          totals: totals({ unmatched_proceeds: UNMATCHED.eth }),
+        }),
+      });
+
+      const region = await loadedRegion();
+      expect(await within(region).findByText('Nothing is held right now.')).toBeInTheDocument();
+      expect(within(region).queryByRole('table')).not.toBeInTheDocument();
+      expect(await summaryValue('Invested')).toHaveTextContent(/^0\.00 USD$/);
+      expect(await summaryValue('Realized P&L')).toHaveTextContent(/^0\.00 USD$/);
+
+      const unmatched = await summaryValue(UNMATCHED_TERM);
+      expect(dataValues(unmatched)).toEqual([UNMATCHED.eth]);
+      expect(unmatched).toHaveTextContent(/^1,234\.57 USD$/);
+      const { items } = unmatchedBlock(region);
+      expect(items.map((item) => item.textContent)).toEqual(['ETH: 1,234.57 USD']);
+      expect(
+        within(region).getByText(
+          '1 asset no longer held is not listed: ETH (Unmatched proceeds). ' +
+            'Its realized P&L is in the total.',
+        ),
+      ).toBeInTheDocument();
+    });
   });
 });
 

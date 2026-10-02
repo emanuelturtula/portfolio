@@ -191,7 +191,9 @@ class AccountingTotalsResponse(BaseModel):
     `total_invested`, `market_value`, `unrealized_pnl` and `unrealized_return_pct` cover the same
     positions -- valued, or holding nothing, and with no unknown-cost units -- so the
     percentage is the return on exactly the money in the total beside it. `realized_pnl`
-    covers every position. The client sums nothing: every figure it shows is here.
+    covers every position, and so does `unmatched_proceeds`: held or not, left out or not.
+    `unmatched_proceeds` is signed, because a sale's proceeds are net of every fee. The client
+    sums nothing: every figure it shows is here.
     """
 
     total_invested: MoneyStr
@@ -199,6 +201,7 @@ class AccountingTotalsResponse(BaseModel):
     unrealized_pnl: MoneyStr
     unrealized_return_pct: MoneyStr | None
     realized_pnl: MoneyStr
+    unmatched_proceeds: MoneyStr
     excluded: list[ExclusionResponse]
 
     @classmethod
@@ -210,6 +213,7 @@ class AccountingTotalsResponse(BaseModel):
             unrealized_pnl=totals.unrealized_pnl,
             unrealized_return_pct=totals.unrealized_return_pct,
             realized_pnl=totals.realized_pnl,
+            unmatched_proceeds=totals.unmatched_proceeds,
             excluded=[ExclusionResponse.of(exclusion) for exclusion in totals.excluded],
         )
 

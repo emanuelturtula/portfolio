@@ -24,6 +24,7 @@ import {
   formatVenues,
   groupExclusions,
   hasNoKnownCost,
+  hasUnmatchedProceeds,
   HELD_EXCEEDS_HISTORY_BADGE,
   HELD_EXCEEDS_HISTORY_EXPLANATION,
   HELD_EXCEEDS_HISTORY_GUIDANCE,
@@ -35,6 +36,8 @@ import {
   missingSources,
   NOTHING_TO_COMPARE,
   partitionReconciliation,
+  UNMATCHED_PROCEEDS_EXPLANATION,
+  UNMATCHED_PROCEEDS_LABEL,
   venueLabel,
   venuesWithFailedSync,
   type EmptyPositions,
@@ -49,6 +52,7 @@ import {
   ALL_RECOMPUTE_OUTCOMES,
   bgbFeeNeverHeld,
   emptySnapshot,
+  ethSoldAtUnknownCost,
   failedFirstRecompute,
   failedRecompute,
   investedPortfolio,
@@ -208,6 +212,89 @@ describe('hasNoKnownCost', () => {
   });
 });
 
+describe('the unmatched proceeds words (spec 026)', () => {
+  it('names the figure as the spec does: one term for the summary and for the mark', () => {
+    expect(UNMATCHED_PROCEEDS_LABEL).toBe('Unmatched proceeds');
+  });
+
+  it("explains the figure in the spec's words, verbatim", () => {
+    // Written out, not imported: the sentence is a statement to the owner, and a change to it
+    // should be a diff here. It says what the figure is, that it is net of fees, why it is not
+    // in realized P&L, and that it covers every position.
+    expect(UNMATCHED_PROCEEDS_EXPLANATION).toBe(
+      'Unmatched proceeds are what sales brought in, net of fees, for units with no known cost: ' +
+        'units that arrived without one, or units sold beyond what the imported history held. ' +
+        'They are kept out of realized P&L, because there is no cost to compare them with. Like ' +
+        'realized P&L, the figure covers every position, held or not.',
+    );
+  });
+
+  it('names both origins of a unit with no known cost (R2)', () => {
+    // On this page "Unknown cost" is a badge of its own, and units sold beyond the history are
+    // "History incomplete": a sentence naming only the first would contradict an asset listed
+    // under it that carries the second badge and not the first.
+    expect(UNMATCHED_PROCEEDS_EXPLANATION).toContain('units that arrived without one');
+    expect(UNMATCHED_PROCEEDS_EXPLANATION).toContain(
+      'units sold beyond what the imported history held',
+    );
+    expect(UNMATCHED_PROCEEDS_EXPLANATION.startsWith(UNMATCHED_PROCEEDS_LABEL)).toBe(true);
+  });
+});
+
+describe('hasUnmatchedProceeds', () => {
+  it.each(['0', '0.000000000000000000', '-0', '-0.000000000000000000', '0.00', '000.000'])(
+    'is false for a zero, however the wire spells it: %s',
+    (zero) => {
+      // Compared as a decimal: none of these but the first is the string "0".
+      expect(hasUnmatchedProceeds(position({ unmatched_proceeds: zero }))).toBe(false);
+      expect(hasUnmatchedProceeds(xrpClosed({ unmatched_proceeds: zero }))).toBe(false);
+    },
+  );
+
+  it.each(['1234.567890123456789012', '20000.000000000000000000', '0.010000000000000000', '1'])(
+    'is true for a positive figure: %s',
+    (amount) => {
+      expect(hasUnmatchedProceeds(position({ unmatched_proceeds: amount }))).toBe(true);
+    },
+  );
+
+  it.each(['-50.250000000000000000', '-1', '-0.010000000000000000'])(
+    'is true for a negative figure: %s',
+    (amount) => {
+      // The figure is signed: "not zero" is the test, not "positive".
+      expect(hasUnmatchedProceeds(position({ unmatched_proceeds: amount }))).toBe(true);
+    },
+  );
+
+  it.each(['0.000000000000000001', '-0.000000000000000001'])(
+    'is true for the smallest amount the engine carries, either sign: %s',
+    (amount) => {
+      // One unit in the eighteenth place: a figure rounded to the cent before it was tested
+      // would be called zero, and the entry, the explanation and the mark would vanish.
+      expect(hasUnmatchedProceeds(position({ unmatched_proceeds: amount }))).toBe(true);
+    },
+  );
+
+  it('judges a held position and one no longer held alike', () => {
+    expect(hasUnmatchedProceeds(position())).toBe(false);
+    expect(hasUnmatchedProceeds(xrpClosed())).toBe(false);
+    expect(hasUnmatchedProceeds(ethSoldAtUnknownCost())).toBe(true);
+    expect(hasUnmatchedProceeds(position({ unmatched_proceeds: '20000.000000000000000000' }))).toBe(
+      true,
+    );
+  });
+
+  it('refuses a figure that is not a plain decimal, rather than calling it zero or not', () => {
+    // It goes through `money()`, like every amount on the page: "1e-18" and "" are a defect in
+    // whatever sent them, not a spelling to interpret.
+    for (const malformed of ['1e-18', '', 'NaN', '+5', '1,234.50']) {
+      expect(() => hasUnmatchedProceeds(position({ unmatched_proceeds: malformed }))).toThrow(
+        TypeError,
+      );
+    }
+  });
+});
+
 describe('flagsOf', () => {
   it('collects each flag once, alphabetically, whichever position carries it first', () => {
     expect(
@@ -317,6 +404,73 @@ describe('describeClosedPositions', () => {
     expect(describeClosedPositions([xrpClosed()], new Set(['BTC']))).toBe(
       '1 asset no longer held is not listed: XRP. Its realized P&L is in the total.',
     );
+  });
+
+  it('marks a closed asset that carries unmatched proceeds, in the singular (spec 026)', () => {
+    // The spec's own example, verbatim. ETH carries no flag: without the mark the line would
+    // say its realized P&L - zero - is in the total, and nothing of the money that came in.
+    expect(describeClosedPositions([ethSoldAtUnknownCost()], NONE)).toBe(
+      '1 asset no longer held is not listed: ETH (Unmatched proceeds). ' +
+        'Its realized P&L is in the total.',
+    );
+  });
+
+  it('marks only the assets that carry them, in the plural, in the order given', () => {
+    expect(
+      describeClosedPositions(
+        [xrpClosed({ asset: 'ADA' }), ethSoldAtUnknownCost(), xrpClosed()],
+        NONE,
+      ),
+    ).toBe(
+      '3 assets no longer held are not listed: ADA, ETH (Unmatched proceeds), XRP. ' +
+        'Their realized P&L is in the total.',
+    );
+  });
+
+  it('puts the mark after the flags and before "Held exceeds history", which stays last', () => {
+    const xrp = xrpClosed({
+      flags: ['history_incomplete', 'unattributed_fee'],
+      unmatched_proceeds: '310.100000000000000000',
+    });
+
+    expect(describeClosedPositions([xrp], new Set(['XRP']))).toBe(
+      '1 asset no longer held is not listed: XRP (History incomplete, Fee not valued, ' +
+        'Unmatched proceeds, Held exceeds history). Its realized P&L is in the total.',
+    );
+    // After the flags, with nothing after it.
+    expect(describeClosedPositions([xrp], NONE)).toBe(
+      '1 asset no longer held is not listed: XRP (History incomplete, Fee not valued, ' +
+        'Unmatched proceeds). Its realized P&L is in the total.',
+    );
+    // Before "Held exceeds history", with nothing before it.
+    expect(describeClosedPositions([ethSoldAtUnknownCost()], new Set(['ETH']))).toBe(
+      '1 asset no longer held is not listed: ETH (Unmatched proceeds, Held exceeds history). ' +
+        'Its realized P&L is in the total.',
+    );
+  });
+
+  it('marks a negative figure and the smallest one, and no zero however it is spelled', () => {
+    const closed = [
+      ethSoldAtUnknownCost({ asset: 'ADA', unmatched_proceeds: '-50.250000000000000000' }),
+      ethSoldAtUnknownCost({ asset: 'DOT', unmatched_proceeds: '0.000000000000000001' }),
+      ethSoldAtUnknownCost({ asset: 'ETH', unmatched_proceeds: '0' }),
+      ethSoldAtUnknownCost({ asset: 'LTC', unmatched_proceeds: '-0' }),
+      ethSoldAtUnknownCost({ asset: 'XRP', unmatched_proceeds: '0.000000000000000000' }),
+    ];
+
+    expect(describeClosedPositions(closed, NONE)).toBe(
+      '5 assets no longer held are not listed: ADA (Unmatched proceeds), ' +
+        'DOT (Unmatched proceeds), ETH, LTC, XRP. Their realized P&L is in the total.',
+    );
+  });
+
+  it("marks with the summary figure's own label, and never with an amount", () => {
+    // The line is a string, and an amount on this page is always a <Money> element.
+    const line = describeClosedPositions([ethSoldAtUnknownCost()], NONE);
+
+    expect(line).toContain(`ETH (${UNMATCHED_PROCEEDS_LABEL})`);
+    expect(line).not.toMatch(/1234|\d[.,]\d/);
+    expect(line.endsWith('Its realized P&L is in the total.')).toBe(true);
   });
 });
 

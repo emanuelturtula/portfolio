@@ -30,6 +30,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from fractions import Fraction
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
@@ -95,8 +96,19 @@ TOTALS_FIELDS: Final = {
     "unrealized_pnl",
     "unrealized_return_pct",
     "realized_pnl",
+    "unmatched_proceeds",
     "excluded",
 }
+#: The totals that are amounts, every one of them a zero when there is no snapshot.
+ZERO_WITHOUT_A_SNAPSHOT: Final = (
+    "total_invested",
+    "market_value",
+    "unrealized_pnl",
+    "realized_pnl",
+    "unmatched_proceeds",
+)
+#: How the endpoint spells a zero amount: eighteen places, like every amount beside it.
+ZERO_ON_THE_WIRE: Final = "0.000000000000000000"
 WARNING_FIELDS: Final = {"kind", "occurred_at", "source", "asset", "quantity", "charged_to"}
 LAST_RECOMPUTE_FIELDS: Final = {"at", "outcome", "error"}
 
@@ -346,12 +358,12 @@ async def test_no_snapshot_is_a_200_with_a_null_timestamp_and_zeros(
     assert (last["outcome"], last["error"]) == (str(startup.outcome), None)
     assert datetime.fromisoformat(last["at"]) == startup.at
     totals = body.pop("totals")
-    assert {
-        key: dec(totals[key])
-        for key in ("total_invested", "market_value", "unrealized_pnl", "realized_pnl")
-    } == dict.fromkeys(
-        ("total_invested", "market_value", "unrealized_pnl", "realized_pnl"), Decimal(0)
+    assert set(totals) == TOTALS_FIELDS
+    assert {key: dec(totals[key]) for key in ZERO_WITHOUT_A_SNAPSHOT} == dict.fromkeys(
+        ZERO_WITHOUT_A_SNAPSHOT, Decimal(0)
     )
+    # Spec 026, criterion 1: the endpoint's zero, spelled as it spells every zero total.
+    assert totals["unmatched_proceeds"] == ZERO_ON_THE_WIRE == totals["realized_pnl"]
     assert (totals["unrealized_return_pct"], totals["excluded"]) == (None, [])
     assert dec(body.pop("unallocated_costs")) == 0
     assert body == {
@@ -413,6 +425,8 @@ async def test_the_specs_example_is_served_figure_for_figure(
     assert dec(totals["unrealized_pnl"]) == Decimal(37500), "realized is not mixed in"
     assert dec(totals["unrealized_return_pct"]) == Decimal("71.4286")
     assert dec(totals["realized_pnl"]) == Decimal(7500)
+    # Spec 026, criterion 1: no position carries any, so the total is the endpoint's zero.
+    assert totals["unmatched_proceeds"] == ZERO_ON_THE_WIRE
     assert totals["excluded"] == []
     assert body["warnings"] == []
 
@@ -620,6 +634,295 @@ async def test_a_value_past_the_range_is_a_null_with_its_reason_never_a_500(
     assert btc["market_value_unavailable_reason"] == "value_out_of_range"
     assert dec(btc["price"]["amount"]) == Decimal(100), "the price itself is still served"
     assert response.json()["totals"]["excluded"] == [{"asset": "BTC", "reason": "unpriced"}]
+
+
+# --------------------------------------------------------------------------------------
+# Spec 026: the total of the unmatched proceeds, over every position served
+# --------------------------------------------------------------------------------------
+
+
+def sale(
+    trade_id: int,
+    minute: int,
+    asset: str,
+    quantity: str,
+    proceeds: str,
+    *,
+    fee_amount: str = "0",
+    fee_asset: str | None = None,
+) -> NormalizedFill:
+    """`quantity` of `asset` sold for `proceeds` USDT."""
+    return make_fill(
+        trade_id,
+        at(minute),
+        symbol=f"{asset}USDT",
+        base_asset=asset,
+        side=FillSide.SELL,
+        quantity=quantity,
+        price=str(Decimal(proceeds) / Decimal(quantity)),
+        quote_quantity=proceeds,
+        fee_amount=fee_amount,
+        fee_asset=fee_asset,
+    )
+
+
+def purchase(trade_id: int, minute: int, asset: str, quantity: str, cost: str) -> NormalizedFill:
+    """`quantity` of `asset` bought for `cost` USDT, with no fee."""
+    return make_fill(
+        trade_id,
+        at(minute),
+        symbol=f"{asset}USDT",
+        base_asset=asset,
+        quantity=quantity,
+        price=str(Decimal(cost) / Decimal(quantity)),
+        quote_quantity=cost,
+        fee_amount="0",
+        fee_asset=None,
+    )
+
+
+def history_with_unmatched_proceeds() -> list[NormalizedFill]:
+    """Eight positions, six of them carrying unmatched proceeds, of every kind the total covers.
+
+    Worked by hand, from the rules in `docs/accounting.md`:
+
+    * **BGB** -- 10 bought for 600 (average 60). One is later paid as a fee, leaving 9 at a
+      basis of 540. Held, no price: left out as `unpriced`. Unmatched: 0.
+    * **BTC** -- 0.25 sold for 10000 with none held: all 10000 unmatched. Then 2 bought for
+      70000 and held. Priced, so it is **comparable**. Unmatched: 10000.
+    * **ETH** -- 1 sold for 10 with none held, and a fee of 1 BGB carried at 60: the proceeds
+      are 10 - 60 = -50. **No longer held.** Unmatched: -50.
+    * **KAS** -- 1000 bought for 100, then 500 more for 1 DOGE nobody ever bought: 1000 of
+      known cost and 500 of unknown. Then 300 sold for 60: the known share is
+      300 x 1000 / 1500 = 200, so 60 x 200 / 300 = 40 is matched against 20 of basis and the
+      other 20 is unmatched. 1200 are left, 400 of unknown cost: left out as
+      **`unknown_basis`**. Unmatched: 20; realized: 20.
+    * **DOGE** -- the swap above sold 1 with none held. A swap has no proceeds. Unmatched: 0.
+    * **LTC** -- 4 sold for 0.1 with none held. **No longer held.** Unmatched: 0.1.
+    * **SOL** -- 2 sold for 300.3 with none held, then 5 bought for 500 and held. No chain
+      prices it: left out as **`unpriced`**. Unmatched: 300.3.
+    * **XRP** -- 1 sold for 0.2 with none held. **No longer held.** Unmatched: 0.2.
+
+    The total is 10000 - 50 + 20 + 0.1 + 300.3 + 0.2 = **10270.6**. The tenths are there on
+    purpose: 0.1 + 0.2 + 300.3 is 300.6 in decimals and 300.59999999999997 in doubles.
+    """
+    return [
+        purchase(7001, 0, "BGB", "10", "600"),
+        sale(7002, 10, "BTC", "0.25", "10000"),
+        purchase(7003, 20, "BTC", "2", "70000"),
+        sale(7004, 30, "ETH", "1", "10", fee_amount="1", fee_asset="BGB"),
+        purchase(7005, 40, "KAS", "1000", "100"),
+        make_fill(
+            7006,
+            at(50),
+            symbol="DOGEKAS",
+            base_asset="DOGE",
+            quote_asset="KAS",
+            side=FillSide.SELL,
+            quantity="1",
+            price="500",
+            quote_quantity="500",
+            fee_amount="0",
+            fee_asset=None,
+        ),
+        sale(7007, 60, "KAS", "300", "60"),
+        sale(7008, 70, "SOL", "2", "300.3"),
+        purchase(7009, 80, "SOL", "5", "500"),
+        sale(7010, 90, "LTC", "4", "0.1"),
+        sale(7011, 100, "XRP", "1", "0.2"),
+    ]
+
+
+#: What each position of `history_with_unmatched_proceeds` carries, as the wire spells it.
+UNMATCHED_BY_ASSET: Final = {
+    "BGB": "0.000000000000000000",
+    "BTC": "10000.000000000000000000",
+    "DOGE": "0.000000000000000000",
+    "ETH": "-50.000000000000000000",
+    "KAS": "20.000000000000000000",
+    "LTC": "0.100000000000000000",
+    "SOL": "300.300000000000000000",
+    "XRP": "0.200000000000000000",
+}
+UNMATCHED_TOTAL: Final = "10270.600000000000000000"
+
+
+async def test_the_unmatched_total_is_the_exact_sum_over_every_position_served(
+    api_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 026, criterion 1: held and closed, comparable and left out, all in one total.
+
+    The total is asserted three ways: as the string the endpoint writes, against the sum of
+    the positions in the same response taken in exact rationals, and each position against
+    the figure worked by hand in `history_with_unmatched_proceeds`.
+    """
+    del api_environment
+    async with application(monkeypatch) as (app, client):
+        await plant(app, {ExchangeKey.BITGET: history_with_unmatched_proceeds()})
+        await price(app, "BTC", "60000", age=timedelta(minutes=5))
+        await price(app, "KAS", "0.12", age=timedelta(minutes=5))
+        await recompute(app)
+        body, raw = await positions(client)
+
+    served = by_asset(body)
+    totals = body["totals"]
+    assert {asset: entry["unmatched_proceeds"] for asset, entry in served.items()} == dict(
+        UNMATCHED_BY_ASSET
+    )
+    assert totals["unmatched_proceeds"] == UNMATCHED_TOTAL
+    assert Fraction(dec(totals["unmatched_proceeds"])) == sum(
+        (Fraction(dec(entry["unmatched_proceeds"])) for entry in body["positions"]), Fraction(0)
+    )
+    # A JSON string in the bytes, and never a bare number: once for the total and once per
+    # position, a negative one included.
+    assert f'"unmatched_proceeds":"{UNMATCHED_TOTAL}"' in raw.replace(" ", "")
+    assert '"unmatched_proceeds":"-50.000000000000000000"' in raw.replace(" ", "")
+    assert not re.search(r'"unmatched_proceeds"\s*:\s*[-0-9]', raw)
+    assert raw.count('"unmatched_proceeds"') == len(UNMATCHED_BY_ASSET) + 1
+
+    # The positions are of the kinds the docstring says, so the total does cover each kind.
+    left_out = {entry["asset"]: entry["reason"] for entry in totals["excluded"]}
+    assert left_out == {"BGB": "unpriced", "KAS": "unknown_basis", "SOL": "unpriced"}
+    assert dec(served["BTC"]["quantity"]) == Decimal(2), "held and comparable"
+    assert served["BTC"]["flags"] == ["history_incomplete"]
+    assert dec(served["KAS"]["quantity"]) == Decimal(1200)
+    assert dec(served["KAS"]["unknown_basis_quantity"]) == Decimal(400)
+    assert dec(served["SOL"]["quantity"]) == Decimal(5)
+    for closed in ("DOGE", "ETH", "LTC", "XRP"):
+        assert dec(served[closed]["quantity"]) == 0, closed
+        assert closed not in left_out, "a position holding nothing is counted"
+
+    # It is its own figure: realized P&L is KAS's 20 alone, and the comparable totals are
+    # BTC's -- 2 held for 70000, worth 120000 -- with no proceeds added to either.
+    assert dec(totals["realized_pnl"]) == Decimal(20)
+    assert dec(totals["total_invested"]) == Decimal(70000)
+    assert dec(totals["market_value"]) == Decimal(120000)
+    assert dec(totals["unrealized_pnl"]) == Decimal(50000)
+
+
+async def test_the_unmatched_total_sits_after_realized_pnl_in_the_totals(
+    api_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 026: the field is placed after `realized_pnl`, in the response as in the model."""
+    del api_environment
+    async with application(monkeypatch) as (app, client):
+        await plant(app, {ExchangeKey.BITGET: history_with_unmatched_proceeds()})
+        await recompute(app)
+        body, _raw = await positions(client)
+
+    names = list(body["totals"])
+    assert set(names) == TOTALS_FIELDS
+    assert names.index("unmatched_proceeds") == names.index("realized_pnl") + 1
+
+
+async def test_two_positions_whose_unmatched_proceeds_cancel_total_exactly_zero(
+    api_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The response spec 026's display rule is written for: a zero total over non-zero figures.
+
+    ETH: 1 sold for 10 with none held and a fee of 1 BGB carried at 60, so -50. LTC: 1 sold
+    for 50 with none held, so +50. The total is the endpoint's zero -- not `-0`, not `0E-18`
+    -- while two positions each carry a figure, one of them negative.
+    """
+    del api_environment
+    async with application(monkeypatch) as (app, client):
+        await plant(
+            app,
+            {
+                ExchangeKey.BITGET: [
+                    purchase(7101, 0, "BGB", "10", "600"),
+                    sale(7102, 10, "ETH", "1", "10", fee_amount="1", fee_asset="BGB"),
+                    sale(7103, 20, "LTC", "1", "50"),
+                ]
+            },
+        )
+        await recompute(app)
+        body, _raw = await positions(client)
+
+    served = by_asset(body)
+    assert served["ETH"]["unmatched_proceeds"] == "-50.000000000000000000"
+    assert served["LTC"]["unmatched_proceeds"] == "50.000000000000000000"
+    assert body["totals"]["unmatched_proceeds"] == ZERO_ON_THE_WIRE
+
+
+async def test_a_negative_unmatched_total_is_served_negative(
+    api_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sum is signed and not clamped: ETH's -50 alone is a total of -50."""
+    del api_environment
+    async with application(monkeypatch) as (app, client):
+        await plant(
+            app,
+            {
+                ExchangeKey.BITGET: [
+                    purchase(7201, 0, "BGB", "10", "600"),
+                    sale(7202, 10, "ETH", "1", "10", fee_amount="1", fee_asset="BGB"),
+                ]
+            },
+        )
+        await recompute(app)
+        body, _raw = await positions(client)
+
+    assert body["totals"]["unmatched_proceeds"] == "-50.000000000000000000"
+    assert dec(body["totals"]["realized_pnl"]) == 0
+
+
+async def test_the_unmatched_total_keeps_every_place_across_the_wire(
+    api_environment: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every one of 18 places, from the stored fills to the JSON string, with no float between.
+
+    ETH: 1 sold for 1234.567890123456789012 with none held. LTC: 1 sold for
+    0.111111111111111111 with none held. The total is 1234.679001234567900123: twenty-two
+    significant digits, where a double keeps about sixteen. Summed through doubles it is
+    1234.6790012345681, so a total that passed through one anywhere on the way -- the engine,
+    the snapshot, the sum, the serializer -- is not this string.
+    """
+    del api_environment
+    async with application(monkeypatch) as (app, client):
+        await plant(
+            app,
+            {
+                ExchangeKey.BITGET: [
+                    sale(7301, 10, "ETH", "1", "1234.567890123456789012"),
+                    sale(7302, 20, "LTC", "1", "0.111111111111111111"),
+                ]
+            },
+        )
+        await recompute(app)
+        body, raw = await positions(client)
+
+    served = by_asset(body)
+    assert served["ETH"]["unmatched_proceeds"] == "1234.567890123456789012"
+    assert served["LTC"]["unmatched_proceeds"] == "0.111111111111111111"
+    assert body["totals"]["unmatched_proceeds"] == "1234.679001234567900123"
+    assert '"unmatched_proceeds":"1234.679001234567900123"' in raw.replace(" ", "")
+    # The control on the claim above: the same two figures through doubles are another number.
+    through_doubles = Decimal(
+        repr(float("1234.567890123456789012") + float("0.111111111111111111"))
+    )
+    assert through_doubles != Decimal("1234.679001234567900123")
+
+
+def test_the_unmatched_total_is_a_required_string_in_the_schema_after_realized_pnl(
+    app: FastAPI,
+) -> None:
+    """Spec 026, criterion 3, against the OpenAPI document `schema.ts` is generated from.
+
+    A string, never nullable, always present, declared straight after `realized_pnl`; and the
+    model says what the figure covers, which is what reaches the generated types' comment.
+    """
+    totals: dict[str, Any] = app.openapi()["components"]["schemas"]["AccountingTotalsResponse"]
+    names = list(totals["properties"])
+
+    assert set(names) == TOTALS_FIELDS
+    assert totals["properties"]["unmatched_proceeds"]["type"] == "string"
+    assert "anyOf" not in totals["properties"]["unmatched_proceeds"]
+    assert "unmatched_proceeds" in totals["required"]
+    assert names.index("unmatched_proceeds") == names.index("realized_pnl") + 1
+    description = " ".join(totals["description"].split())
+    assert "`unmatched_proceeds`" in description
+    assert "every position" in description
 
 
 # --------------------------------------------------------------------------------------

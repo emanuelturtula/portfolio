@@ -309,11 +309,12 @@ td {
 
 /* Invested section (spec 022). */
 
-/* Four figures side by side when they fit and stacked when they do not: `auto-fit` decides,
-   so the summary needs no breakpoint of its own. */
+/* Up to five figures side by side when they fit and stacked when they do not: `auto-fit`
+   decides, so the summary needs no breakpoint of its own. 10rem is what lets the fifth, when
+   there is one, sit beside the other four in the 60rem column; at 375 px it is one column. */
 .invested-summary {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
   gap: 0.75rem 1.5rem;
   margin: 0.75rem 0 1rem;
 }

@@ -606,7 +606,9 @@ export interface components {
          *     `total_invested`, `market_value`, `unrealized_pnl` and `unrealized_return_pct` cover the same
          *     positions -- valued, or holding nothing, and with no unknown-cost units -- so the
          *     percentage is the return on exactly the money in the total beside it. `realized_pnl`
-         *     covers every position. The client sums nothing: every figure it shows is here.
+         *     covers every position, and so does `unmatched_proceeds`: held or not, left out or not.
+         *     `unmatched_proceeds` is signed, because a sale's proceeds are net of every fee. The client
+         *     sums nothing: every figure it shows is here.
          */
         AccountingTotalsResponse: {
             /** Excluded */
@@ -626,6 +628,11 @@ export interface components {
              * @example 1234.56789012
              */
             total_invested: string;
+            /**
+             * Unmatched Proceeds
+             * @example 1234.56789012
+             */
+            unmatched_proceeds: string;
             /**
              * Unrealized Pnl
              * @example 1234.56789012

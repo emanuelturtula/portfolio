@@ -110,6 +110,30 @@ export const EXCLUSION_REASON_MESSAGES: Record<ExclusionReason, string> = {
 };
 
 /**
+ * What sales brought in for units with no known cost to compare them with. The summary's
+ * term for the portfolio figure and the mark beside a closed asset in the line for those no
+ * longer held: one constant, so the mark is the figure's own name and cannot drift from it.
+ */
+export const UNMATCHED_PROCEEDS_LABEL = 'Unmatched proceeds';
+
+/**
+ * Printed under the summary whenever the figure is shown - and so whenever the mark is on
+ * screen, since both follow one condition (spec 026). It says the figure is net of fees, why
+ * it is not in realized P&L, and that, like realized P&L, it covers every position.
+ *
+ * It names both origins of "no known cost": units that arrived without one, and units sold
+ * beyond what the imported history held. On this page "Unknown cost" is a badge of its own
+ * (`unknown_basis`), and units sold beyond the history are `history_incomplete` (spec 022,
+ * R8, N2). A sentence naming only "units with no known cost" would contradict a row that
+ * carries "History incomplete" and no "Unknown cost" (spec 026, R2).
+ */
+export const UNMATCHED_PROCEEDS_EXPLANATION =
+  'Unmatched proceeds are what sales brought in, net of fees, for units with no known cost: ' +
+  'units that arrived without one, or units sold beyond what the imported history held. ' +
+  'They are kept out of realized P&L, because there is no cost to compare them with. Like ' +
+  'realized P&L, the figure covers every position, held or not.';
+
+/**
  * The sentence in the market value cell when there is no value: the price reason's own
  * sentence, or the one reason the valuation itself can add. The price sentences are
  * `PRICE_UNAVAILABLE_MESSAGES`', not copies of them, so the two pages cannot drift.
@@ -138,6 +162,17 @@ export function isHeld(position: Position): boolean {
  */
 export function hasNoKnownCost(position: Position): boolean {
   return equalsMoney(money(position.quantity), money(position.unknown_basis_quantity));
+}
+
+/**
+ * Whether this position carries unmatched proceeds - what sales brought in for units with no
+ * known cost to compare them with - held or not. Compared as a decimal, never as a string:
+ * the wire spells a zero with as many places as the amounts around it. The figure is signed -
+ * a fee paid in a third asset can make it negative - so "not zero" is the test, not
+ * "positive".
+ */
+export function hasUnmatchedProceeds(position: Position): boolean {
+  return !isZeroMoney(money(position.unmatched_proceeds));
 }
 
 /**
@@ -191,14 +226,22 @@ const MANY_CLOSED = { noun: 'assets', verb: 'are', possessive: 'Their' };
 
 /**
  * The one line that stands for every asset no longer held that the table leaves out, naming
- * each, with the label of every flag it carries in brackets beside it, and "Held exceeds
- * history" last when `heldExceedsHistory` has the asset: "2 assets no longer held are not
- * listed: BTC (History incomplete, Held exceeds history), ETH. Their realized P&L is in the
- * total."
+ * each, with the label of every flag it carries in brackets beside it, then
+ * {@link UNMATCHED_PROCEEDS_LABEL} when the asset carries those, and "Held exceeds history"
+ * last when `heldExceedsHistory` has the asset: "2 assets no longer held are not listed: BTC
+ * (History incomplete, Unmatched proceeds, Held exceeds history), ETH. Their realized P&L is
+ * in the total."
  *
  * The flags are named here because `history_incomplete` and `unattributed_fee` are sticky:
  * `dispose` empties the pool when a disposal exceeds it, so the asset with the worst history
  * is often exactly the one that has no row.
+ *
+ * "Unmatched proceeds" is named here because it is the sharpest case of the figure: an asset
+ * whose units all had unknown cost and were all sold. `unknown_basis` is not sticky, so that
+ * position is closed and carries no flag, its realized P&L is `0`, and the line would say
+ * nothing about money that did come in. It is the label and never an amount: this line is a
+ * string, and an amount on this page is always a `<Money>` element. The amount is in the
+ * summary's list, which is on screen whenever this mark is.
  *
  * "Held exceeds history" is named here for the sharpest form of what the holdings check finds:
  * the history says the asset is no longer held while the balances read say it is. A marker
@@ -215,6 +258,9 @@ export function describeClosedPositions(
   const { noun, verb, possessive } = closed.length === 1 ? ONE_CLOSED : MANY_CLOSED;
   const labels = closed.map((position) => {
     const markers = position.flags.map((flag) => FLAG_BADGES[flag]);
+    if (hasUnmatchedProceeds(position)) {
+      markers.push(UNMATCHED_PROCEEDS_LABEL);
+    }
     if (heldExceedsHistory.has(position.asset)) {
       markers.push(HELD_EXCEEDS_HISTORY_BADGE);
     }

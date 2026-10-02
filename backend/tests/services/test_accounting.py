@@ -1239,4 +1239,8 @@ async def test_positions_without_a_snapshot_are_empty_zeros(
     assert view.unallocated_costs == 0
     assert view.totals.total_invested == view.totals.market_value == 0
     assert view.totals.unrealized_pnl == view.totals.realized_pnl == 0
+    # Spec 026, criterion 1: no snapshot is a zero total, a `Decimal`, shaped like the others.
+    assert isinstance(view.totals.unmatched_proceeds, Decimal)
+    assert view.totals.unmatched_proceeds.as_tuple() == view.totals.realized_pnl.as_tuple()
+    assert view.totals.unmatched_proceeds == 0
     assert view.totals.unrealized_return_pct is None

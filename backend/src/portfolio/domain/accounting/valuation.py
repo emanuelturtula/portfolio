@@ -44,7 +44,9 @@ positions that are **fully comparable**: valued (or holding nothing) and with no
 units. A total that mixed in a value with no cost, or a cost with no value, would make the
 percentage return a fiction. The positions left out are named in `excluded`, each with its
 reason, which is what the dashboard shows beside the total (#20). Realized P&L is summed over
-every position, because it does not depend on any current price.
+every position, because it does not depend on any current price. So are the unmatched
+proceeds -- what sales of units with no known cost brought in -- for the same reason
+(spec 026): a position left out, or one no longer held, still counts.
 
 **A stale price is used as it is.** Staleness is shown beside the price, never used to hide
 one (spec 021).
@@ -166,8 +168,12 @@ class PortfolioTotals:
 
     `total_invested`, `market_value`, `unrealized_pnl` and `unrealized_return_pct` cover the
     same positions, the ones not in `excluded`, so the percentage is the return on exactly the
-    money in the total beside it. `realized_pnl` covers every position. `unrealized_return_pct`
-    is `None` when the comparable positions hold no positive basis.
+    money in the total beside it. `realized_pnl` and `unmatched_proceeds` cover every position,
+    held or not, excluded or not. `unrealized_return_pct` is `None` when the comparable
+    positions hold no positive basis.
+
+    `unmatched_proceeds` is signed: a sale's proceeds are net of every fee, and a fee paid in a
+    third asset can cost more than the sale brought in (spec 026).
     """
 
     total_invested: Decimal
@@ -175,6 +181,7 @@ class PortfolioTotals:
     unrealized_pnl: Decimal
     unrealized_return_pct: Decimal | None
     realized_pnl: Decimal
+    unmatched_proceeds: Decimal
     excluded: tuple[Exclusion, ...]
 
 
@@ -226,16 +233,20 @@ def value_portfolio(values: Iterable[PositionValue]) -> PortfolioTotals:
     """Sum the comparable positions, and name the ones left out, in the order given.
 
     Every sum is `money.add`, which is exact. Over no positions, or over none comparable,
-    each total is zero and the percentage is `None`.
+    each total is zero and the percentage is `None`. `realized_pnl` and `unmatched_proceeds`
+    are summed over every position given, before it is decided whether the position is
+    excluded, so over none comparable they are still what the positions carry.
     """
     total_invested = _ZERO
     market_value = _ZERO
     unrealized_pnl = _ZERO
     realized_pnl = _ZERO
+    unmatched_proceeds = _ZERO
     excluded: list[Exclusion] = []
     for value in values:
         position = value.position
         realized_pnl = add(realized_pnl, position.realized_pnl)
+        unmatched_proceeds = add(unmatched_proceeds, position.unmatched_proceeds)
         if PositionFlag.UNKNOWN_BASIS in position.flags:
             excluded.append(Exclusion(position.asset, ExclusionReason.UNKNOWN_BASIS))
         elif value.market_value is None or value.unrealized_pnl is None:
@@ -250,6 +261,7 @@ def value_portfolio(values: Iterable[PositionValue]) -> PortfolioTotals:
         unrealized_pnl=unrealized_pnl,
         unrealized_return_pct=_return_pct(unrealized_pnl, total_invested),
         realized_pnl=realized_pnl,
+        unmatched_proceeds=unmatched_proceeds,
         excluded=tuple(excluded),
     )
 

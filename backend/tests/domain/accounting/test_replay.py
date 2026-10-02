@@ -418,6 +418,142 @@ def test_unknown_basis_is_not_sticky() -> None:
     expect(result, "BTC", quantity="1", cost_basis="31000", unmatched="30000")
 
 
+# Unmatched proceeds are signed (spec 026, *The sign* and R5). Only `_book_sale` writes the
+# figure, and a sale's proceeds are net of every fee. A fee paid in a **third** asset is worth
+# its carried cost, or its amount when that asset is cash, and no rule ties either to what the
+# sale brought in -- so that is the one route to a negative figure, and it has two forms. A fee
+# folded into the cash received cannot do it: the trade is refused. The dashboard's display
+# rule -- judge "is there any" on the positions and not on the total, show a minus -- rests on
+# the engine reaching a negative figure and a pair that cancels, so each is pinned here, worked
+# by hand.
+
+
+def test_unmatched_proceeds_are_negative_when_a_third_asset_fee_costs_more_than_the_sale() -> None:
+    """Units the history never held, sold for 10, with a fee of 1 BGB carried at 60.
+
+    BGB: 10 bought for 600, so 1 leaves with 60 of basis. Proceeds are 10 - 60 = -50, none of
+    it matched, because no ETH of known cost was sold: -50 unmatched, nothing realized.
+    """
+    result = run(
+        buy(key(9, "e0"), "BGB", "USDT", "10", "600"),
+        sell(key(12, "e1"), "ETH", "USDT", "1", "10", "1", "BGB"),
+    )
+
+    expect(
+        result,
+        "ETH",
+        quantity="0",
+        cost_basis="0",
+        realized="0",
+        unmatched="-50",
+        flags=INCOMPLETE,
+    )
+    expect(result, "BGB", quantity="9", cost_basis="540", average="60")
+    assert result.warnings == (NegativeInventory(key(12, "e1"), "ETH", Decimal("1")),)
+    assert position(result, "ETH").unmatched_proceeds.is_signed()
+
+
+def test_negative_unmatched_proceeds_on_a_closed_position_that_carries_no_flag() -> None:
+    """The sharpest case of spec 026, with a minus: units of unknown cost, all of them sold.
+
+    1 ETH entered without a cost, then sold for 10 with a fee of 1 BGB carried at 60. The
+    position is closed, `UNKNOWN_BASIS` cleared with the units, nothing warned: realized 0,
+    unmatched 10 - 60 = -50, and no flag to say anything happened.
+    """
+    result = run(
+        buy(key(8, "e0"), "BGB", "USDT", "10", "600"),
+        adjust(key(9, "m1", "manual"), "ETH", "1", None),
+        sell(key(12, "e1"), "ETH", "USDT", "1", "10", "1", "BGB"),
+    )
+
+    expect(result, "ETH", quantity="0", cost_basis="0", realized="0", unmatched="-50")
+    assert result.warnings == ()
+
+
+def test_negative_unmatched_proceeds_need_no_other_position_when_the_fee_is_cash() -> None:
+    """A fee in the other stablecoin is worth its amount and opens no pool.
+
+    1 ETH of unknown cost sold for 10 USDT with a fee of 60.25 USDC: proceeds -50.25, all of
+    it unmatched, and ETH is the only position. The frontend's fixtures carry a negative
+    figure of this kind, with no fee asset beside it.
+    """
+    result = run(
+        adjust(key(9, "m1", "manual"), "ETH", "1", None),
+        sell(key(12, "e1"), "ETH", "USDT", "1", "10", "60.25", "USDC"),
+    )
+
+    expect(result, "ETH", quantity="0", cost_basis="0", realized="0", unmatched="-50.25")
+    assert [found.asset for found in result.positions] == ["ETH"]
+    assert result.warnings == ()
+
+
+def test_a_fee_folded_into_the_cash_received_cannot_make_the_proceeds_negative() -> None:
+    """R5: the route is narrower than "any fee". A fee in the asset received that takes all
+    of it, or more, is no trade at all, so no event reaches `_book_sale` with one.
+
+    1 ETH for 10 USDT with a fee of 60 USDT, and with a fee of exactly 10: both refused.
+    """
+    for fee in ("60", "10"):
+        with pytest.raises(ValueError, match="must leave a quantity received"):
+            sell(key(12, "e1"), "ETH", "USDT", "1", "10", fee, "USDT")
+
+
+def test_two_positions_whose_unmatched_proceeds_cancel_exactly() -> None:
+    """R5: a total of exactly zero over two positions that each carry a figure.
+
+    ETH: 1 of unknown cost sold for 10 USDT with a fee of 60.25 USDC, so -50.25. LTC: 1 sold
+    for 50.25 with none held, so +50.25. Their exact sum, taken in rationals, is zero -- the
+    response the dashboard's "when it shows" rule is written for.
+    """
+    result = run(
+        adjust(key(9, "m1", "manual"), "ETH", "1", None),
+        sell(key(12, "e1"), "ETH", "USDT", "1", "10", "60.25", "USDC"),
+        sell(key(13, "e2"), "LTC", "USDT", "1", "50.25"),
+    )
+
+    expect(result, "ETH", quantity="0", cost_basis="0", realized="0", unmatched="-50.25")
+    expect(
+        result,
+        "LTC",
+        quantity="0",
+        cost_basis="0",
+        realized="0",
+        unmatched="50.25",
+        flags=INCOMPLETE,
+    )
+    carried = [Fraction(found.unmatched_proceeds) for found in result.positions]
+    assert all(figure != 0 for figure in carried)
+    assert sum(carried, Fraction(0)) == 0
+
+
+def test_negative_proceeds_split_between_realized_and_unmatched_keep_their_sign() -> None:
+    """docs example 8 with a fee that swamps the sale: 3 BTC held, 2 of unknown cost.
+
+    1.5 BTC sold for 60 with a fee of 2 BGB carried at 60 each: proceeds 60 - 120 = -60. The
+    known share sold is 1.5 x 1 / 3 = 0.5 BTC with 15000 of basis, so -60 x 0.5 / 1.5 = -20 is
+    matched and realizes -20 - 15000 = -15020. The complement, -40, is unmatched.
+    """
+    result = run(
+        buy(key(8, "e0"), "BGB", "USDT", "10", "600"),
+        adjust(key(9, "m1", "manual"), "BTC", "2", None),
+        buy(key(10, "e1"), "BTC", "USDT", "1", "30000"),
+        sell(key(12, "e2"), "BTC", "USDT", "1.5", "60", "2", "BGB"),
+    )
+
+    expect(
+        result,
+        "BTC",
+        quantity="1.5",
+        unknown="1",
+        cost_basis="15000",
+        average="30000",
+        realized="-15020",
+        unmatched="-40",
+        flags=UNKNOWN,
+    )
+    expect(result, "BGB", quantity="8", cost_basis="480", average="60")
+
+
 def test_full_liquidation_residue_goes_to_realized() -> None:
     """docs example 6: three thirds, each basis rounded, the last one takes what is left.
 
