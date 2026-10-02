@@ -25,6 +25,7 @@ import type {
 } from '@/api/accounting';
 import type { Exchange } from '@/api/exchanges';
 import type { components } from '@/api/generated/schema';
+import { chainDisplayName } from '@/lib/chains';
 import {
   errorSentence,
   EXCHANGES,
@@ -564,6 +565,7 @@ export type MissingSource =
       readonly lastReadAt: string;
       readonly maxAgeHours: number;
     }
+  | { readonly kind: 'wallets_chain_failed'; readonly chain: string; readonly count: number }
   | { readonly kind: 'wallets_stale'; readonly count: number; readonly maxAgeHours: number }
   | { readonly kind: 'wallets_unread'; readonly count: number };
 
@@ -621,9 +623,11 @@ function venueNotice(exchange: ReconciliationExchange, maxAgeHours: number): Mis
 }
 
 /**
- * The sources left out of the comparison: the venues first, in the endpoint's order, then the
- * wallets that are stale, then the wallets that were never read. A venue whose reading was
- * compared has no entry.
+ * The sources left out of the comparison: the venues first, in the endpoint's order, then one
+ * entry per chain whose wallets were left out because the last balance sync could not read it,
+ * in the endpoint's order, then the wallets that are stale, then the wallets that were never
+ * read. A venue whose reading was compared has no entry, and the endpoint lists only chains
+ * with a wallet left out.
  */
 export function missingSources(
   data: Pick<Reconciliation, 'exchanges' | 'wallets' | 'max_reading_age_hours'>,
@@ -631,9 +635,15 @@ export function missingSources(
   const maxAgeHours = data.max_reading_age_hours;
   const venues = data.exchanges.flatMap((exchange) => venueNotice(exchange, maxAgeHours));
   const { stale, unread } = data.wallets;
+  const chains = data.wallets.failed_chains.map((entry) => ({
+    kind: 'wallets_chain_failed' as const,
+    chain: entry.chain_key,
+    count: entry.wallets,
+  }));
 
   return [
     ...venues,
+    ...chains,
     ...(stale > 0 ? [{ kind: 'wallets_stale' as const, count: stale, maxAgeHours }] : []),
     ...(unread > 0 ? [{ kind: 'wallets_unread' as const, count: unread }] : []),
   ];
@@ -672,6 +682,22 @@ export function describeSyncFailed(venue: ExchangeKey): string {
 /** Why a venue whose last reading is old is left out: the limit is the rule, not a judgement. */
 export function describeOutOfDate(maxAgeHours: number): string {
   return `A reading older than ${String(maxAgeHours)} hours is left out of the comparison.`;
+}
+
+/**
+ * "The last balance sync that finished could not read Bitcoin, so the coins in 2 wallets on it
+ * are left out of the comparison." The backend judges by the last run that finished, and a
+ * newer run that did not finish may have read the chain, so the sentence says which run it
+ * means. A chain fails as a whole, so every wallet on it is left out. No reason is given here:
+ * the balance run log has it.
+ */
+export function describeChainFailed(chain: string, count: number): string {
+  const wallets = count === 1 ? '1 wallet' : `${String(count)} wallets`;
+
+  return (
+    `The last balance sync that finished could not read ${chainDisplayName(chain)}, so the ` +
+    `coins in ${wallets} on it are left out of the comparison.`
+  );
 }
 
 /** "1 wallet was last read more than 24 hours ago, so the coins in it are left out ..." */

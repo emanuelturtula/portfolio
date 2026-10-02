@@ -3,6 +3,7 @@ import type { ReactElement } from 'react';
 import { AbsoluteTime } from '@/components/AbsoluteTime';
 import {
   describeBalancesFailure,
+  describeChainFailed,
   describeNeverRead,
   describeNotReadYet,
   describeOutOfDate,
@@ -45,6 +46,8 @@ function MissingSourceNotice({ source }: { readonly source: MissingSource }): Re
           <AbsoluteTime value={source.lastReadAt} />. {describeOutOfDate(source.maxAgeHours)}
         </p>
       );
+    case 'wallets_chain_failed':
+      return <p role="alert">{describeChainFailed(source.chain, source.count)}</p>;
     case 'wallets_stale':
       return <p role="alert">{describeStaleWallets(source.count, source.maxAgeHours)}</p>;
     case 'wallets_unread':
@@ -52,9 +55,16 @@ function MissingSourceNotice({ source }: { readonly source: MissingSource }): Re
   }
 }
 
-/** One key per notice: a venue has at most one, and each wallet notice is its own kind. */
+/**
+ * One key per notice: a venue has at most one, a chain has at most one, and each of the other
+ * wallet notices is its own kind.
+ */
 function noticeKey(source: MissingSource): string {
-  return 'venue' in source ? `${source.kind}-${source.venue}` : source.kind;
+  if ('venue' in source) {
+    return `${source.kind}-${source.venue}`;
+  }
+
+  return 'chain' in source ? `${source.kind}-${source.chain}` : source.kind;
 }
 
 /**

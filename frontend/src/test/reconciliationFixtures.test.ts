@@ -29,6 +29,7 @@ import {
   ethShortPrecise,
   exchangeBalances,
   failedBalances,
+  failedChain,
   investedPortfolioGaps,
   kasNeverTraded,
   matchedAsset,
@@ -44,6 +45,7 @@ import {
   syncFailedBalances,
   unreadBalances,
   walletReadings,
+  WALLETS_OBSERVED_AT,
   XRP_LEFT,
   xrpHeldElsewhere,
 } from './reconciliationFixtures';
@@ -157,7 +159,7 @@ describe('the reconciliation fixture guard', () => {
   it('refuses a compared wallet reading older than the age limit', () => {
     expect(() =>
       reconciliation({
-        wallets: { compared: 1, stale: 0, unread: 0, oldest_observed_at: OLD_BALANCES_READ_AT },
+        wallets: { ...NO_WALLETS, compared: 1, oldest_observed_at: OLD_BALANCES_READ_AT },
       }),
     ).toThrow('of a compared wallet, so at most the age limit old');
   });
@@ -389,7 +391,7 @@ describe('the reconciliation fixture guard', () => {
     // Stale and unread wallets have no reading that is compared, so they give no oldest one.
     expect(() =>
       reconciliation({
-        wallets: { compared: 0, stale: 2, unread: 1, oldest_observed_at: BALANCES_READ_AT },
+        wallets: { ...NO_WALLETS, stale: 2, unread: 1, oldest_observed_at: BALANCES_READ_AT },
       }),
     ).toThrow('oldest_observed_at');
     expect(() => reconciliation({ wallets: { ...NO_WALLETS, unread: -1 } })).toThrow(
@@ -398,6 +400,186 @@ describe('the reconciliation fixture guard', () => {
     expect(() => reconciliation({ wallets: { ...NO_WALLETS, stale: 1.5 } })).toThrow(
       'non-negative integers',
     );
+  });
+
+  it('accepts wallets left out because their chain failed, beside every other state (spec 028)', () => {
+    // The spec's own document: one wallet compared, two left out on Bitcoin.
+    expect(
+      reconciliation({ wallets: walletReadings(1, { failedChains: [failedChain('bitcoin', 2)] }) })
+        .wallets,
+    ).toEqual({
+      compared: 1,
+      stale: 0,
+      unread: 0,
+      chain_failed: 2,
+      failed_chains: [{ chain_key: 'bitcoin', wallets: 2 }],
+      oldest_observed_at: WALLETS_OBSERVED_AT,
+    });
+    // Both chains failed, beside a stale and an unread wallet: 2 + 1 = 3 left out by chain.
+    expect(
+      reconciliation({
+        wallets: walletReadings(1, {
+          stale: 1,
+          unread: 1,
+          failedChains: [failedChain('bitcoin', 2), failedChain('kaspa', 1)],
+        }),
+      }).wallets,
+    ).toMatchObject({ compared: 1, stale: 1, unread: 1, chain_failed: 3 });
+    // Every wallet left out: nothing is compared, so there is no oldest reading.
+    expect(
+      reconciliation({ wallets: walletReadings(0, { failedChains: [failedChain('kaspa', 4)] }) })
+        .wallets,
+    ).toEqual({
+      compared: 0,
+      stale: 0,
+      unread: 0,
+      chain_failed: 4,
+      failed_chains: [{ chain_key: 'kaspa', wallets: 4 }],
+      oldest_observed_at: null,
+    });
+    // A chain this build has no name for is still a chain the endpoint can list.
+    expect(() =>
+      reconciliation({
+        wallets: walletReadings(0, { failedChains: [failedChain('litecoin', 1)] }),
+      }),
+    ).not.toThrow();
+  });
+
+  it('builds no entry and a count of zero when no chain failed', () => {
+    expect(walletReadings(2)).toEqual({
+      compared: 2,
+      stale: 0,
+      unread: 0,
+      chain_failed: 0,
+      failed_chains: [],
+      oldest_observed_at: WALLETS_OBSERVED_AT,
+    });
+    expect(walletReadings(0, { stale: 1, unread: 2, failedChains: [] })).toEqual({
+      compared: 0,
+      stale: 1,
+      unread: 2,
+      chain_failed: 0,
+      failed_chains: [],
+      oldest_observed_at: null,
+    });
+    expect(NO_WALLETS).toEqual(walletReadings(0));
+    expect(failedChain('kaspa', 3)).toEqual({ chain_key: 'kaspa', wallets: 3 });
+  });
+
+  it('refuses a chain_failed that is not what the failed chains add up to', () => {
+    // Two wallets counted and one named.
+    expect(() =>
+      reconciliation({
+        wallets: {
+          ...NO_WALLETS,
+          chain_failed: 2,
+          failed_chains: [{ chain_key: 'bitcoin', wallets: 1 }],
+        },
+      }),
+    ).toThrow('wallets.chain_failed is 2; the wallets of failed_chains add up to 1');
+    // Counted, and no chain named: nothing would say which one.
+    expect(() => reconciliation({ wallets: { ...NO_WALLETS, chain_failed: 1 } })).toThrow(
+      'wallets.chain_failed is 1; the wallets of failed_chains add up to 0',
+    );
+    // Named, and not counted.
+    expect(() =>
+      reconciliation({
+        wallets: { ...NO_WALLETS, failed_chains: [{ chain_key: 'kaspa', wallets: 3 }] },
+      }),
+    ).toThrow('wallets.chain_failed is 0; the wallets of failed_chains add up to 3');
+    // Two chains: the total is their sum, not either of them.
+    expect(() =>
+      reconciliation({
+        wallets: {
+          ...NO_WALLETS,
+          chain_failed: 2,
+          failed_chains: [
+            { chain_key: 'bitcoin', wallets: 2 },
+            { chain_key: 'kaspa', wallets: 1 },
+          ],
+        },
+      }),
+    ).toThrow('wallets.chain_failed is 2; the wallets of failed_chains add up to 3');
+  });
+
+  it('refuses a failed chain with no wallet left out: only chains with one are listed', () => {
+    expect(() =>
+      reconciliation({
+        wallets: { ...NO_WALLETS, failed_chains: [{ chain_key: 'bitcoin', wallets: 0 }] },
+      }),
+    ).toThrow('lists only the chains with a wallet left out, and bitcoin is stated with 0');
+    expect(() =>
+      reconciliation({
+        wallets: {
+          ...NO_WALLETS,
+          chain_failed: 1,
+          failed_chains: [
+            { chain_key: 'bitcoin', wallets: 2 },
+            { chain_key: 'kaspa', wallets: -1 },
+          ],
+        },
+      }),
+    ).toThrow('kaspa is stated with -1');
+    expect(() =>
+      reconciliation({
+        wallets: {
+          ...NO_WALLETS,
+          chain_failed: 1,
+          failed_chains: [{ chain_key: 'bitcoin', wallets: 1.5 }],
+        },
+      }),
+    ).toThrow('bitcoin is stated with 1.5');
+  });
+
+  it('refuses failed chains out of order, and a chain listed twice', () => {
+    expect(() =>
+      reconciliation({
+        wallets: walletReadings(0, {
+          failedChains: [failedChain('kaspa', 1), failedChain('bitcoin', 1)],
+        }),
+      }),
+    ).toThrow('wallets.failed_chains lists one entry per chain, by chain_key');
+    expect(() =>
+      reconciliation({
+        wallets: walletReadings(0, {
+          failedChains: [failedChain('bitcoin', 1), failedChain('bitcoin', 1)],
+        }),
+      }),
+    ).toThrow('one entry per chain');
+  });
+
+  it('refuses a chain_failed that is not a count', () => {
+    expect(() => reconciliation({ wallets: { ...NO_WALLETS, chain_failed: -1 } })).toThrow(
+      'non-negative integers',
+    );
+    expect(() => reconciliation({ wallets: { ...NO_WALLETS, chain_failed: 0.5 } })).toThrow(
+      'non-negative integers',
+    );
+  });
+
+  it('gives a wallet left out for its chain no part in the oldest reading, or in a quantity', () => {
+    // Left out, so its reading bounds nothing that is compared.
+    expect(() =>
+      reconciliation({
+        wallets: {
+          ...walletReadings(0, { failedChains: [failedChain('bitcoin', 2)] }),
+          oldest_observed_at: BALANCES_READ_AT,
+        },
+      }),
+    ).toThrow('oldest_observed_at');
+    // And it contributes nothing: a wallet quantity needs a wallet that is compared.
+    expect(() =>
+      reconciliation({
+        assets: [assetReconciliation()],
+        wallets: walletReadings(0, { failedChains: [failedChain('bitcoin', 2)] }),
+      }),
+    ).toThrow('a wallet quantity comes from a wallet that is compared');
+    expect(() =>
+      reconciliation({
+        assets: [assetReconciliation()],
+        wallets: walletReadings(1, { failedChains: [failedChain('kaspa', 2)] }),
+      }),
+    ).not.toThrow();
   });
 });
 
@@ -421,10 +603,13 @@ describe('the reconciliation that goes with a snapshot', () => {
     expect(eth?.history_quantity).toBe('2.718281828459045235');
     expect(eth?.held_quantity).toBe('2.718281828459045235');
     expect(eth?.difference).toBe(ZERO);
-    // Nothing is left out: one venue, read and compared, and no wallet stale or unread.
+    // Nothing is left out: one venue, read and compared, and no wallet stale, unread or on a
+    // chain that failed.
     expect(response.exchanges).toEqual([exchangeBalances()]);
     expect(response.exchanges[0]?.not_compared_reason).toBeNull();
     expect(response.wallets).toEqual(NO_WALLETS);
+    expect(response.wallets.chain_failed).toBe(0);
+    expect(response.wallets.failed_chains).toEqual([]);
     expect(response.max_reading_age_hours).toBe(MAX_READING_AGE_HOURS);
     expect(response.max_reading_age_hours).toBe(24);
     // The recompute that wrote the snapshot, as the positions serve it.

@@ -34,6 +34,11 @@ import { NOW } from './fixtures';
  * **A reading is compared only while it is current** (spec 025, R9), and whether it is
  * depends on the clock: the guard measures every reading against `NOW`, the instant every
  * page test runs under, the way `services/reconciliation.py` measures it against its own.
+ *
+ * **A wallet whose chain failed in the latest finished balance run is left out** (spec 028),
+ * counted in `chain_failed` and named by its chain in `failed_chains`. The service lists only
+ * the chains with a wallet left out, sorted by `chain_key`, and their counts add up to
+ * `chain_failed`; the guard holds every fixture to that.
  */
 
 type Schemas = components['schemas'];
@@ -42,6 +47,7 @@ export type ReconciliationResponse = Schemas['ReconciliationResponse'];
 export type AssetReconciliationResponse = Schemas['AssetReconciliationResponse'];
 export type ExchangeBalancesResponse = Schemas['ExchangeBalancesResponse'];
 export type WalletsReadResponse = Schemas['WalletsReadResponse'];
+export type FailedChainResponse = Schemas['FailedChainResponse'];
 export type ReconciliationStatus = Schemas['ReconciliationStatus'];
 export type NotComparedReason = Schemas['NotComparedReason'];
 
@@ -281,9 +287,36 @@ export function assertWritableReconciliation(
     fail('exchanges lists one entry per account, by exchange_key.');
   }
 
-  const { compared, stale, unread, oldest_observed_at: oldest } = response.wallets;
-  if (!isCount(compared) || !isCount(stale) || !isCount(unread)) {
-    fail('wallets.compared, stale and unread are counts, so non-negative integers.');
+  const {
+    compared,
+    stale,
+    unread,
+    chain_failed: chainFailed,
+    failed_chains: failedChains,
+    oldest_observed_at: oldest,
+  } = response.wallets;
+  if (!isCount(compared) || !isCount(stale) || !isCount(unread) || !isCount(chainFailed)) {
+    fail('wallets.compared, stale, unread and chain_failed are counts, so non-negative integers.');
+  }
+  const chains = failedChains.map((entry) => entry.chain_key);
+  if (chains.some((key, index) => index > 0 && (chains[index - 1] ?? '') >= key)) {
+    fail('wallets.failed_chains lists one entry per chain, by chain_key.');
+  }
+  let leftOutByChain = 0;
+  for (const entry of failedChains) {
+    if (!Number.isInteger(entry.wallets) || entry.wallets < 1) {
+      fail(
+        `wallets.failed_chains lists only the chains with a wallet left out, and ` +
+          `${entry.chain_key} is stated with ${String(entry.wallets)}.`,
+      );
+    }
+    leftOutByChain += entry.wallets;
+  }
+  if (leftOutByChain !== chainFailed) {
+    fail(
+      `wallets.chain_failed is ${String(chainFailed)}; the wallets of failed_chains add up ` +
+        `to ${String(leftOutByChain)}.`,
+    );
   }
   if ((compared === 0) !== (oldest === null)) {
     fail('wallets.oldest_observed_at is the oldest reading among the compared wallets, or null.');
@@ -528,21 +561,49 @@ export const NO_WALLETS: WalletsReadResponse = {
   compared: 0,
   stale: 0,
   unread: 0,
+  chain_failed: 0,
+  failed_chains: [],
   oldest_observed_at: null,
 };
 
 /**
+ * One entry of `failed_chains`: a chain the latest finished balance run could not read, and
+ * how many of the owner's wallets on it are left out for that. `chainKey` is a string, as the
+ * endpoint types it: a chain this build has no name for is still an entry.
+ */
+export function failedChain(chainKey: string, wallets: number): FailedChainResponse {
+  return { chain_key: chainKey, wallets };
+}
+
+/** What a set of wallets is left out for. Every count defaults to none. */
+export interface WalletsLeftOut {
+  readonly stale?: number;
+  readonly unread?: number;
+  /** The entries of `failed_chains`, in the endpoint's order: sorted by `chain_key`. */
+  readonly failedChains?: readonly FailedChainResponse[];
+}
+
+/**
  * `compared` wallets, the oldest of them read 20 minutes ago; `stale` ones whose reading is
- * older than the age limit and `unread` ones no sync has read, neither of which adds anything.
+ * older than the age limit, `unread` ones no sync has read, and the wallets of each chain in
+ * `failedChains`, which the latest finished balance run could not read. None of the three adds
+ * anything.
+ *
+ * `chain_failed` is the entries' wallets added up, the way the service counts them: a fixture
+ * cannot state a total its entries do not make.
  */
 export function walletReadings(
   compared: number,
-  leftOut: { readonly stale?: number; readonly unread?: number } = {},
+  leftOut: WalletsLeftOut = {},
 ): WalletsReadResponse {
+  const failedChains = leftOut.failedChains ?? [];
+
   return {
     compared,
     stale: leftOut.stale ?? 0,
     unread: leftOut.unread ?? 0,
+    chain_failed: failedChains.reduce((total, entry) => total + entry.wallets, 0),
+    failed_chains: [...failedChains],
     oldest_observed_at: compared === 0 ? null : WALLETS_OBSERVED_AT,
   };
 }

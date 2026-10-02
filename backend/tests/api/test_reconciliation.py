@@ -26,6 +26,9 @@ through `POST /api/exchanges/sync` against a simulated venue.
   whose fill sync is not `ok`, or whose reading is more than a day old is listed with its
   `not_compared_reason` and adds nothing; a wallet read more than a day ago is counted
   `stale` and adds nothing. `last_recompute` is served as the positions endpoint serves it.
+* **Spec 028's two fields are always served**: `chain_failed` is `0` and `failed_chains` is
+  `[]` in every document here, where no chain failed. A wallet left out for its chain is
+  `tests/api/test_reconciliation_chain_failed.py`'s.
 
 ## Time
 
@@ -103,7 +106,14 @@ EXCHANGE_FIELDS: Final = {
     "balances_error",
     "not_compared_reason",
 }
-WALLETS_FIELDS: Final = {"compared", "stale", "unread", "oldest_observed_at"}
+WALLETS_FIELDS: Final = {
+    "compared",
+    "stale",
+    "unread",
+    "chain_failed",
+    "failed_chains",
+    "oldest_observed_at",
+}
 LAST_RECOMPUTE_FIELDS: Final = {"at", "outcome", "error"}
 
 #: Every property of an asset row that carries a quantity. Each must be a JSON string.
@@ -325,7 +335,7 @@ def test_the_schema_declares_the_specs_shape_and_every_quantity_a_string(app: Fa
     ]["anyOf"]
     assert set(wallets["properties"]) == WALLETS_FIELDS
     assert set(wallets["required"]) == WALLETS_FIELDS
-    for count in ("compared", "stale", "unread"):
+    for count in ("compared", "stale", "unread", "chain_failed"):
         assert wallets["properties"][count]["type"] == "integer", count
 
 
@@ -378,6 +388,8 @@ async def test_the_specs_example_is_served_figure_for_figure(
         "compared": 3,
         "stale": 0,
         "unread": 0,
+        "chain_failed": 0,
+        "failed_chains": [],
         "oldest_observed_at": wire(readings.oldest),
     }
 
@@ -439,11 +451,12 @@ async def test_every_quantity_is_a_json_string_at_eighteen_places(
         assert not re.search(rf'"{field}":\s*[-0-9]', raw), f"{field} is served as a JSON number"
     numbers = re.findall(r'"([a-z_]+)":\s*(-?\d[\d.eE+-]*)', raw)
     assert sorted(name for name, _value in numbers) == [
+        "chain_failed",
         "compared",
         "max_reading_age_hours",
         "stale",
         "unread",
-    ], "the only JSON numbers in the document are three wallet counts and the age limit"
+    ], "the only JSON numbers in the document are four wallet counts and the age limit"
     assert Decimal(by_asset(body)["BTC"]["held_quantity"]) == Decimal(1)
 
 
@@ -509,6 +522,8 @@ async def test_no_snapshot_is_a_200_with_a_null_timestamp_and_no_assets(
         "compared": 3,
         "stale": 0,
         "unread": 0,
+        "chain_failed": 0,
+        "failed_chains": [],
         "oldest_observed_at": wire(readings.oldest),
     }
     assert "history_short" not in raw
@@ -532,7 +547,14 @@ async def test_an_owner_with_nothing_yet_gets_an_empty_comparison(
         "max_reading_age_hours": 24,
         "assets": [],
         "exchanges": [],
-        "wallets": {"compared": 0, "stale": 0, "unread": 0, "oldest_observed_at": None},
+        "wallets": {
+            "compared": 0,
+            "stale": 0,
+            "unread": 0,
+            "chain_failed": 0,
+            "failed_chains": [],
+            "oldest_observed_at": None,
+        },
     }
 
 
@@ -611,6 +633,8 @@ async def test_an_unread_wallet_is_counted_and_adds_nothing(
         "compared": 1,
         "stale": 0,
         "unread": 1,
+        "chain_failed": 0,
+        "failed_chains": [],
         "oldest_observed_at": wire(readings.newer),
     }
     (btc,) = body["assets"]
@@ -621,8 +645,8 @@ async def test_an_unread_wallet_is_counted_and_adds_nothing(
 async def test_a_wallet_read_more_than_a_day_ago_is_counted_stale_and_adds_nothing(
     api_environment: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R9: 9 BTC in a reading two days old is not 9 BTC held. It is a wallet whose chain has
-    stopped answering, and its coins may have moved since."""
+    """R9: 9 BTC in a reading two days old is not 9 BTC held. It is a wallet no balance sync
+    has read for two days, and its coins may have moved since."""
     del api_environment
     readings = Readings()
     async with application(monkeypatch) as (app, client):
@@ -646,6 +670,8 @@ async def test_a_wallet_read_more_than_a_day_ago_is_counted_stale_and_adds_nothi
         "compared": 1,
         "stale": 1,
         "unread": 0,
+        "chain_failed": 0,
+        "failed_chains": [],
         "oldest_observed_at": wire(readings.newer),
     }
     (btc,) = body["assets"]

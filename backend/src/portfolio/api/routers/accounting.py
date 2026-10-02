@@ -99,9 +99,11 @@ async def read_reconciliation(
     `history_short` -- more is held than the history accounts for, which usually means buys
     are missing from it -- or a `history_over`. **Per source**: when each exchange account's
     balances were last read, why the last attempt failed, and why the account was left out if
-    it was; and how many wallets were compared, how many had a reading too old, and how many
-    were never read. Only a reading at most `max_reading_age_hours` old is compared. Every
-    quantity is a JSON string.
+    it was; and how many wallets were compared, how many had a reading too old, how many were
+    never read, and how many were left out because the latest finished balance sync could
+    not read their chain, with each such chain named. Only a reading at most
+    `max_reading_age_hours` old is compared, and a wallet on a chain that sync could not read
+    is left out unless a later sync has already read it. Every quantity is a JSON string.
 
     The balances are the ones the syncs stored: nothing is read from a chain or a venue here.
     With no snapshot yet the answer is still `200`, with `computed_at: null` and no assets.

@@ -1,4 +1,4 @@
-import { act, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent, { type UserEvent } from '@testing-library/user-event';
 import { http, HttpResponse, type HttpHandler } from 'msw';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -54,6 +54,7 @@ import {
   ETH_BEYOND,
   exchangeBalances,
   failedBalances,
+  failedChain,
   investedPortfolioGaps,
   kasNeverTraded,
   matchedAsset,
@@ -71,6 +72,7 @@ import {
   XRP_LEFT,
   xrpLeftOnExchange,
   type ExchangeBalancesResponse,
+  type FailedChainResponse,
   type ReconciliationResponse,
 } from '@/test/reconciliationFixtures';
 import { currentPath, renderApp, settle } from '@/test/render';
@@ -1144,6 +1146,269 @@ describe('HoldingsCheck: the sources left out of the comparison (R9)', () => {
     expect(readings(block).map((entry) => entry.text)).toEqual([
       'Wallets (oldest reading): 20 minutes ago',
     ]);
+  });
+});
+
+/**
+ * BTC's 1.5 sits on Bitget, read and compared, so the asset matches whatever the wallets'
+ * state is: the notices under test are all that the chains left out add to the block.
+ */
+function btcOnBitget(
+  failedChains: readonly FailedChainResponse[],
+  compared = 0,
+): ReconciliationResponse {
+  return reconciliation({
+    assets: [matchedAsset('BTC', '1.500000000000000000')],
+    wallets: walletReadings(compared, { failedChains }),
+  });
+}
+
+/** The text of every alert inside `element`, in document order. */
+function alertTexts(element: HTMLElement): string[] {
+  return within(element)
+    .queryAllByRole('alert')
+    .map((alert) => alert.textContent);
+}
+
+/**
+ * Records every `console.error` while a test runs, each call as one string. React reports two
+ * children with the same key there and nowhere else: both are still drawn on the first render,
+ * so nothing on screen shows it.
+ */
+function recordConsoleErrors(): { messages: () => string[]; restore: () => void } {
+  const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+  return {
+    messages: () => spy.mock.calls.map((call) => call.map(String).join(' ')),
+    restore: () => {
+      spy.mockRestore();
+    },
+  };
+}
+
+const DUPLICATE_KEY = 'two children with the same key';
+
+describe('HoldingsCheck: wallets left out because their chain failed (spec 028)', () => {
+  it('one wallet: names the chain by its display name, in the singular, in an alert', async () => {
+    openDashboard({ reconciliation: btcOnBitget([failedChain('bitcoin', 1)]) });
+
+    const block = await holdingsCheck();
+    const alert = within(block).getByRole('alert');
+    expect(alert.tagName).toBe('P');
+    expect(alert.textContent).toBe(
+      'The last balance sync that finished could not read Bitcoin, so the coins in ' +
+        '1 wallet on it are left out of the comparison.',
+    );
+    // No instant and no reason: nothing here ticks, and the Value section says why.
+    expect(alert.querySelector('time')).toBeNull();
+    expect(alert).not.toHaveTextContent(/ago|just now|hours/);
+    // A wallet left out hides nothing that was found and invents nothing: the rest stands.
+    expect(within(block).getByText(ALL_MATCH)).toBeInTheDocument();
+    expect(within(block).queryByRole('heading', { level: 4 })).toBeNull();
+    expect(await positionHeader('BTC')).toHaveAccessibleName('BTC');
+  });
+
+  it('several wallets: the number of them, in the plural', async () => {
+    openDashboard({ reconciliation: btcOnBitget([failedChain('kaspa', 3)]) });
+
+    expect(alertTexts(await holdingsCheck())).toEqual([
+      'The last balance sync that finished could not read Kaspa, so the coins in ' +
+        '3 wallets on it are left out of the comparison.',
+    ]);
+  });
+
+  it('two failed chains: one alert each, in the endpoint order, each with its own count', async () => {
+    const errors = recordConsoleErrors();
+    try {
+      openDashboard({
+        reconciliation: btcOnBitget([failedChain('bitcoin', 2), failedChain('kaspa', 1)]),
+      });
+
+      const block = await holdingsCheck();
+      expect(alertTexts(block)).toEqual([
+        'The last balance sync that finished could not read Bitcoin, so the coins in ' +
+          '2 wallets on it are left out of the comparison.',
+        'The last balance sync that finished could not read Kaspa, so the coins in ' +
+          '1 wallet on it are left out of the comparison.',
+      ]);
+      // `chain_failed` is 3, and it is not rendered: the entries carry the counts.
+      expect(block).not.toHaveTextContent(/3 wallets/);
+      await settle();
+      // Two notices of one kind are two list children: each needs a key of its own.
+      expect(errors.messages().filter((message) => message.includes(DUPLICATE_KEY))).toEqual([]);
+    } finally {
+      errors.restore();
+    }
+  });
+
+  it('the control: two children with one key are reported where that test looks', () => {
+    const errors = recordConsoleErrors();
+    try {
+      render(
+        <ul>
+          {['a', 'a'].map((key, index) => (
+            <li key={key}>{String(index)}</li>
+          ))}
+        </ul>,
+      );
+
+      expect(errors.messages().some((message) => message.includes(DUPLICATE_KEY))).toBe(true);
+    } finally {
+      errors.restore();
+    }
+  });
+
+  it('a chain this build has no name for is named by its raw key', async () => {
+    openDashboard({ reconciliation: btcOnBitget([failedChain('litecoin', 2)]) });
+
+    expect(alertTexts(await holdingsCheck())).toEqual([
+      'The last balance sync that finished could not read litecoin, so the coins in ' +
+        '2 wallets on it are left out of the comparison.',
+    ]);
+  });
+
+  it('comes after the venues and before the stale wallets, then the unread ones', async () => {
+    const errors = recordConsoleErrors();
+    try {
+      openDashboard({
+        exchanges: bothVenues(),
+        reconciliation: btcShortInWallets({
+          exchanges: [unreadBalances('bingx'), failedBalances('bitget', 'schema')],
+          wallets: walletReadings(2, {
+            stale: 1,
+            unread: 1,
+            failedChains: [failedChain('bitcoin', 2), failedChain('kaspa', 1)],
+          }),
+        }),
+      });
+
+      const block = await holdingsCheck();
+      const alerts = within(block).getAllByRole('alert');
+      expect(alerts.map((alert) => alert.tagName)).toEqual(['P', 'P', 'P', 'P', 'P', 'P']);
+      expect(alerts[0]).toHaveTextContent('The balances at BingX have not been read yet.');
+      expect(alerts[1]).toHaveTextContent('The balances at Bitget could not be read.');
+      expect(alerts[2]?.textContent).toBe(
+        'The last balance sync that finished could not read Bitcoin, so the coins in ' +
+          '2 wallets on it are left out of the comparison.',
+      );
+      expect(alerts[3]?.textContent).toBe(
+        'The last balance sync that finished could not read Kaspa, so the coins in ' +
+          '1 wallet on it are left out of the comparison.',
+      );
+      expect(alerts[4]?.textContent).toBe(
+        '1 wallet was last read more than 24 hours ago, so the coins in it are left out of the ' +
+          'comparison.',
+      );
+      expect(alerts[5]?.textContent).toBe(
+        '1 wallet has not been read yet, so the coins in it are left out of the comparison.',
+      );
+      // The finding of the wallets that were compared is still listed below the notices.
+      const table = shortTable(block, 1);
+      expect(
+        (alerts[5] ?? block).compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(readings(block).map((entry) => entry.text)).toEqual([
+        'Wallets (oldest reading): 20 minutes ago',
+      ]);
+      await settle();
+      expect(errors.messages().filter((message) => message.includes(DUPLICATE_KEY))).toEqual([]);
+    } finally {
+      errors.restore();
+    }
+  });
+
+  it('every wallet left out: the notice alone, and no wallet among the readings', async () => {
+    openDashboard({ reconciliation: btcOnBitget([failedChain('bitcoin', 2)]) });
+
+    const block = await holdingsCheck();
+    expect(alertTexts(block)).toHaveLength(1);
+    expect(readings(block)).toEqual([{ text: 'Bitget: 14 minutes ago', at: BALANCES_READ_AT }]);
+  });
+
+  it('beside wallets that were compared: their oldest reading is still listed', async () => {
+    openDashboard({ reconciliation: btcOnBitget([failedChain('kaspa', 1)], 2) });
+
+    const block = await holdingsCheck();
+    expect(alertTexts(block)).toEqual([
+      'The last balance sync that finished could not read Kaspa, so the coins in ' +
+        '1 wallet on it are left out of the comparison.',
+    ]);
+    expect(readings(block)).toEqual([
+      { text: 'Bitget: 14 minutes ago', at: BALANCES_READ_AT },
+      { text: 'Wallets (oldest reading): 20 minutes ago', at: WALLETS_OBSERVED_AT },
+    ]);
+  });
+
+  it('with no failed chain the block says nothing of one: the notices are what they were', async () => {
+    openDashboard({
+      exchanges: bothVenues(),
+      reconciliation: btcShortInWallets({
+        exchanges: [unreadBalances('bingx'), exchangeBalances()],
+        wallets: walletReadings(2, { stale: 2, unread: 1, failedChains: [] }),
+      }),
+    });
+
+    const block = await holdingsCheck();
+    expect(alertTexts(block)).toEqual([
+      'The balances at BingX have not been read yet. They are read after its next successful ' +
+        'sync, and until then the coins held there are left out of the comparison.',
+      '2 wallets were last read more than 24 hours ago, so the coins in them are left out of ' +
+        'the comparison.',
+      '1 wallet has not been read yet, so the coins in it are left out of the comparison.',
+    ]);
+    expect(block).not.toHaveTextContent(/balance sync that finished/);
+  });
+
+  it('follows the endpoint from one poll to the next: a chain that recovers loses its notice', async () => {
+    fakePolling();
+    const errors = recordConsoleErrors();
+    try {
+      const { accounting } = openDashboard({
+        reconciliation: btcOnBitget([failedChain('bitcoin', 2), failedChain('kaspa', 1)]),
+      });
+      const block = await holdingsCheck();
+      expect(alertTexts(block)).toHaveLength(2);
+
+      // The next balance run read Bitcoin: its two wallets are compared again.
+      accounting.setReconciliation(btcOnBitget([failedChain('kaspa', 1)], 2));
+      nextPoll();
+      await waitFor(() => {
+        expect(alertTexts(block)).toEqual([
+          'The last balance sync that finished could not read Kaspa, so the coins in ' +
+            '1 wallet on it are left out of the comparison.',
+        ]);
+      });
+
+      // And the one after it read Kaspa too.
+      accounting.setReconciliation(btcOnBitget([], 3));
+      nextPoll();
+      await waitFor(() => {
+        expect(alertTexts(block)).toEqual([]);
+      });
+      expect(errors.messages().filter((message) => message.includes(DUPLICATE_KEY))).toEqual([]);
+    } finally {
+      errors.restore();
+    }
+  });
+
+  it('is still said when the history is stale: the sources first, then why nothing is compared', async () => {
+    openDashboard({
+      positions: investedPortfolio({ last_recompute: failedRecompute() }),
+      reconciliation: investedPortfolioGaps({
+        last_recompute: failedRecompute(),
+        wallets: walletReadings(3, { failedChains: [failedChain('kaspa', 1)] }),
+      }),
+      exchanges: bothVenues(),
+    });
+
+    const block = await holdingsCheck();
+    const alerts = alertTexts(block);
+    expect(alerts).toHaveLength(2);
+    expect(alerts[0]).toBe(
+      'The last balance sync that finished could not read Kaspa, so the coins in ' +
+        '1 wallet on it are left out of the comparison.',
+    );
+    expect(alerts[1]).toMatch(STALE_HISTORY);
   });
 });
 

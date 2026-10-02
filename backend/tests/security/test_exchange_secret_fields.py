@@ -69,6 +69,7 @@ from portfolio.services.exchange_sync_plan import (
 from portfolio.services.exchanges import ExchangeView, FillsPage, FillView, LastError
 from portfolio.services.reconciliation import (
     ExchangeBalanceSource,
+    FailedChain,
     ReconciliationView,
     WalletSources,
 )
@@ -136,6 +137,9 @@ PROVIDER_DATACLASSES: Final = (
     ExchangeBalanceSource,
     WalletSources,
     ReconciliationView,
+    # #116: the chain a wallet was left out for, served by the same endpoint. A chain key and
+    # a count cross the API; an address never does, and neither does a secret.
+    FailedChain,
 )
 
 #: The spellings of a secret-bearing type in an annotation. Annotations are strings under
@@ -177,6 +181,10 @@ MUST_BE_SCANNED: Final = frozenset(
         "AssetReconciliation.difference",
         "ExchangeBalanceSource.balances_read_at",
         "WalletSources.unread",
+        "WalletSources.chain_failed",
+        "WalletSources.failed_chains",
+        "FailedChain.chain_key",
+        "FailedChain.wallets",
         "ReconciliationView.exchanges",
     }
 )
