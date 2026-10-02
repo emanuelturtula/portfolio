@@ -37,6 +37,14 @@ that old. Anything else contributes **nothing**, and its source says why. The se
 this module is that rule: each reason, their precedence, the age boundary to the microsecond
 on both sides, and the scenario the rule was written for -- a withdrawal after a reading
 that a failed read then kept -- which used to be reported as coins missing from the history.
+
+## No chain fails in this module
+
+Spec 028 added a second condition for a wallet: its chain did not fail in the latest finished
+balance run. `plant_reading` writes each reading under a `success` run of its own with no
+chain rows, and a chain with no row did not fail, so every wallet here is judged by the age
+limit alone, as it was before that rule. A failed chain is
+`tests/services/test_reconciliation_chain_failed.py`'s.
 """
 
 from __future__ import annotations
@@ -447,7 +455,12 @@ async def test_the_wallet_sources_count_the_compared_and_report_the_oldest_readi
     view = await view_of(factory, planted.user_id)
 
     assert view.wallets == WalletSources(
-        compared=3, stale=0, unread=0, oldest_observed_at=OBSERVED_OLDEST
+        compared=3,
+        stale=0,
+        unread=0,
+        chain_failed=0,
+        failed_chains=(),
+        oldest_observed_at=OBSERVED_OLDEST,
     )
 
 
@@ -465,7 +478,12 @@ async def test_an_unread_wallet_adds_nothing_and_is_counted(
     view = await view_of(factory, planted.user_id)
 
     assert view.wallets == WalletSources(
-        compared=3, stale=0, unread=1, oldest_observed_at=OBSERVED_OLDEST
+        compared=3,
+        stale=0,
+        unread=1,
+        chain_failed=0,
+        failed_chains=(),
+        oldest_observed_at=OBSERVED_OLDEST,
     )
     assert figures(by_asset(view)["BTC"]) == decimals("0.5", "0.7", "0.3", "1.0", "0.5")
 
@@ -479,7 +497,9 @@ async def test_with_no_wallet_read_the_oldest_reading_is_null_and_the_side_is_em
 
     view = await view_of(factory, planted.user_id)
 
-    assert view.wallets == WalletSources(compared=0, stale=0, unread=2, oldest_observed_at=None)
+    assert view.wallets == WalletSources(
+        compared=0, stale=0, unread=2, chain_failed=0, failed_chains=(), oldest_observed_at=None
+    )
     rows = by_asset(view)
     assert figures(rows["BTC"]) == decimals("0.5", "0", "0", "0", "-0.5")
     assert rows["BTC"].status is ReconciliationStatus.HISTORY_OVER, (
@@ -494,7 +514,9 @@ async def test_an_owner_with_no_wallets_has_nothing_compared_stale_or_unread(
 
     view = await view_of(factory, planted.user_id)
 
-    assert view.wallets == WalletSources(compared=0, stale=0, unread=0, oldest_observed_at=None)
+    assert view.wallets == WalletSources(
+        compared=0, stale=0, unread=0, chain_failed=0, failed_chains=(), oldest_observed_at=None
+    )
 
 
 async def test_a_wallets_latest_reading_is_used_not_an_older_one_and_not_their_sum(
@@ -514,7 +536,12 @@ async def test_a_wallets_latest_reading_is_used_not_an_older_one_and_not_their_s
 
     assert by_asset(view)["BTC"].wallet_quantity == Decimal("0.25")
     assert view.wallets == WalletSources(
-        compared=1, stale=0, unread=0, oldest_observed_at=OBSERVED_NEWEST
+        compared=1,
+        stale=0,
+        unread=0,
+        chain_failed=0,
+        failed_chains=(),
+        oldest_observed_at=OBSERVED_NEWEST,
     )
 
 
@@ -595,7 +622,12 @@ async def test_an_archived_wallet_is_neither_summed_nor_counted(
     view = await view_of(factory, planted.user_id)
 
     assert view.wallets == WalletSources(
-        compared=3, stale=0, unread=0, oldest_observed_at=OBSERVED_OLDEST
+        compared=3,
+        stale=0,
+        unread=0,
+        chain_failed=0,
+        failed_chains=(),
+        oldest_observed_at=OBSERVED_OLDEST,
     )
     assert by_asset(view)["BTC"].wallet_quantity == Decimal("0.7")
 
@@ -1000,7 +1032,10 @@ async def test_a_reading_that_becomes_current_again_is_compared_again(
 async def test_a_wallets_reading_is_summed_until_it_is_more_than_a_day_old(
     factory: async_sessionmaker[AsyncSession], age: timedelta, is_compared: bool
 ) -> None:
-    """A chain that fails on every run leaves a wallet's last reading where it was.
+    """A wallet no balance sync reads any more keeps its last reading where it was.
+
+    No chain is recorded as failed here: the age limit decides alone, as it does when the
+    balance timer is off or no run finishes.
 
     A reading dated after the clock -- the clock stepped back since -- is current however far
     after: its age is not positive, and it is the newest reading there is.
@@ -1014,11 +1049,18 @@ async def test_a_wallets_reading_is_summed_until_it_is_more_than_a_day_old(
 
     if is_compared:
         assert view.wallets == WalletSources(
-            compared=1, stale=0, unread=0, oldest_observed_at=observed_at
+            compared=1,
+            stale=0,
+            unread=0,
+            chain_failed=0,
+            failed_chains=(),
+            oldest_observed_at=observed_at,
         )
         assert by_asset(view)["BTC"].wallet_quantity == Decimal("0.4")
     else:
-        assert view.wallets == WalletSources(compared=0, stale=1, unread=0, oldest_observed_at=None)
+        assert view.wallets == WalletSources(
+            compared=0, stale=1, unread=0, chain_failed=0, failed_chains=(), oldest_observed_at=None
+        )
         assert by_asset(view)["BTC"].wallet_quantity == 0
 
 
@@ -1041,7 +1083,12 @@ async def test_the_three_wallet_counts_add_up_and_the_oldest_is_among_the_compar
     view = await view_of(factory, planted.user_id)
 
     assert view.wallets == WalletSources(
-        compared=1, stale=1, unread=1, oldest_observed_at=OBSERVED_NEWER
+        compared=1,
+        stale=1,
+        unread=1,
+        chain_failed=0,
+        failed_chains=(),
+        oldest_observed_at=OBSERVED_NEWER,
     )
     assert by_asset(view)["BTC"].wallet_quantity == Decimal("0.4"), "9 BTC of a stale reading"
 
@@ -1063,19 +1110,28 @@ async def test_a_wallet_is_judged_by_its_latest_reading_not_by_an_older_one(
     view = await view_of(factory, planted.user_id)
 
     assert view.wallets == WalletSources(
-        compared=1, stale=0, unread=0, oldest_observed_at=OBSERVED_NEWEST
+        compared=1,
+        stale=0,
+        unread=0,
+        chain_failed=0,
+        failed_chains=(),
+        oldest_observed_at=OBSERVED_NEWEST,
     )
     assert by_asset(view)["BTC"].wallet_quantity == Decimal("0.25")
 
 
-async def test_coins_that_left_a_wallet_whose_chain_stopped_answering_are_not_counted_twice(
+async def test_coins_that_left_a_wallet_no_sync_has_read_since_are_not_counted_twice(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """The wallet half of the case R9 was ruled on.
 
-    1000 KAS sat in a wallet when it was last read, three days ago; the chain has failed on
-    every run since. The coins were deposited to Bitget, whose reading is ten minutes old.
-    The wallet's old reading and the venue's new one would make 2000 held against 1000.
+    1000 KAS sat in a wallet when it was last read, three days ago, and no balance sync has
+    finished since: the balance timer is off. The coins were deposited to Bitget, whose
+    reading is ten minutes old. The wallet's old reading and the venue's new one would make
+    2000 held against 1000.
+
+    This is the residual the age limit still covers. A chain recorded as failed leaves the
+    wallet out at once, whatever the reading's age (spec 028).
     """
     planted = await plant_owner_with_history(factory, [buy(1001, 0, "KAS", "1000", "100")])
     wallet = await plant_wallet(factory, planted, "kas", ChainKey.KASPA, KASPA_TESTNET_V0)
@@ -1091,7 +1147,9 @@ async def test_coins_that_left_a_wallet_whose_chain_stopped_answering_are_not_co
     (row,) = view.assets
     assert figures(row) == decimals("1000", "0", "1000", "1000", "0")
     assert row.status is ReconciliationStatus.MATCH
-    assert view.wallets == WalletSources(compared=0, stale=1, unread=0, oldest_observed_at=None)
+    assert view.wallets == WalletSources(
+        compared=0, stale=1, unread=0, chain_failed=0, failed_chains=(), oldest_observed_at=None
+    )
 
 
 async def test_every_reading_is_held_to_one_instant(
@@ -1159,7 +1217,14 @@ async def test_with_no_snapshot_nothing_is_compared_and_the_sources_are_still_an
             ),
             compared(ExchangeKey.BITGET, BITGET_READ),
         ),
-        wallets=WalletSources(compared=1, stale=0, unread=1, oldest_observed_at=OBSERVED_NEWER),
+        wallets=WalletSources(
+            compared=1,
+            stale=0,
+            unread=1,
+            chain_failed=0,
+            failed_chains=(),
+            oldest_observed_at=OBSERVED_NEWER,
+        ),
     )
 
 
@@ -1211,7 +1276,12 @@ async def test_another_owners_history_wallets_and_balances_are_not_in_the_view(
     assert [row.asset for row in theirs.assets] == ["BTC", "KAS", "ZZOTHER"]
     assert by_asset(theirs)["BTC"].exchange_quantity == Decimal(4242)
     assert theirs.wallets == WalletSources(
-        compared=1, stale=0, unread=0, oldest_observed_at=OBSERVED_OLDEST
+        compared=1,
+        stale=0,
+        unread=0,
+        chain_failed=0,
+        failed_chains=(),
+        oldest_observed_at=OBSERVED_OLDEST,
     )
 
 

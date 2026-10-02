@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import select, update
 
@@ -120,6 +120,14 @@ class SyncErrorKind(StrEnum):
     UNKNOWN_CHAIN = "unknown_chain"
     ADDRESS_REJECTED = "address_rejected"
     INTERNAL = "internal"
+
+
+_FINISHED_STATUSES: Final = (SyncRunStatus.SUCCESS, SyncRunStatus.PARTIAL, SyncRunStatus.FAILED)
+"""The statuses of a run that ran to its end, and so has its chain rows.
+
+The other two are `RUNNING`, which has not ended, and `INTERRUPTED`, which the sweep wrote
+for a run whose process died or whose close-out failed. Neither has a chain row.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,16 +347,57 @@ class SyncRunRepository:
             .order_by(SyncRunChain.sync_run_id, SyncRunChain.chain_key)
         )
         for row in rows:
-            chains_by_run[row.sync_run_id].append(
-                ChainOutcome(
-                    chain_key=row.chain_key,
-                    status=SyncRunStatus(row.status),
-                    wallets_read=row.wallets_read,
-                    error_kind=None if row.error_kind is None else SyncErrorKind(row.error_kind),
-                    detail=row.detail,
-                )
-            )
+            chains_by_run[row.sync_run_id].append(outcome_of(row))
         return [summary_of(run, tuple(chains_by_run[run.id])) for run in runs]
+
+    async def latest_finished(self) -> SyncRunSummary | None:
+        """The newest run that ran to its end, with its chains, or `None` if none ever has.
+
+        **Finished is `success`, `partial` or `failed`.** A `running` or `interrupted` run has
+        no chain rows -- `finish_run` writes them together with the final status -- so it
+        cannot say which chains failed, and a caller asking that question has to be answered
+        by the run before it. That is the opposite of `latest_started_at`, which counts an
+        attempt of any status, and both are right: one asks whether a vendor was called, the
+        other what a run found.
+
+        What the holdings check reads to leave out a wallet whose chain failed (spec 028).
+
+        `ORDER BY id DESC`, as every read here: identity order is start order, and with one
+        run at a time it is finish order too. The filter is on `status`, a `TEXT` column of
+        enum values that is neither money nor a datetime, and it is an equality test, so
+        nothing here depends on how a `TEXT` value collates.
+
+        Two queries: the run, then its chains, sorted by chain key as `list_runs` sorts them.
+        """
+        run = await self._session.scalar(
+            select(SyncRun)
+            .where(SyncRun.status.in_(_FINISHED_STATUSES))
+            .order_by(SyncRun.id.desc())
+            .limit(1)
+        )
+        if run is None:
+            return None
+        rows = await self._session.scalars(
+            select(SyncRunChain)
+            .where(SyncRunChain.sync_run_id == run.id)
+            .order_by(SyncRunChain.chain_key)
+        )
+        return summary_of(run, tuple(outcome_of(row) for row in rows))
+
+
+def outcome_of(row: SyncRunChain) -> ChainOutcome:
+    """One chain row as the vocabulary above, read while the session is still open.
+
+    The enum constructors behave as `summary_of` says they do: a value the `CHECK`
+    constraints admit always converts.
+    """
+    return ChainOutcome(
+        chain_key=row.chain_key,
+        status=SyncRunStatus(row.status),
+        wallets_read=row.wallets_read,
+        error_kind=None if row.error_kind is None else SyncErrorKind(row.error_kind),
+        detail=row.detail,
+    )
 
 
 def summary_of(run: SyncRun, chains: tuple[ChainOutcome, ...]) -> SyncRunSummary:

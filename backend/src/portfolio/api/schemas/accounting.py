@@ -43,8 +43,10 @@ The balances the holdings check compares against are a lower bound on what the o
 and only a reading that is current is one (spec 025, R9). So beside the per-asset comparison
 the response says how each source stands: every exchange account with when its balances were
 last read, the kind its last attempt failed with, and the reason it was left out if it was;
-and how many wallets were compared, how many had a reading too old to compare, and how many
-were never read. A source that is left out is a reason or a count, never a quantity of zero.
+and how many wallets were compared, how many had a reading too old to compare, how many
+were never read, and how many were left out because the latest finished balance sync could
+not read their chain (spec 028), with each such chain named. A source that is left out is a
+reason or a count, never a quantity of zero.
 `last_recompute` is served for the reason the positions endpoint serves it: a failed recompute
 means the history compared is older than the balances beside it. It is the one response that
 carries what a venue holds, per asset and summed over the accounts; no log line does.
@@ -89,6 +91,7 @@ if TYPE_CHECKING:
     )
     from portfolio.services.reconciliation import (
         ExchangeBalanceSource,
+        FailedChain,
         ReconciliationView,
         WalletSources,
     )
@@ -362,27 +365,56 @@ class ExchangeBalancesResponse(BaseModel):
         )
 
 
+class FailedChainResponse(BaseModel):
+    """A chain the latest finished balance sync could not read, and what that left out.
+
+    `chain_key` is the chain's key, as a wallet carries it. `wallets` is how many of the
+    owner's active wallets on that chain are left out of the comparison because of it, and is
+    never zero. It does not say why the chain failed: `GET /api/balances/runs` does.
+    """
+
+    chain_key: str
+    wallets: int
+
+    @classmethod
+    def of(cls, chain: FailedChain) -> FailedChainResponse:
+        """Render one failed chain."""
+        return cls(chain_key=chain.chain_key, wallets=chain.wallets)
+
+
 class WalletsReadResponse(BaseModel):
     """How the active wallets stand as a source of the comparison. The counts add up to all.
 
-    `compared` wallets have a reading at most `max_reading_age_hours` old, and are in the
-    comparison. `stale` ones have an older reading and `unread` ones have none; neither adds
-    anything, so their coins are missing from it. `oldest_observed_at` is the oldest reading
-    among the `compared` ones, `null` when none is compared.
+    `compared` wallets are in the comparison: their reading is at most
+    `max_reading_age_hours` old, and their chain did not fail in the latest finished balance
+    sync, or a later sync has read them since. The other three counts are wallets that add
+    nothing, so their coins are missing from it, each under the first reason that applies:
+    `chain_failed` ones are on a chain the latest finished balance sync could not read, and
+    no later sync has read them; `unread` ones have no reading; `stale` ones have a reading
+    older than the limit.
+
+    `failed_chains` names the chains behind `chain_failed`, sorted by `chain_key`. Only a
+    chain with at least one wallet left out is listed, and the entries' `wallets` add up to
+    `chain_failed`. `oldest_observed_at` is the oldest reading among the `compared` wallets,
+    `null` when none is compared.
     """
 
     compared: int
     stale: int
     unread: int
+    chain_failed: int
+    failed_chains: list[FailedChainResponse]
     oldest_observed_at: datetime | None
 
     @classmethod
     def of(cls, sources: WalletSources) -> WalletsReadResponse:
-        """Render the wallets' state."""
+        """Render the wallets' state, the failed chains in the order the service gives."""
         return cls(
             compared=sources.compared,
             stale=sources.stale,
             unread=sources.unread,
+            chain_failed=sources.chain_failed,
+            failed_chains=[FailedChainResponse.of(chain) for chain in sources.failed_chains],
             oldest_observed_at=sources.oldest_observed_at,
         )
 

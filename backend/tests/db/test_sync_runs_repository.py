@@ -20,10 +20,10 @@ file and watching an insert be refused is what closes that gap.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import IntegrityError
 
 from portfolio.db.engine import create_session_factory
@@ -35,6 +35,7 @@ from portfolio.repositories.sync_runs import (
     SyncErrorKind,
     SyncRunRepository,
     SyncRunStatus,
+    SyncRunSummary,
     SyncTrigger,
 )
 from tests.balance_harness import sqlite_timestamp
@@ -542,6 +543,280 @@ async def test_listing_runs_attaches_each_run_only_its_own_chains(
 async def test_listing_an_empty_table_is_an_empty_list(repository: SyncRunRepository) -> None:
     """The first day, again: no runs is not an error."""
     assert await repository.list_runs(limit=50) == []
+
+
+# --------------------------------------------------------------------------------------
+# What the holdings check reads: the latest run that ran to its end (spec 028)
+# --------------------------------------------------------------------------------------
+
+READ: Final = ChainOutcome(chain_key=BITCOIN, status=SyncRunStatus.SUCCESS, wallets_read=2)
+KASPA_DOWN: Final = ChainOutcome(
+    chain_key=KASPA,
+    status=SyncRunStatus.FAILED,
+    wallets_read=0,
+    error_kind=SyncErrorKind.UNAVAILABLE,
+    detail="no configured endpoint answered",
+)
+
+
+async def finish(
+    session: AsyncSession,
+    repository: SyncRunRepository,
+    status: SyncRunStatus,
+    chains: tuple[ChainOutcome, ...] = (),
+    *,
+    started_at: datetime = STARTED_AT,
+    finished_at: datetime = FINISHED_AT,
+) -> int:
+    """One run opened and closed out by the repository's own writers, as the sync does."""
+    run_id = await open_and_commit(
+        session, repository, trigger=SyncTrigger.SCHEDULED, started_at=started_at
+    )
+    await repository.finish_run(
+        run_id,
+        status=status,
+        finished_at=finished_at,
+        duration_ms=DURATION_MS,
+        wallets_succeeded=sum(chain.wallets_read for chain in chains),
+        wallets_failed=sum(1 for chain in chains if chain.status is SyncRunStatus.FAILED),
+        chains=chains,
+    )
+    await session.commit()
+    return run_id
+
+
+async def leave_unfinished(
+    session: AsyncSession, repository: SyncRunRepository, status: str
+) -> int:
+    """A run that never ran to its end: still `running`, or swept to `interrupted`."""
+    run_id = await open_and_commit(session, repository)
+    if status == "interrupted":
+        assert await repository.sweep_interrupted() == 1
+        await session.commit()
+    assert (await row_of(session, run_id))["status"] == status
+    return run_id
+
+
+async def test_the_latest_finished_run_is_none_on_a_fresh_database(
+    repository: SyncRunRepository,
+) -> None:
+    """No run has finished, so no chain is known to have failed."""
+    assert await repository.latest_finished() is None
+
+
+@pytest.mark.parametrize("status", ["running", "interrupted"])
+async def test_a_run_that_never_ran_to_its_end_is_not_a_finished_one(
+    session: AsyncSession, repository: SyncRunRepository, status: str
+) -> None:
+    """The only runs there are did not finish: two of them, so "the newest" is not `None`
+    by there being one row too few."""
+    await leave_unfinished(session, repository, status)
+    await leave_unfinished(session, repository, status)
+
+    assert await repository.latest_finished() is None
+    assert await repository.latest_started_at() == STARTED_AT, (
+        "the control: the timer's question counts those same runs"
+    )
+
+
+@pytest.mark.parametrize(
+    "status", [SyncRunStatus.SUCCESS, SyncRunStatus.PARTIAL, SyncRunStatus.FAILED]
+)
+async def test_each_status_of_a_run_that_ended_is_finished_and_is_answered_whole(
+    session: AsyncSession, repository: SyncRunRepository, status: SyncRunStatus
+) -> None:
+    """`success`, `partial` and `failed` alike, with every field of the run and its chains."""
+    run_id = await finish(session, repository, status, (KASPA_DOWN, READ))
+    session.expunge_all()
+
+    found = await repository.latest_finished()
+
+    assert found == SyncRunSummary(
+        run_id=run_id,
+        trigger=SyncTrigger.SCHEDULED,
+        status=status,
+        started_at=STARTED_AT,
+        finished_at=FINISHED_AT,
+        duration_ms=DURATION_MS,
+        wallets_total=2,
+        wallets_succeeded=2,
+        wallets_failed=1,
+        chains=(READ, KASPA_DOWN),
+    )
+    assert found is not None
+    assert isinstance(found.chains, tuple)
+    assert found.chains[1].status is SyncRunStatus.FAILED
+    assert found.chains[1].error_kind is SyncErrorKind.UNAVAILABLE
+    assert found.started_at.tzinfo is not None
+
+
+@pytest.mark.parametrize("newest", ["running", "interrupted"])
+@pytest.mark.parametrize(
+    "older", [SyncRunStatus.SUCCESS, SyncRunStatus.PARTIAL, SyncRunStatus.FAILED]
+)
+async def test_a_newer_run_that_did_not_finish_does_not_hide_the_finished_one_before_it(
+    session: AsyncSession, repository: SyncRunRepository, older: SyncRunStatus, newest: str
+) -> None:
+    """Criterion 4 of spec 028, at the query: the run before a `running` or an `interrupted`
+    one still stands, whichever of the three finished statuses it has."""
+    finished_run = await finish(session, repository, older, (KASPA_DOWN,))
+    unfinished = await leave_unfinished(session, repository, newest)
+    assert unfinished > finished_run
+
+    found = await repository.latest_finished()
+
+    assert found is not None
+    assert found.run_id == finished_run
+    assert found.status is older
+    assert found.chains == (KASPA_DOWN,)
+    assert (await repository.list_runs(limit=1))[0].run_id == unfinished, (
+        "the control: the newest run of any status is the other one"
+    )
+
+
+@pytest.mark.parametrize("newest", ["running", "interrupted"])
+async def test_a_chain_row_under_an_unfinished_run_does_not_make_it_finished(
+    session: AsyncSession, repository: SyncRunRepository, newest: str
+) -> None:
+    """No writer leaves one. The run is chosen by its status, so a row planted there by hand
+    changes nothing: the chains answered are the finished run's own."""
+    finished_run = await finish(session, repository, SyncRunStatus.SUCCESS, (READ,))
+    await insert_run_with(session, trigger="scheduled", status=newest)
+    unfinished = finished_run + 1
+    await insert_chain_with(
+        session, unfinished, chain_key=BITCOIN, status="failed", error_kind="unavailable"
+    )
+    await session.commit()
+
+    found = await repository.latest_finished()
+
+    assert found is not None
+    assert found.run_id == finished_run
+    assert found.chains == (READ,)
+
+
+async def test_the_latest_finished_run_is_the_newest_by_identity_not_by_either_clock(
+    session: AsyncSession, repository: SyncRunRepository
+) -> None:
+    """The later run is given the earlier `started_at` and the earlier `finished_at`.
+
+    Both are `TEXT` in SQLite. Resolved by either of them, the answer would be the older
+    run and its verdict on Kaspa the opposite one.
+    """
+    older = await finish(session, repository, SyncRunStatus.SUCCESS, (READ,))
+    newer = await finish(
+        session,
+        repository,
+        SyncRunStatus.FAILED,
+        (KASPA_DOWN,),
+        started_at=STARTED_AT - timedelta(days=3),
+        finished_at=FINISHED_AT - timedelta(days=3),
+    )
+    assert newer > older
+
+    found = await repository.latest_finished()
+
+    assert found is not None
+    assert found.run_id == newer
+    assert found.status is SyncRunStatus.FAILED
+    assert found.chains == (KASPA_DOWN,)
+
+
+async def test_the_latest_finished_run_follows_each_run_that_finishes(
+    session: AsyncSession, repository: SyncRunRepository
+) -> None:
+    """Three runs finishing one after the other: the answer is the last one each time, with
+    its own chains and none of the others'."""
+    seen: list[tuple[int, tuple[str, ...]]] = []
+    expected: list[tuple[int, tuple[str, ...]]] = []
+    for status, chains in (
+        (SyncRunStatus.PARTIAL, (READ, KASPA_DOWN)),
+        (SyncRunStatus.SUCCESS, (READ,)),
+        (SyncRunStatus.FAILED, (KASPA_DOWN,)),
+    ):
+        run_id = await finish(session, repository, status, chains)
+        found = await repository.latest_finished()
+        assert found is not None
+        seen.append((found.run_id, tuple(chain.chain_key for chain in found.chains)))
+        expected.append((run_id, tuple(chain.chain_key for chain in chains)))
+
+    assert seen == expected
+    assert [chains for _run, chains in seen] == [(BITCOIN, KASPA), (BITCOIN,), (KASPA,)]
+
+
+async def test_a_finished_run_over_no_wallet_has_no_chains(
+    session: AsyncSession, repository: SyncRunRepository
+) -> None:
+    """A run with nothing to read records no chain, and it is still the latest finished one:
+    the run before it, which failed Kaspa, no longer decides anything."""
+    await finish(session, repository, SyncRunStatus.FAILED, (KASPA_DOWN,))
+    empty = await finish(session, repository, SyncRunStatus.SUCCESS)
+
+    found = await repository.latest_finished()
+
+    assert found is not None
+    assert found.run_id == empty
+    assert found.chains == ()
+
+
+async def test_the_latest_finished_run_is_the_same_summary_the_listing_gives(
+    session: AsyncSession, repository: SyncRunRepository
+) -> None:
+    """One reading of a run, whichever method is asked: the endpoint the owner is sent to
+    (`GET /api/balances/runs`) and the holdings check cannot disagree about a chain."""
+    await finish(session, repository, SyncRunStatus.PARTIAL, (KASPA_DOWN, READ))
+    await leave_unfinished(session, repository, "running")
+
+    listed = await repository.list_runs(limit=10)
+
+    assert await repository.latest_finished() == listed[1]
+
+
+async def test_the_latest_finished_run_is_two_statements_on_status_and_identity(
+    session: AsyncSession, repository: SyncRunRepository
+) -> None:
+    """Criterion 8 of spec 028: the run is filtered on `status` and ordered on `id`.
+
+    `started_at` and `finished_at` are `TEXT`. Neither is compared, ordered on or
+    aggregated, and the request stays at two statements with five runs in the table.
+    """
+    for status in (SyncRunStatus.SUCCESS, SyncRunStatus.PARTIAL, SyncRunStatus.FAILED):
+        await finish(session, repository, status, (READ, KASPA_DOWN))
+    await leave_unfinished(session, repository, "interrupted")
+    await leave_unfinished(session, repository, "running")
+    statements: list[tuple[str, Any]] = []
+
+    def record(conn: Any, cursor: Any, statement: str, parameters: Any, *rest: Any) -> None:
+        del conn, cursor, rest
+        statements.append((" ".join(statement.upper().split()), parameters))
+
+    engine = session.bind
+    assert engine is not None
+    event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        found = await repository.latest_finished()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record)
+
+    assert found is not None
+    assert found.status is SyncRunStatus.FAILED
+    assert len(statements) == 2, statements
+    (the_run, run_parameters), (the_chains, chain_parameters) = statements
+    assert " FROM SYNC_RUNS " in the_run
+    assert "SYNC_RUNS.STATUS IN" in the_run
+    assert sorted(run_parameters[:3]) == ["failed", "partial", "success"]
+    assert the_run.split(" ORDER BY ", 1)[1].startswith("SYNC_RUNS.ID DESC")
+    assert " LIMIT " in the_run
+    assert " FROM SYNC_RUN_CHAINS " in the_chains
+    assert "SYNC_RUN_CHAINS.SYNC_RUN_ID = ?" in the_chains
+    assert tuple(chain_parameters) == (found.run_id,)
+    assert the_chains.split(" ORDER BY ", 1)[1] == "SYNC_RUN_CHAINS.CHAIN_KEY"
+    for statement, _parameters in statements:
+        tail = statement.split(" FROM ", 1)[1]
+        for instant in ("STARTED_AT", "FINISHED_AT"):
+            assert instant not in tail, f"{instant} is compared or ordered on: {statement}"
+        for aggregate in ("SUM(", "TOTAL(", "AVG(", "MIN(", "MAX(", "COUNT("):
+            assert aggregate not in statement, statement
 
 
 # --------------------------------------------------------------------------------------

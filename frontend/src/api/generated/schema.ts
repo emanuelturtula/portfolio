@@ -146,9 +146,11 @@ export interface paths {
          *     `history_short` -- more is held than the history accounts for, which usually means buys
          *     are missing from it -- or a `history_over`. **Per source**: when each exchange account's
          *     balances were last read, why the last attempt failed, and why the account was left out if
-         *     it was; and how many wallets were compared, how many had a reading too old, and how many
-         *     were never read. Only a reading at most `max_reading_age_hours` old is compared. Every
-         *     quantity is a JSON string.
+         *     it was; and how many wallets were compared, how many had a reading too old, how many were
+         *     never read, and how many were left out because the latest finished balance sync could
+         *     not read their chain, with each such chain named. Only a reading at most
+         *     `max_reading_age_hours` old is compared, and a wallet on a chain that sync could not read
+         *     is left out unless a later sync has already read it. Every quantity is a JSON string.
          *
          *     The balances are the ones the syncs stored: nothing is read from a chain or a venue here.
          *     With no snapshot yet the answer is still `200`, with `computed_at: null` and no assets.
@@ -1380,6 +1382,20 @@ export interface components {
             reason: components["schemas"]["ExclusionReason"];
         };
         /**
+         * FailedChainResponse
+         * @description A chain the latest finished balance sync could not read, and what that left out.
+         *
+         *     `chain_key` is the chain's key, as a wallet carries it. `wallets` is how many of the
+         *     owner's active wallets on that chain are left out of the comparison because of it, and is
+         *     never zero. It does not say why the chain failed: `GET /api/balances/runs` does.
+         */
+        FailedChainResponse: {
+            /** Chain Key */
+            chain_key: string;
+            /** Wallets */
+            wallets: number;
+        };
+        /**
          * FillSide
          * @description Whether a fill bought or sold the base asset.
          *
@@ -2009,14 +2025,26 @@ export interface components {
          * WalletsReadResponse
          * @description How the active wallets stand as a source of the comparison. The counts add up to all.
          *
-         *     `compared` wallets have a reading at most `max_reading_age_hours` old, and are in the
-         *     comparison. `stale` ones have an older reading and `unread` ones have none; neither adds
-         *     anything, so their coins are missing from it. `oldest_observed_at` is the oldest reading
-         *     among the `compared` ones, `null` when none is compared.
+         *     `compared` wallets are in the comparison: their reading is at most
+         *     `max_reading_age_hours` old, and their chain did not fail in the latest finished balance
+         *     sync, or a later sync has read them since. The other three counts are wallets that add
+         *     nothing, so their coins are missing from it, each under the first reason that applies:
+         *     `chain_failed` ones are on a chain the latest finished balance sync could not read, and
+         *     no later sync has read them; `unread` ones have no reading; `stale` ones have a reading
+         *     older than the limit.
+         *
+         *     `failed_chains` names the chains behind `chain_failed`, sorted by `chain_key`. Only a
+         *     chain with at least one wallet left out is listed, and the entries' `wallets` add up to
+         *     `chain_failed`. `oldest_observed_at` is the oldest reading among the `compared` wallets,
+         *     `null` when none is compared.
          */
         WalletsReadResponse: {
+            /** Chain Failed */
+            chain_failed: number;
             /** Compared */
             compared: number;
+            /** Failed Chains */
+            failed_chains: components["schemas"]["FailedChainResponse"][];
             /** Oldest Observed At */
             oldest_observed_at: string | null;
             /** Stale */

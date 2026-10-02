@@ -377,7 +377,8 @@ out too.
 
 The balances read are never everything the owner holds. A wallet that is not registered here,
 an Earn, futures, margin or funding account at a venue, a venue whose key was refused, a
-wallet no sync has read yet: all of them hold coins the check does not see. Every other rule
+wallet no sync has read yet, a wallet whose chain could not be read: all of them hold coins
+the check does not see. Every other rule
 follows from that one, and it is why the two directions of a difference do not mean the same
 thing.
 
@@ -400,7 +401,10 @@ history accounts for, for units that do not exist. So a reading is compared only
 
 - **A venue's reading is current** when its last balance read succeeded, its last fill sync
   succeeded, and the reading is at most 24 hours old (`max_reading_age_hours`).
-- **A wallet's reading is current** when it is at most 24 hours old.
+- **A wallet's reading is current** when its chain did not fail in the last balance sync that
+  finished, and the reading is at most 24 hours old. When the chain did fail in that sync,
+  the reading is current only if a later sync has already stored it, and it is at most
+  24 hours old.
 
 A venue that is left out says why, in `not_compared_reason`. The first of these that applies:
 
@@ -411,8 +415,38 @@ A venue that is left out says why, in `not_compared_reason`. The first of these 
 | `sync_failed` | The venue's fill sync is not `ok`. Balances are read only after a successful fill sync, so nothing is refreshing the reading. |
 | `out_of_date` | The reading is more than 24 hours old and none of the above explains it: for example the exchange timer is off, the application was not running, or the venue's credentials were removed after the read. |
 
-Wallets are counted: `compared`, `stale` (a reading more than 24 hours old) and `unread` (no
-reading at all). Only the compared ones are in the sum.
+Wallets are counted. `compared` wallets are in the sum, and a wallet that is left out is
+counted under the first of these that applies:
+
+| Count | Means |
+|---|---|
+| `chain_failed` | The last balance sync that finished could not read the wallet's chain, and no later sync has read the wallet. Its last reading is not used, however recent it is. A wallet on that chain with no reading at all is counted here, and not as `unread`: the failure is what the owner can act on. |
+| `unread` | No balance sync has read the wallet yet. |
+| `stale` | The reading is more than 24 hours old, and the chain is not known to have failed: for example the balance timer is off, or no balance sync has finished since. |
+
+The four counts add up to the active wallets.
+
+**A wallet whose chain failed is left out at once, and the check names the chain** (spec
+`docs/specs/028-wallet-chain-failed.md`). A balance sync records, for each chain, whether it
+could be read. Coins sent from a wallet to a venue while its chain cannot be read are read at
+the venue by its next sync, and the wallet's last reading still holds them. So when the last
+balance sync that finished could not read a chain, every wallet on that chain is left out,
+whatever its last reading says, unless a later sync has already read it. `failed_chains`
+lists each such chain with the number of wallets it left out, and the dashboard shows one
+notice per chain. The check does not say why the chain failed. The run log always does:
+`GET /api/balances/runs` carries the failed chain's `error_kind` and `detail` in the last
+sync that finished (`docs/operations.md`, section 11). The Value section's wallet rows
+usually show the reason too, but not after a later sync was interrupted, when the row says
+the sync was interrupted, and not for a wallet that was never read.
+
+- **The last balance sync that finished** is the newest one that ended as `success`, `partial`
+  or `failed`. A sync still in progress, and one that was interrupted, record no result per
+  chain, so the one before them still stands.
+- **A reading stored by a later sync is kept.** A sync still in progress, or one interrupted
+  after it had read the chain, has already stored a reading newer than that failure. It is
+  the newest reading there is, and it is compared like any other current one.
+- A chain that sync did not attempt, because no wallet was active on it then, did not fail.
+  Nor has any chain before the first sync finishes. The age limit alone decides then.
 
 **What remains is coins moved between two current readings.** A venue and a wallet are read
 by two different syncs. Coins withdrawn from the venue after its reading and seen by the
@@ -423,12 +457,25 @@ readings can be depends on whether both sources are still being read:
 - **Minutes, while both syncs are running.** Each runs every fifteen minutes by default.
 - **Up to 24 hours, when a source has stopped being read without a recorded failure.** Its
   last reading stays current until it reaches the age limit, and nothing names the source
-  until then. That is a wallet whose chain is failing on every balance run (#116 will leave
-  such a wallet out), a venue whose credentials were removed or whose exchange timer is off,
-  and a venue whose balance read failed when the failure could not be recorded either: its
-  previous reading then stays in the comparison until a read succeeds or it is 24 hours old.
+  until then. These are the residuals:
+  - a wallet, when the balance timer is switched off, or when no balance sync finishes: the
+    last one that finished is then an old one, and says nothing about what happened since;
+  - a venue whose credentials were removed after a read;
+  - a venue, when the exchange timer is switched off;
+  - a venue whose balance read failed when the failure could not be recorded either: its
+    previous reading then stays in the comparison until a read succeeds or it is 24 hours
+    old.
+- **One balance interval, when a chain starts failing between two balance syncs.** The
+  failure is not known until the next sync finishes, so a wallet on that chain stays in the
+  comparison until then: fifteen minutes by default.
+- **One balance interval, when a chain's only wallets were archived while the last sync ran
+  and were restored afterwards.** A sync does not attempt a chain with no active wallet, so
+  that sync holds no result for the chain, and a chain with no result did not fail. The
+  restored wallets' previous readings are then compared, while they are under 24 hours old,
+  even if the sync before recorded the chain as failed. That lasts until the next sync
+  finishes, which is one balance interval while the balance timer runs.
 
-The check shows the age of each reading, which is how to tell the two apart. No rule removes
+The check shows the age of each reading, which is how to tell them apart. No rule removes
 the gap, which is why a `history_short` is a prompt to look and not a verdict.
 
 **The history can be behind the balances too.** An exchange sync stores each venue's fills and
@@ -524,7 +571,11 @@ leaving the units out in silence.
     {"exchange_key": "bitget", "balances_read_at": "2026-10-01T09:59:00Z",
      "balances_error": null, "not_compared_reason": null}
   ],
-  "wallets": {"compared": 2, "stale": 0, "unread": 0, "oldest_observed_at": "2026-10-01T09:45:00Z"}
+  "wallets": {
+    "compared": 2, "stale": 0, "unread": 0, "chain_failed": 1,
+    "failed_chains": [{"chain_key": "kaspa", "wallets": 1}],
+    "oldest_observed_at": "2026-10-01T09:45:00Z"
+  }
 }
 ```
 
@@ -542,8 +593,15 @@ leaving the units out in silence.
   read keeps the rows of the last good reading in the database, and the comparison does not
   use them: `not_compared_reason` is then `read_failed`.
 - `not_compared_reason` is `null` for a venue whose balances are in the comparison.
-- `wallets.compared`, `wallets.stale` and `wallets.unread` add up to the active wallets.
-  `oldest_observed_at` is the oldest reading among the compared ones, `null` when none is.
+- `wallets.compared`, `wallets.stale`, `wallets.unread` and `wallets.chain_failed` add up to
+  the active wallets. `oldest_observed_at` is the oldest reading among the compared ones,
+  `null` when none is.
+- `wallets.chain_failed` is the number of wallets left out because the last balance sync that
+  finished could not read their chain. `wallets.failed_chains` names those chains, sorted by
+  `chain_key`: each entry has the `chain_key` and `wallets`, the number of wallets on that
+  chain that were left out. Only a chain with at least one wallet left out is listed, so
+  `wallets` is never zero and the entries add up to `chain_failed`. With no such chain the
+  list is empty.
 
 The request reads what is stored. It asks no chain and no venue, and it recomputes nothing.
 The age of a reading is measured when the request is served.

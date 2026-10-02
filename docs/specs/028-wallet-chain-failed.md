@@ -1,7 +1,7 @@
 # 028 — Leave a wallet out of the holdings check when its chain failed
 
 Issue: #116
-Status: in progress
+Status: done
 
 ## Problem
 
@@ -28,8 +28,9 @@ as "Held exceeds history" for units that do not exist, and nothing names the wal
 - No change to a venue's rules, to the age limit, or to the Value section.
 - No per-address isolation of a failure. A chain fails as a whole (#54).
 - No migration. Everything is read from what the balance sync already stores.
-- No reason for the failure in this block. The Value section's wallet rows already say why
-  a chain could not be read, and a venue's `sync_failed` notice does not say why either.
+- No reason for the failure in this block. The balance run log has it
+  (`GET /api/balances/runs`), the Value section's wallet rows usually show it (R2), and a
+  venue's `sync_failed` notice does not say why either.
 
 ## Design: backend
 
@@ -49,8 +50,8 @@ the run before it still stands.
 Condition 2 keeps a reading a **later** run has already written. Snapshots are committed per
 chain before a run closes, so a run that is still in flight, or one that was interrupted
 after it read the chain, leaves a newer reading while the latest finished run still says
-`failed`. That reading is the newest there is, and the Value section calls it up to date.
-The comparison is of two `INTEGER` ids in Python.
+`failed`. That reading is the newest there is (R2). The comparison is of two `INTEGER` ids
+in Python.
 
 The reasons are tested in this order, and the first that applies is the answer, as for a
 venue:
@@ -76,7 +77,7 @@ neither money nor a datetime.
 ### `services/reconciliation.py`
 
 - The service takes the `SyncRunRepository` and reads the latest finished run once per
-  request.
+  request, **before** the wallets' latest snapshots (R3).
 - The rule is one pure, exported function, as `not_compared_reason` is for a venue.
 - `WalletSources` gains:
   - `chain_failed: int`, the number of wallets left out by this rule. The four counts
@@ -117,8 +118,10 @@ neither money nor a datetime.
   - a venue whose credentials were removed after a read;
   - a venue when the exchange timer is switched off;
   - a balance read whose failure could not be recorded (already stated).
-- State the one window the rule leaves: a chain that fails **between** two runs is not known
-  to have failed until the next run finishes, so the gap is one balance interval.
+- State the two windows the rule leaves, each one balance interval long while the timer
+  runs: a chain that fails **between** two runs is not known to have failed until the next
+  run finishes, and a chain the latest finished run did not attempt has no verdict in it
+  (R5).
 - Document the two new fields of `wallets`.
 
 ## Design: frontend
@@ -131,10 +134,12 @@ neither money nor a datetime.
   **after the venues and before `wallets_stale`**.
 - `describeChainFailed(chain: string, count: number): string`, with the chain's display
   name from `chainDisplayName`:
-  - one wallet: "The last balance sync could not read Bitcoin, so the coins in 1 wallet on
-    it are left out of the comparison."
-  - several: "The last balance sync could not read Bitcoin, so the coins in 2 wallets on it
-    are left out of the comparison."
+  - one wallet: "The last balance sync that finished could not read Bitcoin, so the coins
+    in 1 wallet on it are left out of the comparison."
+  - several: "The last balance sync that finished could not read Bitcoin, so the coins in
+    2 wallets on it are left out of the comparison."
+
+  "That finished" is part of the sentence (R1).
 
 No count is summed in the frontend. `chain_failed` is not rendered: the entries carry it.
 
@@ -176,8 +181,56 @@ Nothing else in the block changes. A wallet left out this way is not in
 
 | Agent | Files |
 |---|---|
-| `backend-dev-116` | `backend/src/portfolio/services/reconciliation.py`, `backend/src/portfolio/repositories/sync_runs.py`, `backend/src/portfolio/api/schemas/accounting.py`, `docs/accounting.md`, `docs/operations.md`, and the regenerated `frontend/src/api/generated/schema.ts` |
+| `backend-dev-116` | `backend/src/portfolio/services/reconciliation.py`, `backend/src/portfolio/repositories/sync_runs.py`, `backend/src/portfolio/api/schemas/accounting.py`, `backend/src/portfolio/api/routers/accounting.py` (the endpoint's description only, R4), `docs/accounting.md`, `docs/operations.md`, and the regenerated `frontend/src/api/generated/schema.ts` |
 | `frontend-dev-116` | `frontend/src/lib/accounting.ts`, `frontend/src/pages/dashboard/MissingSources.tsx` |
 | `tester-116` | every test file on both sides, `frontend/src/test/**`, and the gate. Sole gate owner |
 
 The tech lead owns this spec and does the browser check at 1280 px and 375 px.
+
+## Rulings
+
+From the review of the working tree (reviewer: no must-fix, four should-fix), which ran the
+real balance sync and the real service over scratch databases, timeline by timeline.
+
+- **R1. The notice says "the last balance sync that finished".** The rule judges by the
+  latest finished run, and a newer run that did not finish can have read the chain. With
+  run 2 finished and the chain failed, and run 3 interrupted after it read one wallet, a
+  second wallet on the chain is left out while the last sync did read the chain. "The last
+  balance sync could not read Bitcoin" was false there, and it named a different "last
+  sync" from the Value section's row beside it.
+- **R2. Two claims about the Value section were false in specific states.**
+  - "The Value section calls that reading up to date" holds for an interrupted run that
+    read the chain. It does not hold while a run is in flight or has left an orphan
+    `running` row: the row still shows the previous finished run's failure while the check
+    compares the wallet. The check is right, because the reading is the newest there is.
+    The Value section's rule is not changed here. Filed as #121.
+  - "The Value section's rows say why a chain could not be read" does not hold when a later
+    run was interrupted, or for a wallet never read. The balance run log always has the
+    reason, and the documentation and the docstrings point there.
+- **R3. The run is read before the snapshots.** Read after them, a run that wrote the
+  chain's readings and finished between the two statements paired the old reading with the
+  new verdict, and the response was the false `history_short` this issue removes. The
+  reviewer forced that interleaving and could not reproduce it at real timing. With the run
+  read first, a reading written afterwards has a higher `sync_run_id` and is kept, so every
+  interleaving is a state that held at some instant.
+- **R4. The endpoint's published description names the four counts and the chains.** It
+  still listed three. The router file joins `backend-dev-116`'s files for that sentence.
+- **R5. The documentation states the rule's exception, both windows, and the timer.**
+  - The short form of the rule says "unless a later sync has already read it".
+  - A chain the latest finished run did not attempt has no verdict in it. When a chain's
+    only wallets were archived during that run and restored afterwards, their previous
+    readings are compared, even if the run before recorded the chain as failed, until the
+    next run finishes. The age rule alone did the same, so this is not new, and closing it
+    needs a different rule (compare only a reading written by the latest finished run or a
+    later one), which is a design change.
+  - With the balance timer off and the chain failed in the last finished run, the wallet
+    stays `chain_failed` and never turns `stale`. It is left out and named, which is the
+    safe side. The operations table says to check the timer.
+- **Accepted as they are.**
+  - The order `chain_failed`, `unread`, `stale`: it names the cause the owner can act on,
+    and the counts stay a partition.
+  - The notice carries no date and no pointer to the reason.
+  - `failed_chains` counts the requesting owner's wallets, while a run covers every
+    owner's. An owner with no wallet on a failed chain sees nothing.
+  - A chain that failed as `address_rejected` leaves its wallets out like any other
+    failure.

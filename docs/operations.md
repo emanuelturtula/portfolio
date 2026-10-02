@@ -1293,11 +1293,24 @@ is **current**, and one that is not adds nothing:
 
 - **A venue** is compared when its last balance read succeeded, its fill sync is `ok`, and
   the reading is at most **24 hours** old.
-- **A wallet** is compared when its latest reading is at most 24 hours old.
+- **A wallet** is compared when its chain did not fail in the last balance run that finished,
+  and its latest reading is at most 24 hours old. When the chain did fail in that run, the
+  wallet is compared only if a later run has already read it, and that reading is at most
+  24 hours old.
 
 The limit is served as `max_reading_age_hours` and is not configurable. Both syncs run every
 fifteen minutes by default, so a reading only reaches it when a source has stopped being
 read. The age is measured when the request is served.
+
+**A wallet whose chain failed is left out at once**, without waiting for the limit (spec
+`docs/specs/028-wallet-chain-failed.md`). The run that decides is the newest one in
+`GET /api/balances/runs` whose `status` is `success`, `partial` or `failed` (section 11). When
+that run has the wallet's chain as `failed`, the wallet's last reading is not compared,
+however recent it is, unless a later run has already stored it. A `running` or `interrupted`
+run records no chain, so it decides nothing and the run before it still stands. A reading stored by a run later than the one that
+decides, which is a run still in progress or one interrupted after it read the chain, is kept
+and compared. A chain with no entry in that run did not fail, and neither has any chain
+before the first run finishes.
 
 ```bash
 curl -s -b "$COOKIE" https://<host>/api/accounting/reconciliation \
@@ -1321,21 +1334,51 @@ Each entry of `exchanges` has:
 | `sync_failed` | The venue's fill sync is not `ok` (`error`, `auth_failed` or `never_synced`). Balances are read only after a successful fill sync, so nothing is refreshing the reading. | Fix the fill sync: section 13, "What an account's status means". |
 | `out_of_date` | The reading is more than 24 hours old, although the last read succeeded and the account is `ok`. No balance read has succeeded for that venue since, which normally means no sync has run for it. | Check `PORTFOLIO_EXCHANGE_SYNC_ENABLED`, and whether the venue still shows `configured: true`. A manual sync of a configured venue refreshes it. |
 
-`wallets` has three counts that add up to the active wallets: `compared`, `stale` (a reading
-more than 24 hours old) and `unread` (no reading at all, section 11). A `stale` wallet is
-usually one whose chain has been failing on every balance run, or the balance timer being
-off; `GET /api/balances/runs` says which (section 11). `oldest_observed_at` is the oldest
-reading among the compared ones.
+`wallets` has four counts that add up to the active wallets. `compared` wallets are in the
+comparison. A wallet that is left out is counted under the first of these that applies:
+
+| Count | Means | What to do |
+|---|---|---|
+| `chain_failed` | The last balance run that finished could not read the wallet's chain, and no later run has read the wallet. Its last reading is **not** compared. A wallet on that chain with no reading at all is counted here, and not under `unread`. | `failed_chains` names the chain. Read that chain's `error_kind` in `GET /api/balances/runs`: section 11. The wallet is compared again once a run reads the chain. If no run follows, check the balance timer (`PORTFOLIO_BALANCE_SYNC_ENABLED`): with it off no run comes, and the wallet stays left out. |
+| `unread` | No balance run has read the wallet yet (section 11). | Nothing if the wallet was just added: the next run reads it. |
+| `stale` | The reading is more than 24 hours old, and the last run that finished does not have the chain as `failed`. No run has read the wallet for a day. | Check `PORTFOLIO_BALANCE_SYNC_ENABLED`, and whether the runs are all `interrupted` (section 11). |
+
+`failed_chains` lists the chains behind `chain_failed`, sorted by `chain_key`. Each entry has
+the `chain_key` and `wallets`, the number of wallets on that chain that were left out. Only a
+chain with at least one wallet left out is listed, so `wallets` is never zero, the entries add
+up to `chain_failed`, and the list is empty when no wallet is left out this way. An entry does
+not say why the chain failed: the run log does. The dashboard shows one notice per chain.
+`oldest_observed_at` is the oldest reading among the compared wallets.
 
 A source that is left out adds nothing to the held side. That can hide a difference, and
 cannot produce one. What can still produce a false one is coins moved between two current
 readings, taken at different times by two different syncs: they are counted twice, or not at
 all, until both sources have been read again. Those readings are **minutes** apart while both
 syncs are running, and **up to 24 hours** apart when a source has stopped being read without
-a recorded failure: a wallet whose chain is failing on every balance run (#116 will leave such
-a wallet out), a venue whose credentials were removed or whose timer is off, and the double
-failure logged as `exchange_balances_failure_not_recorded` (below). The dashboard shows each
-reading's age. Treat a `history_short` as a prompt to look.
+a recorded failure. Its last reading then stays in the comparison until it reaches the limit,
+and nothing names the source until then. These are the residuals:
+
+- a wallet, when the balance timer is switched off (`PORTFOLIO_BALANCE_SYNC_ENABLED=false`),
+  or when no balance run finishes: the last run that finished is then an old one, and says
+  nothing about what happened since;
+- a venue whose credentials were removed after a read;
+- a venue, when the exchange timer is switched off (`PORTFOLIO_EXCHANGE_SYNC_ENABLED=false`);
+- the double failure logged as `exchange_balances_failure_not_recorded` (below).
+
+The chain rule leaves two windows of its own, each bounded by one balance interval
+(`PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES`, fifteen minutes by default) while the balance
+timer runs:
+
+- A chain that starts failing **between** two balance runs is not known to have failed until
+  the next run finishes, so a wallet on it stays in the comparison for up to one balance
+  interval.
+- A run does not attempt a chain with no active wallet, so it has no entry for that chain, and
+  a chain with no entry did not fail. When a chain's only wallets were archived while the
+  last run ran and were restored afterwards, their previous readings are compared, while
+  they are under 24 hours old, even if the run before has the chain as `failed`. That lasts
+  until the next run finishes.
+
+The dashboard shows each reading's age. Treat a `history_short` as a prompt to look.
 
 `last_recompute` is the one `GET /api/accounting/positions` serves (section 15). It is `null`
 after a restart until the startup recompute ends, and the stored snapshot is compared
@@ -1421,6 +1464,7 @@ The fills are untouched by any of these, and so are the positions.
 | A venue's `balances_error` stays `auth` or `insufficient_scope` after fixing the key | Scheduled runs do not ask again: recreate the container, then trigger a sync by hand — section 16 |
 | The holdings check shows the history above the balances for an asset | Not a finding: only the spot account is read, so coins in Earn, futures or an unregistered wallet are not counted. A sale the import did not see looks the same, and the check cannot tell them apart — section 16 |
 | The holdings check leaves a venue or a wallet out although nothing failed today | Its reading is more than 24 hours old, or the venue's fill sync is not `ok`. Read `not_compared_reason` and `wallets.stale` — section 16 |
+| The holdings check says the last balance sync that finished could not read a chain, and leaves its wallets out | The last balance run that finished has that chain as `failed`. Read `wallets.failed_chains`, then that chain's `error_kind` in `/api/balances/runs`. The wallets are compared again once a run reads the chain; if none follows, check `PORTFOLIO_BALANCE_SYNC_ENABLED` — sections 11 and 16 |
 | The dashboard shows no holdings comparison at all | The last recompute failed, so the history is older than the balances. Read `last_recompute` — sections 15 and 16 |
 | A Bitcoin wallet reports "the address is on a different network" | `PORTFOLIO_BITCOIN_NETWORK` does not match the address — section 8 |
 | Bitcoin balances stop updating and the log shows 429 | The public index is throttling us. Lengthen nothing by hand; run your own Esplora — section 8 |

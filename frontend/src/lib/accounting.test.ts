@@ -6,6 +6,7 @@ import {
   balanceReadings,
   balancesErrorSentence,
   describeBalancesFailure,
+  describeChainFailed,
   describeClosedPositions,
   describeComparison,
   describeEmptyPositions,
@@ -84,6 +85,7 @@ import {
   ethShortPrecise,
   exchangeBalances,
   failedBalances,
+  failedChain,
   kasNeverTraded,
   NO_WALLETS,
   notReconciled,
@@ -952,6 +954,11 @@ describe('missingSources', () => {
   it('names nothing when every venue is compared and no wallet is stale or unread', () => {
     expect(missingSources(reconciliation())).toEqual([]);
     expect(missingSources(reconciliation({ exchanges: [], wallets: NO_WALLETS }))).toEqual([]);
+    // With no chain failed the answer is what it was before the rule existed (spec 028, 11).
+    expect(NO_WALLETS.failed_chains).toEqual([]);
+    expect(
+      missingSources(reconciliation({ wallets: walletReadings(3, { failedChains: [] }) })),
+    ).toEqual([]);
     expect(
       missingSources(
         reconciliation({
@@ -1056,6 +1063,89 @@ describe('missingSources', () => {
     );
   });
 
+  it('names each chain whose wallets were left out, with the number of wallets on it', () => {
+    expect(
+      missingSources(
+        reconciliation({
+          wallets: walletReadings(1, { failedChains: [failedChain('bitcoin', 2)] }),
+        }),
+      ),
+    ).toEqual([{ kind: 'wallets_chain_failed', chain: 'bitcoin', count: 2 }]);
+    // No wallet compared at all: the notice does not depend on one being.
+    expect(
+      missingSources(
+        reconciliation({ wallets: walletReadings(0, { failedChains: [failedChain('kaspa', 1)] }) }),
+      ),
+    ).toEqual([{ kind: 'wallets_chain_failed', chain: 'kaspa', count: 1 }]);
+  });
+
+  it('gives each failed chain an entry of its own, in the endpoint order, each with its own count', () => {
+    const wallets = walletReadings(1, {
+      failedChains: [failedChain('bitcoin', 2), failedChain('kaspa', 1)],
+    });
+
+    // The total is the endpoint's `chain_failed`, and it is in no notice: the entries carry it.
+    expect(wallets.chain_failed).toBe(3);
+    expect(missingSources(reconciliation({ wallets }))).toEqual([
+      { kind: 'wallets_chain_failed', chain: 'bitcoin', count: 2 },
+      { kind: 'wallets_chain_failed', chain: 'kaspa', count: 1 },
+    ]);
+  });
+
+  it('passes on the key of a chain this build has no name for, as it arrived', () => {
+    expect(
+      missingSources(
+        reconciliation({
+          wallets: walletReadings(0, { failedChains: [failedChain('litecoin', 4)] }),
+        }),
+      ),
+    ).toEqual([{ kind: 'wallets_chain_failed', chain: 'litecoin', count: 4 }]);
+  });
+
+  it('puts the failed chains after the venues and before the stale wallets (spec 028)', () => {
+    expect(
+      missingSources(
+        reconciliation({
+          exchanges: [unreadBalances('bingx'), failedBalances('bitget', 'schema')],
+          wallets: walletReadings(1, {
+            stale: 1,
+            unread: 2,
+            failedChains: [failedChain('bitcoin', 2), failedChain('kaspa', 3)],
+          }),
+        }),
+      ),
+    ).toEqual([
+      { kind: 'never_read', venue: 'bingx' },
+      {
+        kind: 'read_failed',
+        venue: 'bitget',
+        error: 'schema',
+        lastReadAt: OLD_BALANCES_READ_AT,
+      },
+      { kind: 'wallets_chain_failed', chain: 'bitcoin', count: 2 },
+      { kind: 'wallets_chain_failed', chain: 'kaspa', count: 3 },
+      { kind: 'wallets_stale', count: 1, maxAgeHours: 24 },
+      { kind: 'wallets_unread', count: 2 },
+    ]);
+  });
+
+  it('names a failed chain beside stale wallets alone, and beside unread ones alone', () => {
+    expect(
+      missingSources(
+        reconciliation({
+          wallets: walletReadings(0, { stale: 2, failedChains: [failedChain('kaspa', 1)] }),
+        }),
+      ).map((source) => source.kind),
+    ).toEqual(['wallets_chain_failed', 'wallets_stale']);
+    expect(
+      missingSources(
+        reconciliation({
+          wallets: walletReadings(0, { unread: 2, failedChains: [failedChain('kaspa', 1)] }),
+        }),
+      ).map((source) => source.kind),
+    ).toEqual(['wallets_chain_failed', 'wallets_unread']);
+  });
+
   it('keeps stale and unread wallets apart, each with its own count', () => {
     expect(
       missingSources(reconciliation({ wallets: walletReadings(1, { stale: 2, unread: 5 }) })),
@@ -1101,6 +1191,13 @@ describe('missingSources', () => {
     expect(missingSources(notReconciled({ exchanges: [unreadBalances('bitget')] }))).toHaveLength(
       1,
     );
+    expect(
+      missingSources(
+        notReconciled({
+          wallets: walletReadings(0, { failedChains: [failedChain('bitcoin', 1)] }),
+        }),
+      ),
+    ).toEqual([{ kind: 'wallets_chain_failed', chain: 'bitcoin', count: 1 }]);
   });
 });
 
@@ -1152,6 +1249,8 @@ describe('the source notices', () => {
     expect(describeNotReadYet('bitget')).toMatch(LEFT_OUT_OF);
     expect(describeSyncFailed('bitget')).toMatch(LEFT_OUT_OF);
     expect(describeOutOfDate(24)).toMatch(LEFT_OUT_OF);
+    expect(describeChainFailed('bitcoin', 1)).toMatch(LEFT_OUT_OF);
+    expect(describeChainFailed('kaspa', 2)).toMatch(LEFT_OUT_OF);
     expect(describeStaleWallets(1, 24)).toMatch(LEFT_OUT_OF);
     expect(describeStaleWallets(2, 24)).toMatch(LEFT_OUT_OF);
     expect(describeUnreadWallets(1)).toMatch(LEFT_OUT_OF);
@@ -1173,6 +1272,65 @@ describe('the source notices', () => {
     expect(describeOutOfDate(48)).toBe(
       'A reading older than 48 hours is left out of the comparison.',
     );
+  });
+
+  it('names the chain the last finished balance sync could not read, one wallet in the singular', () => {
+    // Spec 028's own sentence, written out.
+    expect(describeChainFailed('bitcoin', 1)).toBe(
+      'The last balance sync that finished could not read Bitcoin, so the coins in ' +
+        '1 wallet on it are left out of the comparison.',
+    );
+    expect(describeChainFailed('kaspa', 1)).toBe(
+      'The last balance sync that finished could not read Kaspa, so the coins in ' +
+        '1 wallet on it are left out of the comparison.',
+    );
+  });
+
+  it('counts several wallets on a failed chain in the plural', () => {
+    expect(describeChainFailed('bitcoin', 2)).toBe(
+      'The last balance sync that finished could not read Bitcoin, so the coins in ' +
+        '2 wallets on it are left out of the comparison.',
+    );
+    expect(describeChainFailed('kaspa', 11)).toBe(
+      'The last balance sync that finished could not read Kaspa, so the coins in ' +
+        '11 wallets on it are left out of the comparison.',
+    );
+  });
+
+  it('names a chain it has no display name for by its raw key, rather than dropping it', () => {
+    expect(describeChainFailed('litecoin', 1)).toBe(
+      'The last balance sync that finished could not read litecoin, so the coins in ' +
+        '1 wallet on it are left out of the comparison.',
+    );
+    expect(describeChainFailed('litecoin', 3)).toBe(
+      'The last balance sync that finished could not read litecoin, so the coins in ' +
+        '3 wallets on it are left out of the comparison.',
+    );
+    // A key that is a property of every object is still an unknown chain, not a crash.
+    expect(describeChainFailed('constructor', 1)).toBe(
+      'The last balance sync that finished could not read constructor, so the coins in ' +
+        '1 wallet on it are left out of the comparison.',
+    );
+    expect(describeChainFailed('toString', 2)).toContain('could not read toString, so');
+  });
+
+  it('gives no reason for the failure and no date: the balance run log has the reason', () => {
+    for (const sentence of [describeChainFailed('bitcoin', 1), describeChainFailed('kaspa', 5)]) {
+      expect(sentence).not.toMatch(/unavailable|rate|refused|defect|hours|ago/);
+    }
+  });
+
+  it('says the sync that finished, which a newer unfinished one may have outrun (R1)', () => {
+    // The verdict is the latest finished run's. A newer run that was interrupted can have read
+    // the chain, so "the last balance sync could not read" would be false of it.
+    for (const sentence of [
+      describeChainFailed('bitcoin', 1),
+      describeChainFailed('kaspa', 2),
+      describeChainFailed('litecoin', 3),
+    ]) {
+      expect(sentence.startsWith('The last balance sync that finished could not read ')).toBe(true);
+      expect(sentence).not.toContain('The last balance sync could not read');
+    }
   });
 
   it('counts the stale wallets in the singular and in the plural, with the age limit', () => {
@@ -1204,6 +1362,18 @@ describe('the source notices', () => {
 });
 
 describe('balanceReadings', () => {
+  it('lists the oldest compared wallet reading beside wallets left out for their chain', () => {
+    // The endpoint leaves those wallets out of `oldest_observed_at`; the page lists what it sent.
+    expect(
+      balanceReadings(
+        reconciliation({ wallets: walletReadings(1, { failedChains: [failedChain('kaspa', 2)] }) }),
+      ),
+    ).toEqual([
+      { label: 'Bitget', at: BALANCES_READ_AT },
+      { label: 'Wallets (oldest reading)', at: WALLETS_OBSERVED_AT },
+    ]);
+  });
+
   it('lists each venue that was compared by its display name, then the oldest wallet reading', () => {
     expect(
       balanceReadings(
@@ -1256,6 +1426,14 @@ describe('balanceReadings', () => {
   it('leaves out the wallets when none is compared', () => {
     expect(
       balanceReadings(reconciliation({ wallets: walletReadings(0, { stale: 1, unread: 2 }) })),
+    ).toEqual([{ label: 'Bitget', at: BALANCES_READ_AT }]);
+    // Every wallet left out because its chain failed: none was compared, so none is listed.
+    expect(
+      balanceReadings(
+        reconciliation({
+          wallets: walletReadings(0, { failedChains: [failedChain('bitcoin', 2)] }),
+        }),
+      ),
     ).toEqual([{ label: 'Bitget', at: BALANCES_READ_AT }]);
     expect(balanceReadings(reconciliation({ exchanges: [], wallets: NO_WALLETS }))).toEqual([]);
   });
