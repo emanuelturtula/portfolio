@@ -1,7 +1,7 @@
 # 027 — A page to record and edit manual adjustments
 
 Issue: #111
-Status: in progress
+Status: done
 
 ## Problem
 
@@ -62,8 +62,8 @@ Implementation:
   module-level function in `services/accounting.py`. The minimum is taken on `datetime`
   values in Python. No `MIN()`, `ORDER BY` or comparison on the `executed_at` TEXT column
   (rule 2 covers datetimes stored as text as well as money).
-- It reads the record's own columns and converts nothing, so no stored fill can make it
-  raise.
+- It reads the record's own columns and converts nothing, so the reduction raises on no
+  record it is given (R7).
 - The router parses nothing, calls the service and serialises. Schema models
   `FirstTradeResponse` and `FirstTradesResponse` in `api/schemas/accounting.py`.
 
@@ -123,10 +123,13 @@ heading. The heading reads "Record an adjustment" or "Edit adjustment". The butt
 | Field | Control | Notes |
 |---|---|---|
 | Asset | text input with a `<datalist>` | `autoCapitalize="characters"`, `autoComplete="off"`, `spellCheck={false}`. Hint: the symbol exactly as the exchanges spell it, in upper case, such as BTC. The datalist offers the assets of `first-trades`, which are spelled as the exchanges spell them. |
-| Quantity | text input, `inputMode="decimal"` | |
-| Unit cost (USD) | text input, `inputMode="decimal"` | Optional. Hint: "Leave empty if unknown." and that an unknown cost is not zero: the units count toward the quantity held and are left out of the average cost. |
+| Quantity | text input | No `inputMode` (R9). Hint: "Use a dot for the decimals, such as 0.5." |
+| Unit cost (USD) | text input | No `inputMode` (R9). Optional. Hint: "Use a dot for the decimals. Leave empty if unknown." and that an unknown cost is not zero: the units count toward the quantity held and are left out of the average cost. |
 | Acquired on | `<input type="datetime-local">` | In the browser's local time. |
 | Note | `<textarea>` | Required. Hint: why you are recording this, in your words. |
+
+Asset, Quantity, Acquired on and Note carry `aria-required="true"`, and not `required`:
+native validation must not pre-empt the form's own refusals.
 
 **What is sent.**
 
@@ -139,7 +142,8 @@ heading. The heading reads "Record an adjustment" or "Edit adjustment". The butt
 - **In edit mode the stored instant is sent unchanged unless the owner changes the date
   field.** The field shows the stored instant to the minute, in local time. A stored instant
   can carry seconds, and re-sending a rounded one would move the adjustment among fills of
-  the same minute without the owner having asked.
+  the same minute without the owner having asked. "Unchanged" means the field holds the
+  string the form was opened with (R12).
 - **In edit mode the amounts are shown without trailing zeros** (`1.5`, not
   `1.500000000000000000`), spelled with `decimal.js`, which is exact. They are strings from
   the first byte to the last.
@@ -163,8 +167,10 @@ form does.
 
 **The suggested date.** When the asset field, trimmed, is exactly an asset of
 `first-trades`, a hint under the date field says when the earliest imported trade of that
-asset is, as an absolute local time, and that an opening balance should be dated before it.
-A button beside it, "Use <date>", sets the date field to **local midnight at the start of the
+asset is, as an absolute local time, and which coins the date is for (R8): "Coins you
+already held by then should be dated before it; coins acquired later should carry the date
+you acquired them."
+A button under it, "Use <date>", sets the date field to **local midnight at the start of the
 day before** that trade's local day, computed with calendar arithmetic. It is a button and
 never a prefill: the form cannot know whether the owner is recording an opening balance or
 a later acquisition. When `first-trades` is pending or has failed there is no hint and no
@@ -174,8 +180,9 @@ datalist, and the form works.
 field filled. Nothing else is read from the URL.
 
 **After a success** the form returns to an empty create form and a `role="status"` line
-says "Adjustment recorded." or "Adjustment updated.". The submit button is disabled while
-the request is pending.
+says "Adjustment recorded." or "Adjustment updated.". The line is one element that is always
+in the document, with its text swapped in (R10). The submit button and Cancel are disabled
+while the request is pending.
 
 ### The list
 
@@ -190,9 +197,11 @@ the request is pending.
 - Each row has **Edit** and **Delete**, each with an accessible name that includes the
   asset and the date. Delete asks first: the button is replaced by "Confirm delete" and
   "Cancel", focus moves to the confirm button, and Cancel returns focus to Delete. After a
-  delete a `role="status"` line says "Adjustment deleted.". A delete that fails shows the
-  API's detail in a `role="alert"` beside the row. Deleting the adjustment the form is
-  editing returns the form to an empty create form.
+  delete a `role="status"` line says "Adjustment deleted.". Confirming a delete clears what
+  the line said before. A delete that fails shows the API's detail in a `role="alert"`
+  beside the row. A 404 (deleted elsewhere) is handled as a delete that happened, and the
+  line says "That adjustment was already deleted." (R10, R13).
+  Deleting the adjustment the form is editing returns the form to an empty create form.
 - States: a `Skeleton` while loading; an `ErrorState` with a retry when the first load
   fails; an alert above the stale list when a refetch fails; an `EmptyState` titled "No
   adjustments yet" when there are none. The form is independent of the list's state: it
@@ -202,7 +211,7 @@ the request is pending.
 
 `HELD_EXCEEDS_HISTORY_GUIDANCE` loses its last sentence (the pointer to the
 documentation). After the guidance paragraph, the "Held exceeds history" box gains a line:
-"If the gap is real, record an opening balance for:" followed by one link per listed asset,
+"If the gap is real, record the missing coins for:" (R8) followed by one link per listed asset,
 to `/adjustments?asset=<asset>`, with the asset as the link text. The asset is put in the
 query string with `URLSearchParams`, never by string concatenation.
 
@@ -255,7 +264,7 @@ Both:
 | Agent | Files |
 |---|---|
 | `backend-dev-111` | `backend/src/portfolio/services/accounting.py`, `backend/src/portfolio/api/routers/accounting.py`, `backend/src/portfolio/api/schemas/accounting.py`, `backend/src/portfolio/api/dependencies.py` if needed, `docs/accounting.md`, `docs/operations.md`, and the regenerated `frontend/src/api/generated/schema.ts` |
-| `frontend-dev-111` | `frontend/src/App.tsx`, `frontend/src/api/adjustments.ts`, `frontend/src/lib/adjustments.ts`, `frontend/src/pages/AdjustmentsPage.tsx`, `frontend/src/pages/adjustments/**`, `frontend/src/lib/accounting.ts`, `frontend/src/pages/dashboard/HoldingsLists.tsx`, `frontend/src/index.css` |
+| `frontend-dev-111` | `frontend/src/App.tsx`, `frontend/src/api/adjustments.ts`, `frontend/src/lib/adjustments.ts`, `frontend/src/pages/AdjustmentsPage.tsx`, `frontend/src/pages/adjustments/**`, `frontend/src/lib/accounting.ts`, `frontend/src/lib/money.ts` (R5), `frontend/src/pages/dashboard/HoldingsLists.tsx`, `frontend/src/pages/dashboard/InvestedSection.tsx` (only to share the failed-recompute rendering), `frontend/src/index.css` |
 | `tester-backend-111` | `backend/tests/**`, and the gate. **Sole gate owner** |
 | `tester-frontend-111` | every frontend test file and `frontend/src/test/**` |
 
@@ -263,4 +272,83 @@ The tech lead owns this spec and does the browser check at 1280 px and 375 px.
 
 ## Rulings
 
-None yet.
+From the implementers' reports:
+
+- **R1. A rebate counts.** `fee_amount` is signed, and a negative one is a rebate that moves
+  the fee asset. "Not zero" means exactly that: a rebate makes its asset take part.
+- **R2. A non-zero fee with no fee asset names nothing.** The engine's `Trade` refuses that
+  shape, but this read builds no `Trade`, so such a stored row answers with its base and
+  quote assets only.
+- **R3. `first_trade_at` is the stored instant, unchanged.** It can carry fractional
+  seconds. The frontend treats it as an instant and assumes no precision.
+- **R4. The read loads the owner's whole fill history on each request, as the recompute
+  does.** Accepted: every mutation of an adjustment already triggers a recompute that loads
+  the same rows, so the page's refetch of `first-trades` after a change adds one read of
+  what was just read. The reduction is a single pass with no decoding of amounts.
+- **R5. The plain spelling of an amount lives in `lib/money.ts`.** `decimal.js` is imported
+  by that module only, so `plainMoney` is added there and `frontend-dev-111` owns that one
+  addition.
+- **R6. The documentation points every "use a `PUT`" row at the page.** Three more
+  troubleshooting rows of `docs/operations.md` than the spec named, so that the document
+  does not send the owner to the API in one row and to the page in the next.
+- **R7. "Cannot raise" is a claim about the reduction, not about the whole read.** A row
+  the recompute refuses, a fee that is not a number and an unknown side all answer. A
+  hand-edited row whose stored text does not decode fails in the repository, before the
+  reduction, as it does for the recompute and for every other read of that table. A fee
+  that is not a number is "not zero", so its asset is listed.
+
+From the review of the working tree (reviewer: no must-fix, seven should-fix) and the tech
+lead's browser check:
+
+- **R8. The page does not call every gap an opening balance.** `first-trades` is per asset
+  across every venue, and histories begin per venue. Coins acquired after the asset's first
+  imported fill, such as a buy on a venue whose history starts later, are wrong at the
+  offered date: the method is the weighted average, so an inflow dated too early changes
+  the cost applied to every sale between that date and the real one, and no warning fires.
+  The reviewer ran it on the engine and a gain became a loss of the same size. The button
+  stays, because the date is right for coins held before that fill. The hint says which
+  coins it is for, the holdings prompt says "the missing coins", and `docs/accounting.md`
+  says the same under "Dating an opening balance".
+- **R9. The amount fields have no `inputMode="decimal"`.** On an iPhone the decimal keypad
+  shows only the region's separator, which is a comma in many regions, and the server
+  refuses a comma. The fields use the default keyboard and a hint says to use a dot. The
+  comma is not translated: amounts go as typed. Not verified on a device; the choice is the
+  one that cannot leave the owner without a dot.
+- **R10. Four behaviours the review found.**
+  - Confirming a delete clears the status line, so a stale "Adjustment deleted." never sits
+    beside a delete that failed, and a second delete is announced again.
+  - The status line is one always-mounted `role="status"` element (spec 016, R11).
+  - A 404 on delete refetches the list, as a 404 on save does. Otherwise the row stays, and
+    its Edit opens a form that can only fail.
+  - The form's Cancel is disabled while the save is pending. Otherwise Cancel after "Save
+    changes" discards the form while the change still lands, with nothing said.
+- **R11. The documentation says where an adjustment's id is.** The page shows no ids, and
+  the `UnconvertibleAdjustmentError` row names one. The row points at
+  `GET /api/accounting/adjustments` in `/api/docs` for them.
+- **R12. Smaller points taken.**
+  - An untouched date is compared with the string the form was opened with, so a change of
+    the browser's zone between Edit and Save does not shift it. Inside the repeated hour of
+    an autumn clock change, a changed time resolves to the first occurrence.
+  - Deleting the adjustment being edited while focus is inside the form moves focus to the
+    new form's heading, not to `<body>`.
+  - The required fields say so with `aria-required`.
+  - At 375 px "Unknown cost" stays on one line and the "Use <date>" button has the regular
+    button size.
+- **R13. A 404 on delete is a delete that already happened.** Found by the browser check
+  of R10: with only a refetch, the row went, nothing was said, focus fell to `<body>`, and a
+  form editing that adjustment stayed in edit mode. The adjustment is gone, which is what
+  the owner asked for, so a 404 gets the hand-off of a successful delete: the whole
+  `['accounting']` root is invalidated (the delete made elsewhere moved the positions
+  too), focus goes where a delete sends it, a form editing that adjustment is emptied, and
+  the status line reads "That adjustment was already deleted.". Any other failure keeps
+  the row and shows its alert.
+- **Accepted as they are.**
+  - Every mutation awaits the refetch of the three accounting queries (R4).
+  - After a 404 on save the form stays in edit mode with what was typed.
+  - A save that fails on the network does not refetch the list. If the server committed
+    first, a retry makes a second row, which the list then shows.
+  - Two adjustments of one asset in the same minute share the accessible names of their
+    row controls.
+  - `App.tsx` spells `/adjustments` literally, as it spells every route.
+  - A two-digit year typed in the date field is sent as typed. The server refuses only the
+    future (spec 023).

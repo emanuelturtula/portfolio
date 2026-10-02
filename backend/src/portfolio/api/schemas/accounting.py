@@ -2,7 +2,8 @@
 
 `GET /api/accounting/positions` serves the snapshot valued, and
 `GET /api/accounting/reconciliation` (#104) the same snapshot's quantities beside the balances
-read from the wallets and the venues.
+read from the wallets and the venues. `GET /api/accounting/first-trades` (#111) says when each
+asset's imported history begins: an asset and an instant, and no amount.
 
 **This is the first schema module whose money fields are the owner's own position** -- what
 they hold, what it cost them, what they have gained -- rather than a price or a balance read
@@ -76,9 +77,12 @@ from portfolio.services.prices import PriceUnavailable
 from portfolio.services.reconciliation import ExchangeSyncErrorKind, NotComparedReason
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from portfolio.domain.accounting import AssetReconciliation, Exclusion, PortfolioTotals
     from portfolio.services.accounting import (
         AccountingStatus,
+        FirstTrade,
         PositionsView,
         PricedPosition,
         SnapshotWarning,
@@ -428,3 +432,35 @@ class ReconciliationResponse(BaseModel):
             exchanges=[ExchangeBalancesResponse.of(source) for source in view.exchanges],
             wallets=WalletsReadResponse.of(view.wallets),
         )
+
+
+class FirstTradeResponse(BaseModel):
+    """One asset, and the instant of the earliest imported fill it takes part in.
+
+    It takes part as the fill's base asset, its quote asset, or its fee asset when the fee is
+    not zero. `first_trade_at` is the fill's own time, in UTC.
+    """
+
+    asset: str
+    first_trade_at: datetime
+
+    @classmethod
+    def of(cls, first_trade: FirstTrade) -> FirstTradeResponse:
+        """Render one asset's first trade."""
+        return cls(asset=first_trade.asset, first_trade_at=first_trade.first_trade_at)
+
+
+class FirstTradesResponse(BaseModel):
+    """When the imported history of each asset begins, sorted by asset.
+
+    One entry per asset that takes part in at least one of the owner's imported fills. The
+    cash assets are left out, and manual adjustments are not counted: an asset that only an
+    adjustment names is not listed. With no fills, `assets` is empty.
+    """
+
+    assets: list[FirstTradeResponse]
+
+    @classmethod
+    def of(cls, first_trades: Iterable[FirstTrade]) -> FirstTradesResponse:
+        """Render the service's answer, in the order it gives."""
+        return cls(assets=[FirstTradeResponse.of(first_trade) for first_trade in first_trades])

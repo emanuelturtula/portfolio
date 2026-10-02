@@ -668,3 +668,82 @@ p.state-error[role='alert'] {
 .fill-filters .field input:invalid {
   border-color: var(--color-error);
 }
+
+/* Manual adjustments (spec 027). */
+
+.field textarea {
+  font: inherit;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.25rem;
+  background-color: var(--color-background);
+  color: var(--color-text);
+  resize: vertical;
+}
+
+/* A form this wide is read in one pass; the page's 60rem would stretch every input across it. */
+.adjustment-form {
+  max-width: 36rem;
+}
+
+/* A message under a field or at the bottom of the form. The words say what is wrong; colour
+   is only on top. */
+.field-error {
+  margin: 0;
+  color: var(--color-error);
+  font-size: 0.875rem;
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+}
+
+/* The button that sets the date to the one suggested: the app's regular button size, under the
+   hint that explains it, and not stretched across the field like a flex child would be. */
+.suggestion-button {
+  align-self: flex-start;
+}
+
+/* The outcome of the last save or delete. The paragraph is always in the document and its text
+   is swapped, so that a screen reader announces the change; while it is empty it must take no
+   room, and its margins would. */
+.status-line:empty {
+  margin: 0;
+}
+
+/* The owner's own words wrap, keep their line breaks, and never widen the table: the cell
+   takes what the figures leave, and a word longer than that breaks inside it. */
+.adjustment-table td.note {
+  min-width: 10rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.adjustment-table td time {
+  white-space: nowrap;
+}
+
+/* "Unknown cost" is a phrase in a figure's column, and wrapped onto two lines it reads as two
+   things. */
+.adjustment-table td.num {
+  white-space: nowrap;
+}
+
+.adjustment-table .row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.adjustment-table button {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.8125rem;
+}
+
+.adjustment-table .field-error {
+  max-width: 14rem;
+  margin-top: 0.4rem;
+}

@@ -7,6 +7,7 @@ import {
   fromBaseUnits,
   isZeroMoney,
   money,
+  plainMoney,
   type FormatMoneyOptions,
 } from '@/lib/money';
 
@@ -448,5 +449,92 @@ describe('equalsMoney', () => {
     ['9007199254740993', '9007199254740992'],
   ])('tells %j and %j apart', (a, b) => {
     expect(equalsMoney(money(a), money(b))).toBe(false);
+  });
+});
+
+/**
+ * `plainMoney` (spec 027, "What is sent"): the spelling an input holds when the owner edits a
+ * stored amount. Every expectation is written out by hand; computing one with `decimal.js`
+ * would assert the implementation against itself.
+ */
+describe('plainMoney', () => {
+  /** `[input, the plain spelling]`. */
+  const CASES: readonly (readonly [string, string])[] = [
+    // The wire's eighteen places, with the zeros nobody typed removed.
+    ['1.500000000000000000', '1.5'],
+    ['20000.000000000000000000', '20000'],
+    ['12000.000000000000000000', '12000'],
+    ['0.100000000000000000', '0.1'],
+    ['10.010000000000000000', '10.01'],
+    // Every one of eighteen places in use: nothing to remove, and nothing rounded. As doubles
+    // these are 3.141592653589793 and 1234.5678901234568.
+    ['3.141592653589793238', '3.141592653589793238'],
+    ['1234.567890123456789012', '1234.567890123456789012'],
+    // The integer part is kept whole: only fractional zeros are trailing zeros.
+    ['100.000', '100'],
+    ['1000000.000000000000000000', '1000000'],
+    // No grouping: "1,234,567.89" is not a number a field accepts.
+    ['1234567.890000000000000000', '1234567.89'],
+    // Every zero is "0".
+    ['0.000000000000000000', '0'],
+    ['0', '0'],
+    ['0.0', '0'],
+    // A negative zero never reaches a field.
+    ['-0.000000000000000000', '0'],
+    ['-0', '0'],
+    ['-0.00', '0'],
+    // A negative value keeps its sign.
+    ['-7375.500000000000000000', '-7375.5'],
+    ['-0.000000000000000001', '-0.000000000000000001'],
+    // The smallest eighteen-place value: positional, never "1e-18".
+    ['0.000000000000000001', '0.000000000000000001'],
+    // Twenty digits before the point, the most the engine accepts: never "1.2345678901234567890e+19".
+    ['12345678901234567890.000000000000000000', '12345678901234567890'],
+    ['10000000000000000000.000000000000000000', '10000000000000000000'],
+    // Both at once: thirty-eight significant digits, all of them kept.
+    ['99999999999999999999.999999999999999999', '99999999999999999999.999999999999999999'],
+    // Already plain: unchanged.
+    ['1.5', '1.5'],
+    ['42', '42'],
+  ];
+
+  it.each(CASES)('spells %j as %j', (input, expected) => {
+    expect(plainMoney(money(input))).toBe(expected);
+  });
+
+  it.each(CASES)('keeps %j the same amount', (input) => {
+    // The spelling changes and the amount does not: nothing is rounded on the way to a field,
+    // so what the owner saves untouched is what was stored.
+    const plain = plainMoney(money(input));
+
+    expect(equalsMoney(plain, money(input))).toBe(true);
+    expect(equalsMoney(money(input), plain)).toBe(true);
+  });
+
+  it.each(CASES)(
+    'never writes %j with an exponent, a group separator or a padding zero',
+    (input) => {
+      const plain = plainMoney(money(input));
+
+      // A plain decimal: optional sign, digits, and a fraction that does not end in a zero.
+      expect(plain).toMatch(/^-?(?:0|[1-9]\d*)(?:\.\d*[1-9])?$/);
+      expect(plain).not.toMatch(/[eE,\s]/);
+      // `money()` itself accepts it, so it can go back through every helper here.
+      expect(money(plain)).toBe(plain);
+    },
+  );
+
+  it('is idempotent', () => {
+    for (const [input] of CASES) {
+      const once = plainMoney(money(input));
+      expect(plainMoney(once)).toBe(once);
+    }
+  });
+
+  it('refuses what is not a plain decimal, as every helper here does', () => {
+    // The brand is the only way in, and `money()` is what grants it.
+    expect(() => plainMoney(money('1e-18'))).toThrow(TypeError);
+    expect(() => plainMoney(money('1,234.5'))).toThrow(TypeError);
+    expect(() => plainMoney(money(''))).toThrow(TypeError);
   });
 });

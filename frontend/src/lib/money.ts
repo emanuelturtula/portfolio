@@ -225,6 +225,26 @@ export function addMoney(a: Money, b: Money): Money {
 }
 
 /**
+ * The exact plain spelling of `value`: no grouping, no exponent, no rounding, and no trailing
+ * zeros. For a value an input can hold, such as an amount the owner is about to edit, where
+ * the wire's `"1.500000000000000000"` would show eighteen places nobody typed and
+ * {@link formatMoney}'s `"1,234.5"` is not a number a field accepts.
+ *
+ * The result is the same amount: nothing is rounded, so a value of 18 places keeps all 18.
+ * The edges:
+ *
+ * - every zero is `"0"`, whatever its spelling: `"0.000000000000000000"` and `"-0.00"` too, so
+ *   a negative zero never reaches a field;
+ * - a very small or very large value stays in positional notation (`"0.000000000000000001"`,
+ *   not `"1e-18"`), because `toFixed()` with no argument is the one `decimal.js` output that
+ *   never uses an exponent - the reason {@link addMoney} uses it as well;
+ * - the integer part is kept whole: `"100.000"` is `"100"`, never `"1"`.
+ */
+export function plainMoney(value: Money): Money {
+  return money(new Decimal(value).toFixed());
+}
+
+/**
  * Whether `value` is exactly zero, however the wire spells it: `"0"`, `"0.00"`, `"-0"` and
  * `"0.000000000000000000"` are all zero. Comparing the strings would call the last one
  * non-zero, which is how a fully sold position ends up listed as held.

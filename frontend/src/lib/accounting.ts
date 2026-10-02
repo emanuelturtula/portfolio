@@ -464,18 +464,26 @@ export function partitionReconciliation(assets: readonly ReconciliationAsset[]):
  * look and not a verdict: the readings are taken at different moments, so coins moved between
  * two of them are counted twice until both have been read again - not "until the next sync",
  * since a source that has stopped being read stays compared for up to the reading age limit -
- * and the block shows below the lists how old each reading is. The documentation is named in
- * plain text; there is no page to link to until the page that records an adjustment exists
- * (#111).
+ * and the block shows below the lists how old each reading is. The way out is the line
+ * beneath it, {@link RECORD_MISSING_COINS_PROMPT}, which links to the page that records an
+ * adjustment (spec 027).
  */
 export const HELD_EXCEEDS_HISTORY_GUIDANCE =
   'The balances read hold more than the history accounts for. The usual cause is buys older ' +
   'than an exchange keeps, or coins acquired elsewhere, and average cost and profit then ' +
   'leave those units out. Before recording anything, rule out coins in transit: readings are ' +
   'taken at different moments, so coins moved between two of them are counted twice until ' +
-  'both have been read again. How old each reading is, is shown below the lists. If the gap ' +
-  'is real, an opening balance records what is really missing: see "Recording what the ' +
-  'history does not show" in docs/accounting.md.';
+  'both have been read again. How old each reading is, is shown below the lists.';
+
+/**
+ * The line after the guidance, followed by one link per `history_short` asset to the page that
+ * records the missing coins, with that asset carried over. It says "the missing coins" and not
+ * "an opening balance": the gap can be coins held before the history begins or coins acquired
+ * elsewhere since, and which of the two it is decides the date the adjustment should carry
+ * (spec 027, R8). The quantity is never carried over: the difference shown can include coins in
+ * transit between two readings (spec 025, R9 and R10).
+ */
+export const RECORD_MISSING_COINS_PROMPT = 'If the gap is real, record the missing coins for:';
 
 /**
  * What to say about a `history_over` asset. Never worded as an error or as a thing to fix:

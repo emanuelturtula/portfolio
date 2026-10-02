@@ -1,4 +1,4 @@
-"""The accounting endpoints: the owner's positions valued in USD, and the holdings check.
+"""The accounting endpoints: the positions valued in USD, the holdings check, the first trades.
 
 Thin on purpose: each route calls a service and serializes. Nothing is computed here -- not
 the valuation, not the totals, not which positions the totals leave out, not the tolerance a
@@ -6,9 +6,9 @@ quantity is compared within -- because a rule that lives in a router is a rule t
 have. Nothing is recomputed here either: the snapshot is written by the triggers in `main.py`,
 and a request is served from what is stored.
 
-Neither `/api/accounting/positions` nor `/api/accounting/reconciliation` is in
-`PUBLIC_API_PATHS`, so both require a session. That is the deny-by-default middleware's doing,
-not this module's.
+None of `/api/accounting/positions`, `/api/accounting/reconciliation` and
+`/api/accounting/first-trades` is in `PUBLIC_API_PATHS`, so each requires a session. That is
+the deny-by-default middleware's doing, not this module's.
 
 ## `last_recompute` comes through a dependency
 
@@ -22,6 +22,7 @@ The services import the price cache's read side and the repositories, and nothin
 `portfolio.providers`: the `prices-are-never-fetched-in-a-request` and
 `api-never-reaches-an-exchange-provider` import contracts hold for these routes as they are.
 The reconciliation reads the venue balances the exchange sync stored; it never asks a venue.
+The first trades are read from the fills the exchange sync stored.
 """
 
 from __future__ import annotations
@@ -36,7 +37,11 @@ from portfolio.api.dependencies import (
     get_principal,
     get_reconciliation_service,
 )
-from portfolio.api.schemas.accounting import PositionsResponse, ReconciliationResponse
+from portfolio.api.schemas.accounting import (
+    FirstTradesResponse,
+    PositionsResponse,
+    ReconciliationResponse,
+)
 from portfolio.services.accounting import AccountingService, AccountingStatus
 from portfolio.services.auth import Principal
 from portfolio.services.reconciliation import ReconciliationService
@@ -104,3 +109,26 @@ async def read_reconciliation(
     """
     view = await service.reconciliation(principal.user_id)
     return ReconciliationResponse.of(view, last_recompute=last_recompute)
+
+
+@router.get(
+    "/first-trades",
+    operation_id="readFirstTrades",
+    summary="When the imported history of each asset begins: the instant of its earliest fill",
+    response_model=FirstTradesResponse,
+)
+async def read_first_trades(
+    principal: CurrentPrincipal,
+    service: CurrentAccountingService,
+) -> FirstTradesResponse:
+    """Return, per asset, the instant of the earliest imported fill it takes part in.
+
+    An asset takes part in a fill as its base asset, as its quote asset, or as its fee asset
+    when the fee is not zero. The cash assets are left out, and manual adjustments are not
+    counted: this is where the imported history of an asset starts, which is what an opening
+    balance is dated before. Sorted by asset.
+
+    Read from the stored fills, not from the snapshot, so it does not depend on a recompute.
+    With no fills the answer is still `200`, with an empty list.
+    """
+    return FirstTradesResponse.of(await service.first_trades(principal.user_id))

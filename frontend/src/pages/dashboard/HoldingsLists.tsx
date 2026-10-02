@@ -1,3 +1,6 @@
+import { Fragment } from 'react';
+import { Link } from 'react-router-dom';
+
 import type { ReconciliationAsset } from '@/api/accounting';
 import {
   ALL_QUANTITIES_MATCH,
@@ -5,7 +8,9 @@ import {
   HISTORY_EXCEEDS_HELD_EXPLANATION,
   NOTHING_TO_COMPARE,
   partitionReconciliation,
+  RECORD_MISSING_COINS_PROMPT,
 } from '@/lib/accounting';
+import { adjustmentsRouteFor } from '@/lib/adjustments';
 import { ReconciliationTable } from '@/pages/dashboard/ReconciliationTable';
 
 interface HoldingsListProps {
@@ -18,12 +23,24 @@ interface HoldingsListProps {
  * prompt to look, with the thing to rule out first, and not as a verdict: two readings taken
  * at different moments can show the same gap for coins that were only in transit. The weight
  * is in the words and the border; colour is only on top.
+ *
+ * The way out is a link per asset to the page that records the missing coins, with the
+ * asset carried over and nothing else (spec 027).
  */
 function HeldExceedsHistory({ assets }: HoldingsListProps) {
   return (
     <div className="holdings-short">
       <h4 id="holdings-short-heading">Held exceeds history ({String(assets.length)})</h4>
       <p>{HELD_EXCEEDS_HISTORY_GUIDANCE}</p>
+      <p>
+        {RECORD_MISSING_COINS_PROMPT}{' '}
+        {assets.map((entry, index) => (
+          <Fragment key={entry.asset}>
+            {index > 0 && ', '}
+            <Link to={adjustmentsRouteFor(entry.asset)}>{entry.asset}</Link>
+          </Fragment>
+        ))}
+      </p>
       <ReconciliationTable assets={assets} labelledBy="holdings-short-heading" />
     </div>
   );
