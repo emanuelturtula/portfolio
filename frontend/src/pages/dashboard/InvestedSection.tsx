@@ -45,9 +45,16 @@ const EXCHANGES_LINK = <Link to="/exchanges">Open exchanges</Link>;
  * live region is re-announced every time it changes (spec 016). `error` is the exception's
  * class name, never its message. `last_recompute` lives in memory and the trigger records the
  * class name for every failure, so a null one is a shape the backend cannot write: the type
- * allows it, and it renders nothing rather than an invented name (spec 022, R1).
+ * allows it, and it renders nothing rather than an invented name (spec 022, R1). Exported for
+ * the adjustments page, which says the same thing about the same recompute (spec 027).
  */
-function FailedAttempt({ at, error }: { readonly at: string; readonly error: string | null }) {
+export function FailedAttempt({
+  at,
+  error,
+}: {
+  readonly at: string;
+  readonly error: string | null;
+}) {
   return (
     <>
       failed on <AbsoluteTime value={at} />

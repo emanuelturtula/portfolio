@@ -127,6 +127,10 @@ def test_the_walk_actually_finds_the_routes(auth_app: FastAPI) -> None:
     # #104's one. Not in `PUBLIC_API_PATHS`, so registering it protected it; named so the
     # sweep visibly covers the one endpoint that serves what the owner's venues hold.
     assert ("GET", "/api/accounting/reconciliation") in routes
+    # #111's one. Not in `PUBLIC_API_PATHS`, so registering it protected it; named so the
+    # sweep visibly covers the endpoint that says which assets the owner has traded, and
+    # since when.
+    assert ("GET", "/api/accounting/first-trades") in routes
     # FastAPI's own documentation endpoints are routes like any other, and are covered.
     assert ("GET", "/api/openapi.json") in routes
     assert ("GET", "/api/docs") in routes

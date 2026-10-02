@@ -5,6 +5,7 @@ import { Route } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 
 import { App } from '@/App';
+import { threeAdjustments, threeFirstTrades } from '@/test/adjustmentFixtures';
 import {
   accountFailed,
   accountSucceeded,
@@ -15,6 +16,7 @@ import {
   truncatedExchange,
 } from '@/test/exchangeFixtures';
 import { fakeAccounting } from '@/test/fakeAccounting';
+import { fakeAdjustments } from '@/test/fakeAdjustments';
 import { fakeExchanges, type FakeExchangesOptions } from '@/test/fakeExchanges';
 import { fakePortfolio } from '@/test/fakePortfolio';
 import { healthyPortfolio } from '@/test/fixtures';
@@ -211,6 +213,20 @@ const ROUTE_CASES: readonly RouteCase[] = [
     passwordInputs: 0,
   },
   {
+    route: '/adjustments',
+    visit: '/adjustments?asset=BTC',
+    signedIn: true,
+    ready: async () => {
+      await screen.findByRole('form', { name: 'Record an adjustment' });
+      // The suggestion's button and the rows' controls are on screen too.
+      await screen.findByRole('button', { name: /^Use / });
+      return within(await screen.findByRole('region', { name: 'Recorded adjustments' })).findByRole(
+        'table',
+      );
+    },
+    passwordInputs: 0,
+  },
+  {
     route: '/health',
     visit: '/health',
     signedIn: true,
@@ -234,6 +250,11 @@ function serve(signedIn: boolean, exchanges: FakeExchangesOptions = EXCHANGES_SC
     ...fakePortfolio({ ...scenario, session }).handlers,
     ...fakeExchanges({ ...exchanges, session }).handlers,
     ...fakeAccounting({ session }).handlers,
+    ...fakeAdjustments({
+      adjustments: threeAdjustments(),
+      firstTrades: threeFirstTrades(),
+      session,
+    }).handlers,
   );
 }
 
@@ -280,6 +301,57 @@ describe('credentials', () => {
 
     expectOnlyTheTransactionFilters(main);
     expect(main.querySelector('form')).toBeNull();
+    expect(passwordInputs()).toHaveLength(0);
+  });
+
+  it('the adjustments page has the five fields of an adjustment and no other control', async () => {
+    // Spec 027. The one page besides the wallets with a form on it, so each control's type
+    // and name is pinned: a field added to it - a key to import from a venue, say - fails here.
+    const user = userEvent.setup();
+    serve(true);
+
+    renderApp(['/adjustments']);
+    const form = await screen.findByRole('form', { name: 'Record an adjustment' });
+    const region = await screen.findByRole('region', { name: 'Recorded adjustments' });
+
+    const controls = (): Element[] =>
+      Array.from(screen.getByRole('main').querySelectorAll(CONTROL_SELECTOR));
+    const described = (): string[] =>
+      controls().map((control) => {
+        const labels =
+          control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement
+            ? Array.from(control.labels ?? [])
+                .map((label) => label.textContent.trim())
+                .join(' ')
+            : '';
+        const kind =
+          control instanceof HTMLInputElement ? control.type : control.tagName.toLowerCase();
+        return `${kind} ${labels}`;
+      });
+    const FIELDS = [
+      'text Asset',
+      'text Quantity',
+      'text Unit cost (USD)',
+      'datetime-local Acquired on',
+      'textarea Note',
+    ];
+
+    expect(described()).toEqual(FIELDS);
+    for (const control of controls()) {
+      expect(form.contains(control), `a ${control.tagName} outside the form`).toBe(true);
+    }
+    expectNoCredentialControl();
+
+    // Nor in edit mode, which is the same form filled in.
+    const [edit] = within(region).getAllByRole('button', { name: /^Edit / });
+    if (edit === undefined) {
+      throw new Error('No row offers Edit.');
+    }
+    await user.click(edit);
+    await screen.findByRole('form', { name: 'Edit adjustment' });
+
+    expect(described()).toEqual(FIELDS);
+    expectNoCredentialControl();
     expect(passwordInputs()).toHaveLength(0);
   });
 

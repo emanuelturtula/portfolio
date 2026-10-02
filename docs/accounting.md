@@ -484,10 +484,13 @@ two readings taken at different times lasts until both sources have been read ag
 gone once the transfer has arrived and both readings are fresh. A difference that is still
 there is the one to act on.
 
-Such a `history_short` says units are held that no event acquired. An **opening balance**
-records them: a manual adjustment of the asset, for the `difference`, dated before the first
-fill of that asset, with the cost if the owner knows it and without one if not. The next
-section explains adjustments and works an example.
+Such a `history_short` says units are held that no event acquired. A **manual adjustment**
+records the missing coins: an inflow of the asset, for the `difference`, with the cost if the
+owner knows it and without one if not. It carries the date the coins were acquired. Coins
+already held when the asset's imported history begins are an **opening balance**, dated before
+the first fill of that asset. Coins acquired later carry the date they were acquired, and
+"Dating an opening balance" below says why. The next section explains adjustments and works an
+example.
 
 Take the first row above. The history accounts for 0.5 BTC and 1 BTC is held, so 0.5 BTC is
 missing: it was bought before the venue's history begins. An adjustment of 0.5 BTC raises the
@@ -565,12 +568,28 @@ gift sent or coins lost are not adjustments.
 Every adjustment carries a note, in the owner's words, saying why it exists. The note is never
 logged.
 
-The owner enters adjustments through the authenticated API under
-`/api/accounting/adjustments`. While signed in, `/api/docs` works for listing, creating and
-replacing them. It cannot delete one: every write must carry `Content-Type: application/json`,
+The owner enters, edits and deletes adjustments on the **Adjustments page**, at `/adjustments`
+in the signed-in application (spec `docs/specs/027-manual-adjustments-page.md`). It lists the
+adjustments recorded, and one form records a new one or edits an existing one. A delete asks
+for confirmation first. When the asset entered is one the imported history trades, the form
+says when its earliest imported trade is and offers a date before it. The date is offered and
+never filled in, and the form's hint says which coins it is for: coins already held by then
+are dated before that trade, and coins acquired later carry the date they were acquired (see
+"Dating an opening balance" below). Only the owner knows which of the two an adjustment
+records.
+
+Under "Held exceeds history", the dashboard's holdings check offers to record the missing
+coins, and links each asset it lists there to the page, with the asset filled in. Neither the
+quantity nor the date is carried over. The difference shown there can include coins in transit
+between two readings, and the check cannot know when the coins were acquired, so both are the
+owner's to enter.
+
+The page calls the authenticated API under `/api/accounting/adjustments`, and that API is the
+alternative to it. While signed in, `/api/docs` works for listing, creating and replacing
+adjustments. It cannot delete one: every write must carry `Content-Type: application/json`,
 and Swagger UI sends no content type for a request without a body, so the delete gets a 403.
-To delete one, run this in the browser console on a page of the signed-in application, with
-the adjustment's id in place of `<id>`:
+To delete one without the page, run this in the browser console on a page of the signed-in
+application, with the adjustment's id in place of `<id>`:
 
 ```js
 await fetch('/api/accounting/adjustments/<id>', {method: 'DELETE', headers: {'Content-Type': 'application/json'}})
@@ -585,7 +604,24 @@ response returns.
 An adjustment takes its place among the fills by `occurred_at`. At the same instant as a fill,
 it replays **after** the fill, because its source, `manual`, sorts after every venue's. So date
 an opening balance **before the first sale it has to cover**, not at the moment of that sale.
-The date of the first imported fill, minus a day, is a safe choice.
+For coins that were already held when the asset's imported history begins, on any venue, the
+date of the asset's first imported fill, minus a day, is a safe choice.
+
+The Adjustments page offers such a date. `GET /api/accounting/first-trades` gives it, per
+asset, the instant of the earliest imported fill the asset takes part in: as the fill's base
+asset, as its quote asset, or as the asset of a fee that is not zero. The cash assets are left
+out, and adjustments are not counted, so the instant is where the *imported* history of the
+asset begins. The page offers the start of the day before it, in the browser's local time.
+
+**That instant is per asset, across every venue, while each venue's history begins on its own
+date.** So the offered date fits the coins already held at that instant, and no others. **Coins
+acquired later carry the date they were acquired**: a purchase on a venue made before that
+venue's history begins but after the asset's first imported fill elsewhere, or coins acquired
+off the exchanges. The method is weighted average, so an inflow dated too early joins the pool
+before sales it had no part in. It changes the cost applied to every sale between that date
+and the real one, and with it the realized P&L of each of them; a gain can be reported as a
+loss. **Nothing warns.** The quantities add up either way, so the engine raises no warning and
+no flag, and the holdings check matches.
 
 Two adjustments at the same instant replay in the order they were entered. An adjustment's id
 is its identity in the replay, and ids are never reused.
@@ -622,7 +658,9 @@ the history begins, at 25,000. The positions say so:
 ```
 
 The BTC position carries `history_incomplete`, 10,000 of realized P&L and 20,000 of unmatched
-proceeds. The owner records the opening balance, dated before the buy:
+proceeds. The owner records the opening balance, dated before the buy. On the Adjustments page
+that is the asset, the quantity, the unit cost, the date and a note. Through the API it is the
+same five fields:
 
 ```bash
 curl -s -b "$COOKIE" -H "Origin: https://<host>" -H "Content-Type: application/json" \

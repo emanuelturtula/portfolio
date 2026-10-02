@@ -412,6 +412,9 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         # The holdings check (#104): each asset's replayed quantity beside the balances
         # read. The one response that carries what a venue holds; every quantity a string.
         "/api/accounting/reconciliation",
+        # When each asset's imported history begins (#111), for the adjustments form's date
+        # hint. No money crosses it: an asset and an instant, and nothing else.
+        "/api/accounting/first-trades",
     }
 
 

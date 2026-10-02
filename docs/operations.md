@@ -1171,7 +1171,7 @@ curl -s -b "$COOKIE" https://<host>/api/accounting/positions | jq '.computed_at,
 | `error` | What it means | What to do |
 |---|---|---|
 | `UnconvertibleFillError` | A stored fill has a shape the engine cannot account for: a pair whose base and quote are the same asset, a fee that consumes everything received, or a rebate larger than everything given. Ingestion has refused these since #99, so this is a row written before that, or by hand. | Do not edit the database: `exchange_fills` is append-only, and the recompute will keep failing until the row is dealt with. Report it with the venue and the date. The error names neither the account nor the trade on purpose, so that trade ids stay out of the log. |
-| `UnconvertibleAdjustmentError` | A stored manual adjustment breaks a rule the engine enforces: a quantity not above zero, a negative cost, more than 18 decimal places, a cost times a quantity too large to represent, a blank asset, or a date that cannot be expressed in UTC. The API refuses all of these when an adjustment is entered, so this is a row written some other way, such as by hand on the Pi. | The `accounting_recompute_failed` log line names it: its `adjustment_id` field. Correct that adjustment with a `PUT`, or delete it, under `/api/accounting/adjustments`; either recomputes at once. "Recording an opening balance" below says how to delete one. |
+| `UnconvertibleAdjustmentError` | A stored manual adjustment breaks a rule the engine enforces: a quantity not above zero, a negative cost, more than 18 decimal places, a cost times a quantity too large to represent, a blank asset, or a date that cannot be expressed in UTC. The API refuses all of these when an adjustment is entered, so this is a row written some other way, such as by hand on the Pi. | The `accounting_recompute_failed` log line names it: its `adjustment_id` field. The Adjustments page does not show ids. `GET /api/accounting/adjustments` in `/api/docs`, while signed in, lists each adjustment with its `id`: find the one the log names there, and note its asset and date. Then correct that adjustment, or delete it, on the Adjustments page, where its asset and date identify the row; either recomputes at once. "Recording an opening balance" below describes the page, and the API under `/api/accounting/adjustments` as the alternative to it. |
 | `OperationalError` | SQLite refused the statement, most likely "database is locked": another write held the lock past the five-second busy timeout. Transient. | Nothing. It is retried at the next exchange sync, even one that stores nothing, and at the next restart. If it persists across several syncs, report it. |
 | `StatementError` | The write was refused. The likeliest cause is a figure of 10²⁰ or more, which no column can hold and no real history reaches. | Report it. |
 | `InvalidOperation` | Replay left the engine's range (spec 019, *Risks*). | Report it. |
@@ -1192,7 +1192,18 @@ retention window. The fix is a **manual adjustment**: an inflow of the asset, at
 an unknown cost, dated **before the first sale it has to cover**. `docs/accounting.md`,
 "Recording what the history does not show", explains the rules and works an example.
 
-The endpoints are under `/api/accounting/adjustments` and need a session, like every other:
+**Enter it on the Adjustments page**, at `/adjustments` in the signed-in application. The page
+lists the adjustments recorded, and one form records a new one or edits an existing one. A
+delete asks for confirmation first. When the asset entered is one the imported history trades,
+the form says when its earliest imported trade is and offers a date before it; the date is
+offered, never filled in. The form's hint says which coins that date is for: coins already
+held by then are dated before that trade, and **coins acquired later carry the date they were
+acquired**. An inflow dated too early changes the cost applied to every sale in between, and
+nothing warns about it (`docs/accounting.md`, "Dating an opening balance"). Under "Held exceeds
+history", the dashboard's holdings check offers to record the missing coins and links each
+asset it lists there to the page, with the asset filled in and nothing else.
+
+The page calls these endpoints, which need a session, like every other:
 
 | Method | Path | Does |
 |---|---|---|
@@ -1200,12 +1211,13 @@ The endpoints are under `/api/accounting/adjustments` and need a session, like e
 | `POST` | `/api/accounting/adjustments` | Records one. `201`. |
 | `PUT` | `/api/accounting/adjustments/{id}` | Replaces all five fields, `unit_cost` included: `null` is an unknown cost. |
 | `DELETE` | `/api/accounting/adjustments/{id}` | Deletes one. `204`. |
+| `GET` | `/api/accounting/first-trades` | Per asset, the instant of the earliest imported fill it takes part in, as base asset, as quote asset, or as the asset of a fee that is not zero. Sorted by asset. USDC and USDT are left out and adjustments are not counted. It is where the page's suggested date comes from, and it reads the stored fills, so it does not wait for a recompute. |
 
-**`/api/docs` works for the first three while signed in** (section 6), **not for the delete.**
-Every write must carry `Content-Type: application/json`, and Swagger UI sends no content type
-for a request without a body, so a delete from there is refused with a 403 before it reaches
-the endpoint. Delete from the browser console instead, on a page of the signed-in
-application, with the adjustment's id in place of `<id>`:
+**The alternative to the page is `/api/docs`, which works for all of these while signed in**
+(section 6) **except the delete.** Every write must carry `Content-Type: application/json`,
+and Swagger UI sends no content type for a request without a body, so a delete from there is
+refused with a 403 before it reaches the endpoint. To delete without the page, use the browser
+console, on a page of the signed-in application, with the adjustment's id in place of `<id>`:
 
 ```js
 await fetch('/api/accounting/adjustments/<id>', {method: 'DELETE', headers: {'Content-Type': 'application/json'}})
@@ -1451,7 +1463,7 @@ The fills are untouched by any of these, and so are the positions.
 | `last_recompute.outcome` is `failed` | The previous snapshot is still the one served. Read `error` — section 15 |
 | New trades are imported but the positions do not change | Check `last_recompute`: a failed recompute keeps the old snapshot. If it says `unchanged`, the fills replayed were exactly the ones the snapshot was already computed from — section 15 |
 | An asset shows `market_value: null` with `unsupported_pair` | Only chain assets (BTC, KAS) are priced. It is left out of the totals and named in `totals.excluded` — section 15 |
-| A `negative_inventory` warning, and `history_incomplete` on an asset | A sale larger than the imported history holds. Record the missing coins as a manual adjustment dated before that sale — section 15 |
-| An opening balance was entered and the warning is still there | The adjustment is dated at or after the sale. At the same instant, a fill replays first. Date it earlier with a `PUT` — section 15 |
-| Deleting an adjustment from `/api/docs` returns 403 | Swagger UI sends no content type for a request without a body, and every write needs `application/json`. Delete it from the browser console instead — section 15 |
+| A `negative_inventory` warning, and `history_incomplete` on an asset | A sale larger than the imported history holds. Record the missing coins as a manual adjustment dated before that sale, on the Adjustments page — section 15 |
+| An opening balance was entered and the warning is still there | The adjustment is dated at or after the sale. At the same instant, a fill replays first. Edit it on the Adjustments page and date it earlier — section 15 |
+| Deleting an adjustment from `/api/docs` returns 403 | Delete it on the Adjustments page (`/adjustments`). Swagger UI sends no content type for a request without a body, and every write needs `application/json`, so it cannot send the delete. Without the page, delete it from the browser console — section 15 |
 | Creating an adjustment returns 422 naming `asset` | The symbol must be the venue's own spelling, upper case, such as `BTC`, and not USDC or USDT — section 15 |

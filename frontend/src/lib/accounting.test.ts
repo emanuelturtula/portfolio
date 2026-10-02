@@ -28,6 +28,7 @@ import {
   HELD_EXCEEDS_HISTORY_BADGE,
   HELD_EXCEEDS_HISTORY_EXPLANATION,
   HELD_EXCEEDS_HISTORY_GUIDANCE,
+  RECORD_MISSING_COINS_PROMPT,
   heldExceedsHistoryAssets,
   HISTORY_EXCEEDS_HELD_EXPLANATION,
   HOLDINGS_CHECK_ID,
@@ -743,25 +744,37 @@ describe('the holdings check words', () => {
     expect(() => describeComparison('1e0')).toThrow(TypeError);
   });
 
-  it('tells the owner of a short history the usual cause, what to rule out first, and the way out (R9, R10)', () => {
+  it('tells the owner of a short history the usual cause and what to rule out first (R9, R10)', () => {
+    // Spec 027: the sentence that pointed at the documentation is gone. The way out is the
+    // line after this one, which links to the page that records the missing coins.
     expect(HELD_EXCEEDS_HISTORY_GUIDANCE).toBe(
       'The balances read hold more than the history accounts for. The usual cause is buys ' +
         'older than an exchange keeps, or coins acquired elsewhere, and average cost and profit ' +
         'then leave those units out. Before recording anything, rule out coins in transit: ' +
         'readings are taken at different moments, so coins moved between two of them are ' +
         'counted twice until both have been read again. How old each reading is, is shown ' +
-        'below the lists. If the gap is real, an opening balance records what is really ' +
-        'missing: see "Recording what the history does not show" in docs/accounting.md.',
+        'below the lists.',
     );
+    expect(HELD_EXCEEDS_HISTORY_GUIDANCE).not.toMatch(/docs\/accounting\.md/);
+    expect(HELD_EXCEEDS_HISTORY_GUIDANCE).not.toMatch(/opening balance/);
     // R10: the double count lasts until both sources have been read again, which one sync does
     // not promise - a source that has stopped being read keeps its reading for up to a day.
     expect(HELD_EXCEEDS_HISTORY_GUIDANCE).not.toMatch(/until the next sync/);
     // A prompt to look, not a verdict: the cause is "usual", and nothing is said to be missing
     // before the owner has ruled out coins in transit.
     expect(HELD_EXCEEDS_HISTORY_GUIDANCE).not.toMatch(/are missing from the history/);
-    expect(HELD_EXCEEDS_HISTORY_GUIDANCE.indexOf('rule out coins in transit')).toBeLessThan(
-      HELD_EXCEEDS_HISTORY_GUIDANCE.indexOf('an opening balance records'),
+    expect(HELD_EXCEEDS_HISTORY_GUIDANCE).toMatch(
+      /Before recording anything, rule out coins in transit/,
     );
+  });
+
+  it('offers the way out after the guidance, and only if the gap is real (spec 027)', () => {
+    // Followed on the page by one link per asset. Conditional on purpose: the difference can
+    // be coins in transit between two readings, which no adjustment should paper over.
+    expect(RECORD_MISSING_COINS_PROMPT).toBe('If the gap is real, record the missing coins for:');
+    // "The missing coins", not "an opening balance" (spec 027, R8): the gap can as well be
+    // coins acquired elsewhere since the history began, and those are dated when acquired.
+    expect(RECORD_MISSING_COINS_PROMPT).not.toMatch(/opening balance/);
   });
 
   it('names the causes of a history above the balances, and says it cannot tell them apart (R9)', () => {

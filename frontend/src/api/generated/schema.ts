@@ -74,6 +74,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/accounting/first-trades": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * When the imported history of each asset begins: the instant of its earliest fill
+         * @description Return, per asset, the instant of the earliest imported fill it takes part in.
+         *
+         *     An asset takes part in a fill as its base asset, as its quote asset, or as its fee asset
+         *     when the fee is not zero. The cash assets are left out, and manual adjustments are not
+         *     counted: this is where the imported history of an asset starts, which is what an opening
+         *     balance is dated before. Sorted by asset.
+         *
+         *     Read from the stored fills, not from the snapshot, so it does not depend on a recompute.
+         *     With no fills the answer is still `200`, with an empty list.
+         */
+        get: operations["readFirstTrades"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/accounting/positions": {
         parameters: {
             query?: never;
@@ -1363,6 +1391,34 @@ export interface components {
          * @enum {string}
          */
         FillSide: "buy" | "sell";
+        /**
+         * FirstTradeResponse
+         * @description One asset, and the instant of the earliest imported fill it takes part in.
+         *
+         *     It takes part as the fill's base asset, its quote asset, or its fee asset when the fee is
+         *     not zero. `first_trade_at` is the fill's own time, in UTC.
+         */
+        FirstTradeResponse: {
+            /** Asset */
+            asset: string;
+            /**
+             * First Trade At
+             * Format: date-time
+             */
+            first_trade_at: string;
+        };
+        /**
+         * FirstTradesResponse
+         * @description When the imported history of each asset begins, sorted by asset.
+         *
+         *     One entry per asset that takes part in at least one of the owner's imported fills. The
+         *     cash assets are left out, and manual adjustments are not counted: an asset that only an
+         *     adjustment names is not listed. With no fills, `assets` is empty.
+         */
+        FirstTradesResponse: {
+            /** Assets */
+            assets: components["schemas"]["FirstTradeResponse"][];
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -2092,6 +2148,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    readFirstTrades: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FirstTradesResponse"];
                 };
             };
         };

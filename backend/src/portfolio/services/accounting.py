@@ -5,6 +5,9 @@ the engine's event -- a `Trade`, or an `Adjustment` (#18) -- runs `domain.accoun
 over **one** list of both, and replaces the stored snapshot when the answer changed.
 `positions` reads the stored snapshot back and values it at the cached prices.
 
+A third, small read sits beside them: `first_trades` (#111) says when each asset's imported
+history begins. It reads the fills the recompute reads, and nothing of the snapshot.
+
 **No provider here, and none reachable.** A router imports this module, so it imports
 `repositories` and `services/prices.py` and nothing from `providers`: the
 `prices-are-never-fetched-in-a-request` and `api-never-reaches-an-exchange-provider` import
@@ -70,6 +73,15 @@ An asset is priced only if it is a chain's native asset (`PRICED_ASSETS`), becau
 pairs are ever fetched. Anything else is `unsupported_pair` without a lookup -- which is the
 true reason, where a lookup would answer `never_fetched` and send an operator to check a
 refresh that will never price it. The arithmetic is `domain.accounting.value_position`'s.
+
+## First trades: the stored columns, compared in Python
+
+`first_trades` answers one question for the adjustments form (spec 027): when is the earliest
+imported fill an asset takes part in, so that an opening balance can be dated before it. It
+loads the fills as the recompute does and takes the minimum of `executed_at` **in Python**, on
+`datetime` values: the column is text in SQLite, and a `MIN()` or an `ORDER BY` on it would
+compare strings. It builds no `Trade`, so a stored row the recompute would refuse still
+answers here; and it reads no adjustment, because the question is about the imported history.
 """
 
 from __future__ import annotations
@@ -83,6 +95,7 @@ from typing import TYPE_CHECKING, Final
 from anyio import to_thread
 
 from portfolio.domain.accounting import (
+    DEFAULT_CASH_ASSETS,
     METHOD,
     VALUE_SCALE,
     Adjustment,
@@ -131,6 +144,7 @@ __all__ = [
     "AccountingService",
     "AccountingStatus",
     "AccountingWarningKind",
+    "FirstTrade",
     "PositionsView",
     "PricedPosition",
     "RecomputeOutcome",
@@ -144,6 +158,7 @@ __all__ = [
     "adjustment_of",
     "build_accounting_service",
     "external_id_of",
+    "first_trades_of",
     "lot_kinds_of",
     "trade_of",
     "utc_now",
@@ -378,6 +393,17 @@ class PositionsView:
 
 
 @dataclass(frozen=True, slots=True)
+class FirstTrade:
+    """When an asset's imported history begins: the instant of its earliest fill.
+
+    `first_trade_at` is the fill's `executed_at` exactly as it is stored, timezone-aware UTC.
+    """
+
+    asset: str
+    first_trade_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class _Replayed:
     """What the worker thread hands back: the result, and the kind of event behind each lot."""
 
@@ -501,12 +527,43 @@ def _replay_events(
     return _Replayed(result=replay(events), lot_kinds=lot_kinds_of(events))
 
 
+def first_trades_of(fills: Iterable[AccountingFillRecord]) -> tuple[FirstTrade, ...]:
+    """The earliest fill each non-cash asset takes part in, sorted by asset. Pure.
+
+    **An asset takes part in a fill** as its base asset, as its quote asset, or as its fee
+    asset when the fee amount is not zero: a zero fee moves nothing, so it does not count
+    (spec 027). **Cash assets are left out** (`DEFAULT_CASH_ASSETS`): an adjustment of one is
+    refused, so a date for one has no use.
+
+    The minimum is taken here, on `datetime` values, and the order is the assets' code-point
+    order, which is what `sorted` gives a `str`. No fills gives an empty tuple.
+
+    **It reads the record's own columns and converts nothing** -- no `Trade`, no `FillSide`,
+    no arithmetic -- so no stored fill can make it raise. `Decimal.is_zero` is false for a
+    NaN rather than an error, and `executed_at` is always aware, which `UtcDateTime` sees to.
+    """
+    earliest: dict[str, datetime] = {}
+    for record in fills:
+        assets = [record.base_asset, record.quote_asset]
+        if record.fee_asset is not None and not record.fee_amount.is_zero():
+            assets.append(record.fee_asset)
+        for asset in assets:
+            if asset in DEFAULT_CASH_ASSETS:
+                continue
+            known = earliest.get(asset)
+            if known is None or record.executed_at < known:
+                earliest[asset] = record.executed_at
+    return tuple(
+        FirstTrade(asset=asset, first_trade_at=earliest[asset]) for asset in sorted(earliest)
+    )
+
+
 class AccountingService:
     """Recomputes and stores an owner's snapshot, and serves it valued. Owns its transaction.
 
     It holds the session, unlike the read-only `BalanceService`, because `recompute` commits:
     the snapshot's replacement is one transaction and this is the class that decides it.
-    `positions` and `read_snapshot` only read.
+    `positions`, `read_snapshot` and `first_trades` only read.
     """
 
     def __init__(
@@ -628,6 +685,17 @@ class AccountingService:
             if _same_snapshot(header, again):
                 return StoredSnapshot(header=header, positions=positions, warnings=warnings)
         raise SnapshotReadError
+
+    async def first_trades(self, user_id: int) -> tuple[FirstTrade, ...]:
+        """When each non-cash asset's imported history begins, sorted by asset.
+
+        Reads the owner's fills, the ones `recompute` reads and through the same repository
+        method, and reduces them with `first_trades_of`. Manual adjustments are not read: the
+        answer is where the *imported* history of an asset starts, which is what an opening
+        balance has to be dated before. Nothing is written, and nothing of the snapshot is
+        read, so the answer does not wait for a recompute.
+        """
+        return first_trades_of(await self._fills.list_fills_for_accounting(user_id))
 
     async def _priced(self, position: Position) -> PricedPosition:
         """Value one position at its price, or with the reason it has none."""

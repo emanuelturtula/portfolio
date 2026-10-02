@@ -3,8 +3,10 @@ import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { threeAdjustments, threeFirstTrades } from '@/test/adjustmentFixtures';
 import { exchange } from '@/test/exchangeFixtures';
 import { fakeAccounting } from '@/test/fakeAccounting';
+import { fakeAdjustments } from '@/test/fakeAdjustments';
 import { fakeExchanges } from '@/test/fakeExchanges';
 import { fakePortfolio, recordRequestUrls } from '@/test/fakePortfolio';
 import { currentPath, renderApp, settle, visitedPaths } from '@/test/render';
@@ -26,12 +28,13 @@ function loginFormIsShown(): boolean {
 beforeEach(() => {
   // The dashboard reads the portfolio as soon as a session exists. An empty
   // one is the first-time owner; tests that need data register their own.
-  // The exchanges page likewise, with no exchange configured, and the dashboard's invested
-  // section with a snapshot over no events.
+  // The exchanges page likewise, with no exchange configured, the dashboard's invested
+  // section with a snapshot over no events, and the adjustments page with none recorded.
   server.use(
     ...fakePortfolio().handlers,
     ...fakeExchanges().handlers,
     ...fakeAccounting().handlers,
+    ...fakeAdjustments().handlers,
   );
 });
 
@@ -84,7 +87,7 @@ describe('App', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
-  it('the header links to the dashboard, the wallets page and the exchanges page', async () => {
+  it('the header links to the dashboard, the wallets, the exchanges and the adjustments', async () => {
     const user = userEvent.setup();
     server.use(
       ...fakeSession({ initialUser: TEST_USERNAME }).handlers,
@@ -97,19 +100,23 @@ describe('App', () => {
     const dashboard = within(nav).getByRole('link', { name: 'Dashboard' });
     const wallets = within(nav).getByRole('link', { name: 'Wallets' });
     const exchanges = within(nav).getByRole('link', { name: 'Exchanges' });
+    const adjustments = within(nav).getByRole('link', { name: 'Adjustments' });
     expect(dashboard).toHaveAttribute('href', '/');
     expect(wallets).toHaveAttribute('href', '/wallets');
     expect(exchanges).toHaveAttribute('href', '/exchanges');
-    // In that order: Exchanges comes after Wallets.
+    // The bare page: the link carries no asset, so the form it opens is empty.
+    expect(adjustments).toHaveAttribute('href', '/adjustments');
+    // In that order: Exchanges comes after Wallets, and Adjustments is the fourth (spec 027).
     expect(
       within(nav)
         .getAllByRole('link')
         .map((link) => link.textContent),
-    ).toEqual(['Dashboard', 'Wallets', 'Exchanges']);
+    ).toEqual(['Dashboard', 'Wallets', 'Exchanges', 'Adjustments']);
     // The current page is marked for assistive technology, not by colour alone.
     expect(dashboard).toHaveAttribute('aria-current', 'page');
     expect(wallets).not.toHaveAttribute('aria-current');
     expect(exchanges).not.toHaveAttribute('aria-current');
+    expect(adjustments).not.toHaveAttribute('aria-current');
 
     await user.click(wallets);
 
@@ -137,10 +144,26 @@ describe('App', () => {
       'aria-current',
     );
 
+    await user.click(within(nav).getByRole('link', { name: 'Adjustments' }));
+
+    expect(await screen.findByRole('form', { name: 'Record an adjustment' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 2, name: 'Adjustments' })).toBeInTheDocument();
+    expect(currentPath()).toBe('/adjustments');
+    expect(within(nav).getByRole('link', { name: 'Adjustments' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+    for (const other of ['Dashboard', 'Wallets', 'Exchanges']) {
+      expect(within(nav).getByRole('link', { name: other })).not.toHaveAttribute('aria-current');
+    }
+
     await user.click(within(nav).getByRole('link', { name: 'Dashboard' }));
 
     expect(await screen.findByRole('heading', { name: /no wallets yet/i })).toBeInTheDocument();
     expect(currentPath()).toBe('/');
+    expect(within(nav).getByRole('link', { name: 'Adjustments' })).not.toHaveAttribute(
+      'aria-current',
+    );
   });
 
   it('shows no navigation while signed out', async () => {
@@ -150,6 +173,7 @@ describe('App', () => {
     expect(screen.queryByRole('navigation', { name: 'Main' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'Wallets' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'Exchanges' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Adjustments' })).not.toBeInTheDocument();
   });
 
   it('/wallets requires a session', async () => {
@@ -185,6 +209,54 @@ describe('App', () => {
     expect(urls.filter((url) => new URL(url).pathname.startsWith('/api/exchanges'))).toEqual([]);
     expect(screen.queryByRole('heading', { name: 'Exchanges' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Sync now' })).not.toBeInTheDocument();
+  });
+
+  it('/adjustments requires a session', async () => {
+    // Spec 027, criterion 5. Signed out, with adjustments on the server that must not be read.
+    const adjustments = fakeAdjustments({
+      adjustments: threeAdjustments(),
+      firstTrades: threeFirstTrades(),
+    });
+    server.use(...adjustments.handlers);
+    const urls = recordRequestUrls();
+
+    renderApp(['/adjustments?asset=BTC']);
+
+    await waitFor(() => {
+      expect(currentPath()).toBe('/login');
+    });
+    await settle();
+    expect(currentPath()).toBe('/login');
+    expect(loginFormIsShown()).toBe(true);
+    // The guard decides before the page mounts: nothing about adjustments, first trades or
+    // positions was even asked for.
+    expect(urls.filter((url) => new URL(url).pathname.startsWith('/api/accounting'))).toEqual([]);
+    expect(adjustments.requests).toEqual([]);
+    expect(screen.queryByRole('heading', { name: 'Adjustments' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Record an adjustment' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    expect(screen.queryByText('BTC')).not.toBeInTheDocument();
+  });
+
+  it('returns to /adjustments, with its asset, after signing in from a redirect', async () => {
+    const user = userEvent.setup();
+    server.use(
+      ...fakeSession().handlers,
+      ...fakeAdjustments({ adjustments: threeAdjustments(), firstTrades: threeFirstTrades() })
+        .handlers,
+    );
+
+    renderApp(['/adjustments?asset=KAS']);
+    await user.type(await screen.findByLabelText(/username/i), TEST_USERNAME);
+    await user.type(screen.getByLabelText(/password/i), TEST_PASSWORD);
+    await user.click(screen.getByRole('button', { name: /sign in/i }));
+
+    const form = await screen.findByRole('form', { name: 'Record an adjustment' });
+    await settle();
+    expect(currentPath()).toBe('/adjustments?asset=KAS');
+    // The link from the holdings check survives the detour through the login page.
+    expect(within(form).getByLabelText('Asset')).toHaveValue('KAS');
+    expect(await screen.findByRole('rowheader', { name: 'KAS' })).toBeInTheDocument();
   });
 
   it('returns to /exchanges after signing in from a redirect', async () => {

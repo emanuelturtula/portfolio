@@ -24,6 +24,7 @@ import {
   type PositionsInput,
   type PositionsResponse,
 } from '@/test/accountingFixtures';
+import { firstTrade, firstTrades } from '@/test/adjustmentFixtures';
 import {
   accountSucceeded,
   erroredExchange,
@@ -38,6 +39,7 @@ import {
   RECONCILIATION_PATH,
   type FakeAccounting,
 } from '@/test/fakeAccounting';
+import { fakeAdjustments } from '@/test/fakeAdjustments';
 import { fakeExchanges, type FakeExchanges, type FakeExchangesOptions } from '@/test/fakeExchanges';
 import { fakePortfolio, type FakePortfolioOptions } from '@/test/fakePortfolio';
 import { emptyPortfolio, healthyPortfolio, NOW } from '@/test/fixtures';
@@ -108,9 +110,9 @@ const GUIDANCE =
   'than an exchange keeps, or coins acquired elsewhere, and average cost and profit then leave ' +
   'those units out. Before recording anything, rule out coins in transit: readings are taken ' +
   'at different moments, so coins moved between two of them are counted twice until both ' +
-  'have been read again. How old each reading is, is shown below the lists. If the gap is ' +
-  'real, an opening balance records what is really missing: see "Recording what the history ' +
-  'does not show" in docs/accounting.md.';
+  'have been read again. How old each reading is, is shown below the lists.';
+/** Spec 027: the line after the guidance, followed by one link per asset listed. */
+const RECORD_PROMPT = 'If the gap is real, record the missing coins for:';
 const OVER_EXPLANATION =
   'The history accounts for more than the balances read. The causes include coins held where ' +
   'this application does not read them (another wallet, an Earn product, or a futures or ' +
@@ -296,6 +298,20 @@ function readTable(table: HTMLElement): { columns: string[]; rows: RenderedRow[]
 /** The table of the assets held beyond their history, found by the heading that names it. */
 function shortTable(block: HTMLElement, count: number): HTMLElement {
   return within(block).getByRole('table', { name: `Held exceeds history (${String(count)})` });
+}
+
+/** The line that offers the way out: the paragraph the prompt starts. */
+function recordLine(block: HTMLElement): HTMLElement {
+  return within(block).getByText((_text, element) => {
+    return element?.tagName === 'P' && element.textContent.startsWith(RECORD_PROMPT);
+  });
+}
+
+/** Every link inside `element`: its text and where it goes. */
+function linksIn(element: HTMLElement): { text: string; href: string | null }[] {
+  return within(element)
+    .queryAllByRole('link')
+    .map((link) => ({ text: link.textContent, href: link.getAttribute('href') }));
 }
 
 /** The disclosure of the assets whose history is above the balances read. */
@@ -1201,7 +1217,7 @@ describe('HoldingsCheck: held exceeds history', () => {
     }
   });
 
-  it('says what it means, what it does to the figures, and where the fix is documented', async () => {
+  it('says what it means, what it does to the figures, and what to rule out first', async () => {
     openDashboard({ reconciliation: btcShort() });
 
     const block = await holdingsCheck();
@@ -1209,8 +1225,11 @@ describe('HoldingsCheck: held exceeds history', () => {
     const table = shortTable(block, 1);
     // Above the table, as the reason to read it.
     expect(guidance.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // The documentation is named, not linked: the page that records it is not built yet (#111).
-    expect(within(block).queryByRole('link')).toBeNull();
+    // Spec 027: the pointer to the documentation is gone, now that there is a page to link to.
+    expect(guidance.tagName).toBe('P');
+    expect(guidance).not.toHaveTextContent('docs/accounting.md');
+    expect(block).not.toHaveTextContent('docs/accounting.md');
+    expect(block).not.toHaveTextContent('Recording what the history does not show');
     expect(within(block).getByText(DIFFERENCE_LEGEND)).toBeInTheDocument();
     // R10: it says how old each reading is "is shown below the lists", and it is - a finding
     // needs something held, so a compared source, so a reading to list.
@@ -1224,6 +1243,147 @@ describe('HoldingsCheck: held exceeds history', () => {
     // Beside a finding, nothing says the quantities match.
     expect(block).not.toHaveTextContent(ALL_MATCH);
     expect(block).not.toHaveTextContent(NOTHING_TO_COMPARE);
+  });
+
+  it('links the asset to the page that records the missing coins (spec 027, criterion 15)', async () => {
+    openDashboard({ reconciliation: btcShort() });
+
+    const block = await holdingsCheck();
+    const line = recordLine(block);
+    // After the guidance, which says what to rule out before recording anything.
+    const guidance = within(block).getByText(GUIDANCE);
+    expect(guidance.compareDocumentPosition(line) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(line).toHaveTextContent(`${RECORD_PROMPT} BTC`);
+    // Inside the finding's own box, not loose in the block.
+    expect(line.closest('.holdings-short')).not.toBeNull();
+    // The asset is the link's text, and the only link in the whole block.
+    expect(linksIn(line)).toEqual([{ text: 'BTC', href: '/adjustments?asset=BTC' }]);
+    expect(linksIn(block)).toEqual([{ text: 'BTC', href: '/adjustments?asset=BTC' }]);
+  });
+
+  it('links each asset held beyond its history, in the order they are listed, and no other', async () => {
+    openDashboard({
+      positions: investedPortfolio(),
+      reconciliation: investedPortfolioGaps(),
+      exchanges: bothVenues(),
+    });
+
+    const block = await holdingsCheck();
+    const line = recordLine(block);
+
+    // BTC, ETH and XRP are short. KAS matches and SOL is over: neither has a link, here or
+    // anywhere else in the block.
+    expect(linksIn(line)).toEqual([
+      { text: 'BTC', href: '/adjustments?asset=BTC' },
+      { text: 'ETH', href: '/adjustments?asset=ETH' },
+      { text: 'XRP', href: '/adjustments?asset=XRP' },
+    ]);
+    expect(linksIn(block)).toEqual(linksIn(line));
+    expect(line).toHaveTextContent(`${RECORD_PROMPT} BTC, ETH, XRP`);
+    expect(linksIn(overDisclosure(block))).toEqual([]);
+    // The tables name the assets and link nothing.
+    expect(linksIn(shortTable(block, 3))).toEqual([]);
+  });
+
+  it('carries the asset over and nothing else: never the difference shown beside it', async () => {
+    // Spec 027, non-goals: the quantity is never prefilled. The difference can include coins
+    // in transit between two readings (spec 025, R9 and R10).
+    openDashboard({ reconciliation: btcShort() });
+
+    const [link] = within(recordLine(await holdingsCheck())).getAllByRole('link');
+    const href = link?.getAttribute('href') ?? '';
+    const [path, query] = href.split('?');
+
+    expect(path).toBe('/adjustments');
+    expect([...new URLSearchParams(query).entries()]).toEqual([['asset', 'BTC']]);
+    expect(href).not.toContain(BTC_BEYOND.difference);
+    expect(href).not.toContain('0.37345678');
+  });
+
+  it.each([
+    ['A&B', '/adjustments?asset=A%26B'],
+    ['$MYRO', '/adjustments?asset=%24MYRO'],
+    ['T#1', '/adjustments?asset=T%231'],
+    ['L 2', '/adjustments?asset=L+2'],
+    ['C+', '/adjustments?asset=C%2B'],
+    ['A&B#C', '/adjustments?asset=A%26B%23C'],
+    ['Q?=', '/adjustments?asset=Q%3F%3D'],
+  ])(
+    'encodes the asset %j in the link, so it cannot change what the link means',
+    async (asset, href) => {
+      // A venue's symbol is data. Concatenated into the URL, `A&B` would be an asset `A` and a
+      // parameter `B`, and `T#1` an asset `T` and a fragment.
+      openDashboard({
+        positions: emptySnapshot(),
+        reconciliation: reconciliation({
+          assets: [
+            assetReconciliation({
+              asset,
+              history_quantity: ZERO,
+              wallet_quantity: ZERO,
+              exchange_quantity: '2.000000000000000000',
+              held_quantity: '2.000000000000000000',
+              difference: '2.000000000000000000',
+            }),
+          ],
+        }),
+      });
+
+      const line = recordLine(await holdingsCheck());
+
+      expect(linksIn(line)).toEqual([{ text: asset, href }]);
+      // And the page that reads it back gets the asset exactly.
+      expect(new URLSearchParams(href.slice(href.indexOf('?'))).get('asset')).toBe(asset);
+    },
+  );
+
+  it('the link opens the adjustments page with the asset filled in, and nothing else', async () => {
+    const adjustments = fakeAdjustments({ firstTrades: firstTrades([firstTrade('BTC')]) });
+    const { user } = openDashboard({
+      reconciliation: btcShort(),
+      overrides: adjustments.handlers,
+    });
+
+    await user.click(within(recordLine(await holdingsCheck())).getByRole('link', { name: 'BTC' }));
+
+    const form = await screen.findByRole('form', { name: 'Record an adjustment' });
+    expect(currentPath()).toBe('/adjustments?asset=BTC');
+    expect(within(form).getByLabelText('Asset')).toHaveValue('BTC');
+    // The difference the block showed is not carried over: the owner states the quantity.
+    expect(within(form).getByLabelText('Quantity')).toHaveValue('');
+    expect(within(form).getByLabelText('Unit cost (USD)')).toHaveValue('');
+    expect(within(form).getByLabelText('Acquired on')).toHaveValue('');
+    expect(within(form).getByLabelText('Note')).toHaveValue('');
+  });
+
+  it('an asset whose symbol needs encoding arrives on the page as it is spelled', async () => {
+    // `&` would start a second parameter and `#` a fragment: either one, unencoded, would
+    // cut the asset short on its way to the field.
+    const adjustments = fakeAdjustments();
+    const { user } = openDashboard({
+      positions: emptySnapshot(),
+      reconciliation: reconciliation({
+        assets: [
+          assetReconciliation({
+            asset: 'A&B#C',
+            history_quantity: ZERO,
+            wallet_quantity: ZERO,
+            exchange_quantity: '2.000000000000000000',
+            held_quantity: '2.000000000000000000',
+            difference: '2.000000000000000000',
+          }),
+        ],
+      }),
+      overrides: adjustments.handlers,
+    });
+
+    await user.click(
+      within(recordLine(await holdingsCheck())).getByRole('link', { name: 'A&B#C' }),
+    );
+
+    const form = await screen.findByRole('form', { name: 'Record an adjustment' });
+    expect(currentPath()).toBe('/adjustments?asset=A%26B%23C');
+    expect(within(form).getByLabelText('Asset')).toHaveValue('A&B#C');
   });
 
   it('puts the table in a keyboard-reachable region named by its heading', async () => {

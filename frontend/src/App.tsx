@@ -4,6 +4,7 @@ import { NavLink, Route, Routes } from 'react-router-dom';
 import { describeApiError } from '@/api/client';
 import { logout, sessionQueryKey, useSession } from '@/api/session';
 import { RequireSession } from '@/components/RequireSession';
+import { AdjustmentsPage } from '@/pages/AdjustmentsPage';
 import { DashboardPage } from '@/pages/DashboardPage';
 import { ExchangesPage } from '@/pages/ExchangesPage';
 import { HealthPage } from '@/pages/HealthPage';
@@ -17,8 +18,8 @@ import { WalletsPage } from '@/pages/WalletsPage';
  *
  * `/login` is the only public route. Everything else - including the
  * catch-all - is wrapped in `RequireSession`, per the route table in
- * docs/specs/004-login-page-and-app-shell.md, extended by #11 for `/wallets` and by #16 for
- * `/exchanges`.
+ * docs/specs/004-login-page-and-app-shell.md, extended by #11 for `/wallets`, by #16 for
+ * `/exchanges` and by #111 for `/adjustments`.
  */
 export function App() {
   return (
@@ -56,6 +57,14 @@ export function App() {
             }
           />
           <Route
+            path="/adjustments"
+            element={
+              <RequireSession>
+                <AdjustmentsPage />
+              </RequireSession>
+            }
+          />
+          <Route
             path="/health"
             element={
               <RequireSession>
@@ -78,7 +87,7 @@ export function App() {
 }
 
 /**
- * Links between the dashboard and the wallets page. Renders only when a session exists,
+ * Links between the dashboard and the pages beside it. Renders only when a session exists,
  * like {@link AccountControls} - a signed-out visitor never reaches either destination, so
  * showing the links to them would be navigation to nowhere.
  */
@@ -96,6 +105,7 @@ function MainNav() {
       </NavLink>
       <NavLink to="/wallets">Wallets</NavLink>
       <NavLink to="/exchanges">Exchanges</NavLink>
+      <NavLink to="/adjustments">Adjustments</NavLink>
     </nav>
   );
 }
