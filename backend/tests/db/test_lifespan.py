@@ -90,6 +90,11 @@ def lifespan_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_EXCHANGE_SYNC_ENABLED", "false")
     monkeypatch.delenv("PORTFOLIO_EXCHANGE_HISTORY_START", raising=False)
+    # #22's backup timer too. It is the first timer to reach its sleep when a copy is recent,
+    # which is what `PacedSleep.reached()` waits for, so left on it answered for the timer a
+    # test is about. Its directory is under `tmp_path` in case a test turns it back on.
+    monkeypatch.setenv("PORTFOLIO_BACKUP_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_BACKUP_DIR", str(tmp_path / "lifespan" / "backups"))
     # Offline unless a test says otherwise: see `tests/offline_http.py`. The two tests here
     # whose subject is the client itself take the real one back and prove they got it.
     use_an_offline_http_client(monkeypatch)

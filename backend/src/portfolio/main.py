@@ -57,6 +57,7 @@ from portfolio.services.accounting import (
     build_accounting_service,
     utc_now,
 )
+from portfolio.services.backup import BackupService, build_backup_service
 from portfolio.services.balance_sync import build_balance_sync_service
 from portfolio.services.exchange_sync import build_exchange_sync_service
 from portfolio.services.price_refresh import build_price_refresh_service
@@ -87,6 +88,9 @@ EXCHANGE_SYNC_LOG_PREFIX: Final = "exchange_sync"
 
 ACCOUNTING_STARTUP_TASK_NAME: Final = "accounting-startup-recompute"
 """The startup recompute's task name, as `app.state.accounting_startup_task` carries it."""
+
+BACKUP_TASK_NAME: Final = "backup"
+"""The backup timer's name in every log line the scheduler writes, and in its task's name."""
 
 _logger = structlog.get_logger(__name__)
 
@@ -147,6 +151,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     upgrade, whose new `ENGINE_VERSION` changes every fingerprint. The other two triggers are a
     sync that stored a fill, and a change to a manual adjustment (#18), which reaches the
     trigger through `app.state.accounting_recompute`.
+
+    ## The backups (#22)
+
+    A fourth timer, `backup_scheduler_for`, over the `BackupService` that `create_app`
+    published as `app.state.backup_service`. It shares nothing with the other three, so a
+    failing copy stops no sync and no sync stops a copy. Its "last run" is the newest copy's
+    instant, read from the backup directory, so a restart takes no extra copy and a fresh
+    volume gets one at startup. It is stopped **last of the timers** (ruling R15 of spec 029),
+    and before the engine is disposed. A copy in flight finishes and logs its outcome first,
+    because `BackupService` lets the timer's cancellation through only after the copy has ended
+    (ruling R9), and the copy holds connections of its own rather than the engine's; the other
+    timers are already stopped by then, so none of them starts a tick while it waits. What
+    that costs the shutdown is counted in `drain_coordinators`.
     """
     settings = get_settings()
     ensure_database_directory(settings.database_url)
@@ -188,15 +205,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.exchange_scheduler = exchange_scheduler_for(
             app, settings, exchange_coordinator, configured
         )
-        # Three timers, three tasks, sharing nothing but a class. That is what makes "a
-        # failed price refresh does not stop the balance sync" structural rather than a
-        # promise, and the same for a venue refusing a key.
+        app.state.backup_scheduler = backup_scheduler_for(settings, app.state.backup_service)
+        # Four timers, four tasks, sharing nothing but a class. That is what makes "a failed
+        # price refresh does not stop the balance sync" structural rather than a promise, and
+        # the same for a venue refusing a key or a backup that cannot be written.
         schedulers = [
             timer
             for timer in (
                 app.state.balance_scheduler,
                 app.state.price_scheduler,
                 app.state.exchange_scheduler,
+                app.state.backup_scheduler,
             )
             if timer is not None
         ]
@@ -206,12 +225,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         # Ordered, and the order is the content. The startup recompute is cancelled and
         # awaited first: it is derived data, the next startup computes it again, and nothing
-        # is lost by abandoning it. Every timer stops next so that no new tick can start; the
-        # syncs already in flight then get their grace periods, side by side; the sweeps
-        # record whatever did not finish; and only then are the client and the engine taken
-        # away, because a sync still running would need both.
+        # is lost by abandoning it. Every timer stops next so that no new tick can start, the
+        # backup timer last: stopping it waits for a copy in flight, and a timer still running
+        # meanwhile could start a sync that then needs its grace period too. The syncs already
+        # in flight then get their grace periods, side by side; the sweeps record whatever did
+        # not finish; and only then are the client and the engine taken away, because a sync
+        # still running would need both.
         await cancel_and_wait(startup_recompute)
-        for scheduler in reversed(schedulers):
+        others = [timer for timer in reversed(schedulers) if timer.name != BACKUP_TASK_NAME]
+        backup = [timer for timer in schedulers if timer.name == BACKUP_TASK_NAME]
+        for scheduler in (*others, *backup):
             await scheduler.stop()
         await drain_coordinators(
             (coordinator, settings.balance_sync_shutdown_grace_seconds),
@@ -237,6 +260,22 @@ async def drain_coordinators(*coordinators: tuple[Drainable | None, int]) -> Non
     Concurrently because the deployment's `stop_grace_period` is twenty seconds: two
     ten-second grace periods in sequence would leave nothing for the sweeps and the engine
     before the container is killed. A coordinator that was never built is skipped.
+
+    **The shutdown's arithmetic has a third term: a backup in flight.** The timers are stopped
+    before this runs, the backup timer last, and stopping it waits for a copy already under
+    way: `BackupService` holds the timer's cancellation until the copy has ended and logged
+    its outcome, then lets it through (ruling R9 of spec 029; an anyio thread call alone would
+    not, because a native task cancellation does not wait for the thread). So the worst case
+    is the copy, *then* the longer of the two grace periods, then the sweeps and the disposal:
+    the copy plus ten seconds plus well under one, against twenty. The owner's database copies
+    in well under a second -- a 65 MB database took under 200 ms on a development machine --
+    so the budget is not at risk. What would put it at risk is a copy that takes more than
+    about nine seconds: a database grown to many gigabytes on slow storage, or a backup disk
+    that stops answering and leaves the copy's write hanging. Docker then kills the container.
+    The live database is safe even so -- a copy only reads it -- the unfinished copy's
+    temporary file is removed by an attempt more than an hour later, and a sync cut short is
+    recorded as interrupted by the next start's sweep. If the database ever grows that large,
+    raise `stop_grace_period` in `deploy/compose.yml` rather than shortening a grace period.
 
     **Never raises**: `drain` already handles its own run's failure and cancellation, and
     anything else that escapes one drain is logged here, so that the other drain, both sweeps
@@ -401,6 +440,46 @@ def exchange_scheduler_for(
         name=EXCHANGE_SYNC_TASK_NAME,
         interval_minutes=settings.exchange_sync_interval_minutes,
         last_run_at=lambda: latest_exchange_sync_attempt(app),
+        run=run,
+    )
+
+
+def backup_scheduler_for(settings: Settings, service: BackupService) -> IntervalScheduler | None:
+    """Build the backup timer, or `None` when `PORTFOLIO_BACKUP_ENABLED` is false.
+
+    The switch stops the timer and nothing else: `python -m portfolio backup`, `list-backups`
+    and `restore-backup` build their own service and work either way, and the endpoint still
+    serves the copies there are, as `disabled`.
+
+    `last_run_at` is `BackupService.last_run_at`, the newest copy's instant, so the
+    scheduler's first-run rule applies as written: a fresh volume, or a newest copy older than
+    one interval, gets a copy at startup, and otherwise the timer sleeps what is left of the
+    interval. It counts **successes**, unlike the balance timer's attempts, because a failed
+    attempt leaves no file; a container that crash-loops while copies keep failing therefore
+    tries once per restart. A copy is local work against a local disk rather than a request to
+    someone else's API, so that costs nothing anybody bans you for.
+
+    **It never raises** (ruling R4 of spec 029). A backup directory that cannot be listed
+    answers `None`, so the timer attempts a copy at startup and records the failure, rather
+    than taking the scheduler's "wait a whole interval" path for a question it could not ask
+    -- a path that suits a public API and leaves a backup that cannot be kept unrecorded for a
+    day. The rule is the service's, so `IntervalScheduler` keeps its general one.
+
+    The tick is `take_scheduled`, which records the outcome for `GET /api/health/detail` and
+    swallows a `BackupError` after logging it, so the loop goes on.
+    """
+    if not settings.backup_enabled:
+        _logger.info("scheduler_disabled", scheduler=BACKUP_TASK_NAME)
+        return None
+
+    async def run(at_startup: bool) -> None:
+        del at_startup  # A copy is the same work whenever it is taken.
+        await service.take_scheduled()
+
+    return IntervalScheduler(
+        name=BACKUP_TASK_NAME,
+        interval_minutes=settings.backup_interval_minutes,
+        last_run_at=service.last_run_at,
         run=run,
     )
 
@@ -769,6 +848,10 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
     install_auth_runtime(app, settings)
     install_accounting_runtime(app)
+    # From the factory rather than the lifespan, for the reason `install_auth_runtime` gives:
+    # it holds the timer's last attempt, which `GET /api/health/detail` serves, and building it
+    # reads nothing from the file system, so `create_app()` stays free of side effects.
+    app.state.backup_service = build_backup_service(settings)
 
     # Middleware runs before routing, which is the whole point: the SPA is mounted at the
     # root and matches every path, so a check that ran after routing would see an API

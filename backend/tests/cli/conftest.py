@@ -47,6 +47,9 @@ def cli_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     monkeypatch.setenv("PORTFOLIO_ARGON2_PARALLELISM", "1")
     monkeypatch.setenv("PORTFOLIO_BOOTSTRAP_USERNAME", OWNER_USERNAME)
     monkeypatch.delenv("PORTFOLIO_BOOTSTRAP_PASSWORD", raising=False)
+    # #22: `backup`, `list-backups` and `restore-backup` read the directory from the
+    # settings, and its default is under the working directory.
+    monkeypatch.setenv("PORTFOLIO_BACKUP_DIR", str(tmp_path / "cli" / "backups"))
     get_settings.cache_clear()
     try:
         yield database_path

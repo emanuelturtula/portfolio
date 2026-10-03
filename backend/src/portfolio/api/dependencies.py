@@ -38,6 +38,7 @@ from portfolio.services.auth import (
     Principal,
     build_auth_service,
 )
+from portfolio.services.backup import BackupService
 from portfolio.services.balances import BalanceService, build_balance_service
 from portfolio.services.exchanges import ExchangeService, build_exchange_service
 from portfolio.services.password_hasher import PasswordHasher
@@ -268,6 +269,29 @@ def get_accounting_status(request: Request) -> AccountingStatus | None:
     """
     status = getattr(request.app.state, "accounting_status", None)
     return status if isinstance(status, AccountingStatus) else None
+
+
+def get_backup_service(request: Request) -> BackupService:
+    """The process-wide backup service, which `create_app` installed.
+
+    **Not built per request**, for the reason the coordinators are not: the service holds the
+    timer's last attempt, which `GET /api/health/detail` serves, and a service built for one
+    request would know nothing of it. It is installed by `create_app` rather than the lifespan,
+    as the accounting runtime is, so that it exists for a test that never starts the lifespan;
+    building it reads nothing from the file system.
+
+    Raises:
+        RuntimeError: the application was built without one -- not reachable through
+            `create_app`, and a clear failure is better than an `AttributeError`.
+    """
+    service = getattr(request.app.state, "backup_service", None)
+    if not isinstance(service, BackupService):
+        message = (
+            "No backup service is installed. It is built in `portfolio.main.create_app` and "
+            "published on `app.state.backup_service`."
+        )
+        raise RuntimeError(message)
+    return service
 
 
 def get_principal(request: Request) -> Principal:
