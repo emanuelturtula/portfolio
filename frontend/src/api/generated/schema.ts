@@ -1878,8 +1878,8 @@ export interface components {
          * @description How one timer stands. The member is its wire form.
          *
          *     * `ok` -- running, and not late.
-         *     * `late` -- running, and its last finished tick, or its start before the first tick, is more
-         *       than `LATE_AFTER_INTERVALS` intervals old.
+         *     * `late` -- running, and more than `LATE_AFTER_INTERVALS` intervals old: the tick in flight
+         *       since it started, or otherwise its last finished tick, or its start before the first.
          *     * `stopped` -- the timer was built and its task is not running.
          *     * `disabled` -- the settings switched the timer off, so it was never built. The exchange
          *       timer is also not built when no venue is configured.
