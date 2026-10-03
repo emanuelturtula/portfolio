@@ -479,7 +479,7 @@ def test_bringing_one_back_gives_it_to_the_containers_user() -> None:
 
     assert "run --rm --no-deps -u root" in text
     assert "chown app:app /app/backups/portfolio-" in text
-    assert "This command has not been run on the Pi yet" in text
+    assert "It was run on the Pi on 2026-10-03" in text
 
 
 # --------------------------------------------------------------------------------------
