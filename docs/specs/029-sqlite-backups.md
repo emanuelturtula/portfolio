@@ -1,7 +1,7 @@
 # 029 — Scheduled SQLite backups and a tested restore
 
 Issue: #22
-Status: done, except criterion 14, which runs on the Pi after the merge
+Status: done. Criterion 14 passed on the Pi on 2026-10-03 (see *Criterion 14 on the Pi*)
 
 ## Problem
 
@@ -318,6 +318,48 @@ The router calls the service. It does not touch the file system itself.
     copy taken with the application stopped, and the row counts before and after are
     equal. The result is recorded in this spec without any owner data.
 
+## Criterion 14 on the Pi
+
+Run on 2026-10-03 against the live deployment, v0.29.0, a few minutes after PR #123 was
+deployed, with the owner's allowance for the SSH session. The steps were those of
+`docs/operations.md`, section 17, *Restoring one*, through `~/portfolio-app/prod/compose.sh`:
+
+1. `list-backups` with the application running listed one copy, the one the timer took at
+   startup. The volume was new and empty, so that copy was due at once, as the first-run rule
+   says.
+2. `stop app`. The data directory then held `portfolio.db` alone, with no `-wal`: the
+   application closed the database cleanly.
+3. `run --rm --no-deps app python -m portfolio backup` took a copy with the application
+   stopped.
+4. `run --rm --no-deps app python -m portfolio restore-backup <that copy>` restored it. It
+   exited 0, took a safety copy first, and printed the row counts of all 20 tables.
+5. `start app`. The container was healthy about 20 seconds later. `GET /api/health` answered
+   `ok` for v0.29.0, and the log had no `error` line.
+
+**The row counts were equal.** The counts were compared without ever leaving the host. A
+one-off script printed only the number of tables and a SHA-256 of the sorted `table:count`
+lines. It ran three times:
+
+- on the live database before the restore, read with `immutable=1` so that no sidecar file
+  made the restore refuse;
+- on the counts the restore printed;
+- on the live database after the restore.
+
+All three gave 20 tables and the same digest. The script and the captured output were
+deleted from the host afterwards.
+
+The copy-off and bring-back commands of *Copying one off the host* and *Bringing a copy back
+onto the host* were run as written, on the restore's safety copy:
+
+- `compose.sh cp` copied it out to the home directory.
+- The root one-off container copied it back to the same name, as `app:app`, mode `0600`.
+- Its SHA-256 was the same at each step, and `list-backups` listed it.
+- The copy in the home directory was removed.
+
+The one difference observed: copies the application writes are mode `0644`, while one brought
+back is `0600`. Both live in the `backups` volume, where only the container's user and root
+can reach them, so this was left as it is.
+
 ## File ownership
 
 | Agent | Files |
@@ -403,7 +445,7 @@ The tech lead owns this spec and does the browser check at 1280 px and 375 px.
   - Do not merge to `main` while a restore is in progress: the deployment would start a new
     container on the database being written.
   - Bringing a copy back from off the host: a root one-off container copies it into
-    `/app/backups` and gives it to `app`, because `docker cp` creates files as root. This is
+    `/app/backups` and gives it to `app`, because `docker cp` creates files as root. It was
     checked on the Pi with criterion 14.
 - **R8. Accepted as they are (reviewer nits).**
   - A copy named in the future, after the clock was once ahead, stays `latest_at` until

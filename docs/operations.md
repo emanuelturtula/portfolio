@@ -1771,8 +1771,8 @@ rm ~/portfolio-20261001T030000123456Z.sqlite3
 Keep the name exactly as it was: only a file named like a copy is listed or restored. Then
 `list-backups` shows it, and *Restoring one* applies. The image has `sh`, `cp`, `chown` and
 `chmod`: its own build runs `sh`, `mkdir` and `chown` in the final stage, and all four
-commands come from the base image's essential packages. **This command has not been run on
-the Pi yet**; it is checked there with acceptance criterion 14 of spec 029.
+commands come from the base image's essential packages. It was run on the Pi on 2026-10-03,
+with v0.29.0, as part of acceptance criterion 14 of spec 029.
 
 ## 18. Logs: one line per record, one id per request, and what is redacted
 
