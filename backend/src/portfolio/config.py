@@ -8,6 +8,7 @@ carries a default that would be unsafe if it survived into production.
 import re
 from datetime import UTC, date, datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import Final, Literal, Self
 
 import httpx
@@ -33,6 +34,13 @@ INSECURE_SESSION_COOKIE_NAME: Final = "psid"
 
 PROVIDER_URL_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
 """The schemes a provider base URL may use. `https` everywhere except a local index."""
+
+MINIMUM_BACKUP_INTERVAL_MINUTES: Final = 60
+"""The shortest `PORTFOLIO_BACKUP_INTERVAL_MINUTES` startup accepts (ruling R14 of spec 029).
+
+Rotation keeps every copy on the most recent dates, so the copies kept multiply as the
+interval shrinks, on the database's own disk.
+"""
 
 
 def provider_url_violation(url: str) -> str | None:
@@ -452,6 +460,37 @@ class Settings(BaseSettings):
     exchange_sync_interval_minutes: int = 15
     exchange_sync_shutdown_grace_seconds: int = 10
 
+    # Scheduled copies of the database (#22, spec 029). Past an exchange's retention window the
+    # database is the only record of the owner's trades, and of everything entered by hand.
+    #
+    # `enabled` switches the timer off and nothing else: `python -m portfolio backup`,
+    # `list-backups` and `restore-backup` work either way, for the reason the sync switches
+    # leave their manual triggers alone.
+    #
+    # One day, in whole minutes, and never below an hour (ruling R14 of spec 029): rotation
+    # keeps every copy on the `keep_daily` most recent dates, so the number kept is about
+    # `keep_daily * 1440 / interval` -- 7 at the default, 168 hourly -- and they share the
+    # database's device.
+    #
+    # `dir` is where copies are written. The image sets `/app/backups` (R10), and the
+    # deployment's compose file mounts a volume of its own there, so that removing the data
+    # volume does not remove the copies. The relative default keeps a development checkout's
+    # copies beside its database, under the ignored `data/`.
+    #
+    # Retention: every copy on the `keep_daily` most recent days that have one, and the newest
+    # of each of the `keep_weekly` most recent ISO weeks that have one. `keep_daily` is at
+    # least one, so the copy just taken is never the one rotation deletes; `keep_weekly` may be
+    # zero.
+    #
+    # **The database file is not a setting here.** It is the one `database_url` names, and
+    # `db/backup.py` derives the path from it when a copy is taken -- not at startup, because
+    # the test suite runs on URLs with no file behind them.
+    backup_enabled: bool = True
+    backup_interval_minutes: int = 1440
+    backup_dir: Path = Path("./data/backups")
+    backup_keep_daily: int = 7
+    backup_keep_weekly: int = 4
+
     @property
     def session_cookie_name(self) -> str:
         """`__Host-psid`, degrading to `psid` on the one configuration that cannot use it."""
@@ -501,6 +540,11 @@ class Settings(BaseSettings):
           venue that signs in with the owner's key; and an exchange history start after
           today's UTC date plans nothing, which the owner would read as a working sync that
           found no trades.
+        * a backup interval below an hour multiplies the copies kept -- about
+          `keep_daily * 1440 / interval` of them, thousands at one minute -- on the disk the
+          database lives on, where a full disk stops the application's writes. A `keep_daily`
+          below one would delete the copy just taken, and a negative `keep_weekly` has no
+          meaning.
 
         Refusing to start turns every one of these into a container that fails its health
         check, which is a failure the deployment pipeline already knows how to roll back.
@@ -612,6 +656,29 @@ class Settings(BaseSettings):
                     f"consequence. To stop that timer, set {switch}=false."
                 )
                 raise ValueError(message)
+        # Not in the loop above: its message is about public APIs, and a backup asks none.
+        if self.backup_interval_minutes < MINIMUM_BACKUP_INTERVAL_MINUTES:
+            message = (
+                f"PORTFOLIO_BACKUP_INTERVAL_MINUTES must be at least "
+                f"{MINIMUM_BACKUP_INTERVAL_MINUTES}, got {self.backup_interval_minutes}. "
+                "Rotation keeps every copy of the most recent days, so a shorter interval "
+                "multiplies the copies kept -- about PORTFOLIO_BACKUP_KEEP_DAILY x 1440 / "
+                "interval of them -- and they share the database's disk, where a full disk "
+                "stops the application's writes. To stop that timer, set "
+                "PORTFOLIO_BACKUP_ENABLED=false."
+            )
+            raise ValueError(message)
+        if self.backup_keep_daily < 1:
+            message = (
+                f"PORTFOLIO_BACKUP_KEEP_DAILY must be at least 1, got {self.backup_keep_daily}: "
+                "rotation always keeps the newest copy."
+            )
+            raise ValueError(message)
+        if self.backup_keep_weekly < 0:
+            message = (
+                f"PORTFOLIO_BACKUP_KEEP_WEEKLY must be at least 0, got {self.backup_keep_weekly}."
+            )
+            raise ValueError(message)
         for name, url in (
             ("PORTFOLIO_BITCOIN_ESPLORA_URL", self.bitcoin_esplora_url),
             ("PORTFOLIO_BITCOIN_ESPLORA_FALLBACK_URL", self.bitcoin_esplora_fallback_url),

@@ -1,4 +1,7 @@
-"""Operator commands: `create-user`, `hash-benchmark` and `refresh-prices`.
+"""Operator commands: `create-user`, `hash-benchmark`, `refresh-prices`, and the backups.
+
+The backup commands are `backup`, `list-backups` and `restore-backup NAME` (#22, spec 029):
+take a copy of the database now, list the copies there are, and put one back.
 
 A sibling of `portfolio.api`, not a layer above it: both are entry points onto the same
 services, and neither imports the other. Everything here is a thin shell around
@@ -43,6 +46,7 @@ from portfolio.logging import configure_logging
 from portfolio.providers.http import build_http_client
 from portfolio.providers.prices.registry import price_sources
 from portfolio.services.auth import AuthError, LoginThrottle, build_auth_service
+from portfolio.services.backup import BackupError, RestoreRefusedError, build_backup_service
 from portfolio.services.password_hasher import PasswordHasher
 from portfolio.services.price_refresh import (
     UnknownAssetError,
@@ -50,6 +54,8 @@ from portfolio.services.price_refresh import (
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from portfolio.config import Settings
     from portfolio.services.price_refresh import RefreshReport
 
@@ -342,6 +348,74 @@ def refresh_prices(args: argparse.Namespace) -> int:
     return 0
 
 
+def take_backup(args: argparse.Namespace) -> int:
+    """`backup`: take a copy of the database now, then rotate, and print its name and size.
+
+    The same code as a scheduled copy, rotation included, so a copy taken by hand counts
+    towards the day it was taken in. It works whether or not the timer is enabled, and whether
+    or not the application is running: the copy is read-only and one consistent snapshot.
+    """
+    del args  # The command takes no options.
+    result = asyncio.run(build_backup_service(get_settings()).take())
+    emit(f"Took backup {result.name} ({result.size_bytes} bytes).")
+    if result.deleted:
+        emit(
+            f"Rotation deleted {len(result.deleted)} older backup(s): {', '.join(result.deleted)}."
+        )
+    return 0
+
+
+def list_backups(args: argparse.Namespace) -> int:
+    """`list-backups`: each copy's name, the UTC instant it was started, and its size.
+
+    Newest first, one per line. Only the files named like a copy are listed; anything else in
+    the directory is not one, and is left alone.
+    """
+    del args  # The command takes no options.
+    service = build_backup_service(get_settings())
+    copies = asyncio.run(service.list_backups())
+    if not copies:
+        emit(f"No backups in {service.directory}.")
+        return 0
+    for copy in copies:
+        emit(f"{copy.name}  {utc_text(copy.started_at)}  {copy.size_bytes} bytes")
+    return 0
+
+
+def restore_backup(args: argparse.Namespace) -> int:
+    """`restore-backup NAME`: put the copy `NAME` back as the live database.
+
+    The application must be stopped first: the command refuses while the database is open,
+    and `docs/operations.md` has the procedure. It takes a safety copy of the live database
+    before it writes, and prints that copy's name, so the restore can be undone with this same
+    command. A live database too damaged to copy is moved aside instead, and the line says
+    where (ruling R3 of spec 029). **The rows per table are printed here and nowhere else** --
+    never logged -- so the operator can compare them with the copy's.
+    """
+    name: str = args.name
+    result = asyncio.run(build_backup_service(get_settings()).restore(name))
+    emit(f"Restored {result.restored}.")
+    if result.safety_copy is not None:
+        emit(f"The database as it was before is in the safety copy {result.safety_copy}.")
+    elif result.damaged is not None:
+        emit(
+            "The live database opened but did not pass its own check, so no safety copy was "
+            f"taken: it was moved aside to {result.damaged}. Keep it until the restore is "
+            "checked, then delete it."
+        )
+    else:
+        emit("There was no database to copy first, so no safety copy was taken.")
+    emit("Rows per table after the restore:")
+    for table, rows in result.row_counts.items():
+        emit(f"  {table}: {rows}")
+    return 0
+
+
+def utc_text(instant: datetime) -> str:
+    """An instant as ISO 8601 in UTC with a `Z`, to the microsecond, as the API serves one."""
+    return instant.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The command line. Note what is absent: there is no way to pass a password."""
     parser = argparse.ArgumentParser(prog="portfolio", description=__doc__)
@@ -387,6 +461,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     refresh.set_defaults(handler=refresh_prices)
 
+    backup = commands.add_parser(
+        "backup",
+        help="take a copy of the database now, then rotate the copies",
+    )
+    backup.set_defaults(handler=take_backup)
+
+    listing = commands.add_parser(
+        "list-backups",
+        help="list the copies of the database, newest first",
+    )
+    listing.set_defaults(handler=list_backups)
+
+    restore = commands.add_parser(
+        "restore-backup",
+        help=(
+            "replace the database with a copy, after taking a safety copy of it "
+            "(the application must be stopped)"
+        ),
+    )
+    restore.add_argument("name", help="the copy's file name, as list-backups prints it")
+    restore.set_defaults(handler=restore_backup)
+
     return parser
 
 
@@ -411,10 +507,18 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(get_settings())
     try:
         exit_code: int = args.handler(args)
-    except (CommandError, PasswordPolicyError, AuthError, UnknownAssetError) as exc:
+    except (
+        CommandError,
+        PasswordPolicyError,
+        AuthError,
+        UnknownAssetError,
+        BackupError,
+        RestoreRefusedError,
+    ) as exc:
         # `UnknownAssetError` is a wiring mistake rather than a crash worth a traceback: a
         # supported pair whose asset was never seeded. The message names the symbol and the
-        # remedy, which is all an operator can act on.
+        # remedy, which is all an operator can act on. A `BackupError` or a refused restore is
+        # the same: its message says what failed, where, and what to do, in one line.
         emit_error(str(exc))
         return 1
     return exit_code

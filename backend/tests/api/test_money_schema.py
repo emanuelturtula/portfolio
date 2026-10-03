@@ -415,6 +415,9 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         # When each asset's imported history begins (#111), for the adjustments form's date
         # hint. No money crosses it: an asset and an instant, and nothing else.
         "/api/accounting/first-trades",
+        # How the scheduled backups stand (#22). No money crosses it: a state, instants, a
+        # count and an error kind, and no configuration value.
+        "/api/health/detail",
     }
 
 

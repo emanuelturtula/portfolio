@@ -1,7 +1,7 @@
 # Runtime manifest for the Raspberry Pi. Uploaded by the delivery pipeline for each
 # deployment, which stages it in ~/portfolio-app/prod/incoming/ and, once the container is
 # healthy, keeps it as ~/portfolio-app/prod/compose.yml. Nothing else persists on the host
-# except the data volume and that deployment state.
+# except the two volumes -- the data and the scheduled backups -- and that deployment state.
 #
 # Every PORTFOLIO_* variable below is set by deploy.py, or by the compose.sh it writes
 # beside the live copy. Run compose on the host through that script (docs/operations.md),
@@ -20,6 +20,10 @@ services:
     environment:
       PORTFOLIO_ENVIRONMENT: ${PORTFOLIO_ENVIRONMENT:?An environment name is required}
       PORTFOLIO_DATABASE_URL: sqlite+aiosqlite:////app/data/portfolio.db
+      # The scheduled copies of the database (#22), on the second volume below, so that
+      # removing the data volume does not remove them. Each copy holds the owner's complete
+      # financial data, as the database does. docs/operations.md, section 17.
+      PORTFOLIO_BACKUP_DIR: /app/backups
     # Application secrets (exchange API credentials, price provider keys) live in a
     # host-local file, ~/portfolio-app/prod/secrets.env, that deploy.py guarantees exists at
     # mode 0600. They are written once over SSH by the operator and never pass through
@@ -45,6 +49,7 @@ services:
       - ${PORTFOLIO_SECRETS_ENV_FILE:-/dev/null}
     volumes:
       - data:/app/data
+      - backups:/app/backups
     # Asserts both halves of the image: the API answers, and the single-page application
     # is actually being served. A container that starts but serves no UI is not healthy.
     healthcheck:
@@ -66,3 +71,4 @@ services:
 
 volumes:
   data:
+  backups:

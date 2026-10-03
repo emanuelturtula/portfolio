@@ -94,6 +94,9 @@ def accounting_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iter
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_EXCHANGE_SYNC_ENABLED", "false")
+    # #22's backup timer: off, and writing under `tmp_path` if a test turns it on.
+    monkeypatch.setenv("PORTFOLIO_BACKUP_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_BACKUP_DIR", str(tmp_path / "accounting" / "backups"))
     monkeypatch.delenv("PORTFOLIO_EXCHANGE_HISTORY_START", raising=False)
     monkeypatch.delenv("PORTFOLIO_BOOTSTRAP_PASSWORD", raising=False)
     # Cheap hashing: the lifespan warms the dummy hash, and the shipped cost is a quarter of

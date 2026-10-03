@@ -136,6 +136,10 @@ final name, so a power cut at any moment leaves at least one.
 The backup is there for a person to restore by hand. A failed deployment does not restore
 it: it restarts the previous image against the live database, as it always has.
 
+This backup is the deployment's own, and it is not the only copy of the database: the
+application also takes [scheduled backups](#scheduled-backups) of its own, for the problems
+this one cannot cover.
+
 ### Migrating from the previous layout
 
 Hosts deployed before #94 keep everything under `~/portfolio-app-deploy`, with one
@@ -176,6 +180,54 @@ refuses and changes nothing, so a person decides which one holds the live deploy
 refusal after the rename says the root was migrated. Anything of your own that refers to
 `~/portfolio-app-deploy`, such as a cron job or a script, needs the new path. The legacy
 application's `~/portfolio-deploy` is a different directory, and nothing here touches it.
+
+## Scheduled backups
+
+Bitget keeps 90 days of fills. Past that window the SQLite database is the only record of the
+owner's trade history, and of everything entered by hand: the wallets and the manual
+adjustments. So the application copies its own database on a timer, once a day by default,
+while it runs. Each copy is taken with SQLite's backup API, which reads one consistent
+snapshot without stopping the application's writes, and is checked with
+`PRAGMA integrity_check` before it is kept. Rotation keeps every copy on the 7 most recent
+days that have one, and the newest copy of each of the 4 most recent ISO weeks that have one.
+[Operations](operations.md), section 17, has the settings, how their state shows, and the
+restore procedure. The contract is spec 029.
+
+**A copy holds the owner's complete financial data, as the live database does**: every
+imported trade, every wallet address, every manual adjustment, and the owner's account with
+its password hash. It is not encrypted, as the live database is not. Treat a copy as you
+treat the database, wherever it ends up.
+
+### Where they are
+
+In a named Docker volume of their own, `backups`, mounted in the container at
+`/app/backups`, which the compose file sets as `PORTFOLIO_BACKUP_DIR`. Like the data volume,
+it lives where Docker keeps volumes rather than under `~/portfolio-app/`, and only the
+container's user and root can read it. It is a separate volume so that removing the data
+volume does not remove the copies, and so that a copy can be restored onto a new, empty data
+volume.
+
+### Not the deployment's backup, and why both exist
+
+`prod/backup/` ([One backup, and why](#one-backup-and-why)) is the database as it was just
+before the live deployment replaced it. It exists to undo the deployment that is live, the
+next deployment replaces it, and nothing is copied while no deployment happens. A problem
+noticed a week later, such as a bad import, a wrong manual delete or a corrupted file, has no
+copy from before it there. The scheduled copies are for that. Neither replaces the other, and
+`deploy.py` neither reads nor changes the scheduled copies.
+
+**Do not merge to `main` while a restore is in progress.** A merge deploys, and the deployment
+starts a new container on the database the restore is writing. Operations, section 17, has
+the restore procedure; finish it, including the check, before merging anything.
+
+### What they do not protect against
+
+**The copies are on the same device as the database, so they do not protect against losing
+the storage device.** A failed SD card or SSD, or a Pi that is stolen or destroyed, takes the
+copies with the database. That is the owner's ruling for now (spec 029): the copies protect
+against a bad migration, a corrupted file, a wrong delete and a problem noticed late, and
+getting copies off the host is a later decision. Until then, copy one off the host by hand
+from time to time. Operations, section 17, shows how.
 
 ## One-time setup
 

@@ -1,3 +1,4 @@
+import { BackupNotice } from '@/pages/dashboard/BackupNotice';
 import { InvestedSection } from '@/pages/dashboard/InvestedSection';
 import { ValueSection } from '@/pages/dashboard/ValueSection';
 
@@ -9,10 +10,14 @@ import { ValueSection } from '@/pages/dashboard/ValueSection';
  * Two sections rather than one page with one early return: each reads its own query and
  * owns its own loading, error and empty states, so an owner with trades and no wallets, or
  * wallets and no trades, still sees the half that has something to show.
+ *
+ * Above them, a warning when the scheduled backups failed or stopped, which is about the
+ * data underneath rather than about either section (spec 029).
  */
 export function DashboardPage() {
   return (
     <>
+      <BackupNotice />
       <ValueSection />
       <InvestedSection />
     </>

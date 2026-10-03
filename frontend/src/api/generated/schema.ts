@@ -439,6 +439,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/health/detail": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Report how the scheduled backups stand
+         * @description Return the backup's state, the newest copy's instant, the count and the last attempt.
+         */
+        get: operations["getHealthDetail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/wallets": {
         parameters: {
             query?: never;
@@ -871,6 +891,54 @@ export interface components {
              * @example 1234.56789012
              */
             wallet_quantity: string;
+        };
+        /**
+         * BackupErrorKind
+         * @description Why an attempt to take a copy of the database failed.
+         *
+         *     * `database_error` -- the live database could not be opened or read.
+         *     * `integrity_failed` -- the copy did not pass `PRAGMA integrity_check`, or does not hold
+         *       exactly one schema revision. It was not kept.
+         *     * `storage_error` -- writing, syncing, renaming or removing a file in the backup directory
+         *       failed: a full disk, or a directory the application may not write to.
+         * @enum {string}
+         */
+        BackupErrorKind: "database_error" | "integrity_failed" | "storage_error";
+        /**
+         * BackupState
+         * @description How the scheduled copies of the database stand. The first that applies:
+         *
+         *     * `unreadable` -- the backup directory cannot be listed, so the newest copy and the count
+         *       are unknown.
+         *     * `disabled` -- the backup timer is switched off.
+         *     * `failed` -- the timer's most recent attempt since the application started failed.
+         *     * `stale` -- the newest copy is older than two intervals; or there is no copy although an
+         *       attempt has finished.
+         *     * `pending` -- there is no copy yet, and no attempt has finished.
+         *     * `ok` -- otherwise, including before the first attempt when the newest copy is recent.
+         * @enum {string}
+         */
+        BackupState: "unreadable" | "disabled" | "failed" | "stale" | "pending" | "ok";
+        /**
+         * BackupStatusResponse
+         * @description How the scheduled copies of the database stand.
+         *
+         *     `latest_at` is the newest copy's instant, `null` with none; `count` is how many copies
+         *     there are. Both are `null` when `state` is `unreadable`: the backup directory cannot be
+         *     listed, so they are unknown, which is not the same as none. `last_attempt_at` and
+         *     `last_error_kind` describe the timer's most recent attempt in this process -- both `null`
+         *     before one, and `last_error_kind` `null` after a success. They are held in memory, so a
+         *     restart clears them.
+         */
+        BackupStatusResponse: {
+            /** Count */
+            count: number | null;
+            /** Last Attempt At */
+            last_attempt_at: string | null;
+            last_error_kind: components["schemas"]["BackupErrorKind"] | null;
+            /** Latest At */
+            latest_at: string | null;
+            state: components["schemas"]["BackupState"];
         };
         /**
          * ChainKey
@@ -1439,6 +1507,13 @@ export interface components {
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /**
+         * HealthDetailResponse
+         * @description The state of each source the application owns. Only `backup` so far.
+         */
+        HealthDetailResponse: {
+            backup: components["schemas"]["BackupStatusResponse"];
         };
         /**
          * HealthResponse
@@ -2552,6 +2627,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+        };
+    };
+    getHealthDetail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HealthDetailResponse"];
                 };
             };
         };

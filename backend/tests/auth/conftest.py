@@ -115,6 +115,13 @@ def apply_auth_environment(
     # working with the timer off is a claim that suite makes by name.
     monkeypatch.setenv("PORTFOLIO_EXCHANGE_SYNC_ENABLED", "false")
     monkeypatch.delenv("PORTFOLIO_EXCHANGE_HISTORY_START", raising=False)
+    # #22's backup timer is on by default and takes a copy at startup on a fresh volume, and
+    # its directory defaults to `./data/backups` under the working directory. Off, and the
+    # directory under `tmp_path` regardless, so a suite that turns the timer back on, or calls
+    # the service by hand, writes nowhere but its own temporary directory. The guard in
+    # `tests/conftest.py` fails any test that writes a copy into the working directory.
+    monkeypatch.setenv("PORTFOLIO_BACKUP_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_BACKUP_DIR", str(tmp_path / "auth" / "backups"))
     # The switches stop the application deciding to call a vendor; this stops the call
     # arriving anywhere if something decides to anyway -- and removes the SSL setup that
     # made every lifespan in the suite four times slower. A test whose subject is the real

@@ -1,6 +1,8 @@
 import { http, HttpResponse, type HttpHandler } from 'msw';
 import { setupServer } from 'msw/node';
 
+import { HEALTH_DETAIL_PATH, healthDetail } from './backupFixtures';
+
 /** Body the default `GET /api/health` handler answers with. */
 export const healthFixture = {
   status: 'ok',
@@ -185,9 +187,14 @@ async function readJsonBody(request: Request): Promise<unknown> {
  * Signed out is the safe default. A test that needs a session registers
  * `fakeSession({ initialUser: ... }).handlers`, so no test can drift into
  * asserting authenticated behaviour without having said so.
+ *
+ * The backup detail (spec 029) answers `ok`, the state that renders nothing on the
+ * dashboard: every dashboard and Health page test reads it, and a test about the backups
+ * replaces it with `serveBackup(...)` from `backupFixtures.ts`.
  */
 export const handlers: HttpHandler[] = [
   http.get(HEALTH_PATH, () => HttpResponse.json(healthFixture)),
+  http.get(HEALTH_DETAIL_PATH, () => HttpResponse.json(healthDetail())),
   http.get(SESSION_PATH, () => unauthorized()),
 ];
 

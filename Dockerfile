@@ -46,18 +46,28 @@ FROM python:3.12-slim
 
 ARG APP_VERSION=0.0.0-dev
 
+# PORTFOLIO_BACKUP_DIR is set here as well as in deploy/compose.yml (#22, ruling R10 of spec
+# 029). Without it, a container run outside compose would resolve the default
+# `./data/backups` against WORKDIR /app and write the copies inside the data volume, which is
+# the one place they must not be.
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONPATH=/app/src \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORTFOLIO_VERSION=${APP_VERSION} \
-    PORTFOLIO_ENVIRONMENT=prod
+    PORTFOLIO_ENVIRONMENT=prod \
+    PORTFOLIO_BACKUP_DIR=/app/backups
 
 # Non-root, with a data directory it owns. The SQLite database is the only permanent record
 # of trade history once an exchange's retention window passes, so the volume matters.
+#
+# /app/backups holds the scheduled copies of that database (#22). It is a directory of its
+# own, and a volume of its own below, so that removing the data volume does not remove the
+# copies. Docker gives a new named volume the owner of the image directory it is mounted on,
+# which is what lets the non-root user write to either.
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin app \
-    && mkdir -p /app/data \
-    && chown app:app /app/data
+    && mkdir -p /app/data /app/backups \
+    && chown app:app /app/data /app/backups
 
 WORKDIR /app
 
@@ -85,7 +95,7 @@ RUN python -c "import pathlib, sys; p = pathlib.Path('/app/src/portfolio/web/dis
 
 USER app
 
-VOLUME ["/app/data"]
+VOLUME ["/app/data", "/app/backups"]
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=6s --start-period=20s --retries=3 \

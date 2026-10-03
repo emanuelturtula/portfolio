@@ -1,7 +1,7 @@
 # 029 — Scheduled SQLite backups and a tested restore
 
 Issue: #22
-Status: in progress
+Status: done, except criterion 14, which runs on the Pi after the merge
 
 ## Problem
 
@@ -27,8 +27,8 @@ hand.
 
 - A scheduled backup, taken while the application runs, with the sqlite3 backup API.
 - An integrity check on every copy before it is kept.
-- Rotation: the newest copy of each of the last 7 days that have one, and the newest of
-  each of the last 4 weeks that have one.
+- Rotation: every copy on the last 7 days that have one, and the newest of each of the
+  last 4 weeks that have one (R5).
 - Three CLI commands: take a backup now, list them, and restore one.
 - `GET /api/health/detail` (authenticated) with the backup's state. #23 adds the other
   sources to this endpoint later.
@@ -105,7 +105,7 @@ The message never holds row data. Paths inside the container may appear in it.
 `backups_to_keep(instants, *, keep_daily, keep_weekly) -> frozenset[datetime]`:
 
 - **Daily:** group the instants by UTC calendar date, take the `keep_daily` most recent
-  dates **that have a copy**, and keep the newest copy of each.
+  dates **that have a copy**, and keep **every** copy on them (R5).
 - **Weekly:** group by ISO year and week, take the `keep_weekly` most recent weeks that
   have a copy, and keep the newest copy of each.
 - The answer is the union. "Most recent dates that have a copy" rather than "the last N
@@ -141,6 +141,7 @@ newest copy is old enough.
 
 | `state` | When |
 |---|---|
+| `unreadable` | the backup directory cannot be listed now (R4) |
 | `disabled` | `PORTFOLIO_BACKUP_ENABLED` is false |
 | `failed` | this process's most recent attempt failed |
 | `stale` | the newest copy is older than **two intervals**, or there is none, and an attempt has finished since startup |
@@ -272,7 +273,7 @@ The router calls the service. It does not touch the file system itself.
 - **Restoring**, step by step through `compose.sh`: `stop app`, then
   `run --rm --no-deps app python -m portfolio restore-backup NAME`, then `start app`, then
   check. It also covers what to do when the restore refuses.
-- Copying one off the host: `compose.sh cp app:/app/backups/NAME .` with the application
+- Copying one off the host: `compose.sh cp app:/app/backups/NAME ~/NAME` with the application
   running, then moving it off the host. **The copy holds financial data.**
 - A troubleshooting row for each `error_kind` and for each refusal.
 
@@ -283,22 +284,24 @@ The router calls the service. It does not touch the file system itself.
    self-contained (no `-wal` file needed), and its rows equal the live database's at one
    instant.
 2. A copy that fails the check is not kept, and nothing is rotated after a failure.
-3. Rotation keeps exactly the newest copy of each of the 7 most recent days that have one,
-   and of each of the 4 most recent ISO weeks that have one. It never deletes a file that
+3. Rotation keeps exactly every copy on the 7 most recent days that have one, and the
+   newest copy of each of the 4 most recent ISO weeks that have one (R5). It never deletes a file that
    does not match the name pattern.
 4. The timer follows the first-run rule, survives a failed tick, and is not built when
    disabled.
 5. `GET /api/health/detail` answers `401` without a session, serves the five fields with
    every `state` reachable, and serves no configuration value.
 6. `restore-backup` refuses while the database is open, refuses an unknown name and a copy
-   from a newer schema, and takes a safety copy before it writes. Its result equals the
+   from a newer schema, and takes a safety copy before it writes. Over a damaged live
+   database it moves that file aside and restores (R3). Its result equals the
    chosen copy, row for row.
 7. **End-to-end restore in the test suite**: with a real application on a temporary file
    database, data is created through the API, a backup is taken, the data is changed and
    deleted, the application stops, `restore-backup` runs through the CLI's `main`, a new
    application starts on the same file, and the API serves exactly the data as it was at
    the backup.
-8. Failures are logged with their `error_kind` and no row data, and show as `failed` on the
+8. Failures are logged with their `error_kind` and no row data, and show as `failed` (or
+   `unreadable`, R4) on the
    endpoint, the Health page and the dashboard.
 9. The Health page and the dashboard render every state as designed. The dashboard shows
    nothing for `ok`, `pending`, `disabled` or a failed request.
@@ -324,3 +327,148 @@ The router calls the service. It does not touch the file system itself.
 | `tester-22` | every test file on both sides, `frontend/src/test/**`, `tests/deploy/**`, and the gate. Sole gate owner |
 
 The tech lead owns this spec and does the browser check at 1280 px and 375 px.
+
+## Rulings
+
+- **R1. A read-only connection that closes last leaves `-wal` and `-shm` behind
+  (`backend-dev-22`, by experiment).** On SQLite 3.49 a `mode=ro` connection to a closed WAL
+  database creates both files on its first read and does not remove them on close. So
+  after `python -m portfolio backup` with the application stopped, restore step 1 would
+  refuse as if the database were open. The copy stays read-only. After it is closed,
+  `db/backup.py` opens the live database read-write, reads `PRAGMA schema_version` and
+  closes it. When that connection is the last one, SQLite removes both files. While the
+  application runs it is a no-op. It is best-effort: a failure is logged at warning and
+  does not fail the copy. Step 1 is unchanged, and its "start and stop it once" remedy now
+  covers only an unclean stop or a failed cleanup. The app's own engine, closed through
+  its normal shutdown, was confirmed to leave neither file.
+- **R2. Restoring with no live database file (`backend-dev-22`).** This is the case of a
+  fresh data volume, which is what the separate backups volume is for. The safety copy is
+  skipped and the restore goes on, and the CLI says that no safety copy was taken.
+- **R3. A restore over a damaged live database (reviewer, must-fix).** The safety copy used
+  the scheduled copy's code, so a live database that fails its own check stopped the
+  restore before it wrote anything. That happened with a scribbled page, a damaged header
+  and a 0-byte file, which is exactly when the owner needs the restore. Skipping the
+  safety copy is not enough, because the backup API cannot write into a file whose header
+  is gone. So:
+  - When step 4 fails with `integrity_failed` or `database_error`, the restore checks the
+    **live file itself**, read-only: it must open, pass `PRAGMA integrity_check`, and hold
+    exactly one `alembic_version` row.
+  - If the live file passes, the failure was in writing the copy. The restore refuses with
+    the original error, and nothing is moved.
+  - If it fails, the live file is **moved aside** to `portfolio.db.damaged-<UTC stamp>` in
+    the data directory, a name nothing lists, rotates or restores, and the directory is
+    fsynced. This is safe because step 1 has already shown there is no `-wal`. A stray
+    `-shm` is removed. The restore then goes on along R2's path.
+  - The CLI prints where the damaged file went. A `storage_error` writing the safety copy
+    still refuses, and the live file is untouched.
+  - The documentation says that the moved file holds the owner's data, and that it should
+    be kept until the restore is checked and then deleted by hand.
+- **R4. A backup directory that cannot be listed (tech lead's browser check, and reviewer
+  S1).** `status()` raised, `GET /api/health/detail` answered 500, the dashboard said
+  nothing, and the timer's startup check waited a whole interval without recording an
+  attempt. So:
+  - A sixth state, `unreadable`, comes first in the table. `latest_at` and `count` are
+    `null` while the directory cannot be listed, because they are unknown, not zero.
+  - The timer's `last_run_at` answers `None` when listing fails, so the timer attempts a
+    copy at once and records the outcome. A local copy hammers nobody, so the scheduler's
+    "wait a full interval" rule for an unanswered check does not fit here.
+  - The Health page words it as "Unreadable. The backup directory cannot be read." and
+    shows "unknown" for the newest backup and the count.
+  - The dashboard warns: "The backup directory cannot be read, so it is not known whether
+    backups are being kept." followed by the same link.
+- **R5. Every copy on the most recent days is kept (reviewer S2).** Keeping only the newest
+  copy per day lost data. If the owner noticed a bad import at noon and took a copy "to be
+  safe", rotation deleted that day's copy from before the import. The same happened one
+  rotation after a restore's safety copy. Copies beyond the scheduled one are taken by
+  hand or by a restore, so they stay few.
+- **R6. Temporary files and the clean-up race (reviewer S3).** One process's clean-up could
+  delete another's partial copy in flight, and the loser reported `integrity_failed`, which
+  the documentation says points at the database. So:
+  - The clean-up removes only **regular files** whose name matches the temporary pattern
+    exactly, and whose modification time is more than **one hour** old.
+  - A failure to **open** the copy just written (`SQLITE_CANTOPEN` or the `IOERR` family)
+    is a `storage_error`. Only a check that runs and does not answer `ok`, or a missing
+    `alembic_version` row, is `integrity_failed`.
+  - A lock was considered and not taken, because `fcntl` does not exist on the Windows
+    machine the tests also run on.
+- **R7. Documentation corrections (reviewer S4, S5, S6 and nits).**
+  - Name exactly which variables may go in `secrets.env`. `PORTFOLIO_BACKUP_DIR` is set by
+    `compose.yml`, whose `environment:` overrides `env_file:`.
+  - A failed rotation leaves the new copy kept and may have deleted some older ones.
+    `backup_failed` gains a `kept` field naming the copy in that case.
+  - `ok` is also served before this process's first attempt.
+  - The copy is read-only towards the live database except for R1's release, which after
+    an unclean stop checkpoints the leftover `-wal` into the live file.
+  - After a new, empty data volume, step 4 is `up -d`, not `start`.
+  - Do not merge to `main` while a restore is in progress: the deployment would start a new
+    container on the database being written.
+  - Bringing a copy back from off the host: a root one-off container copies it into
+    `/app/backups` and gives it to `app`, because `docker cp` creates files as root. This is
+    checked on the Pi with criterion 14.
+- **R8. Accepted as they are (reviewer nits).**
+  - A copy named in the future, after the clock was once ahead, stays `latest_at` until
+    that date passes.
+  - A copy in flight delays shutdown. The `drain_coordinators` docstring's arithmetic is
+    corrected to count it. The owner's database copies in well under a second, so
+    `stop_grace_period: 20s` is not at risk, and the docstring says what would change that.
+- **R9. Shutdown waits for a copy in flight, as R8 says (`tester-22`, by experiment).** The
+  scheduler stops its task with `asyncio.Task.cancel()`. anyio's `to_thread.run_sync` does
+  not abandon its thread on an *anyio* cancellation, but a native task cancellation raises
+  at once. So the lifespan went on to the sweeps and `engine.dispose()` while the copy was
+  still running in its thread. The interpreter still joined that non-daemon thread at exit,
+  so the copy finished, but it logged nothing and the order was not the one documented.
+  The copy's thread call is now protected from the task's cancellation and awaited to
+  completion. The cancellation is then re-raised, so `stop` returns after the copy, and
+  `backup_completed` or `backup_failed` is logged.
+- **R10. The image sets `PORTFOLIO_BACKUP_DIR=/app/backups` itself (`tester-22`).** Run
+  outside compose, the default `./data/backups` under `WORKDIR /app` put the copies inside
+  the data volume. Compose still sets it too.
+- **R11. Reading a chosen backup leaves nothing beside it (`tester-22`).** A copy whose
+  header says WAL, such as one brought from elsewhere, gained `-wal` and `-shm` files in
+  the backups directory when the restore read it, both in step 3's check and as step 5's
+  source. Both reads open the copy with `immutable=1`, as R3's live check does.
+- **R12. A live database that cannot be read is not moved aside (delta review S1).** R3
+  moved the live file on any error. A healthy file that could not be *read* at that
+  moment, through an I/O fault or a permission, was then called damaged, and the CLI
+  advised deleting it. `_check_live` now splits the errors as R6 splits them for a copy:
+  - `SQLITE_CANTOPEN` or the `SQLITE_IOERR` family means the live database cannot be read.
+    The restore refuses with "nothing was changed", and the file stays where it is.
+  - Only a file that opens and is wrong (NOTADB, CORRUPT, a failed check, a missing or
+    duplicated `alembic_version` row, or a 0-byte file) is moved aside.
+- **R13. A chosen copy with a `-wal` that holds frames is refused (delta review S2).** R11
+  reads the chosen copy immutably, so frames in a `-wal` beside a copy brought from
+  elsewhere were silently left out. The restore refuses before step 3 when `<chosen>-wal`
+  exists and is not empty. The message says the file is not a self-contained copy, and
+  that it should be opened once with sqlite3 outside the backups directory, which
+  checkpoints it, and copied back.
+- **R14. The interval has a floor of 60 minutes, and the documentation gives the count
+  (delta review S3).** R5 keeps every copy on the most recent dates, so the number kept
+  grows as the interval shrinks: about `keep_daily x 1440 / interval` scheduled copies,
+  7 at the default, 168 hourly, and thousands at the old floor of one minute. They sit on
+  the database's own device, and a full disk stops the application's writes. So
+  `PORTFOLIO_BACKUP_INTERVAL_MINUTES` below 60 is refused at startup, and the
+  documentation states the multiplication beside the setting.
+- **R15. Smaller corrections (delta review nits).**
+  - When the rename succeeds and only the directory's fsync fails, the message says so and
+    names where the file now is. It no longer says the move failed.
+  - A defect that is not a `BackupError` and that ends a copy during a cancellation is
+    logged before the cancellation is re-raised. It is no longer swallowed.
+  - The backup timer is stopped **last** of the timers, so the other timers can start no
+    tick while a copy finishes.
+  - The move aside refuses to overwrite an existing target.
+  - A `-journal` beside the damaged file is moved with it, under the damaged file's name.
+  - The settings table says the image sets `PORTFOLIO_BACKUP_DIR` to `/app/backups` (R10).
+  - Accepted: one copy-named entry that cannot be examined makes the whole directory
+    `unreadable`. That is visible, and it errs on the safe side.
+- **R16. No restore writes a new database beside a leftover `-journal`
+  (`backend-dev-22`).** If the live database file is gone but its non-empty `-journal`
+  remains, for example after R15's journal move failed and the operator restored again,
+  writing the restored file there makes SQLite discard that journal. Measured on SQLite
+  3.49.1 with a real hot journal: SQLite treats a journal beside a zero-page database as a
+  remnant and deletes it. The restored file is correct, but the damaged file's journal is
+  silently lost. So when there is no live database file and a non-empty `-journal` lies
+  beside its path, the restore refuses with reason `leftover_journal` and changes nothing.
+  The message says to move the journal beside its damaged file, or out of the data
+  directory, first. A zero-byte journal, or a live database that exists, changes nothing.
+  This ruling also records that R1's release, which opens the live file read-write, can roll
+  back or remove a journal before R15 would move it.

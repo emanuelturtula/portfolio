@@ -5,7 +5,8 @@ hardware, changing the password, understanding when a session ends, pointing the
 at the chain index it reads balances from, refreshing the prices that turn a balance into
 a value, connecting the Bitget and BingX accounts whose trades say what each asset cost,
 keeping the import of those trades running, reading the cost-basis snapshot built from
-them, and checking that history against the balances actually held.
+them, checking that history against the balances actually held, and backing the database up
+and restoring it.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -1441,6 +1442,338 @@ the only place a venue's balances are served.
 
 The fills are untouched by any of these, and so are the positions.
 
+## 17. Backups: where they are, how they stand, and restoring one
+
+The application copies its own database on a timer, checks each copy, and keeps a rotating
+set of them. Why that matters, and why it is not the deployment's backup in `prod/backup/`,
+is in `docs/deployment.md`, *Scheduled backups*. The contract is spec
+`docs/specs/029-sqlite-backups.md`.
+
+**Every copy holds the owner's complete financial data, as the live database does**: every
+imported trade, every wallet address, every manual adjustment, and the owner's account with
+its password hash. Treat a copy you take off the host as you would the database.
+
+**The copies do not protect against losing the storage device**: they are on the same device
+as the database. Copy one off the host from time to time, as *Copying one off the host* below
+shows.
+
+### Where the copies are, and the five settings
+
+In the `backups` volume, mounted at `/app/backups` in the container. Each copy is one
+self-contained SQLite file named after the UTC instant it was started, to the microsecond:
+`portfolio-20261002T030000123456Z.sqlite3`. **Only files named that way are listed, rotated or
+restored**; anything else in the directory is left alone and never deleted. A
+`.portfolio-<stamp>.partial` file is a copy being written, or one an interrupted attempt left;
+the first attempt more than an hour later removes it. A younger one is left alone, because
+another process may still be writing it.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORTFOLIO_BACKUP_ENABLED` | `true` | The timer only. `backup`, `list-backups` and `restore-backup` work either way. |
+| `PORTFOLIO_BACKUP_INTERVAL_MINUTES` | `1440` | One day. Whole minutes, at least 60. Rotation keeps every copy of the most recent days, so the scheduled copies kept number about `KEEP_DAILY × 1440 / interval`: 7 at the default, 168 hourly. They share the database's disk. |
+| `PORTFOLIO_BACKUP_DIR` | `./data/backups` | Where copies are written. The image sets `/app/backups`, and so does the deployment's compose file; leave it. The default is a development checkout's. |
+| `PORTFOLIO_BACKUP_KEEP_DAILY` | `7` | Keep every copy on this many most recent days that have one. At least 1. |
+| `PORTFOLIO_BACKUP_KEEP_WEEKLY` | `4` | Keep the newest copy of each of this many most recent ISO weeks that have one. At least 0. |
+
+**Four of them can be changed in `secrets.env`**: `PORTFOLIO_BACKUP_ENABLED`,
+`PORTFOLIO_BACKUP_INTERVAL_MINUTES`, `PORTFOLIO_BACKUP_KEEP_DAILY` and
+`PORTFOLIO_BACKUP_KEEP_WEEKLY`. After changing one, run
+`~/portfolio-app/prod/compose.sh up -d --force-recreate app`. A value out of range stops the
+container from starting, and the log names the variable. **`PORTFOLIO_BACKUP_DIR` cannot be
+changed there**: `deploy/compose.yml` sets it under `environment:`, which overrides
+`env_file:`, so a value in `secrets.env` is ignored.
+
+**When a copy is taken.** At startup if there is no copy yet, or the newest is older than one
+interval; otherwise when the rest of the interval has passed, and then once per interval. The
+newest copy's instant is the last run, so a restart or a deployment does not take an extra
+copy.
+
+**What rotation keeps.** After every copy that succeeded, and never after one that failed:
+**every copy on the 7 most recent UTC days that have a copy**, and the newest copy of each of
+the 4 most recent ISO weeks that have one. Counting days that have a copy, rather than the
+last 7 calendar days, means a pause in backups does not empty the set when they resume.
+Keeping every copy on those days means a copy taken by hand, or a restore's safety copy, does
+not push out the scheduled copy of the same day: the copy from before a bad import survives
+the copy you took after noticing it. Once its day falls out of the 7, only the newest copy of
+its week can survive, so to keep a particular copy for longer, copy it off the host.
+
+**If rotation fails**, the copy just taken has still been kept, and rotation may have deleted
+some of the older copies it meant to delete before it stopped. The attempt counts as failed:
+`backup_failed` names the kept copy in a `kept` field, and the state is `failed`.
+
+### How their state shows
+
+- **The Health page** has a *Backups* section: the state in words, the newest copy's date and
+  time, and how many copies there are -- "unknown" for both while the directory cannot be
+  read.
+- **The dashboard** shows a warning above the Value section when the state is `failed`,
+  `stale` or `unreadable`, and nothing otherwise.
+- **`GET /api/health/detail`**, signed in. It is not public, unlike `GET /api/health`:
+
+  ```bash
+  curl -s -b "$COOKIE" <origin>/api/health/detail | jq .backup
+  ```
+
+  ```json
+  {
+    "state": "ok",
+    "latest_at": "2026-10-02T03:00:00.123456Z",
+    "count": 9,
+    "last_attempt_at": "2026-10-02T03:00:00.123456Z",
+    "last_error_kind": null
+  }
+  ```
+
+  `latest_at` is the newest copy's instant and `count` the number of copies; both are `null`
+  when the state is `unreadable`, because they are unknown, not zero. `last_attempt_at` and
+  `last_error_kind` are the timer's most recent attempt since the process started, both
+  `null` before one; they live in memory, so a restart clears them. No setting is served.
+
+| `state` | Meaning |
+|---|---|
+| `unreadable` | The backup directory cannot be listed, so whether copies are being kept is unknown. It comes before every other state. Usually `/app/backups` is not a directory the container's user can read: check the volume in `deploy/compose.yml` and `PORTFOLIO_BACKUP_DIR`. The timer still attempts a copy at startup and records how it went in `last_error_kind`. |
+| `ok` | The newest copy is less than two intervals old, and the timer's last attempt succeeded -- or it has not attempted one since the process started, which is the usual state after a restart. |
+| `pending` | There is no copy yet, and the first attempt has not finished. A fresh installation shows this for the seconds its first copy takes. |
+| `stale` | The newest copy is more than two intervals old, or there is no copy although an attempt has finished. Scheduled copies have stopped: check `PORTFOLIO_BACKUP_ENABLED` and the log. After a restart, a backup that keeps failing shows this until the timer's first attempt fails again. |
+| `failed` | The timer's most recent attempt failed. `last_error_kind` says how; the table below says what to do. |
+| `disabled` | `PORTFOLIO_BACKUP_ENABLED` is false. The copies already taken are still listed and counted. |
+
+**In the container log**, one line per attempt:
+
+```bash
+~/portfolio-app/prod/compose.sh logs app | grep backup_
+```
+
+| Event | Fields | Meaning |
+|---|---|---|
+| `backup_completed` | `name`, `bytes`, `duration_ms`, `deleted` | A copy was taken, checked and kept. `deleted` is how many older copies rotation removed. |
+| `backup_failed` | `error_kind`, `error_type`, and `kept` when rotation failed | The attempt failed. Without `kept`, nothing was kept or deleted. With `kept`, the copy it names was taken and kept, and the rotation after it failed, possibly after deleting some older copies. `error_type` is the class name of the error at the bottom, such as `OperationalError` or `PermissionError`. |
+
+Neither line carries a row of the database or an error's message. Two warnings can appear
+too, and neither fails the copy: `backup_wal_release_failed` (`error_type`), when the
+clean-up after a copy could not run, which can make the next restore refuse as if the
+database were open; and `backup_temporary_file_not_removed` (`suffix`), whose file an attempt
+more than an hour later removes. A restore over a damaged database can log the first one too,
+and it means nothing there. A defect of ours shows as `scheduler_tick_failed` with
+`scheduler=backup` and a traceback, and as `failed` with `last_error_kind: null`.
+
+| `error_kind` | What it means | What to do |
+|---|---|---|
+| `database_error` | SQLite could not open or read the live database, or `PORTFOLIO_DATABASE_URL` names no file. | Check that the container is healthy and the data volume is mounted. If the application itself works, report it with the `error_type`. |
+| `integrity_failed` | The copy did not pass `PRAGMA integrity_check`, or its `alembic_version` is missing or does not hold one row. It was not kept. | A copy is read from the live database, so this points at the database itself. Take one by hand (below) to see the message. If the database is damaged, restoring the newest good copy is the remedy, and the restore moves the damaged file aside first (*Restoring one*). Note the newest copy's date before you choose: everything after it is lost from the live database. |
+| `storage_error` | Writing, reading back, syncing, renaming or deleting a file in `/app/backups` failed: a full disk, or a directory the container's user cannot write. With `kept` in the log line, the copy was kept and the rotation after it failed. | Check free space with `df -h` on the host. A copy is about the size of the database; rotation keeps at least one a day for 7 days and up to 4 weekly ones, plus any taken by hand or by a restore on those days. |
+
+### Taking one by hand, and listing them
+
+With the application running:
+
+```bash
+~/portfolio-app/prod/compose.sh exec app python -m portfolio backup
+~/portfolio-app/prod/compose.sh exec app python -m portfolio list-backups
+```
+
+```
+Took backup portfolio-20261002T091500654321Z.sqlite3 (2154496 bytes).
+```
+
+```
+portfolio-20261002T091500654321Z.sqlite3  2026-10-02T09:15:00.654321Z  2154496 bytes
+portfolio-20261001T030000123456Z.sqlite3  2026-10-01T03:00:00.123456Z  2150400 bytes
+```
+
+`backup` is the same code as a scheduled copy, rotation included, and says which older copies
+rotation deleted when it deleted any. It works whether the timer is on or not. On a failure it
+prints one line and exits 1. It reads the live database without writing to it, with one
+exception: after an unclean stop (the application killed, a power cut) the clean-up that
+follows the copy writes the committed transactions still in the `-wal` into the live file, as
+the application's next start would have, and removes the `-wal`. The copy already holds those
+transactions. With the application stopped, use `run --rm --no-deps` in place of `exec`:
+
+```bash
+~/portfolio-app/prod/compose.sh run --rm --no-deps app python -m portfolio backup
+```
+
+### Restoring one
+
+A restore replaces the whole database with a copy: everything after that copy was taken is
+gone from the live database, and is kept only in the safety copy the restore takes first.
+The application has to be stopped, so this is an operator's act and there is no button for
+it.
+
+**Do not merge to `main` while a restore is in progress.** A merge deploys, and the
+deployment starts a new container on the database the restore is writing. Finish all five
+steps, the check included, before merging anything.
+
+1. **Choose the copy**, while the application still runs:
+
+   ```bash
+   ~/portfolio-app/prod/compose.sh exec app python -m portfolio list-backups
+   ```
+
+2. **Stop the application**:
+
+   ```bash
+   ~/portfolio-app/prod/compose.sh stop app
+   ```
+
+3. **Restore**, in a one-off container on the same image, volumes and settings:
+
+   ```bash
+   ~/portfolio-app/prod/compose.sh run --rm --no-deps app python -m portfolio restore-backup portfolio-20261001T030000123456Z.sqlite3
+   ```
+
+   It refuses while the database is open, refuses a name it does not find, a copy taken by a
+   newer version and a copy with a `-wal` beside it, and checks the copy. Then it takes a **safety copy** of the live database
+   (or, if the live database is damaged, moves it aside: see below), copies the chosen backup
+   into the live file, checks the result, and prints:
+
+   ```
+   Restored portfolio-20261001T030000123456Z.sqlite3.
+   The database as it was before is in the safety copy portfolio-20261002T093012345678Z.sqlite3.
+   Rows per table after the restore:
+     accounting_lots: 12
+     ...
+     wallets: 3
+   ```
+
+   The row counts are checked against the copy's own before this is printed. They are printed
+   here and never logged.
+
+4. **Start the application**:
+
+   ```bash
+   ~/portfolio-app/prod/compose.sh start app
+   ```
+
+   It migrates a copy taken by an older version up to the current schema, as it migrates any
+   database at startup.
+
+5. **Check**: `~/portfolio-app/prod/compose.sh ps` until the container is healthy, then sign in
+   and look at the wallets, the adjustments and the positions. The Health page should show the
+   backups as `ok`.
+
+**A restore brings the account back as it was too.** The password is the one the account had
+when the copy was taken, and the sessions are that copy's: every browser signed in since then
+gets a login page, and a session revoked since then -- by logging out, or by a password change
+-- is valid again until it expires (section 5). If the password was changed after the copy was
+taken, sign in with the old one and change it again (section 4), which revokes every session
+the copy brought back.
+
+**To undo a restore**, restore the safety copy it printed, with the same five steps. The
+safety copy is an ordinary copy and rotates like one: it is kept while its day is among the 7
+most recent days that have a copy, and after that only if it is the newest copy of its ISO
+week. If you may need it later than that, copy it off the host.
+
+**Over a damaged database.** A damaged live database is the usual reason to restore, and it
+is also one a safety copy cannot be taken of: its copy fails the same check. So when the
+safety copy fails its check, or cannot read the live database, the restore checks the live
+file itself. If the live file opens but fails that check -- it is not a database, it is
+damaged, or it holds no schema revision, which is what a 0-byte file looks like -- the
+restore **moves it aside** in the data volume, to
+`/app/data/portfolio.db.damaged-<UTC stamp>`, takes no safety copy, and goes on. A
+`portfolio.db-journal` beside it goes with it, to the same name followed by `-journal`,
+because it belongs to the damaged file. Often there is none left by then: the safety copy
+the restore tries first ends by opening the live file read-write, as every copy does, and
+SQLite deals with a `-journal` on that open, rolling it back into the file or removing it.
+So a `-journal` moves only when SQLite has not already used it. The restore prints:
+
+```
+Restored portfolio-20261001T030000123456Z.sqlite3.
+The live database opened but did not pass its own check, so no safety copy was taken: it was moved aside to /app/data/portfolio.db.damaged-20261002T093012345678Z. Keep it until the restore is checked, then delete it.
+```
+
+**The moved file holds the owner's financial data**, as the database did: it is the database
+as it was, damage included. Nothing lists, rotates or restores it. Keep it until step 5 has
+shown the restore is right, then delete it by hand, with the application running:
+
+```bash
+~/portfolio-app/prod/compose.sh exec app rm /app/data/portfolio.db.damaged-20261002T093012345678Z
+```
+
+Delete its `-journal` the same way, if one was moved with it.
+
+**Only a file that opens is judged damaged.** A live file that cannot be read at all -- a
+permission, an I/O error from the storage device -- may be healthy, so the restore refuses,
+and it stays where it is. If the live file passes its own check, the safety copy failed for
+another reason; the restore refuses and moves nothing. A safety copy that cannot be written
+at all -- a full disk, a backup directory the container cannot write -- also refuses, and
+leaves the live file as it is. A file already at the name the damaged file would be moved to
+is never overwritten: the restore refuses instead.
+
+**Onto a new, empty data volume**, there is no live database to copy first, and the restore
+says `There was no database to copy first, so no safety copy was taken.` The steps change
+in three places, because there is no container to `exec` into or to stop: in step 1, list
+with `~/portfolio-app/prod/compose.sh run --rm --no-deps app python -m portfolio list-backups`;
+skip step 2; and in step 4 create the container with `~/portfolio-app/prod/compose.sh up -d app`
+rather than `start` it.
+
+**When the restore refuses or fails**, it prints one line and exits 1:
+
+| Message begins | Why | What to do |
+|---|---|---|
+| `Refusing to restore: ... -wal exists, so the database is open` | The application is running, or it stopped without closing the database cleanly (killed, a power cut), or the clean-up after a copy failed. Nothing was changed. | `~/portfolio-app/prod/compose.sh ps`. If it is running, stop it. If it is already stopped, start it, wait until it is healthy, and stop it again, which lets SQLite recover the file. Then restore again. There is no option to skip this check. |
+| `Refusing to restore: there is no database at ..., but ... lies beside its path` | There is no `portfolio.db`, but a `portfolio.db-journal` with content is in `/app/data`: most likely an earlier restore moved the damaged database aside and could not move its `-journal` with it. Writing the restored file would make SQLite discard that journal, which belongs to the damaged file (`leftover_journal`). Nothing was changed. | Move it beside the damaged file it belongs to, as `portfolio.db.damaged-<stamp>-journal` with that file's stamp, or out of the data directory, with `~/portfolio-app/prod/compose.sh run --rm --no-deps app mv <from> <to>`. Then restore again. |
+| `Refusing to restore: '...' is not the name of a backup` | The name is mistyped. Nothing was changed. | Copy the name from `list-backups`. |
+| `Refusing to restore: there is no backup named ...` | No copy by that name is in `/app/backups`. Nothing was changed. | Copy the name from `list-backups`. |
+| `Refusing to restore: ... is at schema revision ...` | The copy was taken by a newer version of the application than the one running, and this one cannot migrate it. The message names both revisions. Nothing was changed. | Deploy that version or a newer one, then restore. |
+| `Refusing to restore: ... is not a self-contained copy` | A `-wal` with content is beside the chosen copy in `/app/backups`, most likely because it was brought from elsewhere with its `-wal`. The restore reads the file alone, so the transactions in the `-wal` would be lost (`not_self_contained`). Nothing was changed. | Make it one file. Copy it and its `-wal` off the host as *Copying one off the host* shows. On your own machine, in a directory holding both, run `sqlite3 portfolio-<stamp>.sqlite3 'PRAGMA journal_mode=DELETE;'`, which writes the `-wal` into the file and deletes it. Remove the `-wal`, and a `-shm` if there is one, from `/app/backups` with `~/portfolio-app/prod/compose.sh run --rm --no-deps app rm <path>`. Then bring the file back as *Bringing a copy back onto the host* shows, and restore again. |
+| `Refusing to restore: the backup ... did not pass its check` | The chosen copy is damaged (`integrity_failed`). Nothing was changed. | Choose another copy. |
+| `The database's directory ... does not exist` | `PORTFOLIO_DATABASE_URL` points somewhere unexpected, or the data volume is not mounted. Nothing was changed. | Check the compose file and the volumes, and run the restore through `compose.sh` as above. |
+| `Refusing to restore: no safety copy of ... could be taken, so nothing was changed` | The safety copy could not be written to `/app/backups` (`storage_error`): a full disk, or a directory the container's user cannot write. Nothing was changed. | `df -h` on the host. The rest of the message is the error underneath. Free space, then restore again. |
+| `Refusing to restore: no safety copy of ... could be taken, and the live database passes its own check` | The safety copy failed, but the live database is sound, so it was not moved aside. Nothing was changed. | The rest of the message is the error underneath. Restore again; if it fails the same way, report it with the message. |
+| `Refusing to restore: the live database ... cannot be read` | The safety copy could not read the live database, and neither could the restore's own check of it: a permission, or an I/O error from the storage device (`database_error`). A file that cannot be read may be healthy, so it was not moved aside. Nothing was changed. | Check the data volume, that the file belongs to the container's user, and the storage device (`dmesg` on the host shows I/O errors). Then restore again. |
+| `Refusing to restore: the live database ... did not pass its own check, and ..., where it would be moved aside, already exists` | The live database is damaged, but a file is already at the name it, or its `-journal`, would be moved to. The name is the UTC instant to the microsecond, so the host's clock is wrong or the file was put there by hand. Nothing was changed. | Check the host's clock, and move the file the message names out of `/app/data`. Then restore again. |
+| `Refusing to restore: ... appeared during the restore` | A `-wal` with content appeared beside a damaged live database before it was moved aside: something opened the database, most likely the application starting. Nothing was changed. | Stop the application, then restore again. |
+| `The live database ... did not pass its own check, and moving it aside ... failed` | The live database is damaged and could not be renamed in `/app/data`. Nothing was restored, and the file is where it was. | Check the data volume's permissions, then restore again. |
+| `The damaged live database was moved aside to ..., but moving ... to ... failed` | The damaged database was moved, but the `-journal` beside it could not be moved with it. Nothing was restored. | Move the `-journal` by hand to the name the message gives, with `~/portfolio-app/prod/compose.sh run --rm --no-deps app mv <from> <to>`, then restore again. Do not delete it: it belongs to the damaged file. Until it is moved, the restore refuses. |
+| `The damaged live database was moved aside to ..., but the move could not be made durable` | The damaged database was renamed, and is at the name the message gives, but syncing `/app/data` afterwards failed, so a power cut could still undo the rename. Nothing was restored. | The storage device reported an error: check it (`dmesg` on the host). Then restore again: there is no live database at the usual name now, so the restore takes no safety copy, as onto an empty volume. |
+| `The damaged live database was moved aside to ..., but ... cannot be removed` | The damaged database was moved, but a `-shm` or empty `-wal` beside it could not be deleted. Nothing was restored. | Delete the file the message names with `~/portfolio-app/prod/compose.sh run --rm --no-deps app rm <path>`, then restore again. |
+| Anything naming the safety copy or the moved-aside file | The restore failed after the safety copy was taken, or after the damaged database was moved aside. | The message says which file holds the database as it was. Restore the safety copy; a moved-aside file is kept as evidence and is not a copy that can be restored. |
+
+### Copying one off the host
+
+**The copy holds the owner's complete financial data.** Keep it somewhere at least as private
+as the Pi, preferably on an encrypted disk, and delete the intermediate copy on the host when
+it has been moved.
+
+With the application running, copy it out of the volume into your home directory on the host.
+Give the destination as an absolute path: `compose.sh` runs from its own directory, so `.`
+would mean `~/portfolio-app/prod`.
+
+```bash
+~/portfolio-app/prod/compose.sh cp app:/app/backups/portfolio-20261001T030000123456Z.sqlite3 ~/portfolio-20261001T030000123456Z.sqlite3
+chmod 600 ~/portfolio-20261001T030000123456Z.sqlite3
+```
+
+Then, from your own machine, move it off the host and remove the one left in the home
+directory:
+
+```bash
+scp <user>@<host>:portfolio-20261001T030000123456Z.sqlite3 .
+ssh <user>@<host> rm portfolio-20261001T030000123456Z.sqlite3
+```
+
+A copy is a plain SQLite file and needs nothing else beside it to be read.
+
+### Bringing a copy back onto the host
+
+To restore a copy kept off the host, put it back in `/app/backups` first, owned by the
+container's user. Copying it in the way it came out does not do that: `docker cp` creates
+the file as root, and the application's user then cannot read it. A one-off container
+running as root can. Copy the file into your home directory on the host (`scp` it there),
+then:
+
+```bash
+~/portfolio-app/prod/compose.sh run --rm --no-deps -u root -v "$HOME/portfolio-20261001T030000123456Z.sqlite3:/import/portfolio-20261001T030000123456Z.sqlite3:ro" app sh -c 'cp /import/portfolio-20261001T030000123456Z.sqlite3 /app/backups/portfolio-20261001T030000123456Z.sqlite3 && chown app:app /app/backups/portfolio-20261001T030000123456Z.sqlite3 && chmod 600 /app/backups/portfolio-20261001T030000123456Z.sqlite3'
+rm ~/portfolio-20261001T030000123456Z.sqlite3
+```
+
+Keep the name exactly as it was: only a file named like a copy is listed or restored. Then
+`list-backups` shows it, and *Restoring one* applies. The image has `sh`, `cp`, `chown` and
+`chmod`: its own build runs `sh`, `mkdir` and `chown` in the final stage, and all four
+commands come from the base image's essential packages. **This command has not been run on
+the Pi yet**; it is checked there with acceptance criterion 14 of spec 029.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -1511,3 +1844,20 @@ The fills are untouched by any of these, and so are the positions.
 | An opening balance was entered and the warning is still there | The adjustment is dated at or after the sale. At the same instant, a fill replays first. Edit it on the Adjustments page and date it earlier — section 15 |
 | Deleting an adjustment from `/api/docs` returns 403 | Delete it on the Adjustments page (`/adjustments`). Swagger UI sends no content type for a request without a body, and every write needs `application/json`, so it cannot send the delete. Without the page, delete it from the browser console — section 15 |
 | Creating an adjustment returns 422 naming `asset` | The symbol must be the venue's own spelling, upper case, such as `BTC`, and not USDC or USDT — section 15 |
+| The dashboard says the last scheduled backup failed, `last_error_kind` is `database_error` | SQLite could not open or read the live database. Check that the container is healthy and the data volume is mounted; report it with the `error_type` from the `backup_failed` line — section 17 |
+| `last_error_kind` is `integrity_failed` | A copy did not pass `PRAGMA integrity_check` and was not kept. It is read from the live database, so take one by hand to see the message. If the database is damaged, restore the newest good copy: the restore moves the damaged file aside first — section 17 |
+| `last_error_kind` is `storage_error` | Writing to `/app/backups` failed: usually a full disk. Check `df -h` on the host. If the `backup_failed` line has `kept`, the copy was kept and the rotation after it failed — section 17 |
+| The Health page shows the backups as unreadable, and the dashboard warns that it is not known whether backups are being kept (`unreadable`) | The backup directory cannot be listed: `/app/backups` is not a directory the container's user can read. Check the `backups` volume and `PORTFOLIO_BACKUP_DIR` — section 17 |
+| The dashboard says the newest backup is old and scheduled backups have not completed since (`stale`) | The timer is off or not running. Check `PORTFOLIO_BACKUP_ENABLED` and the `backup_` lines in the log — section 17 |
+| Container refuses to start naming `PORTFOLIO_BACKUP_INTERVAL_MINUTES`, `_KEEP_DAILY` or `_KEEP_WEEKLY` | The interval is below 60, `KEEP_DAILY` below 1, or `KEEP_WEEKLY` below 0. A shorter interval multiplies the copies kept on the database's disk. To stop backups, set `PORTFOLIO_BACKUP_ENABLED=false` — section 17 |
+| `restore-backup` says a `-wal` file exists, so the database is open | Stop the application first. If it is already stopped, start it, wait until it is healthy, stop it, and restore again — section 17 |
+| `restore-backup` says there is no database, but a `-journal` lies beside its path | A rollback journal from a database that is gone, most likely one an earlier restore moved aside. Move it beside that damaged file, or out of `/app/data`, then restore again. Nothing was changed — section 17 |
+| `restore-backup` says the name is not a backup's, or there is no backup by that name | Copy the name from `list-backups` — section 17 |
+| `restore-backup` says the copy is at a schema revision this version does not know | It was taken by a newer version. Deploy that version or a newer one, then restore — section 17 |
+| `restore-backup` says the backup is not a self-contained copy | A `-wal` with content is beside it in `/app/backups`. Make it one file with `sqlite3` off the host, remove the `-wal`, and bring the file back, as section 17 shows. Nothing was changed |
+| `restore-backup` says the backup did not pass its check | That copy is damaged and nothing was changed. Choose another — section 17 |
+| `restore-backup` says the live database did not pass its own check and was moved aside | The live database opened but was damaged, so it was moved to `/app/data/portfolio.db.damaged-<stamp>`, with its `-journal` if it had one, instead of being copied. It holds the owner's data: keep it until the restore is checked, then delete it — section 17 |
+| `restore-backup` refuses because the live database cannot be read | A permission or an I/O error, not damage, so it was not moved aside. Nothing was changed. Check the data volume, its owner and the storage device, then restore again — section 17 |
+| `restore-backup` refuses because no safety copy of the live database could be taken | The backup directory is full or not writable, or the safety copy failed while the live database is sound. Nothing was changed. The message has the error underneath — section 17 |
+| `restore-backup` says the database's directory does not exist | The data volume is not mounted, or `PORTFOLIO_DATABASE_URL` points elsewhere. Run it through `compose.sh` as section 17 shows |
+| A restore failed and its message names the safety copy, or a moved-aside file | That file holds the database as it was before. Restore the safety copy — section 17 |
