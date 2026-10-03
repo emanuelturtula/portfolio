@@ -3,6 +3,13 @@
 Every error the API returns has the same shape, so the frontend needs exactly one code
 path to display a failure, and an unexpected exception never leaks its message -- which
 may quote a database row, a URL or a credential -- to the client.
+
+**The 500 carries `X-Request-ID` itself** (#23). Its handler runs in Starlette's
+`ServerErrorMiddleware`, outside every middleware of the application's own, so the response it
+sends never passes through `RequestContextMiddleware`, which adds the header to every other
+one. The id is read from the context variables that middleware bound, which the handler still
+sees; `request_failed`, `request_refused` and `unhandled_exception` carry it the same way,
+through `merge_contextvars`, with no edit at their call sites.
 """
 
 from __future__ import annotations
@@ -14,6 +21,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+from portfolio.api.request_context import REQUEST_ID_HEADER, current_request_id
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -188,7 +197,11 @@ async def handle_unexpected_error(request: Request, exc: Exception) -> Response:
         detail=UNEXPECTED_DETAIL,
         instance=request.url.path,
     )
-    return problem_response(problem)
+    response = problem_response(problem)
+    request_id = current_request_id()
+    if request_id is not None:
+        response.headers[REQUEST_ID_HEADER] = request_id
+    return response
 
 
 def register_exception_handlers(app: FastAPI) -> None:

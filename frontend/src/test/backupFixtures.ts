@@ -1,10 +1,12 @@
 import { http, HttpResponse, type HttpHandler } from 'msw';
 
 import type { BackupStatus, HealthDetail } from '@/api/health';
+import { okSections, type HealthSections } from '@/test/healthFixtures';
 
 /**
- * `GET /api/health/detail` as the backend serves it (spec 029), one fixture per state. The
- * instants are the spec's own example, in UTC with a `Z`, as the API serialises them.
+ * `GET /api/health/detail` as the backend serves it (spec 029), one fixture per backup state.
+ * The instants are the spec's own example, in UTC with a `Z`, as the API serialises them. The
+ * sections spec 030 added are `healthFixtures.ts`'s.
  */
 export const HEALTH_DETAIL_PATH = '/api/health/detail';
 
@@ -76,20 +78,35 @@ export const unreadableBackup = backupStatus({
   last_error_kind: null,
 });
 
-export function healthDetail(backup: BackupStatus = okBackup): HealthDetail {
-  return { backup };
+/**
+ * The whole document: `backup`, and every section spec 030 added beside it, each answered and
+ * well unless `sections` says otherwise.
+ */
+export function healthDetail(
+  backup: BackupStatus = okBackup,
+  sections: Partial<HealthSections> = {},
+): HealthDetail {
+  return { backup, ...okSections, ...sections };
 }
 
-/** A handler that answers with `backup`, counting the requests it answered. */
-export function serveBackup(backup: BackupStatus): {
+/** A handler that answers with `detail`, counting the requests it answered. */
+export function serveDetail(detail: HealthDetail): {
   handler: HttpHandler;
   requests: () => number;
 } {
   let requests = 0;
   const handler = http.get(HEALTH_DETAIL_PATH, () => {
     requests += 1;
-    return HttpResponse.json(healthDetail(backup));
+    return HttpResponse.json(detail);
   });
 
   return { handler, requests: () => requests };
+}
+
+/** A handler that answers with `backup` and every other section well. */
+export function serveBackup(backup: BackupStatus): {
+  handler: HttpHandler;
+  requests: () => number;
+} {
+  return serveDetail(healthDetail(backup));
 }

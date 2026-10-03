@@ -1,7 +1,7 @@
 # 030 — Observability: redaction by value, request ids, and the sources' health
 
 Issue: #23
-Status: in progress
+Status: done
 
 ## Problem
 
@@ -83,7 +83,7 @@ and sets as `_redact_value` does today, **including `event` and `exception`**. I
 3. **Addresses**, every form this application accepts, mainnet and testnet alike:
    - bech32 and bech32m with the human-readable part `bc`, `tb` or `bcrt`, either case;
    - Base58Check P2PKH and P2SH, starting `1`, `3`, `m`, `n` or `2`, 25 to 34 Base58
-     characters after the first, on word boundaries;
+     characters after the first, not preceded or followed by a letter or a digit (R14);
    - Kaspa: `kaspa`, `kaspatest`, `kaspasim` or `kaspadev`, then `:`, then 61 to 63
      characters of its alphabet.
 
@@ -177,7 +177,7 @@ edit at their call sites.
 | `state` | When |
 |---|---|
 | `stopped` | the scheduler exists and its task is not running |
-| `late` | running, and `now - (last_tick_finished_at or started_at) > 2 × interval` |
+| `late` | running, and either a tick is in flight with `now - last_tick_started_at > 2 × interval`, or none is and `now - (last_tick_finished_at or started_at) > 2 × interval` (R13) |
 | `ok` | running, and not late |
 
 The loop's first tick can wait up to one interval after start. A tick in flight longer than
@@ -348,4 +348,204 @@ The tech lead owns this spec and does the browser check at 1280 px and 375 px.
 
 ## Rulings
 
-(none yet)
+- **R1. Five sections, not four (`frontend-dev-23`).** Exchanges and Prices are two h3
+  sections, so each heading can be found on its own.
+- **R2. The reconciliation link goes to the dashboard's holdings check.** There is no
+  reconciliation route. The link is a router `Link` to `/#holdings-check`, and it shows in
+  every state. Declarative React Router does not scroll to a hash on a client-side
+  navigation, and that is accepted.
+- **R3. One alert for the new sections when the request fails.** With the existing Backups
+  alert, a failed request shows two alerts, not five.
+- **R4. `exchanges[].last_synced_at` is the last *successful* sync.** The repository sets it
+  only together with `sync_status = ok`. The page labels it "Last successful sync".
+- **R5. The request id is a hyphenated UUID, and nothing is exempt from redaction
+  (`backend-dev-23`).** About 2.9% of `uuid4().hex` values match the Base58 address pattern,
+  and the first implementation exempted a 32-hex `request_id` from value redaction. An
+  exemption is a hole: a 32-hex API secret bound under that key would print. `str(uuid4())`
+  has hyphens, so no run of characters long enough to look like an address exists, and no
+  exemption is needed.
+- **R6. The logged route is `root_path` plus the matched route's template.** These are the
+  ASGI scope's documented fields. The first implementation read FastAPI's undocumented
+  `scope["fastapi"]["effective_route_context"]`. If `root_path` plus the template does not
+  give `/api/...` for every API route, the undocumented key stays, behind a test that fails
+  loudly when a FastAPI upgrade removes it.
+- **R7. No handler ever receives an unredacted structlog record.** With the redaction only in
+  the root handler's `ProcessorFormatter`, a structlog record's `msg` is the raw event dict
+  until that formatter runs. Any other handler, such as pytest's `caplog`, a test's
+  `EveryRecord`, or one added later, would see the secret. So both redaction processors also
+  run in structlog's own chain, before `wrap_for_formatter`. The formatter still runs them for
+  standard-library records. Running them twice is harmless: `[REDACTED]` matches no rule,
+  unless a loaded secret is a piece of the marker (R17).
+- **R8. Accepted as built.**
+  - `domain/health.py` takes Protocols, because `domain` cannot import a service type.
+  - The chains are those of the newest finished run with an outcome for them, plus the
+    active wallets' chains.
+  - A reconciliation with nothing to compare is `match`.
+  - A request refused before routing logs `route: "unmatched"`.
+  - The frontend CI job's timeout goes from 5 to 10 minutes for the `uv` install that
+    `diff-cover` needs. It is measured again after the first run.
+  - Vitest's LCOV `projectRoot` is the repository root, because `diff-cover` matched no file
+    against `SF:src/...` and passed silently.
+- **R6, as measured.** `root_path` plus the template gives `/wallets/{wallet_id}` for all 25
+  API operations. In FastAPI 0.141, `include_router(prefix=...)` keeps the original route and
+  never extends `root_path`. So the undocumented `effective_route_context` stays, and a test
+  pins the prefixed template for every API operation. A FastAPI upgrade that removes the key
+  then fails that test rather than logging wrong routes.
+- **R9. A request with no route template (`backend-dev-23`).** Starlette sets no
+  `scope["route"]` for the single-page application, its assets, or FastAPI's documentation
+  paths, so all of them logged `route: "unmatched"`, even with a 200. Now:
+  - a path outside `/api` logs `route: "spa"`, at DEBUG, because one page load fetches
+    several assets;
+  - `/api/openapi.json`, `/api/docs` and `/api/docs/oauth2-redirect` log their own path. They
+    have no parameter, so the path is the template. Take them from the application's
+    configured URLs, not from a copy of the strings;
+  - anything else under `/api` with no route stays `"unmatched"`. That is a 404, or a
+    request refused before routing.
+- **R10. Accepted residuals.**
+  - A standard-library record reaches a handler other than the root's as the library wrote
+    it. In production the root handler is the only one, and it redacts. A record factory or
+    a per-logger filter would close this for handlers nobody has added, at the cost of
+    touching every record twice. The module docstring states it.
+  - A loaded secret that is a substring of `[REDACTED]` gains a bracket on each pass.
+    Nothing is revealed.
+- **R11. From the tech lead's browser check.** The page passes at 1280 px and at 375 px, with
+  no horizontal scroll. The endpoint served all six keys, `X-Request-ID` appeared on a 200
+  and a 404, and an inbound id was ignored. Two changes came out of it:
+  - A `disabled` timer shows its state only, not "Last tick: none since the server started".
+    A switched-off timer never ticks, so that row says nothing.
+  - `duration_ms` uses `time.perf_counter_ns()`. On Windows `time.monotonic()` moves in
+    steps of about 15.6 ms, so the development log printed only 0, 15, 16 and 31.
+- **R12. Keys are redacted like values, and the value rules repeat until nothing changes
+  (`tester-23`, D1 and D2).**
+  - D1: `ValueRedactor` walked mapping values only, so a dict keyed by address, such as
+    `balances={<address>: "0.5"}`, reached stdout whole. That is the likely shape of the
+    hurried log line the address rule exists for. A string key now goes through the same
+    value rules. Two keys that both redact to `[REDACTED]` collapse into one entry, which is
+    accepted: the alternative keeps the address.
+  - D2: one pass applies the rules in a fixed order, and a replacement can create the word
+    boundary an earlier rule needed. A Kaspa address followed directly by a Base58 one left
+    the second whole after one pass, and the root formatter makes only one pass over a
+    standard-library record. The rules now repeat over a string until it stops changing.
+    `[REDACTED]` matches no rule, so this ends, and a bound of a few passes guards it anyway.
+    R17 qualifies this for a secret that is a piece of the marker.
+    Both are pinned by tests.
+- **R13. From the review (`reviewer-23`).**
+  - **M1, must-fix. The URL rule was quadratic, and a client with no session controls its
+    input.** `request_refused` logs the path of every `/api` request refused for want of a
+    session, and `\b[A-Za-z][A-Za-z0-9+.\-]*://…` rescans the rest of a run from every word
+    boundary. A 62 KB path of `a.a.a.…` cost 2.5 s for one log line, and a 200 KB path cost
+    12 s, on the event loop. So the URL query is no longer found by a backtracking regex. The
+    string is split into tokens on whitespace and quotes. In a token holding `://` and, after
+    it, a `?`, everything from that `?` to the next `#` or the token's end becomes
+    `?[REDACTED]`. That is one linear scan. Every other rule is checked for the same
+    quadratic shape, and a test bounds the time of adversarial inputs of 200 KB per rule:
+    `a.` repeated, `a://` repeated, `tb1` repeated, `kaspatest:` repeated, `xpub` repeated,
+    and a long secret prefix repeated.
+  - **S2. A URL glued to a word character** (`fetch_https://…?sign=…`) kept its query. The
+    token scan above has no word boundary, which closes this too.
+  - **S3. `logging`'s error fallback wrote the raw record to stderr.** When formatting
+    raises, `Handler.handleError` prints the original message and its arguments, which
+    bypasses every rule. The root handler is now a subclass whose `handleError` writes one
+    fixed line to stderr: the exception's type and the logger's name, never the message or
+    its arguments. The sentinel test (criterion 7) reads stderr as well as stdout.
+  - **S4. `late` meant one interval in flight, not two.** The loop sleeps an interval *after*
+    a tick finishes. The rule now has two cases:
+    - while a tick is in flight (`last_tick_started_at` after `last_tick_finished_at`),
+      `late` when `now - last_tick_started_at > 2 × interval`;
+    - otherwise, `late` when `now - (last_tick_finished_at or started_at) > 2 × interval`.
+
+    The spec's table and `docs/operations.md` say this.
+  - **Overlapping secrets left a fragment.** Secrets that overlap in a string, such as
+    `XXXXYYYYZZ` and `YYYYZZZZWW` in `XXXXYYYYZZZZWW`, rendered `[REDACTED]ZZWW`. Every
+    secret's occurrences are now found as spans, overlapping spans are merged, and each merged
+    span is replaced once.
+  - **The failure heading.** When the request fails, `DetailSections` heads its alert with an
+    `h3`, not an `h4`, so it is not read as a child of Backups.
+  - **Accepted.** An address glued to a letter or a digit prints. The `ADDRESS_PATTERNS`
+    docstring says so.
+
+  Checked clean by the review:
+  - 200 concurrent requests never swapped an id, and an inbound id was never echoed;
+  - foreign records and uvicorn's are redacted, and so are `exc_info` and `stack_info`;
+  - both `diff-cover` steps fail at 0% on changed lines;
+  - the layering holds, and no float is on a money path;
+  - the endpoint serves no configuration value and calls no provider;
+  - the frontend's wording tables are total.
+- **R14. An address joined by an underscore is redacted (`backend-dev-23`).** `\b` counts
+  `_` as part of a word, so `wallet_<address>`, `snapshot_<address>.json` and
+  `<address>_balance` printed whole. `f"wallet_{address}"` is exactly the hurried shape the
+  rule is for. Every address rule now starts with `(?<![0-9A-Za-z])` instead of `\b`, and
+  the Base58 rule also ends with `(?![0-9A-Za-z])`. The run rules of R16 and R18 end where
+  their alphabet ends. A hyphen still separates, so R5's reasoning about
+  UUIDs holds. The tests that pinned `\b` in the pattern text pin the new boundaries
+  instead.
+  - **Accepted:** an address glued to a letter or a digit, and two addresses glued together,
+    where the first's pattern eats into the second. Neither can be separated without
+    verifying checksums. The `ADDRESS_PATTERNS` docstring and `docs/operations.md` say so.
+- **R15. What pins the repeat loop after R14 (`tester-23`).** Under R14 the D2 case, a Kaspa
+  address glued straight onto a Base58 one, is the accepted "glued to a letter" residual,
+  and it prints whole however many passes run. Every address rule now needs a non-alphanumeric
+  character on both sides, so an address replacement can no longer create a match for an
+  earlier rule. What still can: a loaded secret containing marker characters. With the
+  secret `D]-tail0`, the text `<tb1 address>-tail0` becomes `[REDACTED]-tail0` after one
+  pass, and only a second pass finds the secret. So:
+  - the D2 pin is dropped;
+  - the loop stays, pinned by the marker-secret case, so reducing it to one pass is not an
+    equivalent mutant;
+  - a brute-force property checks that one pass equals the fixpoint for address, key and URL
+    tokens joined by every separator, `""` and `"_"` included, with no secret loaded. It
+    flags any interaction this analysis missed.
+- **R16. From the delta review (`reviewer-23`): no must-fix or should-fix.** It found every
+  rule linear, the worst 200 KB shape at 57 ms against 12 to 27 s before. S2 and S3 are
+  closed, the S4 boundaries hold, and the earlier clean checks still pass. Three nits:
+  - **N1, fixed.** A chain of Kaspa addresses glued together lost one address per pass, so
+    the fifth and later survived the four-pass bound. The Kaspa rule now matches a whole run
+    of glued Kaspa addresses in one match.
+  - **N2, documented.** These URL forms keep their query, and the docstring and §18 now
+    list them:
+    - a quote inside the query, which ends the token;
+    - an unencoded `#` inside the query;
+    - a `?` inside the fragment;
+    - JSON-escaped slashes (`:\/\/`).
+
+    None is a regression. `httpx` percent-encodes `'` and `#` in a query built from
+    `params=`, and no response body is logged.
+  - **N4, accepted and documented.** A tick is "in flight" when its start is after the last
+    finish, by the wall clock. A clock stepped back between a finish and the next start makes
+    a tick in flight be measured from the last finish again, which is the old one-interval
+    threshold, until the clock catches up.
+- **R17. The loop does matter for glued addresses (`tester-23`, D3).** R15 said an address
+  replacement can no longer create a match for an earlier rule. That holds for every
+  separator except none at all. With two addresses glued together, the first one's `[REDACTED]`
+  gives the second the non-alphanumeric boundary it lacked, and only a second pass sees it.
+  This happens after a Kaspa address, and after a bech32 one when the next starts with `b`.
+  So the property is restated:
+  - with every separator but `""`, one pass equals the fixpoint;
+  - with `""`, the fixpoint is reached within the bound, and applying `redact_text` again
+    changes nothing.
+
+  The docstrings that describe glued pairs say exactly what was measured. So does the one
+  claiming `[REDACTED]` matches no rule: it does when a loaded secret is a piece of the
+  marker, and `MAX_REDACTION_PASSES` is what stops it there (I1, pinned). Four crafted
+  secrets that are all fragments of the marker outlast the bound (I2). That needs a
+  credential containing `[REDAC`, and it is not pinned.
+- **R18. Glued bech32 addresses match as one run, like Kaspa (`backend-dev-23`).** `b` is
+  outside the bech32 alphabet, so in a run of glued `bcrt1…` addresses each pass redacted
+  only one more, and the fifth and later survived the bound. N1 had the same shape. The
+  bech32 rule now matches a run, `(?:(?:bc|tb|bcrt)1<alphabet>{11,})+`, with the existing
+  anchors. Both run rules nest a quantifier, so their timing is measured on adversarial
+  runs whose end anchor fails, not only on runs that match. Examples are a glued run
+  followed by a letter or digit, and runs broken by one character outside the alphabet. They
+  must stay linear.
+- **R19. The Kaspa run's third length rule is greedy and case-sensitive, and the
+  glued-address heuristics stop here (`tester-23`, D4).** In R16's third alternative the
+  lazy length `{61,63}?` stopped at 61 when the payload's 62nd character was itself a
+  Base58 start (`2`). That left two payload characters glued in front of the next address,
+  which then printed whole on every pass. The alternative is now greedy, and the Base58
+  start in its lookahead is case-sensitive, `(?-i:[13mn2])`, as the Base58 rule itself is.
+  Measured in memory over 5 Kaspa forms and 12 followers, the tester found no follower
+  printed and no pair other than two markers. Runs still match as one.
+  - **From here on, a new finding about addresses glued with no separator is documented,
+    not fixed.** Without verifying checksums, every such rule is a heuristic, and each fix
+    so far has moved the edge rather than removed it. R14 already accepts glued addresses
+    as a residual. The time limits from M1 still bind any rule.

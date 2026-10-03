@@ -45,6 +45,9 @@ dev = [
     # nobody thinks to write down by hand, so the round trip is asserted over generated
     # decimals rather than over a handful of examples.
     "hypothesis",
+    # Coverage of the lines a pull request changes, backend and frontend (#23): it reads the
+    # backend's Cobertura XML and the frontend's LCOV, so CI installs it once, from here.
+    "diff-cover",
 ]
 
 [build-system]

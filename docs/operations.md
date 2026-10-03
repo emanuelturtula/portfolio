@@ -5,8 +5,8 @@ hardware, changing the password, understanding when a session ends, pointing the
 at the chain index it reads balances from, refreshing the prices that turn a balance into
 a value, connecting the Bitget and BingX accounts whose trades say what each asset cost,
 keeping the import of those trades running, reading the cost-basis snapshot built from
-them, checking that history against the balances actually held, and backing the database up
-and restoring it.
+them, checking that history against the balances actually held, backing the database up and
+restoring it, reading the logs, and reading how every source stands.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -1773,6 +1773,255 @@ Keep the name exactly as it was: only a file named like a copy is listed or rest
 `chmod`: its own build runs `sh`, `mkdir` and `chown` in the final stage, and all four
 commands come from the base image's essential packages. **This command has not been run on
 the Pi yet**; it is checked there with acceptance criterion 14 of spec 029.
+
+## 18. Logs: one line per record, one id per request, and what is redacted
+
+### Reading them
+
+In production every record is **one JSON object on one line** on the container's stdout:
+the application's own, and those of the libraries it uses -- `httpx`, `aiosqlite`, uvicorn --
+which pass through the same processors and the same renderer. In development the same
+records are rendered for a terminal instead.
+
+```bash
+~/portfolio-app/prod/compose.sh logs app
+~/portfolio-app/prod/compose.sh logs app | grep '"level": "error"'
+```
+
+| Key | What it holds |
+|---|---|
+| `event` | What happened: `request_completed`, `backup_failed`, or a library's own message. |
+| `level` | `debug`, `info`, `warning`, `error` or `critical`. |
+| `timestamp` | When, in UTC, ISO 8601. |
+| `request_id` | On every record written while serving a request (below). |
+| `logger` | The library's logger name, on a record a library wrote. |
+| `exception` | The traceback, as text, on a record that logged one. |
+
+`PORTFOLIO_LOG_LEVEL` sets the level, `INFO` by default; a value it does not recognise is
+`INFO` too. At `DEBUG` the health check's `request_completed` line appears every thirty
+seconds, a line appears for every asset the web application loads, and the providers'
+per-request lines appear too.
+
+A record that cannot be written -- a library's message whose arguments do not format, say --
+is dropped, and stderr gets one line in its place, naming the error's type and the logger:
+
+```
+--- Logging error: TypeError in a record from logger httpx; the record was not written ---
+```
+
+Never the record, its arguments or the traceback: the standard library's own report printed
+all three, unredacted.
+
+### Following one request
+
+Every response carries an `X-Request-ID` header: a UUID, 36 characters in five hyphenated
+groups, made by the server for that request -- the 200s, the 401s, the 404s, the 422s and the
+500s alike. Every record written while serving it carries the same value as `request_id`,
+whichever part of the application or which library wrote it. An `X-Request-ID` sent by a client is ignored: never
+used, never logged, never echoed.
+
+```bash
+curl -si -b "$COOKIE" <origin>/api/wallets | grep -i '^x-request-id'
+~/portfolio-app/prod/compose.sh logs app | grep 01234567-89ab-cdef-0123-456789abcdef
+```
+
+When the page shows "The server encountered an unexpected condition.", the response's
+`X-Request-ID` leads to the `unhandled_exception` line with its traceback, and to the
+`request_completed` line with status 500. The browser's developer tools show the header under
+the request's response headers.
+
+### `request_completed`, one line per request
+
+| Field | Meaning |
+|---|---|
+| `method` | `GET`, `POST`, ... |
+| `route` | What the request was for; the list below. |
+| `status` | The status sent. A request that ended in an unhandled exception is 500. |
+| `duration_ms` | How long the request took, in whole milliseconds. |
+
+`route` is the first of these that applies:
+
+1. **The matched route's template**, such as `/api/wallets/{wallet_id}`.
+2. **The API's documentation**: `/api/openapi.json`, `/api/docs` and
+   `/api/docs/oauth2-redirect`, each logged as its own path.
+3. **`spa`** for any path outside `/api`: the web application's page and its assets.
+4. **`unmatched`** for anything else under `/api`: a path with no route (404), or a request
+   refused before routing for having no session -- the `request_refused` line beside it gives
+   the reason.
+
+**Never the raw path and never the query string.** It is at `INFO`, except at `DEBUG` for
+`spa`, since one page load fetches several assets, and for `GET /api/health`, which the
+container's health check calls every thirty seconds. It replaces uvicorn's access line, which
+is no longer written: the access line carried the raw path and query.
+
+### What is redacted
+
+Two rules run on every record, the libraries' included, immediately before it is rendered.
+Each replaces what it finds with `[REDACTED]`.
+
+**By key name.** The value of any field whose name contains `secret`, `passphrase`,
+`api_key`, `apikey`, `token`, `authorization`, `signature`, `password` or `address`, or starts
+with `xpub`, `ypub` or `zpub`, in any case and however deeply nested.
+
+**By value**, inside every string of the record -- the message, the traceback, every field's
+value, and every key at any depth, so a field keyed by address is caught too. The rules repeat
+over a string until nothing more changes, so two values written back to back are both caught:
+
+- **every credential the application holds**: the bootstrap password, the CoinGecko key, the
+  three Bitget variables and the two BingX ones -- every `SecretStr` setting, found by type, so
+  one added later is covered too. Wherever it appears when it is 8 characters or longer, and
+  only as a whole value when shorter, so that a short value does not redact ordinary words;
+- **extended public keys**: `xpub`, `ypub`, `zpub`, `tpub`, `upub`, `vpub`, `Ypub`, `Zpub`,
+  `Upub` and `Vpub`, followed by 100 or more Base58 characters;
+- **addresses**, mainnet and testnet: bech32 and bech32m starting `bc1`, `tb1` or `bcrt1` in
+  either case; Base58 addresses starting `1`, `3`, `m`, `n` or `2`; Kaspa addresses with the
+  `kaspa:`, `kaspatest:`, `kaspasim:` or `kaspadev:` prefix. No checksum is checked, so a word
+  that merely looks like one is redacted too;
+- **the query string of any URL**: `https://host/path?query` is logged as
+  `https://host/path?[REDACTED]`. One exchange signs its requests in the query string.
+
+Nothing is exempt, `request_id` included. A request id never matches a rule: its longest run
+of characters without a hyphen is 12, and the shortest address a rule recognises is 14.
+
+### What is not redacted
+
+- **A value that is none of the above**: an exception message quoting a trade id, an amount,
+  an asset or a label is logged as it is.
+- A credential encoded some other way -- percent-encoded, base64 -- and a path's query when
+  the URL has no scheme.
+- Part or all of a URL's query in four forms: what follows a quote inside the query; what
+  follows an unencoded `#` inside it, which is read as the fragment; what follows a `?`
+  inside the fragment, which is not a query; and the whole query of a URL whose slashes are
+  JSON-escaped (`https:\/\/host\/path?query`), which has no `://`.
+- An address joined to a letter or a digit with nothing between them, such as `x<address>`.
+  A space, an underscore, a hyphen, a slash or other punctuation separates it, so
+  `wallet_<address>` is redacted.
+- Parts of two addresses joined with nothing between them:
+  - after a Bitcoin bech32 address (`bc1`, `tb1`, `bcrt1`), a second one starting with `t`,
+    `k`, `m`, `n`, `2` or `3` is, as a rule, printed but for its first few characters. One
+    starting with `b` (`bc1`, `bcrt1`) or `1` is redacted, and so is a whole run of `b`
+    addresses joined together;
+  - after a Base58 one (`1`, `3`, `m`, `n`, `2`), both are printed.
+
+  After a Kaspa address the second is redacted too, whatever its form -- except about one
+  Base58 address in ten thousand behind a Kaspa address with the shorter, 61-character
+  payload, which is printed in part.
+
+**The second layer.** `httpx`, `httpcore` and `aiosqlite` are held at `WARNING` whatever
+`PORTFOLIO_LOG_LEVEL` says. `httpx` logs every request's URL at `INFO`, and `aiosqlite` every
+statement's parameters at `DEBUG` -- including the password hash whenever one is written,
+which no rule above recognises. Turning the application up to `DEBUG` to investigate does not
+turn them on.
+
+## 19. The health detail: every source, and what to do about each
+
+The Health page (`/health`) shows each section below, after *Backups*. Signed in, the same is
+served by `GET /api/health/detail`:
+
+```bash
+curl -s -b "$COOKIE" <origin>/api/health/detail | jq 'del(.backup)'
+```
+
+```json
+{
+  "schedulers": [
+    {"name": "balance-sync", "state": "ok", "last_tick_at": "2026-10-03T09:15:02.481210Z", "last_tick_succeeded": true},
+    {"name": "price-refresh", "state": "ok", "last_tick_at": "2026-10-03T09:00:01.102934Z", "last_tick_succeeded": true},
+    {"name": "exchange-sync", "state": "disabled", "last_tick_at": null, "last_tick_succeeded": null},
+    {"name": "backup", "state": "ok", "last_tick_at": "2026-10-03T03:00:00.912345Z", "last_tick_succeeded": true}
+  ],
+  "chains": {"state": "ok", "items": [
+    {"chain_key": "bitcoin", "state": "ok", "last_success_at": "2026-10-03T09:15:31.004812Z", "last_error_kind": null},
+    {"chain_key": "kaspa", "state": "failing", "last_success_at": "2026-10-03T08:45:12.774102Z", "last_error_kind": "rate_limited"}
+  ]},
+  "exchanges": {"state": "ok", "items": [
+    {"exchange_key": "bitget", "sync_state": "ok", "last_synced_at": "2026-10-03T09:00:44.310275Z", "balances_state": "ok", "balances_read_at": "2026-10-03T09:00:45.120934Z"}
+  ]},
+  "prices": {"state": "fresh", "latest_fetched_at": "2026-10-03T09:00:01.003712Z"},
+  "reconciliation": {"state": "match", "computed_at": "2026-10-03T09:00:46.551203Z", "assets_compared": 2, "assets_mismatched": 0, "sources_not_compared": 0}
+}
+```
+
+`backup` is section 17. **Each source is what its last recorded attempt says**: the endpoint
+calls no chain index and no exchange -- the page refetches every minute -- so a source looks
+healthy until its next attempt says otherwise. No setting is served: no interval, path, URL,
+key, tolerance or age limit. The timers' fields are held in memory, so a restart clears them.
+
+### `schedulers`: the four timers
+
+| `state` | Meaning | What to do |
+|---|---|---|
+| `ok` | Running and not late. | Nothing. |
+| `late` | Running, and one of two things. A tick is in flight, and it started more than two intervals ago. Or no tick is in flight, and the last one finished more than two intervals ago -- or, before the first tick, the timer started more than two intervals ago. | Look for the timer's lines in the log; a sync stuck on a vendor that never answers shows as a tick in flight. Restarting the container starts the timer again. |
+| `stopped` | The timer was built and its task is not running. | It should not happen while the application runs. Look for a traceback in the log and restart the container. |
+| `disabled` | Its `PORTFOLIO_*_ENABLED` setting is false. The exchange timer is also `disabled` when no exchange has credentials. | Nothing, unless it should be on: sections 10, 11, 13 and 17 name the setting. |
+
+"In flight" is read from the wall clock: the timer records when each tick starts and
+finishes, and a tick is in flight when its start is later than the last finish. If the Pi's
+clock is set back between a finish and the next start, that start can be recorded before the
+finish. The tick is then measured from the finish, so it turns `late` later than it should,
+by less than the clock moved -- never sooner. A clock set back far enough that the instant
+measured from is in the future reads `ok` until the clock catches up.
+
+`last_tick_succeeded` is `false` when the tick raised: the log has `scheduler_tick_failed` with
+`scheduler` and the traceback. A balance sync that recorded a failed chain still finished its
+tick; that failure is the `chains` section's.
+
+### `chains`: the balance sync per chain
+
+One entry per chain that a wallet uses or that the latest finished balance run read.
+
+| `state` | Meaning | What to do |
+|---|---|---|
+| `ok` | The newest finished run that read the chain read it. | Nothing. |
+| `failing` | It failed. `last_error_kind` says how, in the vocabulary of the run log. | Section 11, *Reading the run log*: `GET /api/balances/runs` has the provider's message. `last_success_at` says how long it has been failing. |
+| `never` | No finished run has read it: the wallet was registered after the last run, or no run has finished yet. | Wait for the next run, or trigger one (section 11). |
+
+### `exchanges`: one entry per account
+
+`sync_state` is the fill sync's status -- `ok`, `error`, `auth_failed` or `never_synced`, as
+section 13 describes -- and `last_synced_at` when a run last left the account with nothing
+pending.
+
+| `balances_state` | Meaning | What to do |
+|---|---|---|
+| `ok` | The last balance read succeeded, at `balances_read_at`. | Nothing. |
+| `failing` | The last balance read failed. | Section 16, *What to do about a `balances_error`*. |
+| `never` | No balance read has been made: balances are read only after a successful fill sync. | Look at `sync_state` first. |
+
+### `prices`
+
+| `state` | Meaning | What to do |
+|---|---|---|
+| `fresh` | The newest price is at most an hour old. | Nothing. |
+| `stale` | It is older: the refresh has stopped writing prices. | Check the price timer above and the `price_refresh_incomplete` lines; section 10. |
+| `never` | No price has ever been stored. | Check that the price timer is not `disabled`; section 10. |
+
+### `reconciliation`: the holdings check, in short
+
+A state and three counts: `assets_compared`, `assets_mismatched` and `sources_not_compared`
+(exchange accounts and wallets left out of the comparison). No quantity is served; the
+holdings check on the dashboard, and `GET /api/accounting/reconciliation`, have the detail.
+
+| `state` | Meaning | What to do |
+|---|---|---|
+| `match` | Every asset matches and every source was compared. | Nothing. |
+| `mismatch` | At least one asset's history and balances disagree beyond the tolerance. | Section 16: a `history_short` asset usually means a buy the history does not hold. |
+| `incomplete` | Every compared asset matches, but at least one source was left out: an account whose reading is not current, or a wallet that is stale, unread or on a chain that failed. | Section 16, *Which readings are compared*. |
+| `not_computed` | No cost-basis snapshot has been computed yet. | Wait for the startup recompute, or look at section 15. |
+
+### `unavailable`: a section that could not be read
+
+`chains`, `exchanges`, `prices` and `reconciliation` can each be `unavailable`, with its items
+empty and every other field `null`, while the other sections still answer. The Health page
+says "Could not be read. The log says why." The log has `health_section_failed` with `section`
+and `error_type`, the exception's class name:
+
+```bash
+~/portfolio-app/prod/compose.sh logs app | grep health_section_failed
+```
+
+A lasting one is a defect to report, with the `error_type` and the `request_id`.
 
 ## Troubleshooting
 

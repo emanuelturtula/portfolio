@@ -360,7 +360,13 @@ def test_the_vendor_floor_is_absolute_and_not_relative_to_the_application_level(
             assert logger.getEffectiveLevel() == VENDOR_LOG_FLOOR, f"{name} at app level {level}"
 
 
-async def test_the_leak_returns_the_moment_the_guard_is_removed(
+#: A path segment no value rule redacts: not a secret, not a key, not an address, not a
+#: query. What the control below plants, so that it can tell "the floor stopped the line"
+#: from "the value rule cleaned the line" now that #23 put the second behind the first.
+PLANTED_SEGMENT: Final = "planted-segment-no-rule-redacts-7e4a"
+
+
+async def test_the_request_line_returns_the_moment_the_guard_is_removed(
     capsys: pytest.CaptureFixture[str],
     production_logging: Callable[..., None],
 ) -> None:
@@ -371,27 +377,56 @@ async def test_the_leak_returns_the_moment_the_guard_is_removed(
     route this one watches is not the transport's own log line but
     `httpx.AsyncClient.send`, which no assertion about `request_target` can reach.
 
-    So the guard is lifted, the same request is driven again, and the address is asserted
-    to be **present**. If a future httpx moves its request line to DEBUG or renames its
-    logger, this goes red and says the guard is now watching a route nothing uses --
-    rather than leaving it to protect against nothing with every test still green.
+    So the guard is lifted, the same request is driven again, and the request line is
+    asserted to be **present**, carrying a path segment that no value rule redacts. Before
+    #23 the address itself was that witness; since spec 030 the value rule stands behind the
+    floor and redacts the address and the query even with the floor lifted -- which is
+    criterion 4, asserted here as well. If a future httpx moves its request line to DEBUG or
+    renames its logger, this goes red and says the guard is now watching a route nothing
+    uses -- rather than leaving it to protect against nothing with every test still green.
     """
     production_logging()
     httpx_logger = logging.getLogger("httpx")
     previous = httpx_logger.level
+    url = (
+        f"{ORIGIN}/api/{PLANTED_SEGMENT}/address/{BIP173_TESTNET_P2WPKH}/utxo"
+        f"?apiKey={SENTINEL_API_KEY}&signature={SENTINEL_SIGNATURE}"
+    )
     try:
         httpx_logger.setLevel(logging.INFO)
-        await drive(esplora_style_url(BIP173_TESTNET_P2WPKH), 200)
+        await drive(url, 200)
         written = capsys.readouterr().out
     finally:
         httpx_logger.setLevel(previous)
 
-    assert "HTTP Request:" in written, (
+    request_lines = [line for line in written.splitlines() if "HTTP Request:" in line]
+    assert request_lines, (
         "httpx no longer logs a request line at INFO, so the silenced-logger list is "
         "guarding a route that does not exist and the reason for it needs revisiting"
     )
-    assert BIP173_TESTNET_P2WPKH in written
-    assert SENTINEL_SIGNATURE in written
+    assert PLANTED_SEGMENT in request_lines[0]
+    assert_absent(written, BIP173_TESTNET_P2WPKH)
+    assert SENTINEL_SIGNATURE not in written
+    assert SENTINEL_API_KEY not in written
+
+
+async def test_the_planted_segment_is_absent_while_the_guard_holds(
+    capsys: pytest.CaptureFixture[str],
+    production_logging: Callable[..., None],
+) -> None:
+    """The other half of the control: the floor in place, at DEBUG, and no request line.
+
+    At DEBUG so the transport's own success line is written, which is what makes the
+    absence below an absence from a log that ran.
+    """
+    production_logging(log_level="DEBUG")
+
+    await drive(f"{ORIGIN}/api/{PLANTED_SEGMENT}/utxo", 200)
+    written = capsys.readouterr().out
+
+    assert_carried_something(written, marker=SUCCESS_EVENT)
+    assert "HTTP Request:" not in written
+    assert PLANTED_SEGMENT not in written
 
 
 def test_the_guard_is_restored_after_the_control_lifted_it(

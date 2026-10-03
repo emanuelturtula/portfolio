@@ -16,7 +16,8 @@ from fastapi import FastAPI
 from portfolio import __version__
 from portfolio.api.dependencies import auth_service_for, install_auth_runtime
 from portfolio.api.errors import register_exception_handlers
-from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware
+from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware, is_api_path
+from portfolio.api.request_context import RequestContextMiddleware, documentation_paths
 from portfolio.api.routers import (
     accounting,
     adjustments,
@@ -857,6 +858,16 @@ def create_app() -> FastAPI:
     # root and matches every path, so a check that ran after routing would see an API
     # request only when a route happened to exist for it.
     app.add_middleware(RequestGuardMiddleware, settings=settings)
+    # Added last, so it is the outermost of the application's own middleware: the request id
+    # it binds reaches the guard above, every route, and the 500 handler outside them all
+    # (#23). A pure ASGI middleware, for the reason `api/request_context.py` gives. It labels
+    # a request no route matched by the guard's own `/api` test and by the documentation
+    # paths configured above, read from the application rather than repeated here.
+    app.add_middleware(
+        RequestContextMiddleware,
+        is_api_path=is_api_path,
+        documentation_paths=documentation_paths(app),
+    )
 
     app.include_router(health.router, prefix=API_PREFIX)
     app.include_router(auth.router, prefix=API_PREFIX)

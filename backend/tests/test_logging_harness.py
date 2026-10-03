@@ -33,7 +33,12 @@ import structlog
 
 from portfolio.config import Settings
 from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_TIME_COST
-from portfolio.logging import SILENCED_VENDOR_LOGGERS, VENDOR_LOG_FLOOR, configure_logging
+from portfolio.logging import (
+    SILENCED_VENDOR_LOGGERS,
+    UVICORN_LOGGERS,
+    VENDOR_LOG_FLOOR,
+    configure_logging,
+)
 from tests import test_logging_redaction
 from tests.db import conftest as db_conftest
 from tests.logging_harness import logging_state, preserved_logging
@@ -204,6 +209,45 @@ def test_the_harness_puts_back_a_vendor_floor_a_control_lifted(library: str) -> 
         assert logger.level != VENDOR_LOG_FLOOR, "the lift has to change something"
 
     assert logger.level == VENDOR_LOG_FLOOR
+
+
+@pytest.mark.parametrize("name", UVICORN_LOGGERS)
+def test_the_harness_puts_back_a_uvicorn_logger_a_test_reconfigured(name: str) -> None:
+    """#23: uvicorn's loggers are the application's to route, and a test's to disturb.
+
+    `route_uvicorn_logging` empties their handlers, turns propagation on and raises the access
+    logger; a test that starts a real uvicorn server gets uvicorn's own configuration back on
+    top -- a handler bound to that test's captured stdout, and `propagate = False`. The
+    harness used to restore neither, so the next test's uvicorn records went to a closed
+    capture buffer and never reached the root handler. All three attributes are changed
+    here, the way uvicorn's `dictConfig` changes them, and all three have to come back.
+    """
+    logger = logging.getLogger(name)
+    before = (list(logger.handlers), logger.propagate, logger.level)
+    assert before[0] == [], "the baseline is the application's routing: no handler of its own"
+    assert before[1] is True
+
+    stray = logging.StreamHandler()
+    with preserved_logging():
+        logger.addHandler(stray)
+        logger.propagate = False
+        logger.setLevel(logging.DEBUG if logger.level != logging.DEBUG else logging.ERROR)
+        assert (list(logger.handlers), logger.propagate, logger.level) != before
+
+    assert (list(logger.handlers), logger.propagate, logger.level) == before
+    assert stray not in logger.handlers
+
+
+def test_the_state_snapshot_sees_a_uvicorn_logger_that_was_not_restored() -> None:
+    """The control: `logging_state` compares the uvicorn half, so a leak there is visible."""
+    before = logging_state()
+    logger = logging.getLogger(UVICORN_LOGGERS[-1])
+    with preserved_logging():
+        logger.propagate = False
+        assert logging_state() != before
+        assert logging_state()["uvicorn"] != before["uvicorn"]
+
+    assert logging_state() == before
 
 
 def test_the_comparison_can_see_a_configuration_that_was_not_restored() -> None:

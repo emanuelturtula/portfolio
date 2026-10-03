@@ -6,6 +6,7 @@ import { useHealthDetail, type BackupStatus } from '@/api/health';
 import { AbsoluteTime } from '@/components/AbsoluteTime';
 import { ErrorState } from '@/components/ErrorState';
 import { BACKUP_ERROR_WORDS, BACKUP_STATE_WORDS, UNKNOWN_BACKUP_VALUE } from '@/lib/backups';
+import { DetailSections } from '@/pages/health/DetailSections';
 
 /** Response body of `GET /api/health`. */
 interface HealthStatus {
@@ -111,7 +112,9 @@ function BackupsSection() {
  * The backups section under the details is a second query with the same three states of
  * its own, mounted only once the health check has answered: a backend that is not up has
  * already been reported above, and a second loading line and a second alert for the same
- * outage would only repeat it.
+ * outage would only repeat it. The sections after it (timers, balance sync, exchanges,
+ * prices, reconciliation) read the same entry and are mounted the same way; see
+ * {@link DetailSections}.
  */
 export function HealthPage() {
   const { data, error, isPending, isError } = useQuery({
@@ -155,6 +158,7 @@ export function HealthPage() {
         <dd>{data.environment}</dd>
       </dl>
       <BackupsSection />
+      <DetailSections />
     </section>
   );
 }

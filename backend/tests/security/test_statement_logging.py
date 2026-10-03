@@ -33,10 +33,13 @@ would print is caught by the second today.
   moment and has to reach both captures, so neither can pass by being empty or by running
   above DEBUG.
 * **The rows are read back.** The address and both labels really went through the engine.
-* **The control.** The floor is lifted, the same writes are driven, and the address has to
-  appear -- on an `aiosqlite` line. If a future release stops logging statements or renames
-  its logger, that test goes red and says the floor is guarding a route nothing uses, rather
-  than this module passing against nothing.
+* **The control.** The floor is lifted, the same writes are driven, and both labels have to
+  appear -- on an `aiosqlite` line, on stdout and in a record. A label is a value no rule of
+  #23's value redaction touches, so it, not the address, is what proves the floor is what
+  stops the line: since spec 030 the address is redacted on stdout even with the floor
+  lifted, which the control asserts too. If a future release stops logging statements or
+  renames its logger, that test goes red and says the floor is guarding a route nothing uses,
+  rather than this module passing against nothing.
 """
 
 from __future__ import annotations
@@ -237,17 +240,24 @@ async def test_the_owner_bootstrap_and_a_sign_in_at_debug_put_no_credential_on_a
         assert OWNER_PHRASE not in searched, f"the bootstrap password reached {where}"
 
 
-async def test_the_address_reaches_the_log_the_moment_the_floor_is_lifted(
+async def test_the_statement_reaches_the_log_the_moment_the_floor_is_lifted(
     signed_in_api_client: AsyncClient,
     production_logging: ProductionLoggingInstaller,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The control, and the reason the test above is not a test of nothing.
 
-    The floor is lifted to DEBUG, the same writes are driven, and the address and both labels
-    must be **present** on a line the driver wrote. `production_logging`'s teardown restores
-    the floor through `tests/logging_harness.py`, and `test_logging_harness.py` proves that it
-    does; the `finally` here is so the restore does not depend on which of them runs first.
+    The floor is lifted to DEBUG, the same writes are driven, and both labels must be
+    **present** on a line the driver wrote, on stdout and in a record. A label is what no value
+    rule redacts, so its presence is the floor's absence and nothing else -- the address was
+    that witness until #23, and is now redacted on stdout by the value rule even with the floor
+    lifted, which this asserts as well. A record seen by the test's own handler is not
+    asserted redacted: a standard-library record reaches a handler beside the root's as the
+    library wrote it (spec 030, R10).
+
+    `production_logging`'s teardown restores the floor through `tests/logging_harness.py`,
+    and `test_logging_harness.py` proves that it does; the `finally` here is so the restore
+    does not depend on which of them runs first.
     """
     production_logging("DEBUG")
     driver = logging.getLogger(DRIVER)
@@ -258,13 +268,14 @@ async def test_the_address_reaches_the_log_the_moment_the_floor_is_lifted(
         driver.setLevel(VENDOR_LOG_FLOOR)
 
     for where, searched in {"stdout": written, "a log record": records}.items():
-        leaked = [line for line in searched.splitlines() if BIP173_TESTNET_P2WPKH in line]
-        assert leaked, (
-            f"with the floor lifted the address never reached {where}: {DRIVER} no longer "
-            "logs its statements, so the floor guards a route nothing uses and the reason for "
-            "it needs revisiting"
+        statements = [line for line in searched.splitlines() if LABEL_SENTINEL in line]
+        assert statements, (
+            f"with the floor lifted no statement reached {where}: {DRIVER} no longer logs its "
+            "statements, so the floor guards a route nothing uses and the reason for it needs "
+            "revisiting"
         )
-        assert any("executing" in line for line in leaked), f"not the driver's line in {where}"
-        assert LABEL_SENTINEL in searched
+        assert any("executing" in line for line in statements), f"not the driver's line in {where}"
         assert RENAMED_SENTINEL in searched
+    assert any(f'"logger": "{DRIVER}"' in line for line in written.splitlines())
     assert any(line.startswith(DRIVER) for line in records.splitlines())
+    assert_absent(written, BIP173_TESTNET_P2WPKH)

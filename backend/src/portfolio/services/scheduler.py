@@ -43,6 +43,16 @@ because the loop does not re-check, it simply ticks -- run slightly early. Early
 a second is harmless; the point is that "at most once per interval" should be true as
 written, and up is the direction in which it is.
 
+## Each timer remembers its ticks, in memory, for the health detail (#23)
+
+`started_at`, `last_tick_started_at`, `last_tick_finished_at` and `last_tick_succeeded` are
+read through the injected clock and kept on the instance, so a restart clears them, and
+`status(now)` turns them into what `GET /api/health/detail` serves. The rule that decides
+`ok`, `late` or `stopped` is `domain.health.scheduler_state`, pure and tested with literals; it
+measures a tick in flight from its own start, and otherwise from the last finish (R13). A
+tick that raised is `last_tick_succeeded = False`; a tick cut short by `stop()` records no
+finish at all, because it did not finish.
+
 ## Durations are whole minutes in and whole seconds out
 
 `float` is banned in `services/`, and every interval this product will ever want is a whole
@@ -53,10 +63,13 @@ anything and no conversion introduces one.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
 import structlog
+
+from portfolio.domain.health import SchedulerState, scheduler_state
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine
@@ -66,6 +79,8 @@ __all__ = [
     "IntervalScheduler",
     "LastRunAt",
     "ScheduledRun",
+    "SchedulerState",
+    "SchedulerStatus",
     "sleep_seconds",
     "utc_now",
 ]
@@ -117,6 +132,22 @@ async def sleep_seconds(duration: int) -> None:
     await asyncio.sleep(duration)
 
 
+@dataclass(frozen=True, slots=True)
+class SchedulerStatus:
+    """How one timer stands, as `GET /api/health/detail` serves it. No interval is in it.
+
+    * `state` -- `ok`, `late` or `stopped`, by `domain.health.scheduler_state`.
+    * `last_tick_at` -- when the last tick **finished**, `None` before the first.
+    * `last_tick_succeeded` -- whether that tick returned without raising, `None` before the
+      first. A balance sync that recorded a failed chain still returned, so it succeeded here:
+      the chain's failure is the balance sync section's to show.
+    """
+
+    state: SchedulerState
+    last_tick_at: datetime | None
+    last_tick_succeeded: bool | None
+
+
 class IntervalScheduler:
     """Runs one coroutine every `interval_minutes`, until it is stopped.
 
@@ -145,6 +176,10 @@ class IntervalScheduler:
         self._clock = clock
         self._sleep = sleep
         self._task: asyncio.Task[None] | None = None
+        self._started_at: datetime | None = None
+        self._last_tick_started_at: datetime | None = None
+        self._last_tick_finished_at: datetime | None = None
+        self._last_tick_succeeded: bool | None = None
 
     @property
     def name(self) -> str:
@@ -161,6 +196,44 @@ class IntervalScheduler:
         """Whether the loop's task exists and has not finished."""
         return self._task is not None and not self._task.done()
 
+    @property
+    def started_at(self) -> datetime | None:
+        """When the loop was last started, by the injected clock. `None` if it never was."""
+        return self._started_at
+
+    @property
+    def last_tick_started_at(self) -> datetime | None:
+        """When the most recent tick began, `None` before the first."""
+        return self._last_tick_started_at
+
+    @property
+    def last_tick_finished_at(self) -> datetime | None:
+        """When the most recent tick to finish did so, `None` before the first.
+
+        A tick cut short by `stop()` did not finish and leaves this as it was.
+        """
+        return self._last_tick_finished_at
+
+    @property
+    def last_tick_succeeded(self) -> bool | None:
+        """Whether the most recent tick to finish returned without raising, `None` before one."""
+        return self._last_tick_succeeded
+
+    def status(self, now: datetime) -> SchedulerStatus:
+        """How this timer stands at `now`. In memory, so it never raises and never waits."""
+        return SchedulerStatus(
+            state=scheduler_state(
+                running=self.running,
+                interval=timedelta(seconds=self._interval_seconds),
+                started_at=self._started_at,
+                last_tick_started_at=self._last_tick_started_at,
+                last_tick_finished_at=self._last_tick_finished_at,
+                now=now,
+            ),
+            last_tick_at=self._last_tick_finished_at,
+            last_tick_succeeded=self._last_tick_succeeded,
+        )
+
     async def start(self) -> None:
         """Start the loop. Idempotent: starting a running scheduler does nothing.
 
@@ -171,6 +244,8 @@ class IntervalScheduler:
         """
         if self.running:
             return
+        # Before the task exists, so `status` never sees a running loop with no start.
+        self._started_at = self._clock()
         self._task = asyncio.create_task(self._loop(), name=f"{self._name}-scheduler")
         # Hand control to the loop once, so that `await start()` means the task has begun
         # rather than merely been created. It does **not** mean the first tick has finished:
@@ -258,8 +333,13 @@ class IntervalScheduler:
         worth killing the loop for.
 
         `CancelledError` is a `BaseException` rather than an `Exception`, so `stop()` still
-        ends the loop instead of being caught and logged as a failed tick.
+        ends the loop instead of being caught and logged as a failed tick -- and records no
+        finish, because the tick did not finish.
+
+        The start, the finish and the outcome are recorded through the injected clock for
+        `status`.
         """
+        self._last_tick_started_at = self._clock()
         try:
             await self._run(at_startup)
         except Exception:
@@ -268,3 +348,8 @@ class IntervalScheduler:
                 scheduler=self._name,
                 at_startup=at_startup,
             )
+            succeeded = False
+        else:
+            succeeded = True
+        self._last_tick_finished_at = self._clock()
+        self._last_tick_succeeded = succeeded
