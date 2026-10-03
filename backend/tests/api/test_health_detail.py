@@ -1,8 +1,12 @@
-"""Spec 029 (#22), criterion 5: `GET /api/health/detail`.
+"""Spec 029 (#22), criterion 5: `GET /api/health/detail`, its backup section.
 
 `401` without a session, like every path not on the allowlist; the five fields, exactly, with
 every `state` reachable through the real router and the real service; and **no configuration
 value** -- not the directory, not the interval, not the retention -- anywhere in the body.
+
+Since #23 (spec 030) the body has five more sections beside `backup`. Every test here still
+asserts the body's top level is exactly those six, so a section dropped or added fails here as
+well as in `test_health_detail_sections.py`, which is where the other five are tested.
 
 The application is the real one through its real lifespan, signed in as the owner. Its
 backup service is then replaced with one built over a directory and a clock this test
@@ -12,7 +16,7 @@ controls: the router reads `app.state.backup_service` on each request, which is 
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -23,6 +27,7 @@ from portfolio.services.backup import BackupService
 from tests.backup_harness import T0, fixed, plant_copies, sqlite_url
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
     from httpx import AsyncClient
@@ -30,6 +35,9 @@ if TYPE_CHECKING:
 DETAIL: Final = "/api/health/detail"
 IN_MEMORY: Final = "sqlite+aiosqlite:///:memory:"
 FIELDS: Final = {"state", "latest_at", "count", "last_attempt_at", "last_error_kind"}
+
+#: The body's top level since #23: the backup, and the five sections spec 030 adds beside it.
+SECTIONS: Final = {"backup", "schedulers", "chains", "exchanges", "prices", "reconciliation"}
 
 #: Settings no other value in the payload could coincide with, so their absence means
 #: something: an interval of 4321 minutes, 11 days, 13 weeks.
@@ -62,7 +70,7 @@ async def detail(client: AsyncClient) -> dict[str, Any]:
     response = await client.get(DETAIL)
     assert response.status_code == 200, response.text
     body: dict[str, Any] = response.json()
-    assert set(body) == {"backup"}
+    assert set(body) == SECTIONS
     backup: dict[str, Any] = body["backup"]
     assert set(backup) == FIELDS
     return backup
@@ -233,10 +241,38 @@ async def test_unreadable_is_served_with_the_unknowns_as_null_not_a_500(
 # --------------------------------------------------------------------------------------
 
 
+def scalars(node: object) -> Iterator[object]:
+    """Every scalar value in a parsed JSON document, however deeply nested."""
+    if isinstance(node, dict):
+        for value in node.values():
+            yield from scalars(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from scalars(item)
+    else:
+        yield node
+
+
+def is_instant(value: str) -> bool:
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 async def test_no_configuration_value_is_in_the_body(
     api_app: FastAPI, signed_in_api_client: AsyncClient, tmp_path: Path
 ) -> None:
-    """Not the directory, in any spelling, and not the interval or either retention."""
+    """Not the directory, in any spelling, and not the interval or either retention.
+
+    **The numbers are compared with the body's values, not searched for in its text.** Since
+    #23 the body carries a wall-clock instant -- the startup recompute's `computed_at` -- and
+    "11" or "13" occurs in one about one run in ten, so the text search this test used to make
+    failed for no leak. Each value is now an integer that must not equal a setting, or a
+    string -- other than an instant -- that must not contain one. The directory is still
+    searched for in the raw text, where an escaped spelling would show, and in every value.
+    """
     directory = tmp_path / "a-directory-only-the-operator-knows"
     plant_copies(directory, [T0 - timedelta(hours=1)])
     install(api_app, directory)
@@ -245,17 +281,41 @@ async def test_no_configuration_value_is_in_the_body(
 
     text = response.text
     assert response.status_code == 200
-    for value in (
+    spellings = (
         str(directory),
         directory.as_posix(),
         directory.name,
         str(tmp_path),
-        str(INTERVAL),
-        str(KEEP_DAILY),
-        str(KEEP_WEEKLY),
-    ):
-        assert value not in text, value
+        tmp_path.as_posix(),
+    )
+    for spelling in spellings:
+        assert spelling not in text, spelling
+        assert spelling.replace("\\", "\\\\") not in text, spelling
+    configured = (INTERVAL, KEEP_DAILY, KEEP_WEEKLY)
+    values = list(scalars(response.json()))
+    assert values, "the body has values to compare"
+    for value in values:
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, int):
+            assert value not in configured, value
+            continue
+        assert isinstance(value, str), value
+        for spelling in spellings:
+            assert spelling not in value, value
+        if not is_instant(value):
+            for number in configured:
+                assert str(number) not in value, value
     assert text.count('"count":1') == 1
+
+
+def test_the_value_walk_would_see_a_setting_and_ignores_an_instant() -> None:
+    """The control for the test above: a served interval is found, a timestamp is not."""
+    body = {"a": [{"interval_minutes": INTERVAL}], "b": "2026-10-03T11:13:00.111311Z"}
+
+    assert INTERVAL in list(scalars(body))
+    assert is_instant("2026-10-03T11:13:00.111311Z")
+    assert not is_instant(f"every {KEEP_DAILY} days")
 
 
 # --------------------------------------------------------------------------------------

@@ -5,6 +5,7 @@ from __future__ import annotations
 from http.cookies import SimpleCookie
 from time import perf_counter_ns
 from typing import TYPE_CHECKING, Any, Final
+from uuid import UUID
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -199,10 +200,20 @@ async def test_unknown_user_and_wrong_password_are_indistinguishable(
     # rather than only the content type. A `WWW-Authenticate` on one branch and not the
     # other would be an oracle as surely as a different message would.
     assert unknown.content == wrong.content
-    volatile = {"date", "server"}
+    # `x-request-id` (#23) differs by construction: a fresh id per request, whichever branch
+    # answered. So it is compared for its *shape* instead -- present on both, each a
+    # canonical UUID4, and different -- which no branch could turn into an oracle.
+    volatile = {"date", "server", "x-request-id"}
     assert {k: v for k, v in unknown.headers.items() if k not in volatile} == {
         k: v for k, v in wrong.headers.items() if k not in volatile
     }
+    ids = [UUID(response.headers["x-request-id"]) for response in (unknown, wrong)]
+    assert [str(one) for one in ids] == [
+        unknown.headers["x-request-id"],
+        wrong.headers["x-request-id"],
+    ]
+    assert [one.version for one in ids] == [4, 4]
+    assert ids[0] != ids[1]
     assert "www-authenticate" not in unknown.headers
 
 

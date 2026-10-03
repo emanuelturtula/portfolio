@@ -11,6 +11,7 @@ import {
   failedBackupWithNoKind,
   failedBackupWithNone,
   HEALTH_DETAIL_PATH,
+  healthDetail,
   okBackup,
   pendingBackup,
   serveBackup,
@@ -170,7 +171,7 @@ describe('BackupNotice', () => {
     // TanStack notifies its observers on a timer of its own; let the re-render land.
     await settle();
 
-    expect(queryClient.getQueryData(healthDetailQueryKey)).toEqual({ backup: okBackup });
+    expect(queryClient.getQueryData(healthDetailQueryKey)).toEqual(healthDetail(okBackup));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });

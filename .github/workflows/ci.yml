@@ -108,6 +108,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The whole history, so that `origin/main` and the merge base are there for the
+          # changed-lines step below to compare against (#23).
+          fetch-depth: 0
           persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
@@ -117,15 +120,24 @@ jobs:
         working-directory: backend
       - name: pytest with coverage
         working-directory: backend
-        # The JSON report is for the next step, and goes to the runner's temporary
-        # directory so that nothing lands in the checkout.
-        run: uv run pytest --cov --cov-report=term-missing --cov-report="json:$RUNNER_TEMP/coverage.json"
+        # The reports are for the steps after it -- the JSON for the domain floor, the
+        # Cobertura XML for the changed lines -- and go to the runner's temporary directory
+        # so that nothing lands in the checkout.
+        run: uv run pytest --cov --cov-report=term-missing --cov-report="json:$RUNNER_TEMP/coverage.json" --cov-report="xml:$RUNNER_TEMP/coverage.xml"
       - name: Domain coverage floor
         # Criterion 13 of #17: 95% of lines and 90% of branches under src/portfolio/domain/,
         # on top of the repository-wide floor in backend/pyproject.toml, which one number
         # over everything would let the accounting engine slip under. Standard library only,
         # so it needs nothing the backend installs; it fails closed on a report it cannot use.
         run: python3 scripts/domain_coverage.py "$RUNNER_TEMP/coverage.json"
+      - name: Changed-lines coverage
+        # #23: 90% of the lines this pull request adds or changes under backend/, which the
+        # floors above cannot see -- a well-covered codebase carries a new module that no
+        # test runs. Pull requests only: on main, called from Delivery, there is no diff.
+        # `--compare-branch=origin/main` diffs from the merge base, hence the full fetch.
+        if: github.event_name == 'pull_request'
+        working-directory: backend
+        run: uv run diff-cover "$RUNNER_TEMP/coverage.xml" --compare-branch=origin/main --fail-under=90
       - name: Deployment guardrail tests
         # Plain unittest, no dependencies: these protect the path from a workflow run to a
         # production deployment, so they must run even if the backend fails to install.
@@ -139,10 +151,14 @@ jobs:
     name: Frontend tests
     needs: secrets-scan
     runs-on: ubuntu-latest
-    timeout-minutes: 5 # slowest: 52 s
+    # Slowest: 52 s, measured before #23 added the uv install and the changed-lines step to
+    # pull requests. 10 rather than 5 until a run with them has been measured.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The whole history, for the changed-lines step's comparison with `origin/main`.
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -157,6 +173,26 @@ jobs:
       - name: Build the production bundle
         working-directory: frontend
         run: npm run build
+      # diff-cover is a backend dev dependency, pinned by backend/uv.lock, so the frontend's
+      # changed lines are held to the same tool at the same version as the backend's.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        if: github.event_name == 'pull_request'
+        with:
+          enable-cache: true
+          working-directory: backend
+      - name: Install diff-cover
+        if: github.event_name == 'pull_request'
+        working-directory: backend
+        run: uv sync --locked
+      - name: Changed-lines coverage
+        # #23: 90% of the lines this pull request adds or changes under frontend/, read
+        # from the LCOV report the vitest step wrote. Its paths are relative to the
+        # repository root (see `projectRoot` in vite.config.ts): relative to frontend/ they
+        # would match no changed file, and every pull request would pass with nothing
+        # measured. Pull requests only, as in the backend job.
+        if: github.event_name == 'pull_request'
+        working-directory: frontend
+        run: uv run --locked --project ../backend diff-cover coverage/lcov.info --compare-branch=origin/main --fail-under=90
 
   openapi-drift:
     name: OpenAPI drift

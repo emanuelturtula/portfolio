@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -28,10 +29,12 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 import pytest
 import structlog
 from httpx import ASGITransport, AsyncClient
+from pydantic import SecretStr
 from structlog.testing import capture_logs
 
 from portfolio.api.errors import PROBLEM_CONTENT_TYPE
 from portfolio.config import Settings
+from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_TIME_COST
 from portfolio.logging import (
     REDACTED,
     SENSITIVE_KEY_FRAGMENTS,
@@ -45,6 +48,7 @@ from tests.address_vectors import (
     BIP173_TESTNET_P2WPKH_UPPERCASE,
     KASPA_TESTNET_V1_KEY,
     NAMED_CORRUPTIONS,
+    SYNTHETIC_TPUB,
 )
 from tests.auth.conftest import BASE_URL as SECURE_BASE_URL
 from tests.auth.conftest import JSON_HEADERS
@@ -438,19 +442,18 @@ def test_the_pipeline_does_not_redact_an_exception_message(
 ) -> None:
     """The residual, asserted rather than assumed, because assuming it is what went wrong.
 
-    Redaction works on **key names**. An exception's rendered traceback arrives as the
-    value of `exception`, which is not a sensitive name and whose text no processor
-    inspects, so anything inside an exception message is printed in full. That is not a
-    bug to be fixed here -- a redactor that scanned every string for anything
-    address-shaped would be slow, would mangle tracebacks, and would still miss a
-    truncated address.
+    Since #23 (spec 030) the value rule reads every string of a record, the rendered
+    traceback under `exception` included, and replaces four things in it: a loaded secret, an
+    extended public key, an address of a supported form, and a URL's query. The tests below
+    this one pin each of them inside exception text, through structlog and through the
+    standard library.
 
-    It is the reason the two rules that *do* protect this path have to hold: nothing in
-    this repository may put an address into an exception message, and the database driver
-    must not either. This test exists so that nobody reads the redaction processor and
-    concludes the pipeline is a safety net for exception text. It is a statement of what
-    is **not** covered, in the same spirit as the residual documented in
-    `tests/security/test_no_float.py`.
+    What the rule cannot know is an arbitrary value: a trade id, an amount, a label, a row's
+    contents. This sentinel is none of the four, so it is printed in full. That is the
+    residual the module docstring states, and it is why the rules that keep such values out
+    of exception messages in the first place still have to hold. This test exists so that
+    nobody reads the value rule and concludes the pipeline is a safety net for everything an
+    exception might carry.
     """
     production_logging()
     sentinel = "sentinel-value-carried-inside-an-exception"
@@ -468,6 +471,64 @@ def test_the_pipeline_does_not_redact_an_exception_message(
         "the pipeline now redacts exception text; if that is deliberate, this test should "
         "be replaced by one asserting the redaction rather than deleted"
     )
+
+
+#: Synthetic and distinctive. Loaded as a secret below, so the value rule knows it.
+EXCEPTION_SENTINEL: Final = "sentinel-secret-in-an-exception-9c1d"
+SIGNED_QUERY: Final = "apiKey=k&signature=sentinel-signature-in-an-exception"
+
+
+def exception_settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        environment="prod",
+        allowed_origin=PRODUCTION_ORIGIN,
+        argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
+        argon2_time_cost=OWASP_MINIMUM_TIME_COST,
+        coingecko_api_key=SecretStr(EXCEPTION_SENTINEL),
+    )
+
+
+@pytest.mark.parametrize("writer", ["structlog", "stdlib"])
+@pytest.mark.parametrize(
+    ("carried", "forbidden"),
+    [
+        (BIP173_TESTNET_P2WPKH, BIP173_TESTNET_P2WPKH),
+        (KASPA_TESTNET_V1_KEY, KASPA_TESTNET_V1_KEY),
+        (SYNTHETIC_TPUB, SYNTHETIC_TPUB),
+        (EXCEPTION_SENTINEL, EXCEPTION_SENTINEL),
+        (f"https://api.example.test/v2/fills?{SIGNED_QUERY}", SIGNED_QUERY),
+    ],
+    ids=["bech32", "kaspa", "tpub", "secret", "url-query"],
+)
+def test_exception_text_is_redacted_for_each_of_the_four(
+    writer: str,
+    carried: str,
+    forbidden: str,
+    capsys: pytest.CaptureFixture[str],
+    restored_logging: None,
+) -> None:
+    """Spec 030, criteria 1, 2 and 4: inside a traceback, as anywhere else."""
+    del restored_logging
+    configure_logging(exception_settings())
+
+    try:
+        message = f"failing request carried {carried} and stopped"
+        raise ValueError(message)
+    except ValueError:
+        if writer == "structlog":
+            structlog.get_logger("test").exception("unhandled_exception")
+        else:
+            logging.getLogger("some.library").exception("a library failed")
+
+    written = capsys.readouterr().out
+    [line] = [json.loads(one) for one in written.splitlines() if one.strip()]
+    assert "Traceback" in line["exception"]
+    assert "ValueError: failing request carried" in line["exception"]
+    assert REDACTED in line["exception"]
+    assert forbidden not in written
+    if forbidden != SIGNED_QUERY:
+        assert_absent(written, forbidden)
 
 
 def test_capture_logs_would_not_have_seen_that(

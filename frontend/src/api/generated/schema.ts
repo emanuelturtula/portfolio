@@ -447,8 +447,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Report how the scheduled backups stand
-         * @description Return the backup's state, the newest copy's instant, the count and the last attempt.
+         * Report how the backups, timers, syncs, prices and holdings check stand
+         * @description Return each source's state as its last recorded attempt left it. Calls no vendor.
          */
         get: operations["getHealthDetail"];
         put?: never;
@@ -941,6 +941,23 @@ export interface components {
             state: components["schemas"]["BackupState"];
         };
         /**
+         * ChainHealthResponse
+         * @description One chain the balance sync reads.
+         *
+         *     `state` is its outcome in the newest finished run that has one: `ok`, `failing` when it
+         *     failed, or `never`. `last_success_at` is when the newest run that read it successfully
+         *     finished. `last_error_kind` is the newest outcome's kind while `failing`, else `null`. The
+         *     provider's message is not served; the balance run log has it.
+         */
+        ChainHealthResponse: {
+            /** Chain Key */
+            chain_key: string;
+            last_error_kind: components["schemas"]["SyncErrorKind"] | null;
+            /** Last Success At */
+            last_success_at: string | null;
+            state: components["schemas"]["SourceState"];
+        };
+        /**
          * ChainKey
          * @description Every chain balances can be read from.
          *
@@ -968,6 +985,15 @@ export interface components {
             status: components["schemas"]["SyncRunStatus"];
             /** Wallets Read */
             wallets_read: number;
+        };
+        /**
+         * ChainsHealthResponse
+         * @description The balance sync per chain, sorted by `chain_key`. Empty `items` when `unavailable`.
+         */
+        ChainsHealthResponse: {
+            /** Items */
+            items: components["schemas"]["ChainHealthResponse"][];
+            state: components["schemas"]["SectionState"];
         };
         /**
          * CurrentBalancesResponse
@@ -1275,6 +1301,23 @@ export interface components {
             spent: string;
         };
         /**
+         * ExchangeHealthResponse
+         * @description One exchange account: where its fill sync stands, and its balance reading.
+         *
+         *     `sync_state` is the account's sync status and `last_synced_at` when a run last left it
+         *     with nothing pending. `balances_state` is `ok` with a reading and no error, `failing` after
+         *     a failed read, `never` with neither; `balances_read_at` is when a read last succeeded.
+         */
+        ExchangeHealthResponse: {
+            /** Balances Read At */
+            balances_read_at: string | null;
+            balances_state: components["schemas"]["SourceState"];
+            exchange_key: components["schemas"]["ExchangeKey"];
+            /** Last Synced At */
+            last_synced_at: string | null;
+            sync_state: components["schemas"]["AccountSyncStatus"];
+        };
+        /**
          * ExchangeKey
          * @description Every venue spot fills can be imported from.
          *
@@ -1426,6 +1469,15 @@ export interface components {
             trigger: components["schemas"]["SyncTrigger"];
         };
         /**
+         * ExchangesHealthResponse
+         * @description Every exchange account, by `exchange_key`. Empty `items` when `unavailable`.
+         */
+        ExchangesHealthResponse: {
+            /** Items */
+            items: components["schemas"]["ExchangeHealthResponse"][];
+            state: components["schemas"]["SectionState"];
+        };
+        /**
          * ExclusionReason
          * @description Why a position was left out of the portfolio totals. The member is its wire form.
          *
@@ -1510,10 +1562,16 @@ export interface components {
         };
         /**
          * HealthDetailResponse
-         * @description The state of each source the application owns. Only `backup` so far.
+         * @description The state of each source the application owns.
          */
         HealthDetailResponse: {
             backup: components["schemas"]["BackupStatusResponse"];
+            chains: components["schemas"]["ChainsHealthResponse"];
+            exchanges: components["schemas"]["ExchangesHealthResponse"];
+            prices: components["schemas"]["PricesHealthResponse"];
+            reconciliation: components["schemas"]["ReconciliationHealthResponse"];
+            /** Schedulers */
+            schedulers: components["schemas"]["SchedulerStatusResponse"][];
         };
         /**
          * HealthResponse
@@ -1633,6 +1691,17 @@ export interface components {
             warnings: components["schemas"]["AccountingWarningResponse"][];
         };
         /**
+         * PriceHealthState
+         * @description How the stored prices stand. The member is its wire form.
+         *
+         *     * `fresh` -- the newest price row is at most the age limit old.
+         *     * `stale` -- it is older than that: the refresh has stopped writing rows.
+         *     * `never` -- no price row exists.
+         *     * `unavailable` -- the read raised.
+         * @enum {string}
+         */
+        PriceHealthState: "fresh" | "stale" | "never" | "unavailable";
+        /**
          * PriceResponse
          * @description The price one asset was valued at, and how old it is.
          *
@@ -1683,6 +1752,16 @@ export interface components {
          */
         PriceUnavailable: "never_fetched" | "every_source_failed" | "unsupported_pair" | "no_source_configured";
         /**
+         * PricesHealthResponse
+         * @description The stored prices: `fresh`, `stale`, `never` or `unavailable`, and the newest row's
+         *     instant -- `null` when there is none or it could not be read.
+         */
+        PricesHealthResponse: {
+            /** Latest Fetched At */
+            latest_fetched_at: string | null;
+            state: components["schemas"]["PriceHealthState"];
+        };
+        /**
          * QuoteCurrency
          * @description A currency holdings may be valued in. The member is its own wire form.
          *
@@ -1707,6 +1786,40 @@ export interface components {
          * @enum {string}
          */
         RecomputeOutcome: "unchanged" | "written" | "failed";
+        /**
+         * ReconciliationHealthResponse
+         * @description The holdings check, reduced to a state and three counts. No quantity and no asset.
+         *
+         *     `computed_at` is the accounting snapshot's instant. `assets_compared` and
+         *     `assets_mismatched` count the compared assets and those not `match`; `sources_not_compared`
+         *     counts the exchange accounts and wallets left out. All four are `null` when `unavailable`.
+         *     The reconciliation view has the detail.
+         */
+        ReconciliationHealthResponse: {
+            /** Assets Compared */
+            assets_compared: number | null;
+            /** Assets Mismatched */
+            assets_mismatched: number | null;
+            /** Computed At */
+            computed_at: string | null;
+            /** Sources Not Compared */
+            sources_not_compared: number | null;
+            state: components["schemas"]["ReconciliationHealthState"];
+        };
+        /**
+         * ReconciliationHealthState
+         * @description How the holdings check stands, the first that applies. The member is its wire form.
+         *
+         *     * `not_computed` -- no accounting snapshot has been written yet.
+         *     * `mismatch` -- an asset's status is not `match`: `history_short` or `history_over`.
+         *     * `incomplete` -- every compared asset matches, and a source was left out: an exchange
+         *       account that is not compared, or a wallet that is stale, unread or on a chain that
+         *       failed.
+         *     * `match` -- every asset matches and every source was compared.
+         *     * `unavailable` -- the read raised.
+         * @enum {string}
+         */
+        ReconciliationHealthState: "match" | "mismatch" | "incomplete" | "not_computed" | "unavailable";
         /**
          * ReconciliationResponse
          * @description The replayed quantities beside the balances read, per asset, and every source's state.
@@ -1755,6 +1868,50 @@ export interface components {
          */
         ReconciliationStatus: "match" | "history_short" | "history_over";
         /**
+         * SchedulerName
+         * @description The four timers, by the names their log lines and task names already carry.
+         * @enum {string}
+         */
+        SchedulerName: "balance-sync" | "price-refresh" | "exchange-sync" | "backup";
+        /**
+         * SchedulerState
+         * @description How one timer stands. The member is its wire form.
+         *
+         *     * `ok` -- running, and not late.
+         *     * `late` -- running, and more than `LATE_AFTER_INTERVALS` intervals old: the tick in flight
+         *       since it started, or otherwise its last finished tick, or its start before the first.
+         *     * `stopped` -- the timer was built and its task is not running.
+         *     * `disabled` -- the settings switched the timer off, so it was never built. The exchange
+         *       timer is also not built when no venue is configured.
+         * @enum {string}
+         */
+        SchedulerState: "ok" | "late" | "stopped" | "disabled";
+        /**
+         * SchedulerStatusResponse
+         * @description One of the four timers.
+         *
+         *     `last_tick_at` is when its last tick finished and `last_tick_succeeded` whether that tick
+         *     returned without raising; both `null` before a tick has finished, and always for a
+         *     `disabled` timer. Held in memory, so a restart clears them.
+         */
+        SchedulerStatusResponse: {
+            /** Last Tick At */
+            last_tick_at: string | null;
+            /** Last Tick Succeeded */
+            last_tick_succeeded: boolean | null;
+            name: components["schemas"]["SchedulerName"];
+            state: components["schemas"]["SchedulerState"];
+        };
+        /**
+         * SectionState
+         * @description Whether a section of the health detail could be read. The member is its wire form.
+         *
+         *     `unavailable` means its read raised: the log has `health_section_failed` naming it, and
+         *     every other field of the section is null or empty.
+         * @enum {string}
+         */
+        SectionState: "ok" | "unavailable";
+        /**
          * SessionResponse
          * @description Who the caller is. Deliberately the only thing a session read discloses.
          */
@@ -1787,6 +1944,16 @@ export interface components {
             /** Sync Run Id */
             sync_run_id: number;
         };
+        /**
+         * SourceState
+         * @description What a source's last recorded attempt says. The member is its wire form.
+         *
+         *     * `ok` -- the last attempt succeeded.
+         *     * `failing` -- the last attempt failed, or succeeded only in part.
+         *     * `never` -- no attempt is recorded.
+         * @enum {string}
+         */
+        SourceState: "ok" | "failing" | "never";
         /**
          * SyncErrorKind
          * @description Whose fault a chain's failure was, as a value an operator can act on.

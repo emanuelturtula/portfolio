@@ -13,7 +13,7 @@ nothing, and the hasher because its dummy hash is computed once and reused.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 # A runtime import, deliberately. FastAPI resolves a dependency's annotations when the
 # application is built, and `request: Request` is how it knows to pass the request object
@@ -41,6 +41,12 @@ from portfolio.services.auth import (
 from portfolio.services.backup import BackupService
 from portfolio.services.balances import BalanceService, build_balance_service
 from portfolio.services.exchanges import ExchangeService, build_exchange_service
+from portfolio.services.health import (
+    HealthService,
+    SchedulerName,
+    TimerLike,
+    build_health_service,
+)
 from portfolio.services.password_hasher import PasswordHasher
 from portfolio.services.reconciliation import ReconciliationService, build_reconciliation_service
 from portfolio.services.sync_coordinator import SyncCoordinator
@@ -292,6 +298,39 @@ def get_backup_service(request: Request) -> BackupService:
         )
         raise RuntimeError(message)
     return service
+
+
+SCHEDULER_ATTRIBUTES: Final[tuple[tuple[SchedulerName, str], ...]] = (
+    (SchedulerName.BALANCE_SYNC, "balance_scheduler"),
+    (SchedulerName.PRICE_REFRESH, "price_scheduler"),
+    (SchedulerName.EXCHANGE_SYNC, "exchange_scheduler"),
+    (SchedulerName.BACKUP, "backup_scheduler"),
+)
+"""Each timer's name, and the `app.state` attribute `main.lifespan` publishes it on."""
+
+
+def timers_of(app: FastAPI) -> dict[SchedulerName, TimerLike | None]:
+    """The four timers the lifespan published, `None` for each one it did not build.
+
+    `None` when the settings switched a timer off -- the lifespan publishes `None` then -- and
+    also when the lifespan has not run, which only a test does. Either way the timer is served
+    as `disabled`. Read per request, so the health detail sees the timers as they are now.
+    """
+    return {name: getattr(app.state, attribute, None) for name, attribute in SCHEDULER_ATTRIBUTES}
+
+
+async def get_health_service(request: Request) -> AsyncIterator[HealthService]:
+    """Open a session for this request and hand the router the health service.
+
+    Read-only, like `get_balance_service`: nothing is committed, and a section that failed
+    rolls the session back before the next reads. The backup service and the timers are the
+    process-wide ones, read from `app.state` here, so the service sees the backup timer's last
+    attempt and each timer's ticks.
+    """
+    backup = get_backup_service(request)
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_health_service(session, backup=backup, timers=timers_of(request.app))
 
 
 def get_principal(request: Request) -> Principal:

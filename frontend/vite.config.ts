@@ -32,7 +32,15 @@ export default defineConfig({
     css: false,
     coverage: {
       provider: 'v8',
-      reporter: ['text', 'html', 'lcov'],
+      // `lcov.info` names each file relative to the repository root
+      // (`SF:frontend/src/...`), not to this directory: that is the form
+      // `diff-cover` resolves against `git diff`'s paths. Relative to here, it
+      // matches no changed file and passes a pull request with nothing measured.
+      reporter: [
+        'text',
+        'html',
+        ['lcov', { projectRoot: fileURLToPath(new URL('..', import.meta.url)) }],
+      ],
       include: ['src/**/*.{ts,tsx}'],
       exclude: [
         ...coverageConfigDefaults.exclude,

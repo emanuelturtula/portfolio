@@ -34,7 +34,13 @@ Everything `portfolio.logging.configure_logging` touches, and nothing it does no
   raises. Every call raises them to the same floor today, so this half restores nothing in
   practice -- it is here so that it keeps restoring the day that stops being true, and so
   that a control which lifts a floor on purpose cannot leave it lifted. The list is imported
-  rather than restated, so a logger added to it is restored without an edit here.
+  rather than restated, so a logger added to it is restored without an edit here;
+* each of uvicorn's loggers (`UVICORN_LOGGERS`, #23): its handlers, its `propagate` flag and
+  its level. `route_uvicorn_logging` clears the first, turns the second on and raises
+  `uvicorn.access`, and a test that runs a real uvicorn server installs uvicorn's own
+  configuration -- handlers that write to whatever `sys.stdout` was at that moment, and
+  `propagate = False`. Left behind, either one changes where every later test's uvicorn
+  record goes, and a handler bound to a dead capture buffer is a write to a closed file.
 
 `tests/test_logging_harness.py` drives each fixture's real teardown and compares the state
 afterwards with the state before, so a fourth fixture written the old way, or this one
@@ -49,10 +55,22 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from portfolio.logging import SILENCED_VENDOR_LOGGERS
+from portfolio.logging import SILENCED_VENDOR_LOGGERS, UVICORN_LOGGERS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+
+def uvicorn_state() -> dict[str, tuple[list[logging.Handler], bool, int]]:
+    """Each uvicorn logger's handlers, `propagate` flag and level, copied."""
+    return {
+        name: (
+            list(logging.getLogger(name).handlers),
+            logging.getLogger(name).propagate,
+            logging.getLogger(name).level,
+        )
+        for name in UVICORN_LOGGERS
+    }
 
 
 def logging_state() -> dict[str, Any]:
@@ -72,6 +90,7 @@ def logging_state() -> dict[str, Any]:
         "vendor_levels": {
             library: logging.getLogger(library).level for library in SILENCED_VENDOR_LOGGERS
         },
+        "uvicorn": uvicorn_state(),
     }
 
 
@@ -93,3 +112,8 @@ def preserved_logging() -> Iterator[None]:
         root.setLevel(before["root_level"])
         for library, level in before["vendor_levels"].items():
             logging.getLogger(library).setLevel(level)
+        for name, (handlers, propagate, level) in before["uvicorn"].items():
+            logger = logging.getLogger(name)
+            logger.handlers[:] = handlers
+            logger.propagate = propagate
+            logger.setLevel(level)

@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from portfolio.db.models import SyncRun, SyncRunChain
 
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = [
+    "ChainHistory",
     "ChainOutcome",
     "SyncErrorKind",
     "SyncRunRepository",
@@ -174,6 +175,23 @@ class SyncRunSummary:
     wallets_succeeded: int
     wallets_failed: int
     chains: tuple[ChainOutcome, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ChainHistory:
+    """What the finished runs say about one chain: its newest outcome, and its newest success.
+
+    * `latest` -- the chain's outcome in the newest finished run that has one for it.
+    * `last_success_at` -- the `finished_at` of the newest finished run whose outcome for the
+      chain succeeded, `None` when none has.
+
+    What `GET /api/health/detail` serves per chain (#23). `latest.detail` is carried because
+    the outcome is the run log's own vocabulary; the health service does not serve it.
+    """
+
+    chain_key: str
+    latest: ChainOutcome
+    last_success_at: datetime | None
 
 
 class SyncRunRepository:
@@ -383,6 +401,53 @@ class SyncRunRepository:
             .order_by(SyncRunChain.chain_key)
         )
         return summary_of(run, tuple(outcome_of(row) for row in rows))
+
+    async def chain_histories(self) -> dict[str, ChainHistory]:
+        """Per chain key, its newest outcome and its newest success, over the finished runs.
+
+        A chain is listed when any finished run has an outcome for it. Three statements,
+        whatever the number of runs: the newest finished run id per chain; the newest finished
+        run id per chain whose outcome succeeded; then those runs' chain rows with each run's
+        `finished_at`.
+
+        **`MAX` over `sync_run_id`, an `INTEGER`**, as `latest_finished` orders by `id`: with
+        one run at a time, identity order is finish order, and nothing here sorts, compares or
+        aggregates the `TEXT` datetime. `finished_at` is read, never compared.
+        """
+        finished = SyncRun.status.in_(_FINISHED_STATUSES)
+        newest = (
+            select(SyncRunChain.chain_key, func.max(SyncRunChain.sync_run_id))
+            .join(SyncRun, SyncRun.id == SyncRunChain.sync_run_id)
+            .where(finished)
+            .group_by(SyncRunChain.chain_key)
+        )
+        latest_ids: dict[str, int] = dict((await self._session.execute(newest)).all())
+        if not latest_ids:
+            return {}
+        succeeded = newest.where(SyncRunChain.status == SyncRunStatus.SUCCESS)
+        success_ids: dict[str, int] = dict((await self._session.execute(succeeded)).all())
+        run_ids = set(latest_ids.values()) | set(success_ids.values())
+        rows = await self._session.execute(
+            select(SyncRunChain, SyncRun.finished_at)
+            .join(SyncRun, SyncRun.id == SyncRunChain.sync_run_id)
+            .where(SyncRunChain.sync_run_id.in_(run_ids))
+            .order_by(SyncRunChain.sync_run_id, SyncRunChain.chain_key)
+        )
+        latest: dict[str, ChainOutcome] = {}
+        last_success_at: dict[str, datetime | None] = {}
+        for row, finished_at in rows:
+            if latest_ids.get(row.chain_key) == row.sync_run_id:
+                latest[row.chain_key] = outcome_of(row)
+            if success_ids.get(row.chain_key) == row.sync_run_id:
+                last_success_at[row.chain_key] = finished_at
+        return {
+            chain_key: ChainHistory(
+                chain_key=chain_key,
+                latest=outcome,
+                last_success_at=last_success_at.get(chain_key),
+            )
+            for chain_key, outcome in sorted(latest.items())
+        }
 
 
 def outcome_of(row: SyncRunChain) -> ChainOutcome:
