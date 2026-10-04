@@ -53,6 +53,7 @@ from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_
 from portfolio.logging import (
     ADDRESS_PATTERNS,
     EXTENDED_KEY_PREFIXES,
+    EXTENDED_PRIVATE_KEY_PREFIXES,
     EXTENDED_PUBLIC_KEY_PREFIXES,
     HANDLER_ERROR_LINE,
     MIN_SUBSTRING_SECRET_LENGTH,
@@ -282,7 +283,8 @@ def test_every_key_fragment_and_key_prefix_is_named(logs: str) -> None:
 def test_every_value_rule_is_named_with_its_numbers(logs: str) -> None:
     by_value = flat(raw_section(logs, REDACTED_HEADING)).split("**By value**")[1]
 
-    for prefix in EXTENDED_PUBLIC_KEY_PREFIXES:
+    # Spec 031: the value rule covers the private prefixes too, and the document says so.
+    for prefix in (*EXTENDED_PUBLIC_KEY_PREFIXES, *EXTENDED_PRIVATE_KEY_PREFIXES):
         assert f"`{prefix}`" in by_value, prefix
     assert "100 or more Base58 characters" in by_value
     assert f"{MIN_SUBSTRING_SECRET_LENGTH} characters or longer" in by_value

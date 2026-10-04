@@ -1,9 +1,17 @@
 import { useState } from 'react';
 
+import type { Wallet } from '@/api/wallets';
 import { truncateAddress } from '@/lib/addresses';
 
 interface AddressProps {
+  /**
+   * The address, or - for a wallet whose `kind` is `extended_key` - the masked form the API
+   * serves: four characters, an ellipsis, four characters. The full key never reaches the
+   * browser, so there is nothing here to truncate further or to copy.
+   */
   readonly value: string;
+  /** What `value` is. Omitted, it is an address. */
+  readonly kind?: Wallet['kind'];
   /**
    * What owns this address - a wallet's label, or a chain name plus its truncated address -
    * folded into the copy button's accessible name as "Copy address of {name}". A page with
@@ -17,6 +25,20 @@ interface AddressProps {
 type CopyState = 'idle' | 'copied' | 'failed';
 
 /**
+ * An extended key's masked form, exactly as the API served it, beside a label saying what
+ * it is. Deliberately has no copy button: copying the mask would put something on the
+ * clipboard that looks like a key and is not one, and the real key is never sent here.
+ */
+function MaskedExtendedKey({ value }: { readonly value: string }) {
+  return (
+    <span className="address">
+      <span className="address-short">{value}</span>
+      <span className="badge">Extended key</span>
+    </span>
+  );
+}
+
+/**
  * Renders an address truncated for display, with its full form in `title` and a button
  * that copies it to the clipboard.
  *
@@ -28,8 +50,27 @@ type CopyState = 'idle' | 'copied' | 'failed';
  *
  * The full address never leaves this component for a route, a query string or a log: it is
  * rendered and, on request, handed to `navigator.clipboard` alone.
+ *
+ * With `kind="extended_key"` it renders the masked form instead, with a label and no copy
+ * button - see {@link MaskedExtendedKey}.
  */
-export function Address({ value, name }: AddressProps) {
+export function Address({ value, name, kind = 'address' }: AddressProps) {
+  // A component of its own rather than an early return below: the hook in `CopyableAddress`
+  // would otherwise be called conditionally.
+  return kind === 'extended_key' ? (
+    <MaskedExtendedKey value={value} />
+  ) : (
+    <CopyableAddress value={value} name={name} />
+  );
+}
+
+function CopyableAddress({
+  value,
+  name,
+}: {
+  readonly value: string;
+  readonly name: string | undefined;
+}) {
   const [copyState, setCopyState] = useState<CopyState>('idle');
 
   async function handleCopy() {

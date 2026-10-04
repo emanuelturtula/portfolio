@@ -74,6 +74,15 @@ The reads are sequential. `max_addresses_per_call` is 1, so twenty addresses is 
 calls spaced by `HostRateLimiter`; a `gather` would hand the limiter twenty simultaneous
 acquisitions and turn a floor into a queue whose depth nobody bounded.
 
+## Extended public keys (spec 031)
+
+`scan_extended_key` derives a key's addresses locally (`domain/extended_keys.py`) and reads
+each one through the same per-address request `fetch_balances` makes, because neither
+vendor serves a lookup by extended key. Whether an address is used comes from `tx_count`,
+which both vendors document in both stats objects (re-read on **2026-10-03**; see
+`docs/providers.md`, *Extended public keys*). The gap limit, the cap and the order of work
+are in the method's docstring.
+
 ## Nothing here logs
 
 Not one call. The shared transport logs `"{scheme}://{host}/{label}"` and nothing else,
@@ -98,9 +107,23 @@ from portfolio.domain.addresses import (
 )
 from portfolio.domain.chains import ChainKey
 from portfolio.domain.chains import validate_address as validate_chain_address
+from portfolio.domain.extended_keys import (
+    CHANGE_BRANCH,
+    HARDENED_INDEX,
+    MAX_ADDRESSES_PER_BRANCH,
+    NETWORK_FAMILY_BY_NETWORK,
+    RECEIVE_BRANCH,
+    ScriptType,
+    address_of,
+    addresses_to_extend,
+    derive_child,
+    parse_extended_public_key,
+)
 from portfolio.providers.base import (
     ChainCapabilities,
+    ExtendedKeyScan,
     ProviderHealth,
+    ScannedAddress,
     align_balances,
     decode_json,
     require_json_object,
@@ -115,12 +138,14 @@ if TYPE_CHECKING:
 
     from portfolio.config import Settings
     from portfolio.domain.chains import ValidatedAddress
-    from portfolio.providers.base import AddressBalance
+    from portfolio.domain.extended_keys import DerivedKey, ExtendedPublicKey
+    from portfolio.providers.base import AddressBalance, KnownDerivedAddress
     from portfolio.providers.endpoints import Endpoint
 
 __all__ = [
     "ADDRESS_PATH",
     "BITCOIN_DECIMALS",
+    "BRANCH_CAP_MESSAGE",
     "CAPABILITIES",
     "FALLBACK",
     "PRIMARY",
@@ -160,12 +185,27 @@ CHAIN_STATS: Final = "chain_stats"
 MEMPOOL_STATS: Final = "mempool_stats"
 FUNDED_SUM: Final = "funded_txo_sum"
 SPENT_SUM: Final = "spent_txo_sum"
+TX_COUNT: Final = "tx_count"
 
 CAPABILITIES: Final = ChainCapabilities(
     chain_key=ChainKey.BITCOIN,
     decimals=BITCOIN_DECIMALS,
     max_addresses_per_call=MAX_ADDRESSES_PER_CALL,
 )
+
+BRANCH_CAP_MESSAGE: Final = (
+    f"A branch of the extended key would need more than {MAX_ADDRESSES_PER_BRANCH} addresses "
+    "to complete its gap limit, so the scan stopped rather than read without end."
+)
+"""Why a scan refused to go on (spec 031, R5). A fixed sentence: no key, address or index.
+
+The only plausible cause in a single-owner tracker is an instance that reports history for
+every address it is asked about, which is an answer this cannot use. Raised as
+`ProviderResponseError`, the category for an answer that cannot be trusted.
+"""
+
+_BRANCHES: Final = (RECEIVE_BRANCH, CHANGE_BRANCH)
+"""BIP44's two branches below an account key, scanned in this order."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,10 +219,17 @@ class AddressStats:
     `confirmed` is `chain_stats.funded_txo_sum - spent_txo_sum` and cannot be negative.
     `pending` is the same difference over `mempool_stats`, is **signed**, and is `None`
     when the response carried no mempool figures at all.
+
+    `used` is whether the address has any transaction, confirmed or in the mempool: a
+    `tx_count` above zero in either stats object (spec 031, R5). It is what an extended
+    key's gap scan counts, and a balance read ignores it. An address emptied by a spend is
+    used with a zero balance, which is exactly the case the balance alone cannot tell from
+    an address nobody ever paid.
     """
 
     confirmed: int
     pending: int | None
+    used: bool
 
 
 def parse_address_response(body: str | bytes, expected_address: str) -> AddressStats:
@@ -203,7 +250,13 @@ def parse_address_response(body: str | bytes, expected_address: str) -> AddressS
     | `chain_stats` absent or not an object | the confirmed balance has nowhere to come from |
     | a sum absent, not an integer, or a `bool` | `1.0e8` out of `json.loads` is a float |
     | `spent_txo_sum` over `funded_txo_sum` | an address cannot spend what it never received |
+    | a `tx_count` absent, not an integer, a `bool`, or negative | a gap scan reads "used" |
     | `mempool_stats` present but not an object | mistyped is an error; absent is not |
+
+    **`tx_count` is required in each stats object that is read** (spec 031), on every read
+    and not only an extended key's: one parser, one contract. Both vendors document it in
+    both objects, so no conforming instance is refused for it. It is checked after the two
+    sums of the same object, so a body with a bad sum is refused for the sum, as before.
 
     **The echoed address is checked against the one we asked about**, and the three ways
     it can be wrong are one refusal because they have one remedy. It catches a cache or a
@@ -221,7 +274,8 @@ def parse_address_response(body: str | bytes, expected_address: str) -> AddressS
         expected_address: the canonical address this response is supposed to be about.
 
     Returns:
-        The confirmed balance in satoshis, and the signed mempool delta or `None`.
+        The confirmed balance in satoshis, the signed mempool delta or `None`, and whether
+        the address has ever had a transaction.
 
     Raises:
         ProviderResponseError: any row of the table above.
@@ -234,18 +288,27 @@ def parse_address_response(body: str | bytes, expected_address: str) -> AddressS
         )
         raise ProviderResponseError(message)
 
-    confirmed = _require_stats_delta(document, CHAIN_STATS)
+    chain_stats = _require_stats(document, CHAIN_STATS)
+    confirmed = _require_delta(chain_stats, CHAIN_STATS)
     if confirmed < 0:
         message = (
             f"The response reports a larger {CHAIN_STATS}.{SPENT_SUM} than "
             f"{CHAIN_STATS}.{FUNDED_SUM}, which would make the confirmed balance negative."
         )
         raise ProviderResponseError(message)
+    used = _require_count(chain_stats, CHAIN_STATS, TX_COUNT) > 0
 
     # `in` rather than `.get(...) is None`, so that an explicit null is a mistyped field
     # and reaches the refusal below rather than being read as "no mempool figures".
-    pending = _require_stats_delta(document, MEMPOOL_STATS) if MEMPOOL_STATS in document else None
-    return AddressStats(confirmed=confirmed, pending=pending)
+    pending: int | None = None
+    if MEMPOOL_STATS in document:
+        mempool_stats = _require_stats(document, MEMPOOL_STATS)
+        pending = _require_delta(mempool_stats, MEMPOOL_STATS)
+        # Read before the `or`, never inside it: a short-circuit would skip the check on
+        # every address that already has a confirmed transaction.
+        mempool_used = _require_count(mempool_stats, MEMPOOL_STATS, TX_COUNT) > 0
+        used = used or mempool_used
+    return AddressStats(confirmed=confirmed, pending=pending, used=used)
 
 
 def parse_tip_height(body: str | bytes) -> int:
@@ -274,8 +337,8 @@ def parse_tip_height(body: str | bytes) -> int:
     return height
 
 
-def _require_stats_delta(document: Mapping[str, object], field: str) -> int:
-    """`funded_txo_sum - spent_txo_sum` out of one stats object, refusing anything else.
+def _require_stats(document: Mapping[str, object], field: str) -> Mapping[str, object]:
+    """One stats object out of the response, refusing anything that is not an object.
 
     Absent and mistyped are one refusal deliberately: to a caller they are the same event
     -- this response has no usable figures under that name -- and splitting them would
@@ -283,8 +346,7 @@ def _require_stats_delta(document: Mapping[str, object], field: str) -> int:
     which of the two happened.
 
     Raises:
-        ProviderResponseError: the field is missing, or is not an object, or either sum is
-            missing or is not a whole number of satoshis.
+        ProviderResponseError: the field is missing, or is not an object.
     """
     stats = document.get(field)
     if not isinstance(stats, dict):
@@ -293,7 +355,37 @@ def _require_stats_delta(document: Mapping[str, object], field: str) -> int:
             "object this endpoint documents."
         )
         raise ProviderResponseError(message)
+    return stats
+
+
+def _require_delta(stats: Mapping[str, object], field: str) -> int:
+    """`funded_txo_sum - spent_txo_sum` out of one stats object, refusing anything else.
+
+    Raises:
+        ProviderResponseError: either sum is missing or is not a whole number of satoshis.
+    """
     return _require_sum(stats, field, FUNDED_SUM) - _require_sum(stats, field, SPENT_SUM)
+
+
+def _require_count(stats: Mapping[str, object], field: str, name: str) -> int:
+    """One transaction count, refusing anything that is not a non-negative whole number.
+
+    The same three refusals as `_require_sum` -- absent, mistyped, a `bool` -- for the same
+    reasons, plus a negative count, which no chain can have. A count is not money, but it
+    decides whether a gap scan stops (R5), so a value the parser cannot vouch for is no more
+    acceptable here than in a sum. The message names the field and the type, never the value.
+    """
+    value = stats.get(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        message = (
+            f"The response field {field}.{name} is a {type(value).__name__} rather than "
+            "a whole number of transactions."
+        )
+        raise ProviderResponseError(message)
+    if value < 0:
+        message = f"The response field {field}.{name} is negative, which no count can be."
+        raise ProviderResponseError(message)
+    return value
 
 
 def _require_sum(stats: Mapping[str, object], field: str, name: str) -> int:
@@ -321,6 +413,45 @@ def _require_sum(stats: Mapping[str, object], field: str, name: str) -> int:
     return value
 
 
+def _branch_key(parsed: ExtendedPublicKey, branch: int) -> DerivedKey:
+    """The key of one branch below the account key, derived once per scan.
+
+    BIP32 would have the caller move on to the next index when this one has no key, but a
+    branch's index is fixed by BIP44: there is no other receive branch to move on to. So a
+    key whose branch has no key cannot be scanned at all, and says so with the sentence for
+    a key that holds no usable public key. The probability is below 2^-127; only an injected
+    HMAC reaches this line.
+
+    Raises:
+        AddressInvalidError: `invalid_public_key`.
+    """
+    derived = derive_child(parsed, branch)
+    if derived is None:
+        raise AddressInvalidError(AddressRejection.INVALID_PUBLIC_KEY)
+    return derived
+
+
+def _next_derivable_child(branch_key: DerivedKey, index: int) -> DerivedKey:
+    """The first child at or above `index` that BIP32 gives a key, skipping any that it does not.
+
+    A skipped index is simply never returned, so it is never read, persisted or counted
+    toward the gap (R5).
+
+    Raises:
+        ProviderResponseError: the branch ran out of non-hardened indices, with
+            `BRANCH_CAP_MESSAGE`. Unreachable from a scan that started at zero, since the
+            cap stops it a thousand addresses in; reachable only from a persisted address
+            placed near 2^31, and then it is the same refusal for the same reason -- this
+            branch cannot be completed.
+    """
+    while index < HARDENED_INDEX:
+        child = derive_child(branch_key, index)
+        if child is not None:
+            return child
+        index += 1
+    raise ProviderResponseError(BRANCH_CAP_MESSAGE)
+
+
 def _configured_candidates(settings: Settings) -> tuple[tuple[str, str], ...]:
     """The two configured URLs, in the order they should be tried, as `(position, url)`.
 
@@ -345,7 +476,7 @@ class EsploraProvider:
     Satisfies `ChainProvider` structurally, checked by `mypy --strict` rather than by
     `isinstance`, and `ChainProviderFactory` by taking the shared client as its only
     positional argument -- which is what lets the registry build it with nothing but a
-    client.
+    client. Also satisfies `ExtendedKeyScanner`, the one chain provider that does (spec 031).
     """
 
     def __init__(self, client: httpx.AsyncClient, *, settings: Settings | None = None) -> None:
@@ -449,10 +580,7 @@ class EsploraProvider:
         # from, which is the one that last answered.
         start = 0
         for address in canonical:
-            body, start = await self._instances.read(
-                ADDRESS_PATH.format(address=address), ADDRESS_BALANCE, start
-            )
-            stats = parse_address_response(body, address)
+            stats, start = await self._read_address(address, start)
             confirmed[address] = stats.confirmed
             if stats.pending is not None:
                 pending[address] = stats.pending
@@ -461,6 +589,166 @@ class EsploraProvider:
         # address as "this chain did not say", which is exactly what an empty mapping
         # means here and is not the same statement as a zero.
         return align_balances(canonical, confirmed, decimals=BITCOIN_DECIMALS, pending=pending)
+
+    async def scan_extended_key(
+        self, key: str, known: Sequence[KnownDerivedAddress]
+    ) -> ExtendedKeyScan:
+        """Read every address an extended public key's gap-limit scan reaches (spec 031).
+
+        Satisfies `ExtendedKeyScanner`. The order of work, and why each step is where it is:
+
+        1. **Everything that can be refused is refused before the first request.** The key
+           is parsed; its network family is checked against `PORTFOLIO_BITCOIN_NETWORK`
+           (R3), so a `tpub` on a mainnet instance is `wrong_network` and costs nothing;
+           every persisted address is validated as `fetch_balances` validates one; and both
+           branch keys are derived. The persisted addresses come out of a database column
+           and go into a URL path, which is the same reason `fetch_balances` gives for
+           validating first.
+        2. **Per branch, receive then change, every persisted address is read**, used or
+           not, in index order (R5): funds can arrive at any of them.
+        3. **Then the branch is extended**, deriving only above its highest persisted index
+           (R6), by however many addresses `addresses_to_extend` asks for, until it asks for
+           none. An index BIP32 gives no key is skipped: never read, never returned, never
+           counted toward the gap. A branch that would pass `MAX_ADDRESSES_PER_BRANCH`
+           raises with `BRANCH_CAP_MESSAGE` instead of reading on.
+
+        **Every read goes through the path `fetch_balances` uses** -- `_read_address`: the
+        same endpoint label, the same client, so every request, retries included, acquires
+        the host limiter -- **sequentially**, for the reason the module docstring gives,
+        and with failover sticky for the whole scan, both branches included. A first scan
+        is at least forty requests, so at least forty seconds against one host.
+
+        `used` on each result is the persisted flag or the vendor's answer, whichever says
+        used: an address once used stays used (R5), even if an instance that has pruned its
+        history now reports nothing for it.
+
+        **Nothing here logs**, as everywhere in this module: the key, every address and
+        every index are the owner's holdings. The caller logs counts.
+
+        Raises:
+            AddressInvalidError: the key does not parse (with the parser's reason), belongs
+                to the other network family (`wrong_network`), or has a branch with no key
+                (`invalid_public_key`); or a persisted address does not validate, is not in
+                its canonical form (`malformed`), or is on another network
+                (`wrong_network`). All of them before any request.
+            ValueError: a persisted address sits outside the two branches or the
+                non-hardened range, or two share a position. A caller's mistake, never data
+                a vendor sent; the table's constraints make it unreachable from the sync.
+            ProviderRateLimitedError: every instance answered 429, last one included.
+            ProviderUnavailableError: no instance answered.
+            ProviderResponseError: an instance answered with something that cannot be
+                trusted, or a branch would pass the cap.
+        """
+        parsed = parse_extended_public_key(key)
+        if parsed.network_family is not NETWORK_FAMILY_BY_NETWORK[self._network]:
+            raise AddressInvalidError(AddressRejection.WRONG_NETWORK)
+        known_by_branch = self._known_by_branch(known, parsed.script_type)
+        branch_keys = tuple(_branch_key(parsed, branch) for branch in _BRANCHES)
+
+        scanned: list[ScannedAddress] = []
+        # Sticky for the whole scan, as within one `fetch_balances` call.
+        start = 0
+        for branch, branch_key in zip(_BRANCHES, branch_keys, strict=True):
+            persisted = known_by_branch[branch]
+            on_branch: list[ScannedAddress] = []
+            for entry in persisted:
+                stats, start = await self._read_address(entry.address, start)
+                on_branch.append(
+                    ScannedAddress(
+                        branch=branch,
+                        index=entry.index,
+                        address=entry.address,
+                        used=entry.used or stats.used,
+                        confirmed=stats.confirmed,
+                        pending=stats.pending,
+                    )
+                )
+
+            next_index = persisted[-1].index + 1 if persisted else 0
+            while missing := addresses_to_extend([address.used for address in on_branch]):
+                for _ in range(missing):
+                    if len(on_branch) >= MAX_ADDRESSES_PER_BRANCH:
+                        raise ProviderResponseError(BRANCH_CAP_MESSAGE)
+                    child = _next_derivable_child(branch_key, next_index)
+                    next_index = child.index + 1
+                    address = address_of(child.public_key, parsed.script_type, self._network)
+                    stats, start = await self._read_address(address, start)
+                    on_branch.append(
+                        ScannedAddress(
+                            branch=branch,
+                            index=child.index,
+                            address=address,
+                            used=stats.used,
+                            confirmed=stats.confirmed,
+                            pending=stats.pending,
+                        )
+                    )
+            scanned.extend(on_branch)
+
+        return ExtendedKeyScan(addresses=tuple(scanned), decimals=BITCOIN_DECIMALS)
+
+    async def _read_address(self, address: str, start: int) -> tuple[AddressStats, int]:
+        """One address read: `GET /address/:address` from the first instance that answers.
+
+        The one per-address path both `fetch_balances` and `scan_extended_key` take, so the
+        two cannot drift apart in their endpoint label, their limiter or their parser.
+        `address` must already be validated or derived: it goes into the path verbatim.
+        Returns the parsed figures and the index of the instance that answered, which the
+        caller carries into its next read.
+        """
+        body, start = await self._instances.read(
+            ADDRESS_PATH.format(address=address), ADDRESS_BALANCE, start
+        )
+        return parse_address_response(body, address), start
+
+    def _known_by_branch(
+        self, known: Sequence[KnownDerivedAddress], script_type: ScriptType
+    ) -> dict[int, list[KnownDerivedAddress]]:
+        """The persisted addresses, validated, grouped by branch, each group by index.
+
+        Validated as `validate_address` validates a registered address, with one allowance
+        that is not a loosening. A P2PKH or P2SH-P2WPKH address derived for regtest is byte
+        for byte the testnet one, so `bitcoin_network_of` answers `TESTNET` for it
+        (`domain/addresses.py`, `P2SH_VERSION_BYTE_BY_NETWORK`), and that is the answer
+        expected here under regtest. A bech32 address carries `bcrt` and is held to it.
+
+        A persisted address on another network than the configured one means the setting
+        changed under a wallet whose addresses were derived for the old value. That is
+        `wrong_network`, the same refusal a registered address gets, rather than a read of
+        one chain's addresses against another chain's instance.
+
+        Raises:
+            AddressInvalidError, ValueError: see `scan_extended_key`.
+        """
+        expected_network = (
+            BitcoinNetwork.TESTNET
+            if self._network is BitcoinNetwork.REGTEST and script_type is not ScriptType.P2WPKH
+            else self._network
+        )
+        by_branch: dict[int, list[KnownDerivedAddress]] = {branch: [] for branch in _BRANCHES}
+        positions: set[tuple[int, int]] = set()
+        for entry in known:
+            if entry.branch not in by_branch or not 0 <= entry.index < HARDENED_INDEX:
+                message = (
+                    "A persisted derived address sits outside the receive and change "
+                    "branches or the non-hardened index range."
+                )
+                raise ValueError(message)
+            if (entry.branch, entry.index) in positions:
+                message = "Two persisted derived addresses share one branch and index."
+                raise ValueError(message)
+            positions.add((entry.branch, entry.index))
+
+            validated = validate_chain_address(ChainKey.BITCOIN.value, entry.address)
+            if validated.canonical != entry.address:
+                raise AddressInvalidError(AddressRejection.MALFORMED)
+            if bitcoin_network_of(validated.canonical) is not expected_network:
+                raise AddressInvalidError(AddressRejection.WRONG_NETWORK)
+            by_branch[entry.branch].append(entry)
+
+        for entries in by_branch.values():
+            entries.sort(key=lambda entry: entry.index)
+        return by_branch
 
     async def health(self) -> ProviderHealth:
         """Whether either instance is answering, without reading any address.

@@ -68,6 +68,13 @@ def redact(event: dict[str, Any]) -> dict[str, Any]:
         "YPUB",
         "ypubKey",
         "zpub_main",
+        # Spec 031: the key-name prefixes gain the six lowercase private ones.
+        "xprv",
+        "yprv_account",
+        "ZPRV",
+        "tprv",
+        "uprv_key",
+        "vprv_main",
     ],
 )
 def test_sensitive_keys_are_redacted(key: str) -> None:

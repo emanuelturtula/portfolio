@@ -586,7 +586,11 @@ def test_the_downgrade_drops_the_table_and_the_two_columns_and_nothing_else(
 
     command.downgrade(build_alembic_config(database_url), PARENT)
 
-    assert set(inspect(sync_engine).get_table_names()) == tables_before - {TABLE}
+    # #24's revision sits on top of this one and comes down with it.
+    assert set(inspect(sync_engine).get_table_names()) == tables_before - {
+        TABLE,
+        "derived_addresses",
+    }
     assert set(column_shapes(sync_engine, "exchange_accounts")) == set(
         EXPECTED_ACCOUNT_COLUMNS
     ) - set(NEW_ACCOUNT_COLUMNS)

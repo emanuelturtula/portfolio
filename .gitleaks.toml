@@ -56,6 +56,17 @@ regex = '''\b(?:xpub|ypub|zpub)[1-9A-HJ-NP-Za-km-z]{100,112}\b'''
 keywords = ["xpub", "ypub", "zpub"]
 
 [[rules]]
+id = "extended-private-key"
+description = "BIP32 extended private key on any network (spends every coin of a wallet)"
+# Every SLIP-0132 private prefix, mainnet and test alike, single-signature and multisig.
+# Unlike the public rule above, the test prefixes are NOT excluded: a private key has no
+# business in this repository on any network, and no fixture needs one -- the tests build
+# a private-key-shaped string at run time instead (spec 031). Gitleaks matches keywords
+# without case, so the six lowercase keywords also cover Yprv, Zprv, Uprv and Vprv.
+regex = '''\b(?:xprv|yprv|zprv|tprv|uprv|vprv|Yprv|Zprv|Uprv|Vprv)[1-9A-HJ-NP-Za-km-z]{100,112}\b'''
+keywords = ["xprv", "yprv", "zprv", "tprv", "uprv", "vprv"]
+
+[[rules]]
 id = "exchange-api-credential"
 description = "Bitget or BingX API key, secret or passphrase assigned to a variable"
 regex = '''(?i)\b(?:bitget|bingx)[_-]?(?:api[_-]?)?(?:key|secret|passphrase)\b\s*[:=]\s*['"]?([A-Za-z0-9_\-]{16,})['"]?'''
