@@ -636,6 +636,132 @@ vendor's own documentation, and record here what you confirmed and what you assu
 those words, **with the date you read it** -- an unverified fact and a fact verified two
 years ago are different things, and only one of them says so.
 
+## Extended public keys
+
+Spec 031. A Bitcoin wallet can be registered by its account extended public key instead of
+by single addresses, and the Esplora provider then reads every address the key derives. The
+public APIs cannot do this for us, so the derivation is ours.
+
+### Why the vendors cannot answer it: confirmed on 2026-10-03
+
+Read again on **2026-10-03**, from Blockstream's published `API.md` and mempool.space's REST
+documentation, and recorded with the date for the reason the section above gives:
+
+- **Neither documents an endpoint that takes an extended key or a descriptor.** Every address
+  endpoint takes one address (or one script hash), and neither offers a lookup of many
+  addresses at once. So a key is derived locally and each address read with the same
+  `GET /address/:address` a registered address uses.
+- **`tx_count` is in both `chain_stats` and `mempool_stats`**, beside the four sums the balance
+  read already used. That is what "used" is read from (below).
+- mempool.space still states that exceeding its limits returns 429 and that repeatedly
+  exceeding them may result in a ban, and still publishes no numbers. Blockstream documents no
+  limit. The one-second floor per host stands, and a scan inherits it.
+
+**Not documented, and therefore assumed:** what either vendor answers for an address that has
+never been used. The parser requires the documented shape -- the address echoed, both sums and
+`tx_count` -- and a never-used address is assumed to come back in that shape with zeros.
+If an instance answered a never-used address with a 404 instead, the failover would treat it as
+a refusal and ask the second instance. When every instance has been tried, the chain's failure
+is classified by the last instance asked (`EndpointSet._failure_for` and its caller):
+
+- a 429 is `rate_limited`;
+- a 5xx, or no answer at all, is `unavailable`;
+- a 404, or any other status that is neither 200 nor one of the above, is `response`.
+
+So if the second instance also answers 404, the scan fails as `response`, and it fails as
+`unavailable` only if that instance could not be reached. Either way it is a loud failure,
+never a wrong number, which is the direction this is allowed to be wrong in.
+
+### What is derived
+
+The script type comes from the key's version bytes (SLIP-0132), and so from its prefix, and
+from nothing else. This document names the test-network prefixes and the mainnet version
+bytes, never the mainnet prefixes themselves: `tests/providers/test_documentation.py` keeps
+mainnet material out of the page a provider author copies from, and the three mainnet
+prefixes are in that list. `docs/operations.md`, section 8, gives them by name for the owner.
+
+| Script | Test-network prefix | Mainnet version bytes | Derivation below the key |
+|---|---|---|---|
+| P2PKH (BIP44) | `tpub` | `0x0488B21E` | `/0/i` and `/1/i` |
+| P2SH-P2WPKH (BIP49) | `upub` | `0x049D7CB2` | `/0/i` and `/1/i` |
+| P2WPKH (BIP84) | `vpub` | `0x04B24746` | `/0/i` and `/1/i` |
+
+- **The P2PKH-version caveat.** Many wallets export a segwit account's key with the P2PKH
+  version, `0x0488B21E` (the BIP32 default) on mainnet. Such a key derives P2PKH addresses
+  only, so the wallet reads as zero. The remedy is the owner's: export the key again with the
+  P2WPKH version (or the P2SH-P2WPKH one). Guessing the script type from what the chain
+  reports would mean reading three times the addresses to find out, and still guessing.
+- **No multisig and no taproot.** `Ypub`, `Zpub`, `Upub` and `Vpub` are refused by their
+  prefix, and there is no SLIP-0132 prefix for taproot to accept.
+- **Private keys are refused by their prefix**, wherever it stands: on every chain, before
+  anything else is read, decoded or length-checked, and named `private_key`
+  (`looks_like_private_key`). A value is refused when either holds:
+  - ignoring surrounding whitespace and Unicode format characters (zero-width space, word
+    joiner, directional marks, a byte-order mark), it starts with one of
+    `PRIVATE_KEY_PREFIXES`;
+  - with those format characters removed, a private-key-shaped run appears anywhere in it
+    (`PRIVATE_KEY_RUN_PATTERN`): a private prefix that does not continue a Base58 run,
+    followed by 100 or more Base58 characters. No address contains a Base58 run that long,
+    and the left boundary keeps the run off a public key's own body.
+
+  A key glued directly onto other Base58 text is not such a run. It is refused for another
+  reason, and it is never stored. Private keys are never needed, and the redaction and
+  secret-scanning rules cover them too.
+- **The depth is not enforced.** Derivation is always `/branch/index` below the key as given,
+  which suits an account key at depth 3 and Electrum's depth-1 export alike.
+- **A key is stored by its canonical form** (`canonical_extended_key`): re-serialised at depth
+  0, with a zero parent fingerprint and child number 0, keeping the version, chain code and
+  public key. Two exports of one account that differ only in those three fields derive the
+  same addresses, so the second is refused as a duplicate rather than doubling the total. The
+  version is kept, so a P2WPKH and a P2PKH version over the same bytes are two wallets. The
+  provider is handed the canonical form; the owner only ever sees the key as typed, masked.
+- Derived addresses are encoded for `PORTFOLIO_BITCOIN_NETWORK`: `bc`, `tb` or `bcrt` for
+  bech32, `0x00`/`0x05` on mainnet and `0x6F`/`0xC4` on both test networks for Base58. A key of
+  the other family is refused as `wrong_network` before any request for that key. The
+  chain's address wallets are read first, as one batch, so the chain may already have made
+  requests by then; it fails as a whole either way.
+
+The cryptography is in `domain/`: `secp256k1.py` (decompression, addition, multiplication),
+`ripemd160.py`, and `extended_keys.py` (parsing, BIP32 public derivation, encoding, the gap
+arithmetic). It is pure Python with no new dependency, pinned by the published BIP32, BIP49 and
+BIP84 vectors in test-network form. RIPEMD-160 is not taken from `hashlib`, because whether
+`hashlib` has it depends on the OpenSSL build.
+
+### The scan: gap limit, cap and cost
+
+- **Gap limit 20 per branch**, BIP44's documented value. A branch is complete when its last 20
+  addresses by index are unused; one with nothing used is complete at 20.
+- **Used** means `chain_stats.tx_count > 0`, or `mempool_stats.tx_count > 0` when that object
+  is present. An address emptied by a spend is used with a zero balance, which is why the
+  balance cannot be the test. An address once recorded as used stays used, even if an instance
+  that has pruned its history later reports nothing for it.
+- **Incremental.** The addresses a scan finds are persisted in `derived_addresses`, in the same
+  per-chain commit as the wallet's snapshot. The next scan derives only above the highest
+  persisted index on each branch -- but **reads every persisted address on every sync**, used
+  or not, because funds can arrive at any of them.
+- **Capped at 1000 addresses per branch** (`MAX_ADDRESSES_PER_BRANCH`). A branch that would pass
+  it fails the read with `ProviderResponseError` and a fixed sentence. The plausible cause is an
+  instance reporting history for every address, and the alternative is a scan without end.
+  A failed scan persists nothing, so such an instance costs about 1000 requests on every sync
+  until it is fixed or replaced, and the Bitcoin chain stays failed meanwhile -- loud, by design.
+- **An index BIP32 gives no key is skipped**: never read, never persisted, never counted toward
+  the gap. The probability is below 2^-127 per index.
+- **Cost.** A first scan is at least 40 requests -- 20 per branch -- and the requests are
+  sequential through the shared client, so with the one-second floor per host it takes at
+  least 40 seconds, plus about one request for each used address. Every later sync costs one
+  request per persisted address. All of it goes through the same endpoint label, retry policy
+  and host limiter as a registered address's read, and failover is sticky for the whole scan.
+
+**The disclosure is larger, and stated plainly.** A key's whole run of addresses, used and
+unused, is sent to the configured instance on every sync, from one IP and in index order. That
+tells the instance more than a single address does. Section 8 of `docs/operations.md` already
+says what running your own Esplora instance buys; it buys more here.
+
+`EsploraProvider.scan_extended_key` is the implementation, and `ExtendedKeyScanner` in
+`providers/base.py` the protocol. A future provider that can scan a key says so by satisfying
+it; the balance sync checks at run time and fails a chain as `internal` if a key wallet meets a
+provider that cannot.
+
 ## Price sources, which are a different kind of provider
 
 A chain provider answers a question about the owner's addresses. A price source answers a

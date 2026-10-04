@@ -31,9 +31,14 @@ from portfolio.domain.addresses import (
     BECH32_CHARSET,
     AddressInvalidError,
     AddressRejection,
+    BitcoinNetwork,
     ValidatedAddress,
+    _convert_bits,
     _kaspa_checksum,
+    _looks_like_bech32,
     bech32_decode,
+    bitcoin_network_of,
+    encode_segwit_address,
 )
 from portfolio.domain.chains import ChainKey, validate_address
 from tests.address_vectors import (
@@ -42,11 +47,15 @@ from tests.address_vectors import (
     BIP173_MIXED_CASE,
     BIP173_NON_ZERO_PADDING,
     BIP173_TESTNET_P2WPKH,
+    BIP173_TESTNET_P2WPKH_PROGRAM,
     BIP173_TESTNET_P2WPKH_UPPERCASE,
+    BIP173_TESTNET_P2WSH,
+    BIP173_TESTNET_P2WSH_PROGRAM,
     BIP173_UNKNOWN_HRP,
     BIP350_MIXED_CASE,
     BIP350_NON_ZERO_PADDING,
     BIP350_TESTNET_V1,
+    BIP350_TESTNET_V1_PROGRAM,
     BIP350_UNKNOWN_HRP,
     BIP350_V0_WITH_BECH32M,
     BIP350_V2_WITH_BECH32,
@@ -60,6 +69,7 @@ from tests.address_vectors import (
     DERIVED_BAD_WITNESS_VERSION,
     DERIVED_EMPTY_DATA_SECTION,
     DERIVED_OVER_BECH32_LENGTH_LIMIT,
+    DERIVED_P2PKH_SHAPED_LIKE_BECH32,
     DERIVED_PROGRAM_TOO_LONG,
     DERIVED_PROGRAM_TOO_SHORT,
     DERIVED_V0_WRONG_PROGRAM_LENGTH,
@@ -570,6 +580,37 @@ def test_a_character_outside_the_bech32_alphabet_is_rejected(character: str) -> 
     reject(address)
 
 
+def test_a_base58_address_shaped_like_bech32_is_accepted_as_base58() -> None:
+    """Spec 031's property test found this: a valid testnet P2PKH address the discriminator
+    reads as bech32. The bech32 reading fails, and the address must then verify as what it
+    is rather than be refused as `mixed_case`.
+
+    The first assertion is the guard that keeps this test meaningful: if the discriminator
+    ever stops matching this string, the fallback is no longer exercised here.
+    """
+    assert _looks_like_bech32(DERIVED_P2PKH_SHAPED_LIKE_BECH32)
+
+    validated = validate_address(BITCOIN, DERIVED_P2PKH_SHAPED_LIKE_BECH32)
+
+    assert validated.canonical == DERIVED_P2PKH_SHAPED_LIKE_BECH32
+    assert validated.display == DERIVED_P2PKH_SHAPED_LIKE_BECH32
+    assert bitcoin_network_of(DERIVED_P2PKH_SHAPED_LIKE_BECH32) is BitcoinNetwork.TESTNET
+
+
+def test_a_typo_in_a_base58_address_shaped_like_bech32_keeps_the_bech32_reason() -> None:
+    """The fallback only ever turns a refusal into an acceptance for a verifying address.
+
+    A corrupted copy is neither bech32 nor Base58Check, and it is refused with the reason
+    the bech32 reading gave -- unchanged from before the fallback existed.
+    """
+    corrupted = DERIVED_P2PKH_SHAPED_LIKE_BECH32[:-1] + "N"
+    assert _looks_like_bech32(corrupted)
+
+    assert reject(corrupted).reason is AddressRejection.MIXED_CASE
+    with pytest.raises(AddressInvalidError):
+        bitcoin_network_of(corrupted)
+
+
 def test_an_extended_public_key_is_rejected() -> None:
     """A `tpub` is not an address, and it is the most damaging thing to accept as one.
 
@@ -600,6 +641,49 @@ def test_surrounding_whitespace_does_not_make_a_valid_address_invalid() -> None:
 
     assert validated.canonical == BIP173_TESTNET_P2WPKH
     assert validated.display == BIP173_TESTNET_P2WPKH
+
+
+# --------------------------------------------------------------------------------------
+# The segwit encoder (spec 031), against the published vectors
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("address", "witness_version", "program"),
+    [
+        (BIP173_TESTNET_P2WPKH, 0, BIP173_TESTNET_P2WPKH_PROGRAM),
+        (BIP173_TESTNET_P2WSH, 0, BIP173_TESTNET_P2WSH_PROGRAM),
+        (BIP350_TESTNET_V1, 1, BIP350_TESTNET_V1_PROGRAM),
+    ],
+    ids=["v0 20-byte p2wpkh", "v0 32-byte p2wsh", "v1 32-byte bech32m"],
+)
+def test_the_segwit_encoder_produces_the_published_address_and_decodes_back(
+    address: str, witness_version: int, program: bytes
+) -> None:
+    """The encoder directly, not only through a derived address.
+
+    Spec 031 derives P2WPKH addresses alone, whose 20-byte programs fill 32 five-bit words
+    exactly, so derivation never reaches the zero padding of `_convert_bits(pad=True)`. A
+    32-byte program leaves one bit over, and the published address is the proof that it was
+    padded the way BIP-173 pads it. Version 1 checks that the encoder picks the bech32m
+    constant, the rule the decoder enforces from the other side.
+    """
+    padded_words = -(-len(program) * 8 // 5)
+
+    encoded = encode_segwit_address("tb", witness_version, program)
+
+    assert encoded == address
+    assert validate_address(BITCOIN, encoded) == ValidatedAddress(
+        canonical=address, display=address
+    )
+    decoded = bech32_decode(encoded)
+    assert decoded.hrp == "tb"
+    assert decoded.is_bech32m is (witness_version != 0)
+    assert decoded.data[0] == witness_version
+    assert len(decoded.data) == 1 + padded_words
+    decoded_program = _convert_bits(decoded.data[1:], 5, 8)
+    assert decoded_program is not None
+    assert bytes(decoded_program) == program
 
 
 # --------------------------------------------------------------------------------------

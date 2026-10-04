@@ -50,6 +50,45 @@ export const ADDRESSES = {
   kasSecondary: 'kaspatest:qqnapngv3zxp305qf06w6hpzmyxtx2r99jjhs04lu980xdyd2ulwwmx9evrfz',
 } as const;
 
+/**
+ * Extended public keys, in test-network form only (spec 031, R11), exactly as
+ * `backend/tests/extended_key_vectors.py` has them. A private key never appears
+ * in any fixture at any length beyond a prefix and four characters.
+ */
+export const EXTENDED_KEYS = {
+  /** BIP-32 test vector 1's master key, re-versioned to `tpub`. */
+  tpub: 'tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp',
+  /** BIP-84's account key m/84'/0'/0', re-versioned to `vpub`. */
+  vpub: 'vpub5YvMuJNjRSYon44z9QmCfdf8SqJRVNvz6m55Qy5iVjZQxDfUgtiQjnc7CC1fAbED2tAGCZRERUfvtn2DstZGU6HMns6dXXH2wujSc2wfi2x',
+} as const;
+
+/** What the API serves as `address` for each of {@link EXTENDED_KEYS}: 4 + U+2026 + 4. */
+export const MASKED_EXTENDED_KEYS = {
+  tpub: 'tpub…7VKp',
+  vpub: 'vpub…fi2x',
+} as const;
+
+/** The Base58 alphabet: no `0`, `O`, `I` or `l`. */
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+/**
+ * A private-key-shaped run for spec 031's R2b tests: a **test** prefix and `length`
+ * Base58 characters, assembled in memory when a test calls this.
+ *
+ * R11: no key-shaped string is ever written to a file, and only `tprv`, `uprv` and
+ * `vprv` are used at key length. The body is the alphabet in a fixed stride, so it is
+ * deterministic, every character is in the Base58 class, and it is no key at all: it
+ * has no checksum and no structure. The mainnet prefixes are proven on the pattern
+ * itself, never on a string of this shape.
+ */
+export function privateKeyShapedRun(prefix: 'tprv' | 'uprv' | 'vprv', length = 100): string {
+  const body = Array.from(
+    { length },
+    (_, index) => BASE58_ALPHABET[(index * 7) % BASE58_ALPHABET.length],
+  ).join('');
+  return `${prefix}${body}`;
+}
+
 /** Every fixture address, for the privacy test that no request URL carries one. */
 export const ALL_ADDRESSES: readonly string[] = Object.values(ADDRESSES);
 
@@ -97,6 +136,7 @@ export function wallet(overrides: Partial<WalletResponse> = {}): WalletResponse 
   return {
     id: 1,
     chain_key: 'bitcoin',
+    kind: 'address',
     address: ADDRESSES.btcSegwit,
     label: 'Cold storage',
     archived: false,

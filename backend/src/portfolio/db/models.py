@@ -59,6 +59,24 @@ _ASSET_KIND_CHECK: Final = "kind IN ('crypto', 'fiat')"
 # not an enum edit -- which is the point.
 _WALLET_CHAIN_KEY_CHECK: Final = "chain_key IN ('bitcoin', 'kaspa')"
 
+# What a wallet's address columns hold (spec 031, R1): the `domain.chains.WalletKind` members.
+# The same duplication hazard as every constant here -- repeated verbatim in
+# `0011_extended_keys` -- and the same reflection test.
+_WALLET_KIND_CHECK: Final = "kind IN ('address', 'extended_key')"
+
+# Only Bitcoin derives from an extended key. Kaspa extended keys are a non-goal of spec 031,
+# and registration refuses one by prefix; this refuses one again for a writer that bypasses
+# the registry.
+_WALLET_KIND_CHAIN_CHECK: Final = "kind = 'address' OR chain_key = 'bitcoin'"
+
+# A derived address sits on BIP44's receive branch (0) or its change branch (1), at a
+# non-hardened index: public derivation cannot reach a hardened one. The same duplication
+# hazard and the same reflection test as every constant above.
+_DERIVED_ADDRESS_BRANCH_CHECK: Final = "branch IN (0, 1)"
+_DERIVED_ADDRESS_CHILD_INDEX_CHECK: Final = "child_index >= 0 AND child_index < 2147483648"
+# `Boolean` emits no `CHECK` of its own on SQLite: see the quote-quantity-derived check below.
+_DERIVED_ADDRESS_USED_CHECK: Final = "used IN (0, 1)"
+
 # The fiat currencies a price may be quoted in, carrying exactly the same duplication
 # hazard as the two constants above and covered by the same kind of reflection test. The
 # values are `providers.prices.base.USD` and `EUR`; `db` may not import `providers`, which
@@ -297,6 +315,14 @@ class Wallet(Base):
     constraint, so re-adding the same address is a conflict rather than a resurrection --
     which is deliberate, since a silent resurrection would come back with the old label
     and the old history while looking to the owner like a new wallet.
+
+    **`kind` says what the two address columns hold** (spec 031, R1): an `address`, or an
+    `extended_key` -- a Bitcoin extended public key, from which `derived_addresses` holds what
+    has been derived. `address_display` holds the key as entered; `address_canonical` holds
+    it re-serialised at depth 0 (`domain.extended_keys.canonical_extended_key`), so two
+    exports of one account collide in the unique constraint. Reusing the address columns
+    reuses the unique constraint, archiving and labels unchanged. The key is never served
+    whole: `services.wallets` masks it.
     """
 
     __tablename__ = "wallets"
@@ -312,6 +338,8 @@ class Wallet(Base):
         ),
         # Named, because a batch rebuild cannot re-create an anonymous CHECK.
         CheckConstraint(_WALLET_CHAIN_KEY_CHECK, name="chain_key"),
+        CheckConstraint(_WALLET_KIND_CHECK, name="kind"),
+        CheckConstraint(_WALLET_KIND_CHAIN_CHECK, name="kind_chain"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -330,6 +358,58 @@ class Wallet(Base):
     archived_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    # Last, because `0011_extended_keys` adds it to an existing table. The server default is
+    # what every row written before it becomes.
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'address'"))
+
+
+class DerivedAddress(Base):
+    """One address derived from an extended-key wallet (spec 031).
+
+    **Derived data that is kept so a rescan does not derive it again** (R6). Each sync reads
+    every row of the wallet -- funds can arrive at any of them -- and derives only the
+    indices above the highest one stored on each branch. New rows and newly used flags are
+    written in the same per-chain commit as the wallet's snapshot, so an interrupted scan
+    persists nothing and the next one starts from what was last committed.
+
+    `used` means the vendor reported a transaction for the address, and **it never goes
+    back to false**: once used, the gap limit is counted after it for good, whatever a later
+    answer says. An index BIP32 gives no key has no row (R5).
+
+    No balance is stored here. The wallet's snapshot is the sum over these addresses, and the
+    per-address figures are internal to one sync. `address_canonical` is the owner's
+    holdings like every address column, so nothing logs it.
+
+    `UNIQUE (wallet_id, branch, child_index)`: one address per position. It leads with
+    `wallet_id`, so it also serves the only read there is and the cascade.
+    """
+
+    __tablename__ = "derived_addresses"
+    __table_args__ = (
+        UniqueConstraint(
+            "wallet_id",
+            "branch",
+            "child_index",
+            name="uq_derived_addresses_wallet_branch_index",
+        ),
+        # Named, because a batch rebuild cannot re-create an anonymous CHECK.
+        CheckConstraint(_DERIVED_ADDRESS_BRANCH_CHECK, name="branch"),
+        CheckConstraint(_DERIVED_ADDRESS_CHILD_INDEX_CHECK, name="child_index"),
+        CheckConstraint(_DERIVED_ADDRESS_USED_CHECK, name="used"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No index of its own: the unique constraint leads with it.
+    wallet_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("wallets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    branch: Mapped[int] = mapped_column(Integer, nullable=False)
+    child_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    address_canonical: Mapped[str] = mapped_column(Text, nullable=False)
+    used: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 class AssetPrice(Base):

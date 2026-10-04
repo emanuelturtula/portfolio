@@ -473,8 +473,12 @@ export interface paths {
         get: operations["listWallets"];
         put?: never;
         /**
-         * Register an address to read balances from
-         * @description Register an address after verifying its checksum, offline.
+         * Register an address or an extended public key to read balances from
+         * @description Register an address, or a Bitcoin extended public key, after verifying it offline.
+         *
+         *     A refused key is the same 422 as a refused address, with its own reason as the `type`
+         *     -- `private_key`, `extended_key_multisig`, `invalid_public_key` -- and the response
+         *     serves an extended key masked (spec 031).
          *
          *     A duplicate is a 409 whether or not the row holding the slot is archived, and the
          *     problem detail says which -- because "you already have this" and "you archived this"
@@ -2178,10 +2182,13 @@ export interface components {
         };
         /**
          * WalletCreateRequest
-         * @description A new wallet: which chain, which address, and optionally what to call it.
+         * @description A new wallet: which chain, which address or extended key, and optionally a label.
          */
         WalletCreateRequest: {
-            /** Address */
+            /**
+             * Address
+             * @description An address, or on Bitcoin a single-signature extended public key (xpub, ypub, zpub, tpub, upub or vpub). Never a private key.
+             */
             address: string;
             chain_key: components["schemas"]["ChainKey"];
             /** Label */
@@ -2210,6 +2217,16 @@ export interface components {
             wallet_id: number;
         };
         /**
+         * WalletKind
+         * @description What a wallet's `address` columns hold.
+         *
+         *     A `StrEnum` for the reason `ChainKey` is one: the value in `wallets.kind`, the value its
+         *     `CHECK` admits and the value that crosses the API are one string. Adding a member is a
+         *     migration.
+         * @enum {string}
+         */
+        WalletKind: "address" | "extended_key";
+        /**
          * WalletListResponse
          * @description The wallet collection, wrapped in an object rather than returned as a bare array.
          *
@@ -2225,7 +2242,10 @@ export interface components {
          * @description One wallet, as the API publishes it.
          */
         WalletResponse: {
-            /** Address */
+            /**
+             * Address
+             * @description The address as it was entered. For an extended public key, only its first and last four characters around an ellipsis: the key itself is never served.
+             */
             address: string;
             /** Archived */
             archived: boolean;
@@ -2238,6 +2258,8 @@ export interface components {
             created_at: string;
             /** Id */
             id: number;
+            /** @description What the wallet was registered with: one address, or an extended public key. */
+            kind: components["schemas"]["WalletKind"];
             /** Label */
             label: string | null;
             /**

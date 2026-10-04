@@ -56,6 +56,8 @@ KASPA: Final = "kaspa"
 WALLET_FIELDS: Final = {
     "id",
     "chain_key",
+    # Spec 031: what `address` holds, an address or a masked extended key.
+    "kind",
     "address",
     "label",
     "archived",
@@ -525,7 +527,9 @@ MALFORMED: Final[tuple[tuple[str, str], ...]] = (
     ("mixed case", BIP173_MIXED_CASE),
     ("unknown human readable part", BIP173_UNKNOWN_HRP),
     ("unknown base58 version byte", CORE_UNKNOWN_VERSION_BYTE),
-    ("an extended public key", SYNTHETIC_TPUB),
+    # Spec 031 accepts an extended public key on Bitcoin; this one is still refused, now as
+    # `invalid_public_key`, because its key bytes are a hash and not a point on the curve.
+    ("an extended public key whose key is not a point", SYNTHETIC_TPUB),
     ("empty", ""),
     ("whitespace", "   "),
     ("two hundred characters", TWO_HUNDRED_CHARACTERS),

@@ -1,7 +1,7 @@
 # 031 — Bitcoin extended public keys, derived locally
 
 Issue: #24
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -53,9 +53,17 @@ derivation therefore has to happen here.
 ## Rulings
 
 - **R1. The key lives in the existing address columns, and a new `kind` column says what
-  it is.** `address_canonical` and `address_display` both hold the key exactly as entered,
-  after stripping whitespace. Base58 is case-sensitive, so there is no case folding. This
-  reuses the unique constraint, archiving and labels unchanged.
+  it is.** This reuses the unique constraint, archiving and labels unchanged.
+  - `address_display` holds the key exactly as entered, after stripping whitespace. Base58
+    is case-sensitive, so there is no case folding. The API masks this form.
+  - `address_canonical` holds the key **re-serialised at depth 0**:
+    `version || 0x00 || 00000000 || 00000000 || chain_code || public_key`.
+    - Without this, one account exported twice by tools that serialise depth, parent
+      fingerprint or child number differently would be two strings, two wallets, the same
+      addresses, and a silently doubled total. Review finding S1 (2026-10-03).
+    - The version stays in the canonical form, because an `xpub` and a `zpub` over the same
+      bytes derive different addresses and are legitimately different wallets.
+    - The re-serialised key is valid under R4, and it is what the provider is handed.
   - Rejected: a separate nullable `extended_key` column. It needs a CHECK that exactly one
     of the two is set, and every reader would have to branch on kind anyway.
 - **R2. The script type is fixed by the prefix** (SLIP-0132 version bytes):
@@ -69,10 +77,45 @@ derivation therefore has to happen here.
   | `upub` | `0x044A5262` | test | P2SH-P2WPKH |
   | `vpub` | `0x045F1CF6` | test | P2WPKH |
 
-  Multisig versions are refused with a new reason, `extended_key_multisig`. Any string
-  that starts with `xprv`, `yprv`, `zprv`, `tprv`, `uprv` or `vprv` (or the capitalised
-  multisig forms) is refused with a new reason, `private_key`, **by prefix and before any
-  decoding**, so that a private key with a typo is still named for what it is.
+  **Refusals by prefix, before any decoding**, so that a key with a typo is still named for
+  what it is:
+  - a string that starts with `xprv`, `yprv`, `zprv`, `tprv`, `uprv`, `vprv`, `Yprv`, `Zprv`,
+    `Uprv` or `Vprv` is refused with a new reason, `private_key`;
+  - one that starts with `Ypub`, `Zpub`, `Upub` or `Vpub` is refused with a new reason,
+    `extended_key_multisig`.
+
+  After decoding, a version outside the six above is `unknown_version_byte`. For an 82-byte
+  payload the version fixes the four-character prefix, so no separate "multisig version"
+  check is reachable after decoding.
+- **R2a. Kaspa** (ruled 2026-10-03, during implementation). On Kaspa, `classify_wallet_key`
+  refuses any of the 20 prefixes above by prefix, before the Kaspa codec runs. A private one
+  is refused as `private_key`. A public one, single-sig or multisig, is refused as
+  `extended_key`. Everything else goes to the Kaspa codec unchanged. Before this ruling, a
+  `tpub` on Kaspa reached the codec and was refused as `mixed_case`, which said nothing
+  useful.
+- **R2b. What counts as a private key** (review finding D1, 2026-10-03). A value is refused
+  as `private_key` when either of these holds:
+  - after surrounding whitespace and Unicode format characters (category `Cf`: zero-width
+    space, word joiner, directional marks, BOM) are removed, it starts with a private prefix;
+  - **anywhere in it**, after the same `Cf` removal (so that an invisible character inside
+    the body cannot split it), there is a private-key-shaped run,
+    `(?<![1-9A-HJ-NP-Za-km-z])(?:[xyztuv]|[YZUV])prv[1-9A-HJ-NP-Za-km-z]{100,}`.
+    - This catches a key pasted after other text, inside quotes, or behind an invisible
+      character.
+    - **The left boundary is required.** An extended *public* key has a 107-character Base58
+      body. Without the boundary, roughly one public key in a few hundred thousand has a
+      private prefix inside its body and would be refused. Found by the tester on 2026-10-03.
+    - No address of either chain contains a Base58 run of 100 or more characters.
+    - The one case it gives up: a private key glued directly onto preceding Base58 text, with
+      no separator, or with only a format character as the separator.
+
+  Where the test applies:
+  - **The server** runs it on the raw value, before stripping and before the length cap, so
+    an over-long string is still named `private_key`.
+  - **The client** runs the same test on the address and the label as they are entered.
+
+  Removing the `Cf` characters is for this test only. A stored value is never changed by it,
+  and an address that contains one is still refused as `invalid_character`.
 - **R3. The network check stays at read time,** as for addresses (spec 007).
   - Registration accepts either family.
   - The provider refuses a key whose family does not match `PORTFOLIO_BITCOIN_NETWORK`
@@ -144,6 +187,25 @@ derivation therefore has to happen here.
   `kind = 'extended_key'` wallet exists. The downgraded application would read the key as
   an address and fail the Bitcoin chain on every tick. With no such wallet, it drops the
   table and the column.
+  - Archived wallets count too, because archiving keeps the row.
+  - No endpoint or command deletes a wallet row. `docs/operations.md` gives the operator's
+    SQL, run after `python -m portfolio backup`: `PRAGMA foreign_keys = ON`, then delete the
+    extended-key wallets, which cascades to their snapshots and derived addresses.
+  - Those wallets' history is lost, but the old schema could not read it anyway. The backup
+    is the undo.
+- **R13. A latent validator defect, fixed** (found 2026-10-03, during implementation).
+  - **The defect.** `_looks_like_bech32` sends some valid testnet P2PKH addresses to the
+    bech32 decoder: an `m` or `n` address whose last `1` follows only letters and precedes
+    only bech32-charset characters. The decoder then refused them as `mixed_case`. Derived
+    `tpub` addresses hit this often. Mainnet `1`/`3` and testnet `2` addresses cannot, so no
+    registered production address was ever affected.
+  - **The fix.** `validate_bitcoin_address` and `bitcoin_network_of` fall back to
+    Base58Check when the bech32 reading fails, and re-raise the original bech32 reason when
+    Base58Check fails too.
+  - **No existing reason changes.** The fallback only turns a refusal into an acceptance,
+    and only for a string that verifies as Base58Check with a known version byte.
+  - **Rejected:** restricting the hrp to `bc`/`tb`/`bcrt`. That would change the pinned
+    `unknown_prefix` reason for foreign hrps.
 
 ## Design
 
@@ -180,7 +242,7 @@ derivation therefore has to happen here.
   - `classify_wallet_key(chain_key, raw) -> WalletKey(kind, canonical, display)`.
   - On Bitcoin, any string with an extended-key prefix, public or private, single- or
     multisig, goes to the extended-key parser. Everything else goes to `validate_address`.
-  - On Kaspa, nothing changes.
+  - On Kaspa, the R2a prefix refusals apply, and everything else is unchanged.
   - `WalletKind(StrEnum)`: `address` and `extended_key`.
 
 ### Data model (migration `0011_extended_keys`, on `0010_exchange_balances`)
@@ -202,6 +264,11 @@ derivation therefore has to happen here.
   | `created_at` | `UtcDateTime` NOT NULL | |
 
   - `UNIQUE (wallet_id, branch, child_index)`.
+  - `CHECK (used IN (0, 1))`, named `ck_derived_addresses_used`. This follows the existing
+    convention for Boolean columns, because SQLite's Boolean emits no CHECK of its own.
+  - An offline `alembic downgrade --sql` past 0011 refuses outright. With no database to
+    count extended-key wallets in, a script could strand one (R12). Nothing in this
+    repository runs migrations offline.
   - CHECK texts are model constants, repeated verbatim in the migration as 0010 does. The
     `batch_alter_table` on `wallets` uses an explicit `copy_from`.
 - The downgrade follows R12.
@@ -228,8 +295,26 @@ derivation therefore has to happen here.
     `addresses_to_extend` until it returns 0, subject to R5's cap;
   - read sequentially through the same per-address path, endpoint label and client as
     `fetch_balances`, so every request, retries included, acquires the host limiter;
-  - log only counts (`wallet_id` is the caller's; the provider logs neither the key, an
-    address nor an index).
+  - log nothing, which is this module's existing contract. The service logs per-wallet
+    counts by `wallet_id`, never a key, an address or an index;
+  - validate the persisted addresses it is handed before any request, exactly as registered
+    addresses are validated: codec, canonical equality, network.
+    - Under regtest, a Base58 derived address reads as testnet because the bytes are
+      identical, and that is expected.
+    - A switch of `PORTFOLIO_BITCOIN_NETWORK` between testnet and regtest under an existing
+      `vpub` wallet fails the chain as `address_rejected`: its `tb1`/`bcrt1` addresses
+      differ by network. `tpub` and `upub` addresses are byte-identical on both, so those
+      wallets keep reading correctly (review N1).
+    - The remedy, in `docs/operations.md`, is to take a backup, then
+      `DELETE FROM derived_addresses`. The wallets, their labels and their snapshot history
+      stay, and the next sync re-derives every key for the new network at first-scan cost.
+    - Removing the wallet and adding it again does not work: archiving keeps the row's
+      unique slot, so the re-add is a 409, and restoring brings the stale rows back.
+  - A branch key (`/0` or `/1`) that BIP32 gives no key for is refused as
+    `invalid_public_key`. BIP44 fixes the branch index, so there is no next one to move to.
+  - A malformed persisted position is a programming error and raises `ValueError`, which the
+    sync records as `internal`. That covers a branch other than 0 or 1, an index outside
+    `[0, 2^31)`, and a duplicate. The database's CHECK and UNIQUE make it unreachable.
 - **No new module goes in `providers/chains/`.** `test_chain_modules.py` requires every
   module there to register a provider.
 
@@ -249,6 +334,15 @@ derivation therefore has to happen here.
     derived addresses, in the existing per-chain commit.
   - Any failure fails the chain as today.
   - Run counts stay counts of wallets.
+  - **A scan's result is checked like `_fan_out` checks a batch.** It must cover every
+    persisted position, with no position twice. Otherwise the sync raises
+    `ProviderResponseError` and the chain fails as `response`. A dropped address would make
+    the sum quietly wrong.
+  - The `address_rejected` detail sentence now says "an address or an extended key was
+    refused before it was read". Extended-key wallets are scanned after the address batch,
+    so "before any request" was no longer true.
+  - `balance_sync_extended_key_scanned` carries `wallet_id` and three counts. It is logged
+    after the commit: at INFO when the scan persisted new addresses, at DEBUG otherwise.
 
 ### API
 
@@ -275,8 +369,13 @@ derivation therefore has to happen here.
   - **On Bitcoin, a public extended-key prefix** replaces today's "only single addresses"
     hint with an informative one: every address of the wallet will be scanned, and the
     first scan takes about a minute.
-  - **A private prefix blocks submission client side**, with a message that it is a private
-    key and must not be entered anywhere. The value is never sent.
+  - **A private key is refused as it is entered**, in the address field and in the label
+    field, on any chain. The test is R2b's.
+    - The field is cleared at once (`flushSync`), and focus moves to the alert
+      (`tabIndex={-1}`). The rest of a hand-typed key then lands on a non-editable element
+      instead of the emptied field.
+    - The alert says it is a private key that must not be entered anywhere.
+    - The value is never sent. There is no submit-time guard, because none is reachable.
   - **Kaspa:** unchanged.
 - Wallet list and dashboard table: an extended-key wallet shows the masked `address`, a small
   "Extended key" label, and no copy button. `Address.tsx` must not truncate the masked form
@@ -294,6 +393,11 @@ derivation therefore has to happen here.
   - The cost: at least 40 requests on a first scan, at least 1 s apart per host.
   - That `used` comes from `tx_count`.
   - The `xpub` P2PKH caveat (re-export as `zpub`/`ypub`).
+  - **`docs/providers.md` never spells a mainnet prefix.** Its existing guard
+    (`tests/providers/test_documentation.py`) forbids the bare substrings, `bc1q` included,
+    because it is the document a provider author copies from. So its table gives the mainnet
+    version bytes, and it points to `docs/operations.md`, which names the prefixes for the
+    owner. The guard stays as strict as it is.
   - No taproot and no multisig.
 - `docs/operations.md`: adding an extended key; the first scan's duration; the overlap
   caveat; and the downgrade refusal.
@@ -392,3 +496,8 @@ Criteria added by this spec:
 - **The `tx_count` fields** are documented but have not been read by this code before. If
   either is absent from a live response, the read fails loudly as `response`. It does not
   silently count as unused.
+- **A scan that hits the cap persists nothing,** because the chain rolls back. A vendor that
+  reports every address as used would therefore cost 1000 requests on every sync. At the
+  1 s per-host floor that is about 17 minutes, longer than the 15-minute interval. Bitcoin
+  stays failed, which is loud, and the balance timer reports `late`. The behaviour is
+  accepted. A cheaper failure is a follow-up, if this is ever seen.
