@@ -747,3 +747,43 @@ p.state-error[role='alert'] {
   max-width: 14rem;
   margin-top: 0.4rem;
 }
+
+/* The Value section's Assets and Wallets tables on a phone (#118). */
+
+/* The region takes the table's own margins and the table gives them up. The region is a scroll
+   container, so the table's margins would no longer collapse through it: this is what keeps the
+   spacing, and so the 1280 px layout, what it was before the region. */
+.balance-scroll {
+  margin: 0.75rem 0 1.5rem;
+}
+
+.balance-table {
+  margin: 0;
+}
+
+/* At the desktop's size the four columns need more than the 327 px a 375 px phone leaves them,
+   and the truncated address alone held the first column at 146 px. Below 40rem the cells tighten
+   to the dense tables' size, and an address or a label breaks anywhere rather than widen its
+   column. A figure still never breaks, so one too long to fit scrolls the table inside its
+   region. Above 40rem nothing here applies. */
+@media (max-width: 40rem) {
+  .balance-table {
+    font-size: 0.875rem;
+  }
+
+  .balance-table th,
+  .balance-table td {
+    padding: 0.5rem 0.4rem;
+  }
+
+  .balance-table .wallet-name,
+  .balance-table .address-short,
+  .balance-table .address-full {
+    overflow-wrap: anywhere;
+  }
+
+  .balance-table .address button {
+    padding: 0.1rem 0.5rem;
+    font-size: 0.8125rem;
+  }
+}
