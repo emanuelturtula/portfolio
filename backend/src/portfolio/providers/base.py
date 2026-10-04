@@ -55,7 +55,7 @@ from dataclasses import dataclass
 # A real import, not a `TYPE_CHECKING` one: `decode_json` hands this class to `json.loads`
 # as `parse_float`, so it is needed at run time and not only in an annotation.
 from decimal import Decimal
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from portfolio.domain.money import from_base_units
 from portfolio.providers.errors import ProviderResponseError
@@ -69,7 +69,11 @@ __all__ = [
     "AddressBalance",
     "ChainCapabilities",
     "ChainProvider",
+    "ExtendedKeyScan",
+    "ExtendedKeyScanner",
+    "KnownDerivedAddress",
     "ProviderHealth",
+    "ScannedAddress",
     "align_balances",
     "chunk_addresses",
     "decode_json",
@@ -237,6 +241,88 @@ class ChainProvider(Protocol):
         Separate from `fetch_balances` so that an operations view can report "the chain is
         down" without naming a wallet, and so that a failing health check is not itself a
         disclosure of what is being watched.
+        """
+
+
+# ---------------------------------------------------------------------------------------
+# Extended public keys (spec 031)
+# ---------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class KnownDerivedAddress:
+    """An address a previous scan derived and persisted, handed back to the next one.
+
+    `branch` is 0 for receive and 1 for change; `index` is the child index on it. `used` is
+    what was persisted, and it only ever goes from false to true (R5).
+    """
+
+    branch: int
+    index: int
+    address: str
+    used: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ScannedAddress:
+    """One address a scan read: where it sits, whether it is used, and what it holds.
+
+    `used` is the persisted flag or the vendor's answer, whichever says used. `confirmed`
+    and `pending` mean exactly what they mean on `AddressBalance`, the `None` included.
+    """
+
+    branch: int
+    index: int
+    address: str
+    used: bool
+    confirmed: int
+    pending: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExtendedKeyScan:
+    """Every address a scan read, known and new, and the exponent their counts are in.
+
+    Ordered receive branch first, then change, each by index. Which of them are new is the
+    caller's to work out against what it handed in: it holds the persisted set, and a second
+    copy of that fact here would be one more thing that could disagree with it.
+    """
+
+    addresses: tuple[ScannedAddress, ...]
+    decimals: int
+
+
+@runtime_checkable
+class ExtendedKeyScanner(Protocol):
+    """A chain provider that can scan an extended public key's addresses (spec 031).
+
+    **`runtime_checkable`, unlike `ChainProvider`, and on purpose.** The balance sync holds
+    a `ChainProvider` and has to ask whether it can also do this, because a chain with an
+    extended-key wallet and a provider that cannot scan one must fail loudly as `internal`
+    rather than silently skip the wallet. That question is asked at run time or not at all.
+
+    The module docstring's objection still holds: `isinstance` compares the attribute name
+    and nothing about the signature. So the signature is checked the way `ChainProvider`'s
+    is, by `mypy` deciding assignability -- `tests/providers/` assigns the Esplora provider
+    to a variable of this type -- and the `isinstance` is only the run-time gate.
+    """
+
+    async def scan_extended_key(
+        self, key: str, known: Sequence[KnownDerivedAddress]
+    ) -> ExtendedKeyScan:
+        """Read every address the key's gap-limit scan reaches, deriving only what is new.
+
+        Args:
+            key: the serialised extended public key, as the wallet row stores it.
+            known: what earlier scans persisted for this key. Every one of them is read;
+                derivation starts above the highest index on each branch.
+
+        Raises:
+            AddressInvalidError: the key does not parse, or belongs to a network family the
+                provider is not configured for. Checked before any request.
+            ProviderUnavailableError: the chain could not be reached, or did not answer.
+            ProviderResponseError: it answered with something that cannot be trusted, or a
+                branch would pass `MAX_ADDRESSES_PER_BRANCH`.
         """
 
 

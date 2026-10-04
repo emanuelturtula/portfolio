@@ -6,7 +6,9 @@ authenticates by signing the request *in the query string* -- which means a sign
 the key that produced it can ride along in a URL that any middleware, retry handler or
 exception renderer might cheerfully log. Extended public keys (`xpub`/`ypub`/`zpub`) are
 just as damaging in a different way: they are not spendable, but one leaked xpub exposes
-every address and every balance the wallet will ever derive.
+every address and every balance the wallet will ever derive. An extended *private* key is
+worse than either -- it spends -- and since spec 031 accepts extended keys in the field an
+owner pastes into, one pasted by mistake is redacted by the same two rules.
 
 ## One pipeline for every record (#23)
 
@@ -69,7 +71,7 @@ a substring, so `api_key`, `API_KEY` and `bitget_api_key_header` are all caught.
 
 1. every loaded secret, as `secret_values` finds them on `Settings`, overlapping occurrences
    merged and replaced once;
-2. extended public keys, by pattern;
+2. extended keys, public and private, by pattern;
 3. addresses of every form this application accepts, mainnet and testnet, by pattern;
 4. the query string of any `scheme://` URL, found by a token scan, not a backtracking pattern.
 
@@ -139,8 +141,20 @@ SENSITIVE_KEY_FRAGMENTS: Final[tuple[str, ...]] = (
 )
 
 # Matched as a case-insensitive prefix of the key: an extended public key leaks the
-# whole derivation tree, so a field named after one is redacted wholesale.
-EXTENDED_KEY_PREFIXES: Final[tuple[str, ...]] = ("xpub", "ypub", "zpub")
+# whole derivation tree, and an extended private key spends it, so a field named after
+# either is redacted wholesale. The private six arrived with spec 031; matched without case,
+# they cover the four uppercase multisig spellings as well.
+EXTENDED_KEY_PREFIXES: Final[tuple[str, ...]] = (
+    "xpub",
+    "ypub",
+    "zpub",
+    "xprv",
+    "yprv",
+    "zprv",
+    "tprv",
+    "uprv",
+    "vprv",
+)
 
 MAX_REDACTION_PASSES: Final = 4
 """The most passes `ValueRedactor.redact_text` makes over one string (R12).
@@ -182,9 +196,29 @@ EXTENDED_PUBLIC_KEY_PREFIXES: Final[tuple[str, ...]] = (
 )
 """The extended public key prefixes the value rule redacts.
 
-The six `domain/addresses.py` refuses at registration, and the four multisig forms. Matched
-case-sensitively, because the case is part of the prefix: `Ypub` and `ypub` are different
-version bytes.
+The six single-signature prefixes `domain/extended_keys.py` parses, and the four multisig
+forms it refuses. Matched case-sensitively, because the case is part of the prefix: `Ypub`
+and `ypub` are different version bytes.
+"""
+
+EXTENDED_PRIVATE_KEY_PREFIXES: Final[tuple[str, ...]] = (
+    "xprv",
+    "yprv",
+    "zprv",
+    "tprv",
+    "uprv",
+    "vprv",
+    "Yprv",
+    "Zprv",
+    "Uprv",
+    "Vprv",
+)
+"""The extended private key prefixes the value rule redacts as well (spec 031).
+
+SLIP-0132's ten private counterparts of the ten above, mainnet and test alike. Registration
+refuses every one of them by its prefix, before decoding a character, so none should ever
+reach a log. This is for the one that does anyway -- a request body echoed by a library, a
+traceback with the form in scope -- because the cost of that one is the owner's funds.
 """
 
 _BASE58: Final = "1-9A-HJ-NP-Za-km-z"
@@ -193,10 +227,16 @@ _BASE58: Final = "1-9A-HJ-NP-Za-km-z"
 _BECH32: Final = "ac-hj-np-z02-9"
 """The bech32 alphabet as a character-class body: no `1`, `b`, `i` or `o`."""
 
-EXTENDED_PUBLIC_KEY_PATTERN: Final = re.compile(
-    "(?:" + "|".join(EXTENDED_PUBLIC_KEY_PREFIXES) + f")[{_BASE58}]{{100,}}"
+EXTENDED_KEY_PATTERN: Final = re.compile(
+    "(?:"
+    + "|".join((*EXTENDED_PUBLIC_KEY_PREFIXES, *EXTENDED_PRIVATE_KEY_PREFIXES))
+    + f")[{_BASE58}]{{100,}}"
 )
-"""A prefix followed by 100 or more Base58 characters. A real one is 111 characters long."""
+"""A public or private prefix followed by 100 or more Base58 characters.
+
+A real key, of either kind, is 111 characters long. Renamed from `EXTENDED_PUBLIC_KEY_PATTERN`
+when spec 031 widened it, so that the name does not promise less than the pattern redacts.
+"""
 
 ADDRESS_STARTS: Final = r"(?<![0-9A-Za-z])"
 """Where an address may start: no letter or digit right before it (R14).
@@ -474,7 +514,7 @@ class ValueRedactor:
        and a shorter one where it is the whole string. Every occurrence of every spelling is
        found as a span, and spans that overlap are merged and replaced once (R13), so neither
        one secret inside another nor two that overlap leaves a fragment;
-    2. `EXTENDED_PUBLIC_KEY_PATTERN`;
+    2. `EXTENDED_KEY_PATTERN`, public and private;
     3. `ADDRESS_PATTERNS`;
     4. `redact_url_queries`, keeping each URL's base and fragment and replacing its query.
 
@@ -527,7 +567,7 @@ class ValueRedactor:
         if text in self._short_secrets:
             return REDACTED
         text = self._redact_secrets(text)
-        text = EXTENDED_PUBLIC_KEY_PATTERN.sub(REDACTED, text)
+        text = EXTENDED_KEY_PATTERN.sub(REDACTED, text)
         for pattern in ADDRESS_PATTERNS:
             text = pattern.sub(REDACTED, text)
         return redact_url_queries(text)

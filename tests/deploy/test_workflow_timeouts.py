@@ -33,9 +33,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 BACKEND_PYPROJECT = REPO_ROOT / "backend" / "pyproject.toml"
 
-# The largest bound any job may declare without editing this file. The deploy job holds the
-# largest today, at 20. A job set to 360 would pass a "has a timeout" check and still hold
-# a runner for six hours, so the check has to be about size as well as presence.
+# The largest bound any job may declare without editing this file. The backend test job
+# holds it today, at 30, because the suite outgrew 15. A job set to 360 would pass a "has a
+# timeout" check and still hold a runner for six hours, so the check has to be about size
+# as well as presence.
 MAX_TIMEOUT_MINUTES = 30
 
 # How much longer the deploy job must be allowed to run than the SSH call it wraps.

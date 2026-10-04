@@ -137,6 +137,7 @@ function WalletBalanceRow({
         {walletRecord !== undefined && (
           <Address
             value={walletRecord.address}
+            kind={walletRecord.kind}
             name={
               wallet.label ??
               `${chainDisplayName(wallet.chain_key)} wallet #${String(wallet.wallet_id)}`

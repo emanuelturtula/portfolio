@@ -35,6 +35,7 @@ import {
   interruptedRun,
   KAS_OBSERVED_AT,
   kaspaDownPortfolio,
+  MASKED_EXTENDED_KEYS,
   NOW,
   previousRun,
   PREVIOUS_OBSERVED_AT,
@@ -1588,6 +1589,51 @@ describe('DashboardPage: after a wallet changes', () => {
     const region = await walletsRegion();
     expect(within(region).queryByTitle(ADDRESSES.kasPrimary)).not.toBeInTheDocument();
     expect(within(await assetsRegion()).queryByRole('rowheader', { name: 'KAS' })).toBeNull();
+  });
+});
+
+describe('DashboardPage: an extended-key wallet (spec 031)', () => {
+  /** The healthy portfolio with wallet 2 registered as an extended public key. */
+  function withExtendedKey(label: string | null): PortfolioScenario {
+    const scenario = healthyPortfolio();
+    return {
+      ...scenario,
+      wallets: scenario.wallets.map((row) =>
+        row.id === 2
+          ? { ...row, kind: 'extended_key', address: MASKED_EXTENDED_KEYS.vpub, label }
+          : row,
+      ),
+    };
+  }
+
+  it('shows the masked key, labelled, with no copy control, and its value as served', async () => {
+    openDashboard(withExtendedKey('Spending'));
+    await loaded();
+
+    const row = await walletRow('Spending');
+
+    expect(row).toHaveTextContent(MASKED_EXTENDED_KEYS.vpub);
+    expect(within(row).getByText(MASKED_EXTENDED_KEYS.vpub)).not.toHaveAttribute('title');
+    expect(within(row).getByText('Extended key')).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: /^Copy address/ })).not.toBeInTheDocument();
+    // The wallet's figures are the backend's sum over its addresses, rendered as any other.
+    expect(dataValues(cell(row, 'Quantity'))).toEqual(['0.12345678']);
+    expect(dataValues(cell(row, 'Value'))).toEqual(['6419.7525600000']);
+    // The other rows are unchanged, copy control included.
+    const cold = await walletRow('Cold storage');
+    expect(within(cold).getByRole('button', { name: /^Copy address/ })).toBeInTheDocument();
+    expect(within(cold).queryByText('Extended key')).not.toBeInTheDocument();
+  });
+
+  it('an unlabelled extended-key wallet is still recognisable by its mask', async () => {
+    openDashboard(withExtendedKey(null));
+    await loaded();
+
+    const row = await walletRow(MASKED_EXTENDED_KEYS.vpub);
+
+    expect(row).toHaveTextContent('Bitcoin');
+    expect(within(row).getByText('Extended key')).toBeInTheDocument();
+    expect(dataValues(cell(row, 'Value'))).toEqual(['6419.7525600000']);
   });
 });
 
