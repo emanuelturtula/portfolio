@@ -389,8 +389,15 @@ def looks_like_private_key(raw: str) -> bool:
 
     Run on the raw value, before any stripping or length cap, so that a key inside an
     over-long paste is still named for what it is.
+
+    No ASCII character is a format character, so an ASCII value -- every key and address
+    there is -- skips the per-character pass, and a long paste costs only the regex scan.
     """
-    visible = "".join(char for char in raw if unicodedata.category(char) != "Cf")
+    visible = (
+        raw
+        if raw.isascii()
+        else "".join(char for char in raw if unicodedata.category(char) != "Cf")
+    )
     return (
         visible.strip().startswith(PRIVATE_KEY_PREFIXES)
         or PRIVATE_KEY_RUN_PATTERN.search(visible) is not None

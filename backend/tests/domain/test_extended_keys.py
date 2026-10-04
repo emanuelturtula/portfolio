@@ -20,6 +20,7 @@ import dataclasses
 import re
 import string
 import time
+import unicodedata
 from typing import Final
 
 import pytest
@@ -709,3 +710,8 @@ def test_a_megabyte_of_ordinary_text_is_answered_promptly() -> None:
     assert not looks_like_private_key(" " + "prv" * 300_000)
 
     assert time.perf_counter() - started < 2.0
+
+
+def test_no_ascii_character_is_a_format_character() -> None:
+    """The premise of the ASCII fast path: skipping the `Cf` removal changes nothing."""
+    assert [point for point in range(128) if unicodedata.category(chr(point)) == "Cf"] == []
