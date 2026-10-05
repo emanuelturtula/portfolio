@@ -16,6 +16,17 @@ providers" section after it is about the third. Each says where it differs.
 Read `backend/src/portfolio/providers/base.py` alongside this. The docstrings there are the
 reasoning; this is the checklist.
 
+**Every vendor fact here carries one of three words**, in the summary table at the top of
+each provider's section and in the detail beneath it:
+
+- **confirmed**: read in the vendor's published documentation, on the date given;
+- **measured**: seen in an answer from the live service, on the date given;
+- **unverified**: neither. The row says what would settle it, and who is placed to.
+
+A fact nobody has read or seen is unverified, however plausible. The summary tables are under
+"Vendor facts" for Bitcoin and Kaspa, under "Price sources" for the four price sources, and
+under each venue's own heading for Bitget and BingX.
+
 ## The shape
 
 A provider is any class that satisfies the `ChainProvider` protocol in
@@ -155,10 +166,10 @@ the sorted list of what *is* registered.
 
 ### 6. Make every request through the shared client
 
-`portfolio.providers.http.build_http_client()` returns an `httpx.AsyncClient` whose
-transport already carries connect/read/write/pool timeouts, bounded retry with full jitter,
-`Retry-After` handling and a per-host rate limiter. A provider takes the client in its
-constructor and does not build its own.
+`portfolio.providers.http.build_http_client()` returns an `httpx.AsyncClient` that already
+carries connect/read/write/pool timeouts and does not follow redirects, and whose transport
+carries bounded retry with full jitter, `Retry-After` handling and a per-host rate limiter. A
+provider takes the client in its constructor and does not build its own.
 
 The machinery is in a transport rather than in a helper function because **a helper has to
 be remembered and a transport cannot be bypassed** -- the same argument the authentication
@@ -225,9 +236,17 @@ because the second instance runs the same software and would refuse identically 
 right and is false for every refusal scoped to an instance rather than to a request: a ban
 that is spelled 403, an auth proxy returning 401, a base URL missing its `/api` path
 returning 404. Those are precisely the cases a second instance exists for, and stopping made
-the fallback unreachable in exactly them. The misconfiguration is not lost by moving on; it
-surfaces in `health`, which probes each instance in turn — that loop stays in your provider,
-because only you know how to read your vendor's health document.
+the fallback unreachable in exactly them. The misconfiguration is not lost by moving on:
+
+- the transport logs a 4xx or 5xx, and a request that got no answer, at error, as
+  `provider_request_failed` with the host and the label, whether or not the next instance
+  answers. A 3xx is the exception: it fails over, and is logged only at debug;
+- `health()` probes each instance in turn and says which one failed. That loop stays in your
+  provider, because only you know how to read your vendor's health document.
+
+**Nothing in production calls `health()` yet.** `GET /api/health/detail` reads recorded
+outcomes and asks no vendor (`services/health.py`), so today the log line is where a broken
+instance behind a working one shows.
 
 A 200 whose body will not parse is the exception and still stops. That decision is in your
 provider rather than in `EndpointSet`, and deliberately: a non-200 is one instance declining
@@ -310,9 +329,9 @@ from portfolio.providers.http import ADDRESS_BALANCE, ENDPOINT_EXTENSION
 response = await self._client.get(url, extensions={ENDPOINT_EXTENSION: ADDRESS_BALANCE})
 ```
 
-The transport logs `"{scheme}://{host}/{label}"` and **never the path**. Both current
-vendors put the address in the path, so a log line built from the URL would disclose
-exactly what the wallet registry refuses to disclose.
+The transport logs `"{scheme}://{host}/{label}"` and **never the path**. Both chain vendors
+put the address in the path, so a log line built from the URL would disclose exactly what
+the wallet registry refuses to disclose.
 
 **A label reaches the log only if it is a member of `ENDPOINT_LABELS`.** Anything else --
 including a perfectly well-shaped string -- renders `"<unlabelled>"`. That is the completion
@@ -333,10 +352,11 @@ about an endpoint is a visible edit to a named constant. The label must still ma
 `ENDPOINT_LABEL`'s pattern, which a test asserts over the set's contents.
 
 `strip_query(url)` exists separately and removes the query string, the fragment and any
-userinfo. It is the rule `CLAUDE.md` states, and it is what a future **exchange** provider
-will use, because one exchange signs its requests in the query string. It is not sufficient
-for a chain provider: reaching for it to log a chain request would meet the letter of the
-rule and leak the address anyway.
+userinfo. It is the rule `CLAUDE.md` states, written for the exchange that signs its requests
+in the query string. **No provider calls it.** That exchange is BingX, and its requests are
+logged through `request_target` like every other, which carries neither the path nor the
+query. `strip_query` is not sufficient for a chain provider either: reaching for it to log a
+chain request would meet the letter of the rule and leak the address anyway.
 
 Four further rules, none of them optional:
 
@@ -347,10 +367,12 @@ Four further rules, none of them optional:
 - **Never turn the `httpx` logger back up.** `configure_logging` holds `httpx` and
   `httpcore` at WARNING, because `httpx.AsyncClient.send` logs every request at INFO with
   the full URL -- path and query string -- through the standard library, above the
-  transport and outside structlog's redaction chain. Raising it to debug one provider call
-  puts every wallet address and every exchange signature on stdout, which is exactly when
-  someone is tailing the log. Use the transport's own `provider_request` line, or add a
-  temporary field to it; both are address-safe by construction.
+  transport. Since #23 such a record does pass the root formatter's redaction, which
+  replaces addresses, extended keys and a URL's query by pattern. That is the second layer,
+  not a licence: a pattern catches only the shapes it knows, and a handler added beside the
+  root one sees the record unredacted (spec 030, R10). Use the transport's own
+  `provider_request` line, or add a temporary field to it; both are address-safe by
+  construction.
 - **`ProviderHealth.detail` is for an operator**, so it carries "connect timeout" or
   "HTTP 503" and never an address, a URL or a body.
 
@@ -404,6 +426,48 @@ use testnet addresses only -- `tb1`, `bcrt1`, `kaspatest:`, `tpub` -- and they l
 
 The next person cannot tell a verified endpoint from a plausible one unless the difference
 is written down, and will trust both equally.
+
+### The two chain providers at a glance
+
+The endpoints are read from `providers/chains/bitcoin.py` and `providers/chains/kaspa.py`.
+The statuses are the ones the sections below establish, and each row's detail is there.
+
+#### Bitcoin: Esplora, at mempool.space and blockstream.info
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| balance read | `GET /address/{address}`, one address per call, labelled `address_balance` | **confirmed** 2026-09-22, from Blockstream's `API.md` and mempool.space's REST documentation |
+| batch read | none; `max_addresses_per_call` is 1 | **confirmed** 2026-09-22 and 2026-10-03: neither documents one |
+| extended keys | derived locally; neither vendor takes a key or a descriptor | **confirmed** 2026-10-03 |
+| "used", for a key's scan | `tx_count`, in `chain_stats` and in `mempool_stats` | **confirmed** 2026-10-03 |
+| health | `GET /blocks/tip/height`, labelled `block_tip_height`. Nothing in production calls it | **confirmed** 2026-09-22 |
+| base URLs | `https://mempool.space/api` first, `https://blockstream.info/api` second | **confirmed** 2026-09-22 |
+| rate limit, mempool.space | no number published. Exceeding it is a 429, and exceeding it repeatedly may end in a ban | **confirmed** 2026-09-22, read again 2026-10-03 |
+| rate limit, blockstream.info | none documented | **confirmed** 2026-09-22, read again 2026-10-03 |
+| our pacing | one request a second per host, `DEFAULT_MIN_HOST_INTERVAL_MS` | **unverified**: a guess from the ban warning. A 429 in a production log would settle it, and the operator is the one to see it |
+| retention or history window | none needed: a balance read asks for no history | **unverified** for both vendors, and moot until something reads transaction history. No issue owns it |
+| error statuses | none documented, so every mapping is by status alone | **unverified**: neither vendor documents one. An address is validated offline, so the case is not asked |
+| an address never used | assumed to answer in the documented shape, with zeros | **unverified**. A 404 instead would fail the scan as `response`, loudly; no issue owns it |
+| `mempool_stats` | read as `pending=None` when it is absent | **unverified** that it is always sent |
+| `Retry-After` | honoured when sent | **unverified** that either vendor sends one |
+
+#### Kaspa: kaspa-rest-server, at api.kaspa.org
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| single read | `GET /addresses/{address}/balance`, labelled `address_balance`, for a chunk of one address | **confirmed** 2026-09-22, from the live OpenAPI document |
+| batch read | `POST /addresses/balances`, body `{"addresses": [...]}`, labelled `address_balances`, declared idempotent | **confirmed** 2026-09-22 |
+| batch ceiling | 64, `MAX_ADDRESSES_PER_CALL` | **unverified**: the document declares no `maxItems` (confirmed 2026-09-22). A refused batch in production, a 413 or a 422 naming its size, would settle it; the operator is the one to see it |
+| health | `GET /info/health`, labelled `node_health`. Nothing in production calls it | **confirmed** 2026-09-22 |
+| errors | 422 on the balance endpoint, 503 on health | **confirmed** 2026-09-22 |
+| base URL | `https://api.kaspa.org`, and no fallback by default | **confirmed** 2026-09-22: one operator, and the document declares no `servers` block |
+| rate limit | none documented, and no `ratelimit-*` or `x-ratelimit-*` header sent | **confirmed** absent from the document 2026-09-22; headers **measured** absent 2026-09-23 |
+| our pacing | one request a second per host, shared with the price read | **unverified**: a 429, or a CDN's 403, in a production log would settle it; the operator |
+| what is in front | Cloudflare, with `Cache-Control: public, max-age=8` on a balance answer and on an error | **measured** 2026-09-23 |
+| networks | the public instance serves mainnet only; a test-network address is a 422 | **measured** 2026-09-23 |
+| checksums | the vendor does not check them | **measured** 2026-09-23 |
+| retention or history window | none needed: a balance read asks for no history | **unverified**, and moot until something reads transaction history. No issue owns it |
+| `isUtxoIndexed` | required true for a node to count as usable | **unverified** what the field means when false. The vendor's documentation or source would settle it; no issue owns it |
 
 ### Confirmed against the published documentation, read on 2026-09-22
 
@@ -509,8 +573,9 @@ because the document hands you a string that is guaranteed to parse.
 Test fixtures use `kaspatest:` vectors from published sources -- rusty-kaspa's own case
 table and the Aspectron documentation -- and they live in `backend/tests/address_vectors.py`.
 `tests/security/test_address_logging.py::test_fixtures_contain_no_mainnet_address` scans
-every test file and this document for a mainnet address, which is what makes that a control
-rather than a request.
+every Python file under `backend/tests/` for a mainnet address, and
+`tests/providers/test_documentation.py` refuses the mainnet prefixes in this document. Those
+two are what make it a control rather than a request.
 
 The second half of the trap is subtler: the vendor does not verify checksums, so a mainnet
 example that has been *retyped* by hand still gets a 200 and a balance of zero. A test built
@@ -796,6 +861,51 @@ numbers:
   `services/price_refresh.py` is the only module in `services/` that does. That split is the
   guarantee; see both module docstrings.
 
+### Each source at a glance
+
+The endpoints are read from the four modules under `providers/prices/`. No source is asked for
+history, so none has a retention window to record: each is asked for the current price only.
+
+#### Kraken, the primary
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| endpoint | `GET https://api.kraken.com/0/public/Ticker?pair=XXBTZUSD,XXBTZEUR,KASUSD,KASEUR`, labelled `asset_prices` | **measured** 2026-09-23 |
+| what one call answers | all four pairs, with no key | **measured** 2026-09-23 |
+| the price | a string, `c[0]`; a failure arrives in `error`, on a 200 | **measured** 2026-09-23 |
+| the keys of `result` | the pair codes asked for. An entry under any other key is refused, never matched by position | **measured** 2026-09-23 for these four; the documentation does not promise it |
+| rate limit | public endpoints are limited per IP address, and calling them once a second or less stays within the limit. No monthly quota is stated | **confirmed** 2026-10-04, Kraken's support article on API rate limits |
+
+#### Coinbase, the first fallback for bitcoin
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| endpoint | `GET https://api.coinbase.com/v2/prices/{BASE}-{QUOTE}/spot`, one pair per call, labelled `asset_price` | **measured** 2026-09-23; **confirmed** 2026-10-04 |
+| pairs | BTC/USD and BTC/EUR; KAS is a 404 in either currency | **measured** 2026-09-23 |
+| key | none | **measured** 2026-09-23; **confirmed** 2026-10-04 |
+| the price | a string, `data.amount`, beside `data.currency` | **measured** 2026-09-23; **confirmed** 2026-10-04 |
+| `data.base` | required, and checked against the pair asked for | **measured** 2026-09-23 only: the documented example, read 2026-10-04, shows `amount` and `currency` and no `base`. If it stopped arriving, every bitcoin answer here would be refused and fall to the next source. No issue owns it |
+| rate limit | none known | **unverified**: the documentation, read 2026-10-04, gives 10,000 requests an hour per API key or OAuth user, and nothing for a call with neither. A 429 in a production log would settle it; the operator |
+
+#### The Kaspa server's price endpoint, the last key-free source for KAS/USD
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| endpoint | `GET /info/price` on `PORTFOLIO_KASPA_API_URL`, then its fallback, labelled `asset_price` | **measured** 2026-09-23, on `https://api.kaspa.org` |
+| key | none | **measured** 2026-09-23 |
+| the price | a JSON number, `{"price": ...}`, decoded as a `Decimal` | **measured** 2026-09-23 |
+| the currency | USD, `ASSUMED_CURRENCY` | **unverified**: the body and the documentation name none. Only the vendor naming one would settle it; no issue owns it |
+| rate limit | nothing read and nothing measured for this path | **unverified**. It shares the host's one-a-second floor with the balance reads |
+
+#### CoinGecko, only when `PORTFOLIO_COINGECKO_API_KEY` is set
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| endpoint | `GET https://api.coingecko.com/api/v3/simple/price`, with `ids`, `vs_currencies` and `precision=full`, labelled `asset_prices` | **confirmed** 2026-09-23. Never called from this repository |
+| key | the Demo header `x-cg-demo-api-key`, per request | **confirmed** 2026-09-23 |
+| the response | keyed by coin id, then by lower-case currency; JSON numbers | **confirmed** 2026-09-23. **Unverified** against a real answer: the first refresh that reaches it with a key is the first measurement, and the operator sees it |
+| rate limit | Demo plan: 10,000 call credits a month and 100 calls a minute; each 200 costs one credit | **confirmed** 2026-10-04 for the two numbers, from the pricing page; 2026-09-23 for the credit rule |
+
 ### The measured monthly call budget
 
 **One request per refresh. At an hourly refresh that is 24 a day and 24 × 30 = 720 a month**,
@@ -819,16 +929,23 @@ one request. The arithmetic in full, so it can be checked rather than believed:
 | a year | 24 × 365 = 8,760 | |
 
 **Kraken publishes no monthly quota for the public ticker at all**, and none was measured.
-The shared `DEFAULT_MIN_HOST_INTERVAL_MS` floor of one request per second per host applies,
-which is about 86,400 requests a day if anything ever wanted them — three orders of magnitude
-above what this needs.
+Its support article on API rate limits, read on **2026-10-04**, says the public endpoints are
+limited per IP address and that calling them once a second or less stays within the limit.
+The shared `DEFAULT_MIN_HOST_INTERVAL_MS` floor of one request per second per host is that
+same rate, which is about 86,400 requests a day if anything ever wanted them — three orders
+of magnitude above what this needs.
+
+- Kraken's support article: https://support.kraken.com/articles/206548367-what-are-the-api-rate-limits-
 
 **The budget on a bad day is bounded and worth knowing.** If Kraken fails, the fallbacks cost
 more because they are not batched: Coinbase is one request per pair for the two BTC pairs, the
 Kaspa endpoint is one request for KAS/USD, and KAS/EUR has no key-free fallback at all. So a
-refresh with Kraken down costs at most **3 requests to three different hosts** (plus one
-failed Kraken attempt), or 4 with CoinGecko keyed. It never costs more than one request per
-pair per source.
+refresh with Kraken down costs at most **3 requests** beyond the failed Kraken call: two to
+Coinbase and one to the Kaspa server, which is two hosts. With CoinGecko keyed it is 4, the
+fourth to a third host. It never costs more than one request per pair per source.
+
+These count calls as a source makes them. The transport may spend up to three attempts on a
+call that meets a 429, a 5xx or no answer, the failed Kraken call included.
 
 **The issue's premise about the budget turned out not to hold, and the conclusion still
 does.** #9 was written around CoinGecko's Demo quota — roughly 10,000 calls a month, about 13
@@ -853,7 +970,7 @@ the three arguments and is the only one that changed.
 list and not constructed** — criterion 5's "absent, not skipped" — and its class refuses to
 be built without one, so there is no object holding a blank credential.
 
-### Confirmed against the live services on 2026-09-23
+### Measured against the live services on 2026-09-23
 
 | Source | Endpoint | BTC/USD | BTC/EUR | KAS/USD | KAS/EUR | Key | Price type |
 |---|---|---|---|---|---|---|---|
@@ -868,6 +985,12 @@ be built without one, so there is no object holding a blank credential.
 - Coinbase echoes `base` and `currency` in its body, and the parser checks both against what
   it asked for. The pair is in the **path**, so a mis-keyed cache entry is one step from
   attaching one asset's price to another.
+- Coinbase's documentation, read on **2026-10-04**, agrees on the path, on needing no key and
+  on `data.amount`. Its example shows `amount` and `currency` and **no `base`**, so the check
+  on `base` rests on the measurement alone. Its rate-limit page gives 10,000 requests an hour
+  per API key or OAuth user, and says nothing of a call made with neither. Sources:
+  https://docs.cdp.coinbase.com/coinbase-business/track-apis/prices and
+  https://docs.cdp.coinbase.com/coinbase-app/api-architecture/rate-limiting
 - **The Kaspa body is `{"price": 0.04228645}` and it names no currency.** See below.
 - **No vendor returns a quote timestamp**, on any of the three measured endpoints. `as_of` is
   therefore the time *we observed* the price, and the column, the dataclass and the docstrings
@@ -910,10 +1033,13 @@ forbids this repository from containing one. Read from the vendor's documentatio
   `{"bitcoin": {"usd": 86123.45, "eur": 79211.02}}` — **JSON numbers, not strings**.
 - "Each successful request (HTTP 200) deducts 1 credit from your monthly quota."
 
-**The Demo plan's numbers — 10,000 calls a month, 100 a minute — come from the issue, not from
-a page read here.** The authentication documentation says credits and rate limits depend on
-the plan and points at a pricing page. Both figures are far above an hourly refresh either
-way, and this source is only asked when the primary has already failed.
+**The Demo plan's numbers — 10,000 calls a month, 100 a minute — came from the issue, and the
+pricing page, read on 2026-10-04, states the same**: 10k call credits a month and 100 calls a
+minute. The authentication documentation says credits and rate limits depend on the plan and
+points at that page. Both figures are far above an hourly refresh, and this source is only
+asked when the primary has already failed.
+
+- Pricing page, read on 2026-10-04: https://www.coingecko.com/en/api/pricing
 
 So this is the one parser in the package that meets a real server for the first time on the
 day it is needed. A response that differs from the shape above is refused as untrustworthy
@@ -1074,7 +1200,7 @@ symbol in one query, and both return `()`.
 | `max_query_window` | the longest `FillWindow` one request may cover; `assemble_fill_page` refuses a longer one |
 | `page_size` | the most fills one page may carry; more is a refusal |
 | `cursor_kind` | `trade_id_before`, `trade_id_after`, `time` or `none` -- how the next page is asked for |
-| `rate_limit` | a `RateLimit(max_requests, per_ms)`; `min_interval_ms` rounds **up**, so 3 per 1000 ms is 334 |
+| `rate_limit` | a `RateLimit(max_requests, per_ms)`; `min_interval_ms` rounds **up**, so 3 per 1000 ms is 334. **Nothing reads it yet**: the sync does not pace by it, and the transport's one request a second per host is stricter than either venue's declaration |
 | `requires_symbol` | whether fills can only be listed per symbol |
 
 `ExchangeCapabilities` refuses a page size below one and a zero or negative query window or
@@ -1379,6 +1505,23 @@ table of configured venues. The module docstring is the reasoning; this section 
 Since #104 it reads the spot account's balances as well; "The balance read", at the end of
 this section, is that record.
 
+#### Bitget at a glance
+
+The endpoints are read from `providers/exchanges/bitget.py`; the statuses are the ones the
+subsections below establish.
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| fills | `GET https://api.bitget.com/api/v2/spot/trade/fills`, signed, no `symbol`, labelled `exchange_fills` | **confirmed** 2026-09-25, Get Fills |
+| symbol info | `GET /api/v2/spot/public/symbols?symbol=X`, unsigned, once per symbol per provider instance, labelled `exchange_symbol` | **confirmed** 2026-09-25, Get Symbol Info |
+| balances | `GET /api/v2/spot/account/assets?assetType=hold_only`, signed, labelled `exchange_balances` | **confirmed** 2026-10-01, Get Account Assets |
+| rate limit | fills: 10 a second per UID, and 6000 a minute per IP overall. Symbol info: 20 a second per IP. Balances: 10 a second per UID | **confirmed** 2026-09-25 and 2026-10-01. The transport's one request a second per host is what paces |
+| retention | 90 days, declared as such | **confirmed** 2026-09-25. Whether `40704`'s "last three months" is shorter is **unverified**: a `40704` on a first sync's oldest window would show it, and the owner's first sync is that check |
+| query window | 90 days documented, 30 declared | **confirmed** 2026-09-25 |
+| page size | 100 | **confirmed** 2026-09-25 |
+| account type | Classic, which v2 is documented for. A UTA account reads `GET /api/v3/trade/fills` | the owner's account **measured** Classic 2026-09-25, in the app. UTA support is #76 |
+| live answers | none seen from this repository: written from the documentation alone | **unverified**. The inclusive bounds, the order within a page, the fee's sign, BGB fees and `cTime`'s unit are designed around, below. The owner's first sync is the first measurement |
+
 #### Confirmed against Bitget's documentation on 2026-09-25
 
 Every old `https://www.bitget.com/api-doc/...` URL now redirects to the UTA introduction. The
@@ -1541,7 +1684,7 @@ that declares `Content-Encoding: gzip` or `deflate` and whose body does not deco
 `client.get` raise `httpx.DecodingError` -- a `RequestError`, **not** a `TransportError` --
 before any status is known; it is `ExchangeUnavailableError` with no cause and no context,
 since a corrupt compressed body from an intermediary is most plausibly transient. (The chain
-and price providers still let it escape; that is its own issue.)
+and price providers still let it escape; that is #75.)
 
 **A fills answer whose `data` is `null` is refused, and that was decided twice.** The
 documented empty result is `"data": []`; `null` under `"00000"` is not documented. Reading it
@@ -1695,6 +1838,22 @@ as well; "The balance read", at the end of this section, is that record.
 itself on whether `symbol` is required and on the largest page. A live probe then contradicted
 it on retention and on what an unbounded query returns. So every fact below names its source,
 and where the probe and the documentation differ, the probe wins.
+
+#### BingX at a glance
+
+The endpoints are read from `providers/exchanges/bingx.py`. "The probe" is the owner's, below:
+a measurement of the live service, on 2026-09-26 and 2026-09-27.
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| fills | `GET https://open-api.bingx.com/openApi/spot/v1/trade/myTrades`, signed, no `symbol`, labelled `exchange_fills` | **confirmed** 2026-09-27, V3 and V1; **measured** by the probe |
+| balances | `GET /openApi/spot/v1/account/balance`, signed, labelled `exchange_balances` | **confirmed** 2026-10-01, V3. Never called with a real key |
+| rate limit | fills: 5 a second per UID. Balances: 5 a second per UID and 3 a second per IP | **confirmed** 2026-09-27 and 2026-10-01; the `X-RateLimit-Requests-*` headers **measured** present by the probe. The transport's one request a second per host is what paces |
+| retention | 365 days declared, because the documented 7 days is wrong | the 7 days **disproved** by the probe: older fills came back, and spans to 365 days answered. The year is **unverified**: BingX states one only for its web export, and nothing short of a fill older than a year can settle it |
+| query window | 30 days declared; spans to 365 days were accepted | **measured** by the probe |
+| page size | 500, the smaller of the two maxima V3 states | the two maxima **confirmed** 2026-09-27; `limit` of 1 and 5 **measured** as honoured |
+| bounds | `startTime` and `endTime` both inclusive; the cursor is a time | **measured** by the probe |
+| still open | a page past the first, a second symbol in one answer, and history older than the probe's two weeks | **unverified**. The owner's first sync past each is the check; `docs/operations.md` section 14 says how for the second symbol |
 
 #### Three sources, and how each was read
 
@@ -2200,19 +2359,20 @@ A second caller does not start a second run. It attaches to the one in flight an
 run's summary with `joined: true`, so a double-clicked refresh button costs no extra requests
 at a public index.
 
-One thing reaches a **price** source: the price timer, every
+Inside the application, one thing reaches a **price** source: the price timer, every
 `PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES` minutes -- sixty by default, matching
 `STALE_AFTER` -- plus once at startup when the newest `prices.fetched_at` is older than one
-interval. That one counts successes, because there is no record of a price attempt: while
-every source fails, a crash loop costs one price request per restart. `portfolio
-refresh-prices` is the same work on demand.
+interval. That one counts successes, because there is no record of a price attempt. So while
+every source fails, a crash loop costs one refresh per restart: one call to Kraken, up to two
+to Coinbase, one to the Kaspa server, and one to CoinGecko when it is keyed. There is no
+coordinator and no join, because there is no endpoint that can ask for one: nothing in a
+request path may reach a price vendor, which is the contract. `portfolio refresh-prices` is the
+same work on demand, in a process of its own with a client of its own.
 
-**Neither timer sleeps a whole interval after a restart that found nothing due.** It sleeps
-what is left, rounded up to a whole second, so a deploy resumes the schedule rather than
-pushing it back -- the first version pushed it back, and every deploy left prices stale for
-most of an hour. There is no coordinator and
-no join, because there is no endpoint that can ask for one: nothing in a request path may
-reach a price vendor, which is the contract.
+**No timer sleeps a whole interval after a restart that found nothing due.** It sleeps what
+is left, rounded up to a whole second, so a deploy resumes the schedule rather than pushing
+it back -- the first version pushed it back, and every deploy left prices stale for most of
+an hour.
 
 **Landed in #15: what reaches an exchange provider.** The lifespan builds the provider
 mapping once, with `exchange_providers(client, settings=settings)`, and hands it to a closure
@@ -2224,14 +2384,20 @@ venue is configured, and `POST /api/exchanges/sync`. The
 `portfolio.api` from importing `portfolio.providers.exchanges` at all, directly or not, so the
 coordinator is the only path from a request to a credential.
 
-**Three timers, three tasks, three switches, and no shared state.** The paragraph below
-predates the exchange timer and holds for it too.
+**Three timers reach a provider, each its own task with its own switch, and they share no
+state.** A fourth, the backup timer (#22), reaches none. `services/scheduler.py` is generic
+over what it ticks -- it takes "when did this last happen" and "do it" -- so the timers are
+instances rather than loops, and none can stop another. They are separate because they
+answer to different vendors:
 
-**Two timers, two tasks, two switches, and no shared state.** `services/scheduler.py` is
-generic over what it ticks -- it takes "when did this last happen" and "do it" -- so the two
-are instances rather than loops, and neither can stop the other. They are separate because
-they answer to different vendors: chain indexes that ban you for asking too often, against
-market-data APIs where the primary answers every configured pair in one call.
+- chain indexes that ban you for asking too often;
+- market-data APIs where the primary answers every configured pair in one call;
+- venues that sign every request with the owner's key.
+
+**Nothing in production calls a chain provider's `health()`.** `GET /api/health/detail`
+(#23) reports what each source's last recorded attempt says and asks no vendor, because the
+page refetches every minute and a check that called an index would spend the budget the
+limiter exists to protect (`services/health.py`).
 
 ### The per-address cache is the snapshot table
 
@@ -2273,11 +2439,12 @@ it by returning a stale number that looks exactly like a fresh one, which is the
   its window, its rate and its field names, so supporting a UTA account is a second provider
   or a second mode, written from its own documentation. That is #76. Until then the operator keeps the account Classic (`docs/operations.md`
   section 12).
-- **The Bitget provider has never met its venue.** Like CoinGecko's parser, it is written
-  from documentation, because measuring a signed endpoint needs a key this repository must
-  not contain. Every guess in the Bitget section is written to fail loudly, as a typed error
-  naming a field, rather than to guess; the owner's first sync with #15 is the first
-  measurement, and a refusal there is the evidence to act on.
+- **The Bitget provider was written from documentation.** Measuring a signed endpoint needs
+  a key this repository must not contain. Every guess in the Bitget section is written to
+  fail loudly, as a typed error naming a field, rather than to guess. The owner's production
+  syncs since #15 have imported fills through it, so the fill read works against the venue
+  for a Classic account; the guesses listed next have not been checked one by one, and a
+  refusal on a later sync is the evidence to act on.
 - **What #15 guessed, and the owner's first sync measures.** `RETENTION_STEP` (a day),
   `MAX_RETENTION_STEPS` (three), `OVERLAP` (five minutes) and the rate-limit numbers are
   choices, not documentation; "The exchange sync" above says what each does. A retention
@@ -2286,8 +2453,18 @@ it by returning a stale number that looks exactly like a fresh one, which is the
   venue requires one. A symbol first traded later is read only from windows planned after it
   appears. #14 found that BingX needs none: one query without a symbol answers every symbol.
 - **A corrected fill is refused, not recorded.** The sync stops the account with `conflict`
-  rather than overwriting or silently keeping the first version. Recording a correction as an
-  adjustment is M4's, with the cost-basis model.
+  rather than overwriting or silently keeping the first version. M4's manual adjustments did
+  not change that: an adjustment is an inflow only (`docs/accounting.md`, "What an adjustment
+  is"), so it cannot stand for a fill a venue changed. No issue owns recording a correction.
+- **A venue's declared `rate_limit` is read by nothing.** Bitget declares 10 requests a
+  second and BingX 5; the sync does not pace by either, and the transport's one request a
+  second per host is what actually spaces them. `RateLimit` still refuses a budget below one
+  when it is built, so the declaration is ready for the day a sync needs it.
+- **A throttle answered on a 200 loses its `Retry-After`.** BingX's `_get` reads the header
+  only when the status is not 200, and BingX answers most errors on a 200, so the sync waits
+  its own backoff instead of the venue's. That is #115. Bitget's `_get` has the same
+  condition, so its in-band `429` would drop the header too, if Bitget sends one with it; that
+  is not documented either way.
 - **A signed request replayed by the transport can arrive expired.** `RetryingTransport`
   retries a `GET` that got a 429, a 5xx or no answer by sending **the same request
   again** -- same timestamp, same signature -- for up to `RetryPolicy.max_attempts` (3)
@@ -2299,29 +2476,49 @@ it by returning a stale number that looks exactly like a fresh one, which is the
   backoff is likely refused, as `100421`, which is `ExchangeUnavailableError`. The probe saw
   every error on a 200, which the transport does not retry, so it is the rarer path. Neither
   venue's clock error marks the account `auth_failed`: the key is not what failed.
-- **Tuning settings.** Every number in the first table above is still a module constant.
-  Promoting one to a `PORTFOLIO_PROVIDER_*` setting is a change an operator's measurement
-  should drive, not a guess made before anything has ever made a request.
-- **The source-walk test over `providers/`, and now over the sync.**
-  `backend/tests/security/test_address_logging.py` walks the wallet modules and fails on a
-  log call that could carry an address. No chain provider has a log call at all, and
-  neither does either exchange provider --
-  deliberately, since the transport's contract is the only one that is enforced rather than
-  remembered -- so the walk is worth extending the day a provider needs one.
+- **Tuning settings.** Every number in the defaults table under "Vendor facts" -- the host
+  interval, the retry policy and the four timeouts -- is still a module constant. Promoting one
+  to a `PORTFOLIO_PROVIDER_*` setting is a change an operator's measurement should drive, not
+  a guess.
+- **No bound on a whole read.** Each attempt has its timeouts, but a read is up to three
+  attempts and the backoff between them, and nobody chose a ceiling for the sum. A server
+  that sends a byte just inside the read timeout holds one attempt open for as long as it
+  likes. That is #50.
+- **A partial multi-address read returns nothing.** A Bitcoin read that fails at the twelfth
+  of twenty addresses yields none of the eleven it read. That falls out of raising on the
+  first failure; whether it is the right answer is #54.
+- **A corrupt compressed body escapes as `httpx.DecodingError`.** It is not an
+  `httpx.TransportError`, which is all the chain and price providers and `EndpointSet` catch,
+  so it breaks `health()`'s promise never to raise and can end a price refresh instead of
+  failing over. Both exchange providers already catch it. That is #75.
+- **A JSON object that names a key twice keeps the last value.** `decode_json` gives
+  `json.loads` no `object_pairs_hook`, so a repeated `free` or `price` is read silently
+  rather than refused. No
+  vendor is known to send one. That is #114.
+- **A failed price refresh cannot tell a bad key from an outage.** Each source's
+  `ProviderError` is swallowed the same way, so a wrong `PORTFOLIO_COINGECKO_API_KEY` on a day
+  the key-free sources are down reads as "every source failed". That is #59.
+- **The source-walk test, and the traceback it does not reach.**
+  `backend/tests/security/test_address_logging.py` walks the modules that handle an address,
+  `services/balance_sync.py` and `providers/chains/bitcoin.py` among them, and fails on a log
+  call that could bind one. No chain, price or exchange provider has a log call at all. The
+  transport's is the only one, deliberately, since its contract is the only one enforced
+  rather than remembered.
 
-  **#10 added the first log call that could carry one, and it is worth knowing about.**
-  `services/balance_sync.py` catches any non-`ProviderError` exception from a chain and calls
-  `_logger.exception`, which writes the traceback -- and a `KeyError` raised while correlating
-  a balance renders its key, which would be an address. The database column and the response
-  body are protected: only the exception's *type name* is recorded there, never its message.
-  The log is not, and the precedent for accepting that is
-  `api.errors.handle_unexpected_error`, which has logged unhandled exceptions from the wallet
-  router the same way since #5. The alternative is a defect nobody can diagnose. Worth either
-  extending the module walk to `services/balance_sync.py` or dropping the traceback for a
-  correlation id, and worth deciding rather than inheriting.
+  **What the walk cannot see is a traceback.** `services/balance_sync.py` catches any
+  non-`ProviderError` exception from a chain and calls `_logger.exception`, and a `KeyError`
+  raised while correlating a balance renders its key, which would be an address. The database
+  column and the response body carry only the exception's *type name*, never its message.
+  `api.errors.handle_unexpected_error` has logged the same way since #5.
+
+  Since #23 the traceback is rendered to a string before the `ValueRedactor` runs, so an
+  address in it is replaced by pattern. That is redaction by recognition, not by
+  construction. Dropping the traceback for a correlation id is the other remedy, and #62,
+  which asked for one or the other, is still open.
 - **Network-aware address registration.** A wrong-network address is refused by the
   *provider*, at read time, not when the wallet is registered. Making registration
-  network-aware changes #5's contract and needs a story for rows that already exist.
+  network-aware changes #5's contract and needs a story for rows that already exist. That is
+  #55.
 - **The Kaspa batch ceiling.** 64 is a guess; see above. The first evidence will be a
   refused batch in production, and the refusal is written to carry the size so that the
   evidence is actionable when it arrives.
