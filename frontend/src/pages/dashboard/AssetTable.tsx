@@ -92,70 +92,83 @@ interface AssetTableProps {
   readonly data: CurrentBalances;
 }
 
-/** One row per asset: quantity, price and fiat value, summed from the wallet rows. */
+/**
+ * One row per asset: quantity, price and fiat value, summed from the wallet rows.
+ *
+ * The table scrolls inside its own region, so that a figure too wide for a phone scrolls the
+ * table rather than the page (#118). The region is named apart from the section around it:
+ * two landmarks called "Assets", one inside the other, cannot be told apart.
+ */
 export function AssetTable({ data }: AssetTableProps) {
   const rows = buildAssetRows(data);
 
   return (
     <section aria-labelledby="assets-heading">
       <h2 id="assets-heading">Assets</h2>
-      <table>
-        <thead>
-          <tr>
-            <th scope="col">Asset</th>
-            <th scope="col">Quantity</th>
-            <th scope="col">Price</th>
-            <th scope="col">Value</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr key={row.assetSymbol}>
-              <th scope="row">{row.assetSymbol}</th>
-              <td>
-                {row.quantity === null ? (
-                  'Not read yet'
-                ) : (
-                  <>
-                    <Money value={row.quantity} /> {row.assetSymbol}
-                    {row.excludedUnreadCount > 0 &&
-                      ` (excludes ${String(row.excludedUnreadCount)} wallet${
-                        row.excludedUnreadCount === 1 ? '' : 's'
-                      } not yet read)`}
-                  </>
-                )}
-              </td>
-              <td>
-                {row.price !== null ? (
-                  <>
-                    <Money value={money(row.price.amount)} options={PRICE_OPTIONS} />{' '}
-                    {data.quote_currency}
-                    {row.price.stale && (
-                      <>
-                        {' '}
-                        (stale, as of <RelativeTime value={row.price.as_of} />)
-                      </>
-                    )}
-                  </>
-                ) : row.unpricedReason !== null ? (
-                  PRICE_UNAVAILABLE_MESSAGES[row.unpricedReason]
-                ) : (
-                  '—'
-                )}
-              </td>
-              <td>
-                {row.value === null ? (
-                  '—'
-                ) : (
-                  <>
-                    <Money value={row.value} options={FIAT_OPTIONS} /> {data.quote_currency}
-                  </>
-                )}
-              </td>
+      <div
+        className="table-scroll balance-scroll"
+        role="region"
+        aria-label="Assets table"
+        tabIndex={0}
+      >
+        <table className="balance-table">
+          <thead>
+            <tr>
+              <th scope="col">Asset</th>
+              <th scope="col">Quantity</th>
+              <th scope="col">Price</th>
+              <th scope="col">Value</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.assetSymbol}>
+                <th scope="row">{row.assetSymbol}</th>
+                <td>
+                  {row.quantity === null ? (
+                    'Not read yet'
+                  ) : (
+                    <>
+                      <Money value={row.quantity} /> {row.assetSymbol}
+                      {row.excludedUnreadCount > 0 &&
+                        ` (excludes ${String(row.excludedUnreadCount)} wallet${
+                          row.excludedUnreadCount === 1 ? '' : 's'
+                        } not yet read)`}
+                    </>
+                  )}
+                </td>
+                <td>
+                  {row.price !== null ? (
+                    <>
+                      <Money value={money(row.price.amount)} options={PRICE_OPTIONS} />{' '}
+                      {data.quote_currency}
+                      {row.price.stale && (
+                        <>
+                          {' '}
+                          (stale, as of <RelativeTime value={row.price.as_of} />)
+                        </>
+                      )}
+                    </>
+                  ) : row.unpricedReason !== null ? (
+                    PRICE_UNAVAILABLE_MESSAGES[row.unpricedReason]
+                  ) : (
+                    '—'
+                  )}
+                </td>
+                <td>
+                  {row.value === null ? (
+                    '—'
+                  ) : (
+                    <>
+                      <Money value={row.value} options={FIAT_OPTIONS} /> {data.quote_currency}
+                    </>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }

@@ -434,6 +434,39 @@ describe('DashboardPage: values', () => {
   });
 });
 
+describe('DashboardPage: on a phone (#118)', () => {
+  // jsdom lays nothing out, so the widths are checked in a browser. What a test can pin is the
+  // structure that keeps a table too wide for a phone from widening the page: each table
+  // scrolls inside a region of its own, which a keyboard can reach.
+  it('puts the assets and the wallets tables each in a labelled, focusable scroll region', async () => {
+    openDashboard();
+
+    for (const [section, name] of [
+      [await assetsRegion(), 'Assets table'],
+      [await walletsRegion(), 'Wallets table'],
+    ] as const) {
+      const scroller = within(section).getByRole('region', { name });
+      expect(scroller).toHaveClass('table-scroll');
+      expect(scroller).toContainElement(within(section).getByRole('table'));
+      expect(scroller).toHaveAttribute('tabindex', '0');
+
+      act(() => {
+        scroller.focus();
+      });
+      expect(scroller).toHaveFocus();
+    }
+  });
+
+  it('names each scroll region apart from its section, so no landmark name is used twice', async () => {
+    openDashboard();
+    await walletsRegion();
+
+    for (const name of ['Assets', 'Wallets', 'Assets table', 'Wallets table']) {
+      expect(screen.getAllByRole('region', { name })).toHaveLength(1);
+    }
+  });
+});
+
 describe('DashboardPage: precision', () => {
   it('a balance past MAX_SAFE_INTEGER base units renders exactly', async () => {
     // 2870000000000000123 sompi. Through a JavaScript number the trailing 123

@@ -190,7 +190,12 @@ interface WalletBalanceTableProps {
   readonly freshnessKnown: boolean;
 }
 
-/** One row per wallet: its reading, its freshness, and its value. */
+/**
+ * One row per wallet: its reading, its freshness, and its value.
+ *
+ * In a scroll region of its own, named apart from the section, for the reasons `AssetTable`
+ * gives (#118).
+ */
 export function WalletBalanceTable({
   data,
   walletsById,
@@ -200,28 +205,35 @@ export function WalletBalanceTable({
   return (
     <section aria-labelledby="wallet-balances-heading">
       <h2 id="wallet-balances-heading">Wallets</h2>
-      <table>
-        <thead>
-          <tr>
-            <th scope="col">Wallet</th>
-            <th scope="col">Quantity</th>
-            <th scope="col">Freshness</th>
-            <th scope="col">Value</th>
-          </tr>
-        </thead>
-        <tbody>
-          {data.wallets.map((wallet) => (
-            <WalletBalanceRow
-              key={wallet.wallet_id}
-              wallet={wallet}
-              walletRecord={walletsById.get(wallet.wallet_id)}
-              quoteCurrency={data.quote_currency}
-              settledRun={settledRun}
-              freshnessKnown={freshnessKnown}
-            />
-          ))}
-        </tbody>
-      </table>
+      <div
+        className="table-scroll balance-scroll"
+        role="region"
+        aria-label="Wallets table"
+        tabIndex={0}
+      >
+        <table className="balance-table">
+          <thead>
+            <tr>
+              <th scope="col">Wallet</th>
+              <th scope="col">Quantity</th>
+              <th scope="col">Freshness</th>
+              <th scope="col">Value</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.wallets.map((wallet) => (
+              <WalletBalanceRow
+                key={wallet.wallet_id}
+                wallet={wallet}
+                walletRecord={walletsById.get(wallet.wallet_id)}
+                quoteCurrency={data.quote_currency}
+                settledRun={settledRun}
+                freshnessKnown={freshnessKnown}
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }
