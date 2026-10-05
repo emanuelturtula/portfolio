@@ -77,6 +77,19 @@ BIP173_TESTNET_P2WSH: Final = "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefv
 #: BIP-350, "Valid addresses": testnet witness version 1, bech32m.
 BIP350_TESTNET_V1: Final = "tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c"
 
+#: The witness programs of the three addresses above, as BIP-173 and BIP-350 publish them
+#: beside each one: the scriptPubKey without its version opcode and its push byte. For the
+#: segwit encoder (spec 031). A 20-byte program is 160 bits, exactly 32 five-bit words; a
+#: 32-byte one is 256 bits, 51 words and one bit over, which is the only case that reaches
+#: the encoder's zero padding.
+BIP173_TESTNET_P2WPKH_PROGRAM: Final = bytes.fromhex("751e76e8199196d454941c45d1b3a323f1433bd6")
+BIP173_TESTNET_P2WSH_PROGRAM: Final = bytes.fromhex(
+    "1863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262"
+)
+BIP350_TESTNET_V1_PROGRAM: Final = bytes.fromhex(
+    "000000c4a5cad46221b2a187905e5266362b99d5e91c6ce24d165dab93e86433"
+)
+
 #: Bitcoin Core `key_io_valid.json`, chain `testnet4`: witness version 1, bech32m.
 CORE_TESTNET4_V1: Final = "tb1p35n52jy6xkm4wd905tdy8qtagrn73kqdz73xe4zxpvq9t3fp50aqk3s6gz"
 
@@ -100,6 +113,15 @@ CORE_TESTNET4_P2SH: Final = "2MwBVrJQ76BdaGD76CTmou8cZzQYLpe4NqU"
 
 #: Bitcoin Core `key_io_valid.json`, chain `regtest`: legacy P2SH, version byte 0xC4.
 CORE_REGTEST_P2SH: Final = "2MxFajLApXpYk4VodBSZSt7rw8y4ryABkfA"
+
+#: Derived, not published: a test-network P2PKH address **shaped like bech32**. Its last `1`
+#: follows only letters and precedes only bech32-alphabet characters, so the bech32
+#: discriminator reads it as segwit first. Before spec 031 it was refused as `mixed_case`,
+#: which no published base58 vector exposes; spec 031's property test found it among derived
+#: `tpub` addresses. It is BIP-32 test vector 1's master key, child /0/1000001, as P2PKH
+#: under version byte 0x6F, minted by the independent implementation that produced
+#: `tests/extended_key_vectors.py` and reproduced the published BIP-32 vectors first.
+DERIVED_P2PKH_SHAPED_LIKE_BECH32: Final = "moKbLCYdi1dEKVpscE9FnNVsGTpV8mk7DM"
 
 #: The same address as `BIP173_TESTNET_P2WPKH`, rendered the way a QR-code wallet shows
 #: it. Bech32 is case insensitive, so this is the *same* address; it is here because the
@@ -140,6 +162,7 @@ BASE58_VECTORS: Final[tuple[Vector, ...]] = tuple(
         ("signet p2pkh", CORE_SIGNET_P2PKH),
         ("testnet4 p2sh", CORE_TESTNET4_P2SH),
         ("regtest p2sh", CORE_REGTEST_P2SH),
+        ("testnet p2pkh shaped like bech32", DERIVED_P2PKH_SHAPED_LIKE_BECH32),
     )
 )
 
