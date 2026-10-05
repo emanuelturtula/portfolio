@@ -109,4 +109,4 @@ for the agents and for me is in [CLAUDE.md](CLAUDE.md).
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
