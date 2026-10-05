@@ -178,8 +178,7 @@ file at that path does the same job: `touch ~/portfolio-app-deploy`.
 If both `~/portfolio-app-deploy` and `~/portfolio-app` exist as directories, the deployment
 refuses and changes nothing, so a person decides which one holds the live deployment. A
 refusal after the rename says the root was migrated. Anything of your own that refers to
-`~/portfolio-app-deploy`, such as a cron job or a script, needs the new path. The legacy
-application's `~/portfolio-deploy` is a different directory, and nothing here touches it.
+`~/portfolio-app-deploy`, such as a cron job or a script, needs the new path.
 
 ## Scheduled backups
 
