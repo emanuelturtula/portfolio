@@ -182,9 +182,10 @@ SNAPSHOT_READ_ATTEMPTS: Final = 3
 """How many times `read_snapshot` reads the snapshot before giving up on a consistent one.
 
 A read is retried only when a recompute committed in the middle of it, and a recompute writes
-at startup and after an exchange sync that stored a fill -- a few times a day, each commit a
-fraction of a second. Two in a row inside one read is already beyond what the triggers do;
-three is a margin, not a measurement. See `SnapshotReadError` for what happens past it.
+at startup, after an exchange sync that stored a fill or followed a failed recompute, and
+after an adjustment changes -- a few times a day, each commit a fraction of a second. Two in
+a row inside one read is already beyond what the triggers do; three is a margin, not a
+measurement. See `SnapshotReadError` for what happens past it.
 """
 
 _NOTHING: Final = Decimal((0, (0,), -VALUE_SCALE))

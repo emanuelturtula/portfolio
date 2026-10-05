@@ -30,6 +30,9 @@ EXPECTED_NAMES = {
         "pk_wallets",
         "uq_wallets_user_chain_address",
         "ck_wallets_chain_key",
+        # #24. What the address columns hold, and that only Bitcoin may hold a key.
+        "ck_wallets_kind",
+        "ck_wallets_kind_chain",
         "fk_wallets_user_id_users",
         "ix_wallets_user_id",
     },
@@ -99,6 +102,16 @@ EXPECTED_NAMES = {
         "pk_exchange_balances",
         "uq_exchange_balances_account_asset",
         "fk_exchange_balances_exchange_account_id_exchange_accounts",
+    },
+    # #24. The unique key leads with the wallet, so the table needs no index beside it --
+    # the one read there is, and the cascade, both go through it -- and has none.
+    "derived_addresses": {
+        "pk_derived_addresses",
+        "uq_derived_addresses_wallet_branch_index",
+        "ck_derived_addresses_branch",
+        "ck_derived_addresses_child_index",
+        "ck_derived_addresses_used",
+        "fk_derived_addresses_wallet_id_wallets",
     },
     "exchange_fills": {
         "pk_exchange_fills",

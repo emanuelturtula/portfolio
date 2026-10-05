@@ -19,6 +19,13 @@ any future importer have to inherit them:
 Nothing in this module logs an address, and nothing puts one in an exception message. The
 registry's whole content is the owner's holdings, and a log line is the easiest way for it
 to leave the process.
+
+**An extended public key is registered through the same columns as an address** (spec 031,
+R1), with `kind` saying which it is. `domain.chains.classify_wallet_key` decides, and it is
+the only change to how a wallet is created: the duplicate check, the label and the archive
+rules are the same for both. What differs is on the way out. A key is **never served in
+full** (R8): `view_of` masks it to its first and last four characters, so nothing above this
+layer -- router, response, client -- ever holds more of it than that.
 """
 
 from __future__ import annotations
@@ -28,7 +35,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Final
 
-from portfolio.domain.chains import validate_address
+from portfolio.domain.chains import WalletKind, classify_wallet_key
 from portfolio.repositories.wallets import WalletConstraintError, WalletRepository
 
 if TYPE_CHECKING:
@@ -44,8 +51,22 @@ DUPLICATE_ARCHIVED_DETAIL: Final = (
     "This address is already registered for this chain and is archived. "
     "Restore it instead of adding it again."
 )
+DUPLICATE_KEY_DETAIL: Final = (
+    "This extended public key, or another export of the same account key, is already "
+    "registered for this chain."
+)
+DUPLICATE_KEY_ARCHIVED_DETAIL: Final = (
+    "This extended public key, or another export of the same account key, is already "
+    "registered for this chain and is archived. Restore it instead of adding it again."
+)
 WALLET_NOT_FOUND_DETAIL: Final = "No wallet with that id."
-"""The three strings a failure can carry to the client. **None of them names the address.**
+"""The strings a failure can carry to the client. **None of them names the address or key.**
+
+The two key sentences exist because a key is compared by its canonical form (spec 031): a
+second export of the same account collides with the first, and the masked key in the list
+shows the *first* export's last four characters, which the owner cannot match against what
+they just pasted. So the sentence says that another export counts, instead of quoting
+anything.
 
 A 409 that quoted the address would put the owner's holdings in a response body, and from
 there into whatever the client logs -- which is the same leak a 422 would be, arriving
@@ -55,6 +76,12 @@ through a different door.
 MAX_LABEL_LENGTH: Final = 100
 """What a label may be, in characters. Enforced here as well as in the request schema,
 because the CLI does not go through the schema."""
+
+MASK_VISIBLE_CHARACTERS: Final = 4
+"""How many characters of an extended key stay visible at each end of its masked form (R8)."""
+
+MASK_ELLIPSIS: Final = "\N{HORIZONTAL ELLIPSIS}"
+"""What stands for the hidden middle: one HORIZONTAL ELLIPSIS, not three full stops."""
 
 
 def utc_now() -> datetime:
@@ -87,11 +114,16 @@ class WalletAlreadyExistsError(WalletError):
 
     `archived` says whether the row holding the slot is a retired one, because that is the
     difference between "you already have this" and "you had this and put it away".
+    `kind` picks the address sentences or the extended-key ones; every one is fixed.
     """
 
-    def __init__(self, *, archived: bool) -> None:
+    def __init__(self, *, archived: bool, kind: WalletKind = WalletKind.ADDRESS) -> None:
         self.archived = archived
-        super().__init__(DUPLICATE_ARCHIVED_DETAIL if archived else DUPLICATE_DETAIL)
+        if kind is WalletKind.EXTENDED_KEY:
+            detail = DUPLICATE_KEY_ARCHIVED_DETAIL if archived else DUPLICATE_KEY_DETAIL
+        else:
+            detail = DUPLICATE_ARCHIVED_DETAIL if archived else DUPLICATE_DETAIL
+        super().__init__(detail)
 
 
 class WalletNotFoundError(WalletError):
@@ -110,10 +142,13 @@ class WalletView:
     would be reading a detached instance. And `address_canonical` is an implementation
     detail of the uniqueness rule -- publishing both forms would invite a client to pick
     the wrong one -- so the view carries only the display form, under the name `address`.
+
+    For `kind = extended_key`, `address` is the masked key (R8) and never the key itself.
     """
 
     id: int
     chain_key: str
+    kind: WalletKind
     address: str
     label: str | None
     archived: bool
@@ -121,12 +156,33 @@ class WalletView:
     updated_at: datetime
 
 
+def mask_extended_key(key: str) -> str:
+    """The first four characters, an ellipsis, and the last four (R8).
+
+    Enough for the owner to tell two keys apart and to recognise the prefix -- and so the
+    script type -- of each, and far too little to derive anything from: the 103 characters
+    in between carry the chain code and the public key, and both are needed to derive a
+    single address. A string too short to have a hidden middle is masked entirely, rather
+    than served whole; no key the domain accepts is that short, so this is a floor, not a
+    case.
+    """
+    if len(key) <= 2 * MASK_VISIBLE_CHARACTERS:
+        return MASK_ELLIPSIS
+    return f"{key[:MASK_VISIBLE_CHARACTERS]}{MASK_ELLIPSIS}{key[-MASK_VISIBLE_CHARACTERS:]}"
+
+
 def view_of(wallet: Wallet) -> WalletView:
-    """Snapshot a row while its session is still open."""
+    """Snapshot a row while its session is still open, masking an extended key (R8)."""
+    kind = WalletKind(wallet.kind)
     return WalletView(
         id=wallet.id,
         chain_key=wallet.chain_key,
-        address=wallet.address_display,
+        kind=kind,
+        address=(
+            mask_extended_key(wallet.address_display)
+            if kind is WalletKind.EXTENDED_KEY
+            else wallet.address_display
+        ),
         label=wallet.label,
         archived=wallet.archived_at is not None,
         created_at=wallet.created_at,
@@ -193,18 +249,24 @@ class WalletService:
         address: str,
         label: str | None = None,
     ) -> WalletView:
-        """Register an address, after proving offline that it is one.
+        """Register an address or an extended public key, after proving offline that it is one.
 
         Validation comes first, before the duplicate lookup, so that a mistyped address is
         reported as mistyped rather than as "no conflict, here is your new wallet". The
         lookup is on the canonical form, which is what the unique constraint indexes.
 
+        `classify_wallet_key` decides which of the two `address` holds (spec 031): an
+        extended-key prefix on Bitcoin goes to the key parser, which refuses a private key
+        by its prefix before reading a character more of it; everything else is validated
+        as an address, exactly as before. The network is not checked here (R3): it is the
+        provider's, at read time, as it is for an address.
+
         Raises:
-            AddressInvalidError: the chain key or the address did not validate.
+            AddressInvalidError: the chain key, the address or the key did not validate.
             WalletAlreadyExistsError: the slot is taken, by an active or an archived row.
             ValueError: the label is too long.
         """
-        validated = validate_address(chain_key, address)
+        validated = classify_wallet_key(chain_key, address)
         clean_label = normalise_label(label)
 
         existing = await self._wallets.find_by_canonical(
@@ -213,7 +275,9 @@ class WalletService:
             address_canonical=validated.canonical,
         )
         if existing is not None:
-            raise WalletAlreadyExistsError(archived=existing.archived_at is not None)
+            raise WalletAlreadyExistsError(
+                archived=existing.archived_at is not None, kind=validated.kind
+            )
 
         try:
             wallet = await self._wallets.add(
@@ -223,6 +287,7 @@ class WalletService:
                 address_display=validated.display,
                 label=clean_label,
                 created_at=self._clock(),
+                kind=validated.kind.value,
             )
         except WalletConstraintError:
             # **The lookup above is an optimisation. This is the authority.** Nothing
@@ -247,7 +312,9 @@ class WalletService:
             )
             if conflicting is None:
                 raise
-            raise WalletAlreadyExistsError(archived=conflicting.archived_at is not None) from None
+            raise WalletAlreadyExistsError(
+                archived=conflicting.archived_at is not None, kind=validated.kind
+            ) from None
         view = view_of(wallet)
         await self._session.commit()
         return view
