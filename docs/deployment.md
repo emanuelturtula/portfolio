@@ -127,10 +127,10 @@ no copy of the tooling.
    health check: `/api/health` answers `ok`, and the single-page application is served.
 8. **On success**, make the candidate the live deployment and the previous one the backup.
    **On failure**, stop the candidate, and if it migrated the database, restore the snapshot
-   taken in step 6. Then start the previous deployment again, and keep the failed attempt's
-   evidence in `prod/failed/`. [Rolling back](#rolling-back) has the details. A first
-   deployment, with nothing to go back to, takes the candidate down and keeps the data
-   volume.
+   taken in step 6. Then start the previous deployment again, unless the restore failed, and
+   keep the failed attempt's evidence in `prod/failed/`. [Rolling back](#rolling-back) has
+   the details. A first deployment, with nothing to go back to, takes the candidate down and
+   keeps the data volume.
 
 Nothing before step 7 stops or replaces the running container. The writes before it are:
 
@@ -316,8 +316,15 @@ volume.
 before the live deployment replaced it. It exists to undo the deployment that is live, the
 next deployment replaces it, and nothing is copied while no deployment happens. A problem
 noticed a week later, such as a bad import, a wrong manual delete or a corrupted file, has no
-copy from before it there. The scheduled copies are for that. Neither replaces the other, and
-`deploy.py` neither reads nor changes the scheduled copies.
+copy from before it there. The scheduled copies are for that. Neither replaces the other.
+
+`deploy.py` never reads or deletes a scheduled copy. A rollback that restores adds two copies
+to the backups volume: the snapshot it restored and the safety copy `restore-backup` took
+first ([Rolling back](#rolling-back)). Rotation treats them like any other copy. Every copy is
+kept while its day is one of the 7 most recent days that have a copy, and after that only
+the newest copy of each of the 4 most recent ISO weeks is, with the default settings. So they
+age out like the rest, and on a day the timer has not copied yet, they count as that day's
+copies.
 
 **Do not merge to `main` while a restore is in progress.** A merge deploys, and the deployment
 starts a new container on the database the restore is writing. Operations, section 17, has
@@ -473,7 +480,12 @@ Do not re-run an old workflow to roll back: `deploy.py` rejects it by design.
 its database forward when it starts, and never backwards. An image that does not know the
 revision the database is at refuses to start, with `Can't locate revision identified by ...`
 in its log. A candidate that migrated the database and then failed would leave the previous
-image nothing it can start on. So before the rollback starts the previous image again, it:
+image nothing it can start on.
+
+If the previous deployment is still running, healthy and on its own digest, the candidate's
+container never replaced it, so the candidate never ran and cannot have migrated anything.
+The rollback then goes straight to step 4, with `database=unchanged`. Otherwise, before it
+starts the previous image again, it:
 
 1. **Stops the candidate**, so that nothing writes to the database while it is read or
    replaced.
@@ -484,7 +496,8 @@ image nothing it can start on. So before the rollback starts the previous image 
    `restore-backup`, the command Operations, section 17, describes. The snapshot is first
    streamed into the backups volume under a copy's name. `restore-backup` checks it, takes
    a safety copy of the migrated database before it writes, and only then puts the snapshot
-   back. Nothing the candidate wrote is deleted: it is in that safety copy, or, for a live
+   back. Nothing written since the snapshot is deleted, whether by the candidate or by the
+   previous version before the candidate started: it is in that safety copy, or, for a live
    database too damaged to copy, in the file `restore-backup` moved it aside to.
 4. **Starts the previous image** and checks it is healthy, as it always has.
 
@@ -500,10 +513,10 @@ The error line says what happened as `database=`, after `rollback=`:
 
 | `database=` | What happened |
 |---|---|
-| `unchanged` | The revision had not moved. Nothing was restored. |
-| `restored` | The candidate had migrated the database. The snapshot was restored, and the previous version runs on the database it left. |
+| `unchanged` | The revision had not moved, or the previous deployment was still running because the candidate never replaced it. Nothing was restored. |
+| `restored` | The candidate had migrated the database. The snapshot was restored, and the previous version runs on the database it left. With `database_error` set, `restore-backup` reported a completed restore and then failed; the restore stands, and the previous image was started all the same. |
 | `not_restored` | A database is there, but this attempt has no snapshot of its own with a revision to compare with: the live container was not healthy, was not the one `current.json` names, or had no database yet, or the snapshot held no single revision. Nothing was restored, and the previous image was started anyway. If it came up, `rollback=healthy`, the candidate had not migrated. If it did not, `rollback=failed`, it most likely had: restore by hand. |
-| `restore_failed` | The candidate had migrated the database, and putting the snapshot back failed. The previous image was **not** started on a database it cannot read, so `rollback=failed` and production is down. |
+| `restore_failed` | The candidate had migrated the database, and putting the snapshot back failed. The previous image was **not** started on a database it cannot read, so `rollback=failed` and production is down. If the restore got as far as its safety copy, `database_safety_copy` names it. |
 | `unread` | Stopping the candidate or reading the revision failed, so nothing was compared or restored. The previous image was started anyway, as before this step existed. `database_error` says what failed. |
 | absent | There was no previous deployment, so there was no rollback to check the database for. |
 
@@ -514,16 +527,20 @@ The line carries the state and nothing else, because it reaches the public Actio
   null when there was no snapshot, or the snapshot held no single revision. A successful
   deployment records it in `current.json` too, as the revision it started from.
 - `database_revision_live`: the revision the candidate left, null when there was no
-  database file.
+  database file. Absent when it was not read: the previous deployment was still running, or
+  the read failed.
 - `database_restored_from`: the snapshot's name in the backups volume, set once it is there.
-- `database_safety_copy`: the safety copy of the migrated database, which holds what the
-  candidate wrote.
+- `database_safety_copy`: the safety copy `restore-backup` took of the live database, which
+  holds everything written since the snapshot. Set with `restored`, and with
+  `restore_failed` when the restore got as far as taking it.
 - `database_error`: with `unread`, why stopping the candidate or reading the revision
-  failed.
+  failed. With `restored`, a fixed note that `restore-backup` reported a completed restore
+  and then failed; its output is not recorded.
 
 Both copies are in the backups volume, `/app/backups` in the container, beside the scheduled
 copies. `list-backups` shows them, and the scheduled rotation removes them like any other
-copy, so keep one elsewhere if you need it for longer. The snapshot also stays in
+copy ([Not the deployment's backup](#not-the-deployments-backup-and-why-both-exist)), so keep
+one elsewhere if you need it for longer. The snapshot also stays in
 `prod/failed/database.sqlite3`. Of what `restore-backup` prints, only the safety copy's name
 is recorded, and, when it fails, its error in `rollback_error`, on the host. Its rows per
 table stay out of every log, as for any restore.
@@ -571,12 +588,12 @@ not.
 | "... did not finish within 900 seconds" | a docker command hung for 15 minutes, most often the image pull. A pull that hangs has changed nothing |
 | "must not be group or world readable" | `secrets.env` permissions were loosened |
 | "The backup failed before the service was replaced" | the live database could not be copied, or its copy failed the integrity check. The live deployment was not touched; `failed/result.json` has the reason |
-| "Deployment failed; rollback=healthy; database=unchanged" | the candidate did not become healthy within three minutes, or was not running the digest requested, and the previous deployment is running again on the database as it was. The rollback replaced the candidate's container, so its logs went with it; `failed/result.json` has the error compose reported |
-| "Deployment failed; rollback=healthy; database=restored" | the same, but the candidate had migrated the database before it failed. The snapshot from before it was restored, and the previous version runs on it. Anything written while the candidate ran is only in the safety copy `database_safety_copy` names, in the backups volume ([Rolling back](#rolling-back)) |
+| "Deployment failed; rollback=healthy; database=unchanged" | the candidate did not become healthy within three minutes, or was not running the digest requested, and the previous deployment is running on the database as it was: again, or still, if the candidate's container never replaced it. The rollback replaced any candidate container, so its logs went with it; `failed/result.json` has the error compose reported |
+| "Deployment failed; rollback=healthy; database=restored" | the same, but the candidate had migrated the database before it failed. The snapshot from before it was restored, and the previous version runs on it. Anything written since the snapshot is only in the safety copy `database_safety_copy` names, in the backups volume ([Rolling back](#rolling-back)). A `database_error` here says `restore-backup` failed after it had finished the restore, which stands |
 | "Deployment failed; rollback=healthy; database=not_restored" | the candidate failed, the attempt had no snapshot of its own with a revision to compare with, and the previous version started on the database as the candidate left it, so the candidate had not migrated it. Nothing to do about the database |
 | "Deployment failed; rollback=healthy; database=unread" | the candidate failed, and stopping it or reading the database's revision failed too, so nothing was compared or restored. The previous version started anyway, so the database is at a revision it knows. `database_error` in `failed/result.json` says what failed: a compose file compose rejects fails here, for one |
 | "Deployment failed; rollback=no_previous_deployment" | the first deployment on this host failed, for example on a `secrets.env` without `PORTFOLIO_ALLOWED_ORIGIN`. The candidate was taken down and the data volume kept |
-| "Deployment failed; rollback=failed; database=restore_failed" | production is down. The candidate migrated the database, and putting the snapshot back failed, so the previous image was not started on a database it cannot read. `failed/result.json` has `rollback_error`, with what `restore-backup` refused or failed on. The snapshot is `failed/database.sqlite3`, and in the backups volume as well when `database_restored_from` names it. Fix the cause and restore by hand, Operations, section 17, then start the application ([Rolling back](#rolling-back)) |
+| "Deployment failed; rollback=failed; database=restore_failed" | production is down. The candidate migrated the database, and putting the snapshot back failed, so the previous image was not started on a database it cannot read. `failed/result.json` has `rollback_error`, with what `restore-backup` refused or failed on. The snapshot is `failed/database.sqlite3`, and in the backups volume as well when `database_restored_from` names it. If the restore got as far as its safety copy, `database_safety_copy` names the copy holding the migrated database. Fix the cause and restore by hand, Operations, section 17, then start the application ([Rolling back](#rolling-back)) |
 | "Deployment failed; rollback=failed; database=not_restored" | production is down. The candidate most likely migrated the database, and the attempt had no snapshot of its own with a revision to put back, so the previous image cannot start on it. The newest copy from before it may be the one in `failed/database.sqlite3`, or a scheduled copy (`list-backups`): choose, and restore it by hand ([Rolling back](#rolling-back)) |
 | "Deployment failed; rollback=failed; database=unread" | production is down. Stopping the candidate or reading the database's revision failed (`database_error`), so nothing was restored, and the previous image did not come up either (`rollback_error`). If its log says `Can't locate revision identified by ...`, the candidate migrated the database: restore a copy from before it by hand, such as `failed/database.sqlite3` when there is one ([Rolling back](#rolling-back)) |
 | "Deployment failed; rollback=failed" with `database=unchanged` or `restored`, or none | production is down. `failed/result.json` has `rollback_error`. With `database=` set, the previous image was given the database it left and still did not come up, so the cause is elsewhere. With none, this was the first deployment on the host, and taking the candidate down failed |

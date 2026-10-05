@@ -273,15 +273,29 @@ class FakeDocker:
         # The one-off container that reads the revision cannot run at all.
         self.fail_revision_read = False
         self.fail_stream = False
-        # The stream ends early (a pipe cut short) and says how much it wrote: less.
+        # The stream's stdin ends early (a pipe cut short): the script receives fewer bytes
+        # than the size it was told, and exits non-zero naming both, as STREAM_SCRIPT does.
         self.short_stream = False
+        # The stream stores the copy whole but prints another count: deploy.py's own
+        # comparison of "ok <bytes>" with the file it sent is then the last check.
+        self.stream_miscounts = False
         self.fail_restore = False
         # restore-backup restores and prints its report, then is killed: run() quotes the
         # stdout of a command that failed with nothing on stderr.
         self.restore_killed_after_report = False
+        # restore-backup fails after it protected the live database, with the message the
+        # application gives (db/backup.py), which names the safety copy: "write" (the backup
+        # API failed and SQLite rolled the write back) or "counts" (the rows per table
+        # differ from the copy's after the write).
+        self.restore_failure: str | None = None
         # What restore-backup says of the live database it replaced, as portfolio.cli does:
         # "safety" (a safety copy was taken), "damaged" (moved aside) or "none" (no file).
         self.restore_outcome = "safety"
+        # Every report restore-backup printed, returned or not: what must never leave.
+        self.reports: list[str] = []
+        # image -> compose rejects its up before creating any container (an invalid compose
+        # file, say): the container running before keeps running.
+        self.refuse_up: set[str] = set()
         self._stamps = 0
 
     # -- scripting ----------------------------------------------------------------------
@@ -444,6 +458,12 @@ class FakeDocker:
             call.kind = "compose-up"
             self._require_env_file(env)
             image = env["PORTFOLIO_IMAGE"]
+            if image in self.refuse_up:
+                # Rejected while compose loads the project: nothing is created or replaced.
+                raise deploy.DeploymentError(
+                    "Command failed (15): validating compose.yml: services.app additional "
+                    "properties 'healthchek' not allowed"
+                )
             actual = self.substitute.get(image, image)
             if self.database is not None and not self.image_knows(actual, self.revision):
                 # The application migrates at startup (upgrade_to_head) and cannot start on
@@ -514,21 +534,34 @@ class FakeDocker:
                     "Command failed (1): expected exactly one row in alembic_version"
                 )
             return self.revision
-        if len(command) == 5 and command[:4] == ("python", "-c", stream_script, BACKUPS_PATH):
+        if len(command) == 6 and command[:4] == ("python", "-c", stream_script, BACKUPS_PATH):
+            # STREAM_SCRIPT <directory> <name> <size>: stdin into a .partial, renamed to
+            # the name only when exactly <size> bytes arrived.
             call.kind = "compose-run-stream"
-            name = command[4]
+            name, size = command[4], command[5]
             if call.stdin is None:
                 self.unexpected.append(call.argv)
                 raise deploy.DeploymentError("the stream was given nothing on stdin")
+            try:
+                expected = int(size)
+            except ValueError:
+                raise deploy.DeploymentError(
+                    f"Command failed (1): ValueError: invalid literal for int(): {size!r}"
+                ) from None
             if self.fail_stream:
                 raise deploy.DeploymentError(
                     "Command failed (1): [Errno 28] No space left on device"
                 )
             if name in self.backups:
                 raise deploy.DeploymentError(f"Command failed (1): {name} already exists")
-            written = call.stdin[: len(call.stdin) // 2] if self.short_stream else call.stdin
-            self.backups[name] = written
-            return f"ok {len(written)}"
+            received = call.stdin[: len(call.stdin) // 2] if self.short_stream else call.stdin
+            if len(received) != expected:
+                # The .partial is removed: nothing ever takes the copy's name.
+                raise deploy.DeploymentError(
+                    f"Command failed (1): received {len(received)} bytes, expected {expected}"
+                )
+            self.backups[name] = received
+            return f"ok {len(received) + 1}" if self.stream_miscounts else f"ok {len(received)}"
         if len(command) == 5 and command[:4] == ("python", "-m", "portfolio", "restore-backup"):
             call.kind = "compose-run-restore"
             return self._restore(command[4], image)
@@ -560,30 +593,49 @@ class FakeDocker:
         if refusal is not None:
             # The command prints no counts when it refuses; run() reports its stderr.
             raise deploy.DeploymentError(f"Command failed (1): Refusing to restore: {refusal}")
-        lines = [f"Restored {name}."]
+        # Step 4: protect the live database. ``line`` is what the report says of it and
+        # ``before`` what a failure's message says (db/backup.py, _before_sentence).
         if self.restore_outcome == "none" or self.database is None:
-            lines.append("There was no database to copy first, so no safety copy was taken.")
+            line = "There was no database to copy first, so no safety copy was taken."
+            before = "There was no database before the restore, so there is no safety copy."
         elif self.restore_outcome == "damaged":
             moved = f"{DATABASE_PATH}.damaged-{self._copy_name()[10:-8]}"
-            lines.append(
+            line = (
                 "The live database opened but did not pass its own check, so no safety copy "
                 f"was taken: it was moved aside to {moved}. Keep it until the restore is "
                 "checked, then delete it."
+            )
+            before = (
+                f"The live database did not pass its own check and was moved aside to {moved}, "
+                "which holds it as it was; there is no safety copy."
             )
         else:
             safety = self._copy_name()
             self.backups[safety] = self.database
             self.snapshot_revisions.setdefault(self.database, self.revision)
             self.safety_copies.append(safety)
-            lines.append(f"The database as it was before is in the safety copy {safety}.")
+            line = f"The database as it was before is in the safety copy {safety}."
+            before = f"The safety copy {safety} holds the database as it was before the restore."
+        if self.restore_failure == "write":
+            # SQLite rolls the destination's write transaction back: the database is as it was.
+            raise deploy.DeploymentError(
+                f"Command failed (1): Writing the backup into {DATABASE_PATH} failed: "
+                f"disk I/O error (SQLITE_IOERR). {before}"
+            )
         self.database = self.backups[name]
         self.revision = revision
         self.wal = False
+        if self.restore_failure == "counts":
+            raise deploy.DeploymentError(
+                f"Command failed (1): After the restore, the rows per table of {DATABASE_PATH} "
+                f"differ from {name}'s. {before}"
+            )
         self.restored.append(name)
-        lines.append("Rows per table after the restore:")
+        lines = [f"Restored {name}.", line, "Rows per table after the restore:"]
         counts = (("accounts", 3), ("exchange_fills", SENTINEL_ROW_COUNT), ("wallets", 2))
         lines.extend(f"  {table}: {rows}" for table, rows in counts)
         report = "\n".join(lines)
+        self.reports.append(report)
         if self.restore_killed_after_report:
             raise deploy.DeploymentError(f"Command failed (137): {report}")
         return report

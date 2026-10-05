@@ -266,7 +266,8 @@ class RevisionScriptTests(ScriptTestCase):
 
 
 class StreamScriptTests(ScriptTestCase):
-    """``STREAM_SCRIPT <directory> <name>``: stdin into the backups volume, byte for byte."""
+    """``STREAM_SCRIPT <directory> <name> <size>``: stdin into the backups volume, byte for
+    byte, under the name only when exactly ``size`` bytes arrived."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -275,7 +276,9 @@ class StreamScriptTests(ScriptTestCase):
         self.name = deploy.copy_name(datetime(2026, 10, 5, 12, 34, 56, 789012, tzinfo=UTC))
 
     def test_stdin_lands_byte_for_byte_under_a_name_the_application_accepts(self) -> None:
-        process = run_script(deploy.STREAM_SCRIPT, self.backups, self.name, stdin=AWKWARD)
+        process = run_script(
+            deploy.STREAM_SCRIPT, self.backups, self.name, len(AWKWARD), stdin=AWKWARD
+        )
 
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(stdout(process), f"ok {len(AWKWARD)}")
@@ -290,7 +293,11 @@ class StreamScriptTests(ScriptTestCase):
         self.assertEqual(stdout(taken), f"ok {REVISION}", taken.stderr)
 
         process = run_script(
-            deploy.STREAM_SCRIPT, self.backups, self.name, stdin=snapshot.read_bytes()
+            deploy.STREAM_SCRIPT,
+            self.backups,
+            self.name,
+            snapshot.stat().st_size,
+            stdin=snapshot.read_bytes(),
         )
 
         self.assertEqual(stdout(process), f"ok {snapshot.stat().st_size}", process.stderr)
@@ -305,7 +312,7 @@ class StreamScriptTests(ScriptTestCase):
         self.assertEqual(query(alone, "SELECT version_num FROM alembic_version"), [(REVISION,)])
 
     def test_an_empty_stdin_is_an_empty_file_and_says_so(self) -> None:
-        process = run_script(deploy.STREAM_SCRIPT, self.backups, self.name, stdin=b"")
+        process = run_script(deploy.STREAM_SCRIPT, self.backups, self.name, 0, stdin=b"")
 
         self.assertEqual(stdout(process), "ok 0", process.stderr)
         self.assertEqual((self.backups / self.name).read_bytes(), b"")
@@ -313,7 +320,9 @@ class StreamScriptTests(ScriptTestCase):
     def test_a_name_already_taken_is_refused_and_left_alone(self) -> None:
         (self.backups / self.name).write_bytes(b"an older copy with this name\n")
 
-        process = run_script(deploy.STREAM_SCRIPT, self.backups, self.name, stdin=AWKWARD)
+        process = run_script(
+            deploy.STREAM_SCRIPT, self.backups, self.name, len(AWKWARD), stdin=AWKWARD
+        )
 
         self.assertNotEqual(process.returncode, 0)
         self.assertEqual((self.backups / self.name).read_bytes(), b"an older copy with this name\n")
@@ -328,11 +337,50 @@ class StreamScriptTests(ScriptTestCase):
             self.name.replace(".sqlite3", ".db"),
         ):
             with self.subTest(name=name):
-                process = run_script(deploy.STREAM_SCRIPT, self.backups, name, stdin=b"data")
+                process = run_script(deploy.STREAM_SCRIPT, self.backups, name, 4, stdin=b"data")
 
                 self.assertNotEqual(process.returncode, 0)
                 self.assertEqual(list(self.backups.iterdir()), [])
                 self.assertFalse((self.directory / self.name).exists())
+
+    def test_fewer_bytes_than_the_size_leave_nothing_and_say_both_counts(self) -> None:
+        # A pipe cut short: what arrived is a prefix, and restore-backup must never see it.
+        received = AWKWARD[:-100]
+
+        process = run_script(
+            deploy.STREAM_SCRIPT, self.backups, self.name, len(AWKWARD), stdin=received
+        )
+
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(stdout(process), "", "no ok for a short copy")
+        # No final file and no .partial: the directory is as it was.
+        self.assertEqual(list(self.backups.iterdir()), [])
+        message = process.stderr.decode("utf-8")
+        self.assertRegex(message, rf"\b{len(received)}\b")
+        self.assertRegex(message, rf"\b{len(AWKWARD)}\b")
+
+    def test_any_other_count_is_refused_too(self) -> None:
+        for data, size in ((AWKWARD, len(AWKWARD) - 1), (b"", 10), (b"data", 0)):
+            with self.subTest(received=len(data), size=size):
+                process = run_script(
+                    deploy.STREAM_SCRIPT, self.backups, self.name, size, stdin=data
+                )
+
+                self.assertNotEqual(process.returncode, 0)
+                self.assertEqual(list(self.backups.iterdir()), [])
+                message = process.stderr.decode("utf-8")
+                self.assertRegex(message, rf"\b{len(data)}\b")
+                self.assertRegex(message, rf"\b{size}\b")
+
+    def test_a_missing_or_malformed_size_writes_nothing(self) -> None:
+        for size in ((), ("four",), ("",), ("4.0",)):
+            with self.subTest(size=size):
+                process = run_script(
+                    deploy.STREAM_SCRIPT, self.backups, self.name, *size, stdin=b"data"
+                )
+
+                self.assertNotEqual(process.returncode, 0)
+                self.assertEqual(list(self.backups.iterdir()), [])
 
 
 class CopyNameTests(unittest.TestCase):
@@ -364,6 +412,77 @@ class CopyNameTests(unittest.TestCase):
     def test_a_naive_instant_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             deploy.copy_name(datetime(2026, 10, 5, 12, 34, 56))
+
+
+class SafetyCopyNameTests(unittest.TestCase):
+    """``safety_copy_name``: the one thing of restore-backup's output a record may hold
+    (spec 034, R5), and only as the name that directly follows "safety copy"."""
+
+    SAFETY = "portfolio-20261005T123456789012Z.sqlite3"
+    RESTORED = "portfolio-20261004T030000000000Z.sqlite3"
+    OTHER = "portfolio-20261005T123457000000Z.sqlite3"
+
+    def test_the_line_restore_backup_prints_on_success(self) -> None:
+        line = f"The database as it was before is in the safety copy {self.SAFETY}."
+        self.assertEqual(deploy.safety_copy_name(line), self.SAFETY)
+
+    def test_the_sentence_of_a_restore_that_failed_after_taking_it(self) -> None:
+        # db/backup.py, _before_sentence, at the end of the failure's message.
+        message = (
+            "Command failed (1): Writing the backup into /app/data/portfolio.db failed: disk "
+            f"I/O error (SQLITE_IOERR). The safety copy {self.SAFETY} holds the database as "
+            "it was before the restore."
+        )
+        self.assertEqual(deploy.safety_copy_name(message), self.SAFETY)
+
+    def test_a_whole_report_gives_the_safety_copy_and_not_the_restored_one(self) -> None:
+        report = "\n".join(
+            [
+                f"Restored {self.RESTORED}.",
+                f"The database as it was before is in the safety copy {self.SAFETY}.",
+                "Rows per table after the restore:",
+                "  accounts: 3",
+            ]
+        )
+        self.assertEqual(deploy.safety_copy_name(report), self.SAFETY)
+
+    def test_the_same_name_twice_is_that_name(self) -> None:
+        text = (
+            f"The database as it was before is in the safety copy {self.SAFETY}.\n"
+            f"The safety copy {self.SAFETY} holds the database as it was before the restore."
+        )
+        self.assertEqual(deploy.safety_copy_name(text), self.SAFETY)
+
+    def test_no_name_or_two_different_names_give_none(self) -> None:
+        for text in (
+            "",
+            "There was no database to copy first, so no safety copy was taken.",
+            "There was no database before the restore, so there is no safety copy.",
+            "The live database did not pass its own check and was moved aside to "
+            "/app/data/portfolio.db.damaged-20261005T123456789012Z, which holds it as it "
+            "was; there is no safety copy.",
+            f"The safety copy {self.SAFETY} holds it, and so does the safety copy "
+            f"{self.OTHER}.",
+            f"The safety copy {self.SAFETY} holds the database.\n"
+            f"The database as it was before is in the safety copy {self.OTHER}.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(deploy.safety_copy_name(text))
+
+    def test_a_name_that_does_not_follow_safety_copy_is_not_taken(self) -> None:
+        for text in (
+            # On the same line as "safety copy", but not after it.
+            f"Restored {self.RESTORED}; no safety copy was taken.",
+            f"No safety copy was taken before {self.RESTORED} was restored.",
+            f"The safety copy: {self.SAFETY}.",
+            f"The safety copy holds nothing; see {self.SAFETY}.",
+            # Not the words "safety copy", and not a whole copy name.
+            f"The unsafety copy {self.SAFETY}.",
+            f"The safety copy {self.SAFETY}x.",
+            f"The safety copy {self.SAFETY[:-1]}.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(deploy.safety_copy_name(text))
 
 
 class RunInputFileTests(unittest.TestCase):
@@ -401,6 +520,31 @@ class RunInputFileTests(unittest.TestCase):
         moved = self.directory.with_name("failed")
         self.directory.rename(moved)
         (moved / "database.sqlite3").unlink()
+
+    def test_without_an_input_file_the_command_reads_an_empty_stdin(self) -> None:
+        """deploy.py's own stdin is the ssh session from the Actions runner, and compose run
+        attaches stdin by default: a command it runs without ``input_file`` must find
+        nothing there, never what deploy.py was given.
+
+        Run in a child whose stdin holds bytes, as deploy.py runs: a command that inherited
+        it would read them, and one given /dev/null reads nothing and ends.
+        """
+        wrapper = (
+            "import importlib.util, sys\n"
+            "spec = importlib.util.spec_from_file_location('deploy', sys.argv[1])\n"
+            "deploy = importlib.util.module_from_spec(spec)\n"
+            "sys.modules['deploy'] = deploy\n"
+            "spec.loader.exec_module(deploy)\n"
+            "reader = 'import sys; print(len(sys.stdin.buffer.read()))'\n"
+            "print(deploy.run([sys.executable, '-c', reader]))\n"
+            "print(deploy.run([sys.executable, '-c', reader], input_file=sys.argv[2]))\n"
+        )
+        session = b"what the runner's ssh session sends\n"
+
+        process = run_script(wrapper, deploy.__file__, self.source, stdin=session)
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(stdout(process).splitlines(), ["0", str(len(AWKWARD))])
 
     def test_a_failure_names_neither_the_file_nor_what_it_holds(self) -> None:
         self.source.write_bytes(b"what the database holds\n")

@@ -52,7 +52,8 @@ Safety properties, in the order they are enforced:
   deleted before the copy replacing it is fsynced under its final name;
 * the new container must report healthy *and* be running the exact digest, otherwise the
   previous deployment is restored;
-* before the previous deployment starts again, the candidate is stopped and the live
+* before the previous deployment starts again -- unless it never stopped, because the
+  candidate's container never replaced it -- the candidate is stopped and the live
   database's schema revision is read; if the candidate moved it, the attempt's own
   snapshot is put back with the previous image's own ``restore-backup``, which keeps a
   safety copy of the migrated database, and a restore that fails leaves the previous image
@@ -64,14 +65,15 @@ Safety properties, in the order they are enforced:
   the backups volume too: the snapshot a rollback restores lands there through a
   ``.partial`` file, fsynced and renamed.
 
-A rollback that restores leaves two copies in the backups volume, beside the scheduled
-ones and rotated with them: the snapshot it restored, under a copy's name, and the safety
-copy ``restore-backup`` took of the migrated database. The snapshot also stays in
-``failed/``. ``result.json`` says which happened in ``database``: ``unchanged``,
-``restored``, ``not_restored`` (the revision moved, or could not be compared, and the
-attempt has no snapshot of its own with a revision to put back), ``restore_failed``, or
-``unread`` (stopping the candidate or reading the revision failed). See
-``roll_back_database`` (spec 034).
+A rollback that restores adds two copies to the backups volume, beside the scheduled ones
+and rotated with them, and deletes none: the snapshot it restored, under a copy's name,
+and the safety copy ``restore-backup`` took of the live database. The snapshot also stays
+in ``failed/``. ``result.json`` says which happened in ``database``: ``unchanged`` (the
+revision had not moved, or the previous deployment never stopped), ``restored``,
+``not_restored`` (the revision moved, or could not be compared, and the attempt has no
+snapshot of its own with a revision to put back), ``restore_failed``, or ``unread``
+(stopping the candidate or reading the revision failed). See ``roll_back_database``
+(spec 034).
 """
 
 from __future__ import annotations
@@ -110,8 +112,12 @@ DATABASE_REVISION = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 # A copy's name, as the application's BACKUP_NAME_PATTERN (domain/backups.py) accepts it:
 # the UTC instant it was started, to the microsecond.
 COPY_NAME = re.compile(r"portfolio-[0-9]{8}T[0-9]{12}Z\.sqlite3")
+# How restore-backup names the safety copy it took, on success and in a failure's message.
+SAFETY_COPY = re.compile(rf"\bsafety copy ({COPY_NAME.pattern})\b")
 # What restore-backup prints before the rows per table, which no record may hold (spec 034
-# R5). Only ever looked for in a failure's diagnostic; see roll_back_database.
+# R5). It prints it only once the restore has finished and its row counts were checked, so
+# in the text of a failed restore-backup it means the restore completed; see
+# roll_back_database.
 ROWS_REPORT = "Rows per table"
 # docker compose run, for a one-off container of the service: removed when it exits, with
 # no other service started, no terminal and no published port. The service's volumes,
@@ -177,10 +183,12 @@ print(rows[0][0])
 # application writes a scheduled copy: into ".portfolio-<stamp>.partial", fsynced, renamed,
 # and the directory fsynced. The application's own clean-up removes a .partial a crash
 # left, once it is an hour old. Refuses a name that is not a copy's, or one already taken.
-# Prints "ok <bytes written>", which the caller compares with the file it sent.
+# argv[3] is the size the caller sent: a copy that received any other number of bytes is
+# removed before it ever takes a copy's name, so restore-backup can never see a short one.
+# Prints "ok <bytes written>", which the caller also compares with the file it sent.
 STREAM_SCRIPT = """\
 import os, re, shutil, sys
-directory, name = sys.argv[1], sys.argv[2]
+directory, name, expected = sys.argv[1], sys.argv[2], int(sys.argv[3])
 match = re.fullmatch(r"portfolio-([0-9]{8}T[0-9]{12}Z)[.]sqlite3", name)
 if match is None:
     sys.exit("not a copy's name")
@@ -195,6 +203,8 @@ try:
         target.flush()
         os.fsync(target.fileno())
         size = target.tell()
+    if size != expected:
+        sys.exit("received %d bytes, expected %d" % (size, expected))
     if os.path.lexists(final):
         sys.exit(name + " already exists")
     os.rename(partial, final)
@@ -274,13 +284,15 @@ def run(
     ``input_file``, when given, is opened in binary and becomes the command's stdin. It is
     how a rollback hands a database copy to a one-off container: a bind mount of a 0600 file
     the deploy user owns cannot be read by the container's user, and ``docker cp`` would
-    leave the copy owned by root (spec 034).
+    leave the copy owned by root (spec 034). Without one, stdin is ``/dev/null``: this
+    script's own stdin is the ssh session from the Actions runner, and no command it runs
+    has any business reading it -- ``compose run`` attaches stdin by default.
     """
     stdin = None if input_file is None else open(input_file, "rb")
     try:
         return subprocess.run(
-            args, env=env, stdin=stdin, check=True, text=True, capture_output=True,
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            args, env=env, stdin=subprocess.DEVNULL if stdin is None else stdin, check=True,
+            text=True, capture_output=True, timeout=COMMAND_TIMEOUT_SECONDS,
         ).stdout.strip()
     except subprocess.CalledProcessError as error:
         detail = (error.stderr or error.stdout or "No diagnostic output").strip()
@@ -1203,18 +1215,17 @@ def copy_name(instant: datetime) -> str:
 
 
 def safety_copy_name(output: str) -> str | None:
-    """The safety copy ``restore-backup`` reports in ``output``, or None.
+    """The safety copy ``restore-backup`` names in ``output``, or None.
 
-    Read from the one line that mentions a safety copy, and only as a copy's name: nothing
-    else of that output may be recorded (spec 034, R5). None when no line, or more than one,
-    mentions it, or the line names no single copy -- there was no live database to copy, or
-    it was too damaged to copy and was moved aside instead.
+    Only a copy's name that directly follows "safety copy", which is how the command names
+    it both on success ("... is in the safety copy <name>.") and in the message of a restore
+    that failed after taking it ("The safety copy <name> holds the database as it was
+    before the restore."). Nothing else of that output may be recorded (spec 034, R5).
+    None unless exactly one distinct name is found: there was no live database to copy, it
+    was too damaged to copy and was moved aside instead, or the restore failed before it.
     """
-    lines = [line for line in output.splitlines() if "safety copy" in line]
-    if len(lines) != 1:
-        return None
-    names = re.findall(rf"\b{COPY_NAME.pattern}\b", lines[0])
-    return names[0] if len(names) == 1 else None
+    names = set(SAFETY_COPY.findall(output))
+    return names.pop() if len(names) == 1 else None
 
 
 def roll_back_database(
@@ -1232,6 +1243,10 @@ def roll_back_database(
     migrated and then failed would leave the previous image a database it cannot start on.
     Spec 034:
 
+    0. If the previous deployment is still running, healthy and on its own digest, the
+       candidate's ``up`` never replaced it -- compose rejected the file, say -- so the
+       candidate never ran: ``unchanged``, with nothing stopped or read, and no
+       ``database_revision_live``. Any failure of that check goes on to step 1.
     1. Stop the candidate, so that nothing writes while the revision is read or the
        database replaced. Compose does not restart a container it stopped, and the ``up``
        that follows replaces it.
@@ -1244,21 +1259,25 @@ def roll_back_database(
          since, and replacing them is a person's call (R6); a snapshot without one
          revision is one ``restore-backup`` refuses (R11);
        - different, with one: stream the snapshot into the backups volume under a copy's
-         name (``STREAM_SCRIPT``), then restore it with the previous image's own
-         ``restore-backup`` (spec 029), which checks the copy and that the image knows its
-         revision, takes a safety copy of the migrated database first, and writes through
-         the backup API. ``restored``.
+         name (``STREAM_SCRIPT``, which is told the size and refuses any other), then
+         restore it with the previous image's own ``restore-backup`` (spec 029), which
+         checks the copy and that the image knows its revision, takes a safety copy of the
+         live database first, and writes through the backup API. ``restored``.
 
     Only a failed restore raises (R12). A stream or restore that fails is
     ``restore_failed``: the revision is known to have moved, so the previous image is not
     started on a database it cannot read. A stop or revision read that fails has changed
     nothing, so it is ``unread``, with ``database_error``, and returns: the rollback starts
-    the previous image as it did before this step existed. Every field goes into ``result``
-    as soon as it is known, so a failure part-way still records how far this got.
+    the previous image as it did before this step existed. A ``restore-backup`` that failed
+    after printing its report had finished the restore -- the report comes only after the
+    row counts were checked -- so it is ``restored``, with a fixed ``database_error``, and
+    returns too. Every field goes into ``result`` as soon as it is known, so a failure
+    part-way still records how far this got.
 
     ``restore-backup`` prints the rows per table, which spec 029 keeps out of every log, and
-    the error message reaches a public Actions log: nothing of its output but the safety
-    copy's name ever enters ``result`` (R5).
+    the error message reaches a public Actions log. Nothing of its output but the safety
+    copy's name ever enters ``result``, on success or failure (R5); only a refusal or an
+    error, which it writes to stderr without counts, becomes ``rollback_error``.
 
     Needs a previous image that has ``restore-backup``: v0.29.0 or later (R10). A rollback
     target is always the live image, and every one from now on is newer than that, so this
@@ -1271,6 +1290,15 @@ def roll_back_database(
     service's volumes and environment apply. Assumed, not documented: ``stop`` of a service
     with no container succeeds and changes nothing.
     """
+    try:
+        verify_running(previous.manifest, previous.compose_file, secrets_file)
+    except Exception:  # noqa: BLE001 - not still running: the candidate replaced it
+        pass
+    else:
+        # The candidate's up never replaced the live container, so it never ran, and
+        # cannot have migrated anything. Nothing to stop, nothing to read.
+        result["database"] = "unchanged"
+        return
     try:
         compose(candidate, candidate_compose, secrets_file, "stop", "app")
         output = compose(
@@ -1300,31 +1328,42 @@ def roll_back_database(
     # Stamped when the restore starts, as the copy's name records when it was taken.
     name = copy_name(datetime.now(UTC))
     try:
+        size = snapshot.stat().st_size
         streamed = compose(
             previous.manifest, previous.compose_file, secrets_file,
-            *ONE_OFF, "python", "-c", STREAM_SCRIPT, BACKUP_DIRECTORY, name,
+            *ONE_OFF, "python", "-c", STREAM_SCRIPT, BACKUP_DIRECTORY, name, str(size),
             input_file=snapshot,
         )
-        if streamed != f"ok {snapshot.stat().st_size}":
+        if streamed != f"ok {size}":
             raise DeploymentError("The snapshot did not reach the backups volume whole")
-        result["database_restored_from"] = name
+    except Exception:
+        result["database"] = "restore_failed"
+        raise
+    result["database_restored_from"] = name
+    try:
         restored = compose(
             previous.manifest, previous.compose_file, secrets_file,
             *ONE_OFF, "python", "-m", "portfolio", "restore-backup", name,
         )
     except Exception as failure:
-        result["database"] = "restore_failed"
-        # The command prints its report on stdout, and run() quotes stdout when stderr is
-        # empty: a restore that reported and was then killed would put the rows per table
-        # into rollback_error. Of that report only the safety copy's name is kept, which is
-        # where the migrated database now is. Refusals and errors go to stderr, and are kept.
+        # Where the migrated database went, if the restore got as far as its safety copy:
+        # the one thing of this output that may be recorded (R5).
+        safety = safety_copy_name(str(failure))
+        if safety is not None:
+            result["database_safety_copy"] = safety
+        # The report is printed only after the restore finished and its row counts were
+        # checked, so a failure whose text holds it is a restore that completed: the
+        # process was killed after it, and run() quoted its stdout, since stderr was empty.
+        # The previous image can start, and nothing of that report is recorded.
         if ROWS_REPORT in str(failure):
-            safety = safety_copy_name(str(failure))
-            if safety is not None:
-                result["database_safety_copy"] = safety
-            raise DeploymentError(
-                "restore-backup failed after it reported a result; its output is not recorded"
-            ) from None
+            result["database"] = "restored"
+            result["database_error"] = (
+                "restore-backup reported a completed restore and then failed; "
+                "its output is not recorded"
+            )
+            return
+        # A refusal or an error, from stderr, which prints no counts: kept as rollback_error.
+        result["database"] = "restore_failed"
         raise
     safety = safety_copy_name(restored)
     if safety is not None:

@@ -1,7 +1,7 @@
 # 034 — A rollback restores the database a failed candidate migrated
 
 Issue: #140
-Status: implementing
+Status: done
 
 ## Problem
 
@@ -94,7 +94,8 @@ cover the one change most likely to break a deployment: a migration.
   - `restore-backup` prints rows per table. Spec 029 keeps those counts out of every log,
     and `deploy.py`'s error message reaches the GitHub Actions log of a public repository.
   - So the result and the message carry only:
-    - the state: `database = "unchanged" | "restored" | "not_restored" | "restore_failed"`;
+    - the state: `database = "unchanged" | "restored" | "not_restored" | "unread" |
+      "restore_failed"` (`unread` is R12's);
     - the two revisions;
     - the restored copy's name;
     - the safety copy's name, extracted with the copy-name pattern from the one line that
@@ -141,6 +142,41 @@ cover the one change most likely to break a deployment: a migration.
   - When the stream or `restore-backup` fails, the revision is known to have moved, so the
     previous image cannot start. It is not started, and the state is `restore_failed`.
 
+Added after review:
+
+- **R13. A previous deployment that is still running is never stopped.**
+  - Before it stops anything, the rollback checks the previous deployment with
+    `verify_running`. If it is running its own image and healthy, the candidate's `up`
+    never replaced the live container.
+  - Migrations run only when the application starts, so a candidate that never started
+    cannot have moved the database. The state is `unchanged`, with no stop and no revision
+    read, and `database_revision_live` is absent.
+  - Without this, a candidate refused before it was created (a compose file compose
+    rejects, a missing image) would stop a healthy production only to start it again.
+  - If that check fails for any reason, the rollback goes on as R2 and R3 describe.
+- **R14. A restore that reported its result happened.**
+  - `restore-backup` prints rows per table only after `restore_copy` returns, and by then
+    the copy has been written and its row counts checked. A command that printed that
+    report and then failed, for example because removing the one-off container failed,
+    has restored the database.
+  - So the state is `restored`, with a fixed `database_error` and none of the output. The
+    rollback goes on to the previous image's `up`.
+  - Only the restore's own failure is read this way, never the stream's.
+- **R15. The stream checks its own size.**
+  - The stream script takes the expected byte count as an argument. It refuses to rename
+    a `.partial` of any other size, and removes that partial.
+  - `deploy.py` still compares the `ok <size>` it prints. That makes two checks, one on
+    each side of the pipe.
+- **R16. The safety copy is recorded whenever `restore-backup` names it, failures included.**
+  - The name is taken only where it follows the words `safety copy`. The output must name
+    exactly one copy that way. That covers the success line and spec 029's failure
+    sentence ("The safety copy … holds the database as it was before the restore").
+  - On `restore_failed`, the name then says where the migrated database went.
+- **R17. A docker call that is given no input reads none.**
+  - `run()` passes `stdin=DEVNULL` when there is no `input_file`.
+  - Over SSH, the deploy's own stdin is the Actions runner's, and a one-off container
+    attaches stdin by default.
+
 ## Design
 
 All of it is in `deploy/deploy.py`.
@@ -152,6 +188,8 @@ All of it is in `deploy/deploy.py`.
   `current.json` therefore records the revision each deployment started from.
 
 **On the failure path, when there is a previous deployment.**
+0. If the previous deployment is still running and healthy → `database = "unchanged"`, and
+   go straight to step 4 (R13).
 1. Stop the candidate: `compose(candidate, candidate_compose, secrets, "stop", "app")`.
 2. Read the live revision (R3).
 3. Decide:
@@ -213,6 +251,13 @@ Added by this spec:
     `database=unread` with `database_error`. The previous image's `up` is still attempted,
     and when it comes up the outcome is `rollback=healthy`.
 11. An own snapshot with no single revision gives `database=not_restored`, with no restore.
+12. A previous deployment still running and healthy when the rollback starts is neither
+    stopped nor read: `database=unchanged`, with no `database_revision_live` (R13).
+13. A `restore-backup` that printed its report and then failed gives `database=restored`
+    with `database_error`, and the previous image is started (R14).
+14. A short stream leaves neither the final copy nor a `.partial` (R15). A failed restore
+    that names its safety copy records it in `database_safety_copy` (R16). A call without
+    `input_file` gets no stdin (R17).
 
 ## Test plan
 
@@ -228,6 +273,9 @@ Added by this spec:
 | 11 | The fake snapshot reports bare `ok` (no revision) and the candidate migrates: `not_restored`, with no stream and no restore |
 | 9 | The fake `restore-backup` prints rows-per-table lines with a sentinel count. The test asserts that the sentinel appears in no message, no JSON and no captured stdout or stderr. The existing secrets-sentinel checks run on the new paths |
 | 4 | `test_deploy_docs.py`: the section names the restore and the `database=` states |
+| 12 | `verify_running(previous)` passes at rollback: `unchanged`, no `stop`, no one-off `run` |
+| 13 | The fake `restore-backup` prints its report and exits non-zero: `restored`, `database_error`, the previous `up` called, `rollback=healthy`, and no count anywhere |
+| 14 | The real stream script given fewer bytes than its argument; `safety_copy_name` on both sentences, on none, on two and on a copy name not after "safety copy"; `run()` with no `input_file` gives a child EOF on stdin |
 | — | Every existing test in `tests/deploy/` still passes. The ones that pin the old rollback sequence change only to follow the new steps, never to weaken what they check |
 
 ## File ownership
@@ -253,3 +301,12 @@ does that first.
   real (criterion 8), and the choreography by the fake. The command shapes follow Docker
   Compose's documented `run` options. If a Docker engine is available locally, the tester
   rehearses the stream and the revision read against a real container.
+  - None was available when this was built, so there was no rehearsal. Every way the new
+    steps can fail ends no worse than before this change:
+    - a stop or read failure is `unread`, and the rollback runs as it did (R12);
+    - a stream or restore failure keeps the previous image off a database it cannot start
+      on, which is what happened anyway.
+- **Mutation testing:** not run locally, per the project policy since 2026-10-05.
+  - The first verification round ran one sweep anyway, against that policy. It killed 28
+    of 31 mutants; the other 3 are equivalent.
+  - The review fixes were not swept.

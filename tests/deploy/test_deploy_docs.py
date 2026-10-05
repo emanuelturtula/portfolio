@@ -205,6 +205,37 @@ class OperatorDocsTests(unittest.TestCase):
             with self.subTest(state=state):
                 self.assertRegex(text, rf"database={state}(?![\w])")
 
+    def test_step_8_starts_the_previous_deployment_unless_the_restore_failed(self) -> None:
+        # Spec 034: a failed restore leaves the previous image unstarted, on purpose.
+        text = section_in(
+            (DOCS / "deployment.md").read_text(encoding="utf-8"), "## What happens on the host"
+        )
+        self.assertIn("unless the restore failed", " ".join(text.split()))
+
+    def test_the_safety_copy_holds_everything_written_since_the_snapshot(self) -> None:
+        # It holds the live database as restore-backup found it: what the candidate wrote,
+        # and what the previous version wrote after the snapshot, before the candidate ran.
+        text = " ".join(
+            section_in(
+                (DOCS / "deployment.md").read_text(encoding="utf-8"), "## Rolling back"
+            ).split()
+        )
+        self.assertIn("written since the snapshot", text)
+        for stale in ("Nothing the candidate wrote is deleted", "holds what the candidate wrote"):
+            self.assertNotIn(stale, text, "no longer the whole of it")
+
+    def test_the_scheduled_copies_section_says_a_rollback_adds_to_them(self) -> None:
+        # A rollback that restores writes two copies into the backups volume.
+        docs = " ".join((DOCS / "deployment.md").read_text(encoding="utf-8").split())
+        self.assertNotIn("neither reads nor changes the scheduled copies", docs, "no longer true")
+        text = " ".join(
+            section_in(
+                (DOCS / "deployment.md").read_text(encoding="utf-8"),
+                "### Not the deployment's backup, and why both exist",
+            ).split()
+        )
+        self.assertIn("safety copy", text)
+
     def test_the_section_reader_stops_at_the_next_heading(self) -> None:
         sample = "\n".join(
             [
