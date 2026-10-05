@@ -98,7 +98,7 @@ async def list_wallets(
 @router.post(
     "",
     operation_id="createWallet",
-    summary="Register an address to read balances from",
+    summary="Register an address or an extended public key to read balances from",
     status_code=status.HTTP_201_CREATED,
     response_model=WalletResponse,
 )
@@ -107,7 +107,11 @@ async def create_wallet(
     principal: CurrentPrincipal,
     service: CurrentWalletService,
 ) -> WalletResponse:
-    """Register an address after verifying its checksum, offline.
+    """Register an address, or a Bitcoin extended public key, after verifying it offline.
+
+    A refused key is the same 422 as a refused address, with its own reason as the `type`
+    -- `private_key`, `extended_key_multisig`, `invalid_public_key` -- and the response
+    serves an extended key masked (spec 031).
 
     A duplicate is a 409 whether or not the row holding the slot is archived, and the
     problem detail says which -- because "you already have this" and "you archived this"

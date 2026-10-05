@@ -36,7 +36,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Literal, overload
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -45,9 +45,9 @@ MAX_ADDRESS_LENGTH: Final = 128
 """The longest string any codec here will look at.
 
 Comfortably above every supported form: BIP-173 caps bech32 at 90 characters, a
-Base58Check address is 34 or 35, and the longest Kaspa address is a `kaspatest:` prefix
-plus 63 characters. It is here so that a pasted paragraph is refused by its length rather
-than walked character by character.
+Base58Check address is 34 or 35, the longest Kaspa address is a `kaspatest:` prefix plus 63
+characters, and a serialised extended public key is 111. It is here so that a pasted
+paragraph is refused by its length rather than walked character by character.
 """
 
 
@@ -71,6 +71,10 @@ class AddressRejection(StrEnum):
     EXTENDED_KEY = "extended_key"
     MALFORMED = "malformed"
     WRONG_NETWORK = "wrong_network"
+    # Spec 031: the three ways an extended key is refused that are not a decoding failure.
+    PRIVATE_KEY = "private_key"
+    EXTENDED_KEY_MULTISIG = "extended_key_multisig"
+    INVALID_PUBLIC_KEY = "invalid_public_key"
 
 
 REJECTION_MESSAGES: Final[Mapping[AddressRejection, str]] = {
@@ -87,6 +91,9 @@ REJECTION_MESSAGES: Final[Mapping[AddressRejection, str]] = {
     AddressRejection.EXTENDED_KEY: "This is an extended public key, not an address.",
     AddressRejection.MALFORMED: "The address is not shaped like an address for this chain.",
     AddressRejection.WRONG_NETWORK: "The address belongs to a different network of this chain.",
+    AddressRejection.PRIVATE_KEY: "This is a private key. Never enter it here or anywhere else.",
+    AddressRejection.EXTENDED_KEY_MULTISIG: "Multisig extended public keys are not supported.",
+    AddressRejection.INVALID_PUBLIC_KEY: "The extended key does not hold a valid public key.",
 }
 """One fixed sentence per reason. **Not one of them interpolates anything.**
 
@@ -239,14 +246,36 @@ def _bech32_hrp_expand(hrp: str) -> list[int]:
     return [*high, 0, *low]
 
 
-def _convert_bits(values: Sequence[int], from_bits: int, to_bits: int) -> list[int] | None:
+@overload
+def _convert_bits(
+    values: Sequence[int], from_bits: int, to_bits: int, *, pad: Literal[True]
+) -> list[int]: ...
+
+
+@overload
+def _convert_bits(
+    values: Sequence[int], from_bits: int, to_bits: int, *, pad: Literal[False] = False
+) -> list[int] | None: ...
+
+
+def _convert_bits(
+    values: Sequence[int], from_bits: int, to_bits: int, *, pad: bool = False
+) -> list[int] | None:
     """Regroup small integers into a different word size, or return `None` if it does not fit.
 
-    BIP-173's `convertbits` with `pad=False`, which is the only direction a decoder needs.
-    Leftover bits are not merely dropped: the function refuses when there are enough of them
-    to have held another whole input word, and when the padding they carry is not zero.
-    Dropping them quietly is how a decoder comes to accept several distinct strings as the
-    same address -- BIP-173's own invalid-address vectors include exactly that case.
+    BIP-173's `convertbits`, in both of its directions.
+
+    **`pad=False` is the decoder's**, and the default. Leftover bits are not merely dropped:
+    the function refuses when there are enough of them to have held another whole input
+    word, and when the padding they carry is not zero. Dropping them quietly is how a
+    decoder comes to accept several distinct strings as the same address -- BIP-173's own
+    invalid-address vectors include exactly that case.
+
+    **`pad=True` is the encoder's** (spec 031, a derived segwit address). The leftover bits
+    are shifted into one last output word, zero-filled, which is exactly the padding the
+    strict direction then accepts: a program encoded here decodes back to itself. It never
+    refuses, and the overloads say so, so the encoder needs no branch for a `None` that
+    cannot arrive.
     """
     accumulator = 0
     bits = 0
@@ -258,6 +287,10 @@ def _convert_bits(values: Sequence[int], from_bits: int, to_bits: int) -> list[i
         while bits >= to_bits:
             bits -= to_bits
             result.append((accumulator >> bits) & max_value)
+    if pad:
+        if bits:
+            result.append((accumulator << (to_bits - bits)) & max_value)
+        return result
     if bits >= from_bits or (accumulator << (to_bits - bits)) & max_value:
         return None
     return result
@@ -356,6 +389,34 @@ def _validate_segwit_address(raw: str) -> ValidatedAddress:
     return ValidatedAddress(canonical=raw.lower(), display=raw)
 
 
+def encode_segwit_address(hrp: str, witness_version: int, program: bytes) -> str:
+    """The segwit address for a witness program: BIP-173's encoder, and BIP-350's for v1+.
+
+    The inverse of `_validate_segwit_address`, written for spec 031, whose derived P2WPKH
+    addresses are version 0 programs of twenty bytes. The checksum constant follows the same
+    rule the decoder enforces: bech32 for version 0, bech32m for 1 to 16. Lowercase, which
+    is the canonical form -- so a derived address goes into `derived_addresses` and into a
+    request path exactly as `validate_bitcoin_address` would canonicalise it.
+
+    Nothing is validated here. The caller is `extended_keys.address_of`, which hands over a
+    HASH160 and a constant version, and the property that matters -- that every derived
+    address validates and comes out as its own canonical form -- is pinned by a test that
+    feeds the result back through the decoder, which is a stronger check than a guard here
+    would be.
+    """
+    data = [witness_version, *_convert_bits(program, 8, 5, pad=True)]
+    constant = _BECH32_CONST if witness_version == 0 else _BECH32M_CONST
+    polymod = (
+        _bech32_polymod([*_bech32_hrp_expand(hrp), *data, *([0] * _BECH32_CHECKSUM_LENGTH)])
+        ^ constant
+    )
+    checksum = [
+        (polymod >> 5 * (_BECH32_CHECKSUM_LENGTH - 1 - position)) & 31
+        for position in range(_BECH32_CHECKSUM_LENGTH)
+    ]
+    return hrp + "1" + "".join(BECH32_CHARSET[value] for value in [*data, *checksum])
+
+
 # ---------------------------------------------------------------------------------------
 # Base58Check
 # ---------------------------------------------------------------------------------------
@@ -379,23 +440,40 @@ _BASE58CHECK_LENGTH: Final = 25
 _BASE58CHECK_CHECKSUM_LENGTH: Final = 4
 
 EXTENDED_KEY_PREFIXES: Final[tuple[str, ...]] = ("xpub", "ypub", "zpub", "tpub", "upub", "vpub")
-"""Extended public keys, refused by name before anything tries to decode them.
+"""Extended public keys, refused *as addresses* by name before anything tries to decode them.
 
-An extended key is not an address, and deriving addresses from one is a separate change.
-Rejecting it explicitly is what lets the owner be told that, rather than being told the
-checksum failed -- because the checksum would pass: a serialised extended key is perfectly
-valid Base58Check, just 82 bytes rather than 25.
+An extended key is not an address. Rejecting it explicitly is what lets the owner be told
+that, rather than being told the checksum failed -- because the checksum would pass: a
+serialised extended key is perfectly valid Base58Check, just 82 bytes rather than 25.
+
+Registration no longer reaches this refusal with one (spec 031): `domain.chains.
+classify_wallet_key` sends every extended-key prefix to `domain.extended_keys` first. It
+stays because `validate_bitcoin_address` is also what a provider runs on an address wallet's
+column before building a URL, and an extended key there is still not an address.
 """
 
 
-def base58check_decode(raw: str) -> bytes:
+def _base58check_checksum(payload: bytes) -> bytes:
+    """The first four bytes of SHA-256 applied twice: what Base58Check appends."""
+    return hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:_BASE58CHECK_CHECKSUM_LENGTH]
+
+
+def base58check_decode(raw: str, *, length: int = _BASE58CHECK_LENGTH) -> bytes:
     """Decode a Base58Check string and verify its four-byte double-SHA256 checksum.
 
-    Returns the version byte and hash, with the checksum removed.
+    Returns the payload -- for an address, the version byte and hash -- with the checksum
+    removed.
+
+    **`length` is the decoded length checksum included, and it is exact.** It defaults to
+    the 25 bytes of an address, which every caller that decodes an address relies on
+    without saying so. Spec 031 decodes a serialised extended key, which is 82: four
+    version bytes, the 74 bytes of BIP32's serialisation format after them, and the
+    checksum. A length check rather than an "at least" is what keeps an address from being
+    read as a truncated key and a key from being read as an address with trailing bytes.
 
     Raises:
-        AddressInvalidError: a character outside the alphabet, a payload that is not the
-            25 bytes an address is, or a checksum that does not match.
+        AddressInvalidError: a character outside the alphabet, a payload that is not
+            `length` bytes, or a checksum that does not match.
     """
     number = 0
     for character in raw:
@@ -409,14 +487,37 @@ def base58check_decode(raw: str) -> bytes:
     leading_zeros = len(raw) - len(raw.lstrip("1"))
     magnitude = number.to_bytes((number.bit_length() + 7) // 8, "big")
     payload = b"\x00" * leading_zeros + magnitude
-    if len(payload) != _BASE58CHECK_LENGTH:
+    if len(payload) != length:
         raise AddressInvalidError(AddressRejection.MALFORMED)
 
     versioned = payload[:-_BASE58CHECK_CHECKSUM_LENGTH]
-    expected = hashlib.sha256(hashlib.sha256(versioned).digest()).digest()
-    if expected[:_BASE58CHECK_CHECKSUM_LENGTH] != payload[-_BASE58CHECK_CHECKSUM_LENGTH:]:
+    if _base58check_checksum(versioned) != payload[-_BASE58CHECK_CHECKSUM_LENGTH:]:
         raise AddressInvalidError(AddressRejection.BAD_CHECKSUM)
     return versioned
+
+
+def base58check_encode(payload: bytes) -> str:
+    """Encode a payload as Base58Check: append the checksum, then write it in base 58.
+
+    The inverse of `base58check_decode`, written for spec 031's derived P2PKH and
+    P2SH-P2WPKH addresses. Every leading zero byte is written as a `1`, the one thing the
+    integer conversion cannot carry -- the decoder's comment on the same point names the
+    mainnet P2PKH version byte as the case that depends on it.
+
+    Args:
+        payload: the bytes to encode, without a checksum.
+
+    Returns:
+        The Base58Check string. Base58 is case sensitive, so this is also the canonical form.
+    """
+    data = payload + _base58check_checksum(payload)
+    number = int.from_bytes(data, "big")
+    digits: list[str] = []
+    while number:
+        number, remainder = divmod(number, 58)
+        digits.append(BASE58_ALPHABET[remainder])
+    leading_zeros = len(data) - len(data.lstrip(b"\x00"))
+    return "1" * leading_zeros + "".join(reversed(digits))
 
 
 def _validate_base58_address(raw: str) -> ValidatedAddress:
@@ -600,10 +701,21 @@ def _looks_like_bech32(raw: str) -> bool:
     is perfectly legal and must reach the base58 branch, while a mixed-case bech32 one has
     to reach the bech32 branch in order to be rejected for the right reason.
 
-    A Base58Check address cannot match. Verified rather than assumed, against every base58
-    vector in Bitcoin Core's `src/test/data/key_io_valid.json`: not one satisfies all three
-    conditions, because the part in front of a `1` in a base58 address always contains a
-    digit or one of `b`, `i`, `o`, none of which the bech32 charset has.
+    **A valid Base58Check address can match, and this used to say it could not.** The claim
+    was checked against every base58 vector in Bitcoin Core's `key_io_valid.json`, none of
+    which matches -- but the hrp test is `isalpha()`, which admits `b`, `i` and `o`, and a
+    testnet P2PKH address (`m` or `n`) whose last `1` follows only letters and precedes
+    only characters of the bech32 alphabet satisfies all three conditions. Spec 031's
+    property test found one among derived `tpub` addresses within seconds: it was refused as
+    `mixed_case`. Mainnet cannot match -- `1` and `3` addresses start with a digit, so the
+    part in front of any `1` is never all letters, and neither is testnet's `2` -- which is
+    why no registered address ever showed it.
+
+    So the discriminator stays a *first guess*, and `validate_bitcoin_address` and
+    `bitcoin_network_of` fall back to Base58Check when the bech32 reading fails
+    (`_base58_or_reraise`). Every reason this function's callers report for a string that
+    is neither is unchanged: the fallback only ever turns a refusal into an acceptance, and
+    only for a string that verifies as Base58Check with a known version byte.
     """
     lowered = raw.lower()
     separator = lowered.rfind("1")
@@ -631,8 +743,28 @@ def validate_bitcoin_address(raw: str) -> ValidatedAddress:
     if raw.startswith(EXTENDED_KEY_PREFIXES):
         raise AddressInvalidError(AddressRejection.EXTENDED_KEY)
     if _looks_like_bech32(raw):
-        return _validate_segwit_address(raw)
+        try:
+            return _validate_segwit_address(raw)
+        except AddressInvalidError as error:
+            return _base58_or_reraise(raw, error)
     return _validate_base58_address(raw)
+
+
+def _base58_or_reraise(raw: str, error: AddressInvalidError) -> ValidatedAddress:
+    """`raw` as a Base58Check address, or the bech32 refusal it was already given.
+
+    The fallback `_looks_like_bech32` needs: a string shaped like bech32 that does not
+    verify as bech32 is read as Base58Check, and accepted only if it verifies there with a
+    known version byte. Anything else re-raises the bech32 reason unchanged, so a mistyped
+    segwit address is still reported as one rather than as a bad base58 checksum.
+
+    Raises:
+        AddressInvalidError: `error`, when the string is not a Base58Check address either.
+    """
+    try:
+        return _validate_base58_address(raw)
+    except AddressInvalidError:
+        raise error from None
 
 
 def validate_kaspa_address(raw: str) -> ValidatedAddress:
@@ -731,6 +863,40 @@ and the same address on testnet are the same 25 bytes. `REGTEST` is reachable fr
 and from nothing else.
 """
 
+# The three tables below run the other way: from a network to how an address on it is
+# written. Spec 031 (R3) needs them to *encode* a derived address for the configured network,
+# where everything above only ever decodes one. They are the same facts as the two tables
+# above -- `src/kernel/chainparams.cpp` -- and a test asserts each agrees with its inverse,
+# so the two directions cannot drift apart. Mainnet support is proven on these tables, never
+# on a mainnet string: rule 3 keeps every mainnet address out of the repository.
+
+BITCOIN_HRP_BY_NETWORK: Final[Mapping[BitcoinNetwork, str]] = {
+    BitcoinNetwork.MAINNET: "bc",
+    BitcoinNetwork.TESTNET: "tb",
+    BitcoinNetwork.REGTEST: "bcrt",
+}
+"""`bech32_hrp` per network: the exact inverse of `BITCOIN_NETWORK_BY_HRP`."""
+
+P2PKH_VERSION_BYTE_BY_NETWORK: Final[Mapping[BitcoinNetwork, int]] = {
+    BitcoinNetwork.MAINNET: 0x00,
+    BitcoinNetwork.TESTNET: 0x6F,
+    BitcoinNetwork.REGTEST: 0x6F,
+}
+"""`base58Prefixes[PUBKEY_ADDRESS]` per network. Regtest shares testnet's byte."""
+
+P2SH_VERSION_BYTE_BY_NETWORK: Final[Mapping[BitcoinNetwork, int]] = {
+    BitcoinNetwork.MAINNET: 0x05,
+    BitcoinNetwork.TESTNET: 0xC4,
+    BitcoinNetwork.REGTEST: 0xC4,
+}
+"""`base58Prefixes[SCRIPT_ADDRESS]` per network. Regtest shares testnet's byte.
+
+So a P2PKH or P2SH-P2WPKH address derived for regtest is, byte for byte, the testnet one,
+and `bitcoin_network_of` answers `TESTNET` for it. That is the residual its docstring
+records, met from the other side, and the provider allows for it when it re-reads a
+persisted derived address under `PORTFOLIO_BITCOIN_NETWORK=regtest`.
+"""
+
 
 def bitcoin_network_of(canonical: str) -> BitcoinNetwork:
     """Which Bitcoin network an address is on, offline, from the address alone.
@@ -766,11 +932,17 @@ def bitcoin_network_of(canonical: str) -> BitcoinNetwork:
             the message nor the arguments contain the address.
     """
     if _looks_like_bech32(canonical):
-        hrp = bech32_decode(canonical).hrp
-        network = BITCOIN_NETWORK_BY_HRP.get(hrp)
-        if network is None:
-            raise AddressInvalidError(AddressRejection.UNKNOWN_PREFIX)
-        return network
+        try:
+            hrp = bech32_decode(canonical).hrp
+        except AddressInvalidError as error:
+            # A Base58Check address the discriminator mistook for bech32: its network is
+            # read from its version byte below, as for any other legacy address.
+            _base58_or_reraise(canonical, error)
+        else:
+            network = BITCOIN_NETWORK_BY_HRP.get(hrp)
+            if network is None:
+                raise AddressInvalidError(AddressRejection.UNKNOWN_PREFIX)
+            return network
 
     version_byte = base58check_decode(canonical)[0]
     network = BITCOIN_NETWORK_BY_VERSION_BYTE.get(version_byte)

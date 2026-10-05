@@ -2,11 +2,11 @@
 
 One `asyncio.Task` holding a sleep and a tick, and **nothing in this module knows what it is
 running**. It takes two callables -- "when did this last happen" and "do it" -- so the
-application's two timers, the balance sync and the price refresh, are two instances rather
-than two loops.
+application's four timers, the balance sync, the price refresh, the exchange sync and the
+backup, are four instances rather than four loops.
 
-That generalisation was a choice worth stating. The differences between the two are three
-injected values; the similarities are the whole class: start, stop, the cancellation
+That generalisation was a choice worth stating, when there were two. The differences between
+them are three injected values; the similarities are the whole class: start, stop, the cancellation
 handshake, the first-run condition, and the rule that a failed tick must not kill the loop.
 Two copies of that would have been eighty lines of subtle cancellation handling written
 twice, and the second copy is the one that would have drifted.

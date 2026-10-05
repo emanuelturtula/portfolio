@@ -4,7 +4,7 @@ import { StrictMode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Address } from '@/components/Address';
-import { ADDRESSES } from '@/test/fixtures';
+import { ADDRESSES, MASKED_EXTENDED_KEYS } from '@/test/fixtures';
 
 function renderAddress(value: string) {
   return render(
@@ -99,5 +99,45 @@ describe('Address', () => {
     expect(await screen.findByText(/address copied/i)).toBeInTheDocument();
     expect(writeText).toHaveBeenCalledTimes(2);
     expect(writeText).toHaveBeenLastCalledWith(ADDRESSES.btcScript);
+  });
+});
+
+describe('Address: an extended key (spec 031, R8)', () => {
+  function renderMasked(value: string, name?: string) {
+    return render(
+      <StrictMode>
+        <Address value={value} kind="extended_key" {...(name === undefined ? {} : { name })} />
+      </StrictMode>,
+    );
+  }
+
+  it('shows the masked form exactly as served, beside a label saying what it is', () => {
+    renderMasked(MASKED_EXTENDED_KEYS.vpub);
+
+    const shown = screen.getByText(MASKED_EXTENDED_KEYS.vpub);
+    // Not truncated a second time: the nine characters the API sent, whole.
+    expect(shown.textContent).toBe(MASKED_EXTENDED_KEYS.vpub);
+    expect(MASKED_EXTENDED_KEYS.vpub).toHaveLength(9);
+    // No title: there is no full form in the browser to reveal on hover.
+    expect(shown).not.toHaveAttribute('title');
+    expect(screen.getByText('Extended key')).toBeInTheDocument();
+  });
+
+  it('has no copy control, whatever it is named', () => {
+    renderMasked(MASKED_EXTENDED_KEYS.tpub, 'Savings');
+
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('an address is still an address when the kind says so, or says nothing', () => {
+    const { unmount } = render(<Address value={ADDRESSES.btcSegwit} kind="address" />);
+    expect(screen.getByRole('button', { name: 'Copy address' })).toBeInTheDocument();
+    expect(screen.queryByText('Extended key')).not.toBeInTheDocument();
+    unmount();
+
+    render(<Address value={ADDRESSES.btcSegwit} />);
+    expect(screen.getByRole('button', { name: 'Copy address' })).toBeInTheDocument();
+    expect(screen.queryByText('Extended key')).not.toBeInTheDocument();
   });
 });

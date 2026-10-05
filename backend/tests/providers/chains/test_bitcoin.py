@@ -1346,7 +1346,8 @@ def test_the_parser_reads_the_documented_shape() -> None:
 
     stats = parse_address_response(body, BIP173_TESTNET_P2WPKH)
 
-    assert stats == AddressStats(confirmed=ONE_COIN - DUST, pending=7)
+    # Spec 031: `used` is read from `tx_count`, which `balance_body` reports as 2 and 1.
+    assert stats == AddressStats(confirmed=ONE_COIN - DUST, pending=7, used=True)
 
 
 def test_an_unexpected_extra_field_is_not_a_reason_to_refuse() -> None:

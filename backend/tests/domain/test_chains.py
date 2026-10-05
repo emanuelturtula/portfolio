@@ -43,14 +43,24 @@ PURE_IMPORTS_ALLOWED: Final = frozenset(
         "enum",
         "functools",
         "hashlib",
+        # Spec 031: BIP-32's child derivation is defined as HMAC-SHA512, and RIPEMD-160 is
+        # written out over `struct`. Both are arithmetic over the caller's bytes.
+        "hmac",
         "itertools",
         "operator",
         "re",
         "string",
+        "struct",
         "types",
         "typing",
+        # Spec 031, R2b: the private-key test removes Unicode format characters (`Cf`) by
+        # category. A read-only table from the interpreter itself: no I/O, no clock.
+        "unicodedata",
         "portfolio.domain.addresses",
         "portfolio.domain.chains",
+        "portfolio.domain.extended_keys",
+        "portfolio.domain.ripemd160",
+        "portfolio.domain.secp256k1",
     }
 )
 
@@ -170,7 +180,19 @@ def test_the_validator_accepts_the_enum_and_the_bare_string_alike() -> None:
     assert from_enum == from_string
 
 
-@pytest.mark.parametrize("module", ["addresses.py", "chains.py", "currencies.py"])
+@pytest.mark.parametrize(
+    "module",
+    [
+        "addresses.py",
+        "chains.py",
+        "currencies.py",
+        # Spec 031: the derivation modules are on the address path too. A clock or a socket
+        # in any of them would make registering an extended key cost a round trip.
+        "extended_keys.py",
+        "ripemd160.py",
+        "secp256k1.py",
+    ],
+)
 def test_the_address_modules_import_nothing_that_could_block_or_drift(module: str) -> None:
     """The property that puts these modules in `domain` instead of in `providers`.
 
