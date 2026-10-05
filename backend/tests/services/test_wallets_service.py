@@ -54,6 +54,9 @@ def a_wallet(*, label: str | None = "Cold storage", archived: bool = False) -> W
         archived_at=UPDATED_AT if archived else None,
         created_at=CREATED_AT,
         updated_at=UPDATED_AT,
+        # NOT NULL with a server default, which only an INSERT applies: an unflushed row
+        # has no kind until one is given, and `view_of` reads it strictly.
+        kind="address",
     )
 
 

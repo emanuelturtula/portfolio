@@ -324,6 +324,129 @@ browser tab discloses the same thing. If it is not a price you want to pay, run 
 [Esplora](https://github.com/Blockstream/esplora) and point both variables at it. The
 application does not care which instance answers, and the fallback URL may be left blank.
 
+### Adding an extended public key instead of single addresses
+
+A wallet that hands out a fresh address for every payment, and a fresh change address for
+every spend, cannot be tracked one pasted address at a time. Paste its **account extended
+public key** into the address field instead, with the chain set to Bitcoin. The application
+derives the wallet's addresses itself, offline, and reads each one from the instances above.
+
+| Paste | Addresses derived | Network |
+|---|---|---|
+| `zpub` | native segwit, P2WPKH (BIP84) | mainnet |
+| `ypub` | nested segwit, P2SH-P2WPKH (BIP49) | mainnet |
+| `xpub` | legacy, P2PKH (BIP44) | mainnet |
+| `vpub` / `upub` / `tpub` | the same three, in that order | testnet, signet and regtest |
+
+**The prefix decides the address type, and nothing else does.** Many wallets export an
+account key as `xpub` whatever kind of addresses the account actually uses, and an `xpub`
+here derives legacy addresses only. If a segwit wallet shows zero, that is almost always
+why: export the key again as `zpub` (or `ypub` for nested segwit) — most wallets offer it
+in the same screen — and register that instead.
+
+What is refused, with the reason the form shows:
+
+- **A private key** (`xprv`, `zprv` and the rest). The API refuses it with "This is a
+  private key. Never enter it here or anywhere else.", before anything else about the value
+  is read, on either chain, in two cases:
+  - the value starts with a private prefix, ignoring surrounding spaces and invisible
+    characters such as a zero-width space;
+  - a whole private key appears anywhere in it: after other text and a space, inside
+    quotes, or with an invisible character in the middle of it.
+
+  The form applies the same test as you enter the value, clears the field and never sends
+  it, and shows its own warning instead: the sentence above is what any other client of the
+  API sees. A private key stuck directly onto other letters or digits,
+  with nothing in between, is refused as an invalid address instead; it is still never
+  stored. Nothing here ever needs one; if you pasted one anywhere, treat that wallet as
+  compromised.
+- **A multisig key** (`Ypub`, `Zpub`, `Upub`, `Vpub`): not supported.
+- Taproot is not supported either: there is no taproot prefix to paste.
+
+**The key is shown masked from then on**, as its first and last four characters, and it is
+never served in full again — not in the list, not in the response to adding it. Keep your
+own copy in your wallet software, where it came from.
+
+**The first sync after adding one takes about a minute.** A key has two branches, receive
+and change, and the scan reads addresses on each until it has seen 20 unused ones in a row
+after the last used one (the standard gap limit of 20). That is at least 40 reads, and reads
+to one host are spaced by at least a second, so at least 40 seconds; a wallet with history
+takes about a second more per address it has used. The addresses it finds are remembered,
+so a later sync derives only what is new — but it still **reads every remembered address on
+every sync**, used or not, because a payment can arrive at any of them. A long-lived wallet
+therefore makes each sync slower by roughly a second per address it has ever handed out. A
+branch that would need more than 1000 addresses stops the scan with an error rather than
+reading on; the plausible cause is an instance reporting history for every address.
+
+The wallet counts as one wallet in the run log, and its balance is the sum over every
+address read. One line per sync is logged for it, `balance_sync_extended_key_scanned`, with
+the wallet's id and counts only; it is `INFO` when the scan found new addresses and `DEBUG`
+otherwise.
+
+**Do not also register an address the key derives.** The balance of an address that is both
+registered on its own and derived from a registered key is counted twice, and nothing
+detects the overlap. If you are moving from single addresses to the key, archive the single
+addresses after adding the key.
+
+**The same account is one wallet, however it was exported.** A key is compared by what it
+derives — its prefix, chain code and public key — not by the string, so the same account
+exported by two tools that write the rest of the key differently is refused the second time
+as a duplicate. A `zpub` and an `xpub` of the same account are two wallets, because they derive
+different addresses.
+
+**The network check applies to the key as it does to an address.** A key is accepted
+whichever network it is for, and the sync refuses it, as `address_rejected` with
+`wrong_network`, when it does not match `PORTFOLIO_BITCOIN_NETWORK`: a `zpub` on a testnet
+instance, a `vpub` on mainnet. Nothing is requested for it, and the rest of the Bitcoin
+chain fails with it, on every sync. A key for the other network is one this instance cannot
+read at all, so archive it: an archived wallet is not read.
+
+#### Forgetting the derived addresses after switching between testnet and regtest
+
+**A rare operator act**, for a development or self-hosted test instance; production is
+mainnet and never needs it. `testnet` and `regtest` both read `vpub`, `upub` and `tpub` keys.
+A `tpub` or `upub` wallet needs nothing: its addresses are Base58, byte for byte the same on
+both networks, and they keep reading correctly after a switch. **A `vpub` wallet does**: its
+addresses are bech32, `tb1` on testnet and `bcrt1` on regtest, the ones already derived were
+encoded for the network the instance had then, and after a switch every sync is refused as
+`wrong_network` while one is registered. Archiving the wallet and adding the key again does
+not help: the archived wallet keeps its place, so the second add is refused as a duplicate,
+and restoring it brings the old addresses back.
+
+Instead, take a backup and make the application forget every derived address. The wallets,
+their labels and their balance history stay; the next sync derives the addresses again for
+the new network, at the cost of a first scan — for every key wallet, `tpub` and `upub` ones
+included, since the command forgets them all. **The backup is the undo.**
+
+```bash
+~/portfolio-app/prod/compose.sh exec app python -m portfolio backup
+~/portfolio-app/prod/compose.sh exec app python -c "import sqlite3; c = sqlite3.connect('/app/data/portfolio.db', timeout=30); n = c.execute('DELETE FROM derived_addresses').rowcount; c.commit(); print(n, 'derived addresses forgotten')"
+```
+
+#### Deleting extended-key wallets before a downgrade
+
+**A rare operator act**, needed only to go back to a release from before extended keys. That
+downgrade refuses while any key is registered, archived ones included, with
+`Refusing to downgrade below 0011_extended_keys: ... wallet(s), archived ones included, hold
+an extended public key.` The previous release has no way to tell a key from an address: it
+would read the key as an address and fail the whole Bitcoin chain on every sync.
+
+Archiving keeps the row, and there is no button that deletes a wallet, so take a backup and
+delete those wallets by hand. **This loses their balance history** along with their derived
+addresses — history the previous release could not have read anyway. **The backup is the
+undo.**
+
+```bash
+~/portfolio-app/prod/compose.sh exec app python -m portfolio backup
+~/portfolio-app/prod/compose.sh exec app python -c "import sqlite3; c = sqlite3.connect('/app/data/portfolio.db', timeout=30); c.execute('PRAGMA foreign_keys = ON'); n = c.execute(\"DELETE FROM wallets WHERE kind = 'extended_key'\").rowcount; c.commit(); print(n, 'extended-key wallets deleted')"
+```
+
+**`PRAGMA foreign_keys = ON` is not optional.** Python's `sqlite3` opens a connection with
+foreign keys off, and without it the delete leaves every balance reading and derived address
+of those wallets behind, pointing at a wallet that no longer exists. The downgrade drops the
+derived addresses with their table, but the readings stay, and every startup after it warns
+about them as `pre_existing_foreign_key_violations`.
+
 ## 9. Where Kaspa balances are read from
 
 Balances come from a
@@ -1861,7 +1984,8 @@ Each replaces what it finds with `[REDACTED]`.
 
 **By key name.** The value of any field whose name contains `secret`, `passphrase`,
 `api_key`, `apikey`, `token`, `authorization`, `signature`, `password` or `address`, or starts
-with `xpub`, `ypub` or `zpub`, in any case and however deeply nested.
+with `xpub`, `ypub`, `zpub`, `xprv`, `yprv`, `zprv`, `tprv`, `uprv` or `vprv`, in any case and
+however deeply nested.
 
 **By value**, inside every string of the record -- the message, the traceback, every field's
 value, and every key at any depth, so a field keyed by address is caught too. The rules repeat
@@ -1871,8 +1995,11 @@ over a string until nothing more changes, so two values written back to back are
   three Bitget variables and the two BingX ones -- every `SecretStr` setting, found by type, so
   one added later is covered too. Wherever it appears when it is 8 characters or longer, and
   only as a whole value when shorter, so that a short value does not redact ordinary words;
-- **extended public keys**: `xpub`, `ypub`, `zpub`, `tpub`, `upub`, `vpub`, `Ypub`, `Zpub`,
-  `Upub` and `Vpub`, followed by 100 or more Base58 characters;
+- **extended keys, public and private**: the public `xpub`, `ypub`, `zpub`, `tpub`, `upub`,
+  `vpub`, `Ypub`, `Zpub`, `Upub` and `Vpub`, and the private `xprv`, `yprv`, `zprv`, `tprv`,
+  `uprv`, `vprv`, `Yprv`, `Zprv`, `Uprv` and `Vprv`, followed by 100 or more Base58
+  characters. Registration refuses a private key before reading it; this is for one that
+  reaches a log some other way;
 - **addresses**, mainnet and testnet: bech32 and bech32m starting `bc1`, `tb1` or `bcrt1` in
   either case; Base58 addresses starting `1`, `3`, `m`, `n` or `2`; Kaspa addresses with the
   `kaspa:`, `kaspatest:`, `kaspasim:` or `kaspadev:` prefix. No checksum is checked, so a word

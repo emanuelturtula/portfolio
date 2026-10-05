@@ -99,6 +99,9 @@ APPLICATION_TABLES = frozenset(
         # #104. The last reading of each exchange account's spot balances, replaced whole
         # by every successful read. Derived data: the venue is the source.
         "exchange_balances",
+        # #24. The addresses an extended-key wallet has derived, with whether each one has
+        # ever been used. Derived from the key; kept so a rescan does not derive them again.
+        "derived_addresses",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -153,6 +156,10 @@ ADJUSTMENT_TABLES = frozenset({"manual_adjustments"})
 #: `0010_exchange_balances` takes it down as well, and each test subtracts it.
 EXCHANGE_BALANCE_TABLES = frozenset({"exchange_balances"})
 
+#: #24's one. Its revision sits on top of #104's, so every single-step reversal below
+#: `0011_extended_keys` takes it down as well, and each test subtracts it.
+DERIVED_ADDRESS_TABLES = frozenset({"derived_addresses"})
+
 EXPECTED_SEED_ROWS = [
     ("BTC", "Bitcoin", 8, "crypto"),
     ("KAS", "Kaspa", 8, "crypto"),
@@ -169,6 +176,11 @@ EXPECTED_CONSTRAINT_NAMES = {
         "pk_wallets",
         "uq_wallets_user_chain_address",
         "ck_wallets_chain_key",
+        # #24: the batch rebuild that added `kind` has to keep every name above, and adds
+        # these two. Compared with their model constants in
+        # `tests/db/test_extended_keys_migration.py`.
+        "ck_wallets_kind",
+        "ck_wallets_kind_chain",
         "fk_wallets_user_id_users",
     },
     # #9. `uq_prices_asset_currency` is what makes this the *current* price rather than a
@@ -294,6 +306,17 @@ EXPECTED_CONSTRAINT_NAMES = {
         "pk_exchange_balances",
         "uq_exchange_balances_account_asset",
         "fk_exchange_balances_exchange_account_id_exchange_accounts",
+    },
+    # #24. Three CHECKs, compared with their model constants and exercised with real inserts
+    # in `tests/db/test_extended_keys_migration.py`. The unique key is what makes a rescan
+    # an upsert rather than a second copy of the same index.
+    "derived_addresses": {
+        "pk_derived_addresses",
+        "uq_derived_addresses_wallet_branch_index",
+        "ck_derived_addresses_branch",
+        "ck_derived_addresses_child_index",
+        "ck_derived_addresses_used",
+        "fk_derived_addresses_wallet_id_wallets",
     },
 }
 
@@ -481,6 +504,7 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
         - ACCOUNTING_TABLES
         - ADJUSTMENT_TABLES
         - EXCHANGE_BALANCE_TABLES
+        - DERIVED_ADDRESS_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -518,6 +542,7 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
         - ACCOUNTING_TABLES
         - ADJUSTMENT_TABLES
         - EXCHANGE_BALANCE_TABLES
+        - DERIVED_ADDRESS_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -589,6 +614,7 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
         - ACCOUNTING_TABLES
         - ADJUSTMENT_TABLES
         - EXCHANGE_BALANCE_TABLES
+        - DERIVED_ADDRESS_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:

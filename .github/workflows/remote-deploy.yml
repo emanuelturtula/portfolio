@@ -38,8 +38,10 @@ jobs:
     # the same 17 minutes, so one that stalls can spend it.
     # tests/deploy/test_workflow_timeouts.py pins the ordering.
     timeout-minutes: 20
-    # Deployments are serialized by the flock in deploy/deploy.py rather than by a GitHub
-    # concurrency group, so a queued deploy waits instead of being silently discarded.
+    # Two layers keep deployments from overlapping. On GitHub, the workflow-level
+    # concurrency group in delivery.yml runs one delivery at a time and, when several
+    # queue, keeps only the newest pending one. On the host, the flock in deploy/deploy.py
+    # serializes whatever reaches it, whatever that group says.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

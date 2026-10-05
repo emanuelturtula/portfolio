@@ -197,7 +197,7 @@ function WalletRow({ wallet, isShowingArchived, focusListHeading }: WalletRowPro
       <div className="wallet-row-main">
         <span className="wallet-chain">{chainDisplayName(wallet.chain_key)}</span>
         {wallet.label !== null && <span className="wallet-label">{wallet.label}</span>}
-        <Address value={wallet.address} name={name} />
+        <Address value={wallet.address} name={name} kind={wallet.kind} />
         {wallet.archived && <span className="badge">Archived</span>}
       </div>
 

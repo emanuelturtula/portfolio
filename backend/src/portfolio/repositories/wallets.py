@@ -132,12 +132,17 @@ class WalletRepository:
         address_display: str,
         label: str | None,
         created_at: datetime,
+        kind: str = "address",
     ) -> Wallet:
-        """Insert a wallet. The caller has already validated the address.
+        """Insert a wallet. The caller has already validated the address or the key.
 
         `updated_at` starts equal to `created_at`: a row that has never been edited has
         been "updated" exactly once, when it was created, and a null here would make every
         reader handle a case that lasts until the first `PATCH`.
+
+        `kind` is a `domain.chains.WalletKind` value. It defaults to `address`, which is
+        what every caller before spec 031 meant, and the `CHECK`s on the table refuse
+        anything else and an extended key on a chain other than Bitcoin.
 
         Raises:
             WalletConstraintError: the database refused the insert. The driver's exception
@@ -153,6 +158,7 @@ class WalletRepository:
             archived_at=None,
             created_at=created_at,
             updated_at=created_at,
+            kind=kind,
         )
         self._session.add(wallet)
         try:

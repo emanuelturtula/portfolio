@@ -57,6 +57,7 @@ from tests.security.conftest import (
     assert_absent,
     rendered,
 )
+from tests.wallets_harness import lose_the_race
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -230,45 +231,6 @@ async def test_no_log_line_contains_an_address(
     assert_absent(written, BIP173_TESTNET_P2WPKH, BIP173_TESTNET_P2WPKH_UPPERCASE, corrupted)
 
 
-def lose_the_race(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make the duplicate pre-check miss **once**, then behave normally again.
-
-    That single call is the whole race. Two requests arrive together, both run
-    `find_by_canonical` before either has committed, both find nothing, both insert, and
-    the second meets `uq_wallets_user_chain_address`. By the time the service looks again
-    to establish *why* the insert was refused, the competing row is committed and visible
-    -- so the recovery lookup must see it.
-
-    Patching the method to answer `None` unconditionally, which is what this helper did
-    first, models something else entirely: a database that has lost the row. The service
-    correctly refuses to call that a conflict, re-raises, and the test then measures the
-    handling of a bug rather than the handling of a race. A simulation that is wrong in
-    that direction is worse than none, because it fails and looks like a real defect.
-    """
-    real = WalletRepository.find_by_canonical
-    missed = False
-
-    async def absent_once(
-        self: WalletRepository,
-        *,
-        user_id: int,
-        chain_key: str,
-        address_canonical: str,
-    ) -> Wallet | None:
-        nonlocal missed
-        if not missed:
-            missed = True
-            return None
-        return await real(
-            self,
-            user_id=user_id,
-            chain_key=chain_key,
-            address_canonical=address_canonical,
-        )
-
-    monkeypatch.setattr(WalletRepository, "find_by_canonical", absent_once)
-
-
 async def test_a_duplicate_that_loses_the_race_is_409_and_logs_no_address(
     signed_in_api_client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -352,7 +314,11 @@ async def test_a_constraint_refusal_that_is_not_a_duplicate_logs_no_address(
         address_display: str,
         label: str | None,
         created_at: datetime,
+        kind: str = "address",
     ) -> Wallet:
+        # `kind` mirrors `WalletRepository.add` (spec 031). Without it the service's call
+        # raises `TypeError` before any insert, which is also a 500 that logs no address --
+        # and this test would pass without ever reaching the foreign key it is about.
         del user_id
         return await real_add(
             self,
@@ -362,6 +328,7 @@ async def test_a_constraint_refusal_that_is_not_a_duplicate_logs_no_address(
             address_display=address_display,
             label=label,
             created_at=created_at,
+            kind=kind,
         )
 
     monkeypatch.setattr(WalletRepository, "add", add_for_a_missing_account)
@@ -393,6 +360,9 @@ async def test_a_constraint_refusal_that_is_not_a_duplicate_logs_no_address(
     assert response.status_code == 500, response.text
     assert BIP173_TESTNET_P2WPKH not in response.text
     assert "unhandled_exception" in written, written[:400]
+    # The refusal that reached the handler is the database's, translated by the repository:
+    # the path under test, and not some earlier failure that happens to look the same.
+    assert "WalletConstraintError" in written, written[:400]
     assert_absent(written, BIP173_TESTNET_P2WPKH)
     assert "Cold storage" not in written
 
@@ -635,6 +605,12 @@ ADDRESS_HANDLING_MODULES: Final = (
     SOURCE_ROOT / "services" / "scheduler.py",
     SOURCE_ROOT / "api" / "routers" / "balances.py",
     SOURCE_ROOT / "api" / "schemas" / "balances.py",
+    # Spec 031. An extended public key is every address a wallet will ever derive, so the
+    # modules that parse one, derive from one, scan one and persist what it derived are held
+    # to the same rule as the ones that handle a single address.
+    SOURCE_ROOT / "domain" / "extended_keys.py",
+    SOURCE_ROOT / "providers" / "chains" / "bitcoin.py",
+    SOURCE_ROOT / "repositories" / "derived_addresses.py",
 )
 
 #: Names that would carry an address into a log call's keyword arguments.
