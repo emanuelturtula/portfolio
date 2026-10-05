@@ -7,9 +7,13 @@ what lands in ``backup/``, what a crash between two renames leaves behind -- is 
 fake Docker does prove it. So this module provides:
 
 * ``FakeDocker``: a replacement for ``deploy.run`` that records every command and answers
-  ``pull``, ``image inspect``, ``compose ps/up/down``, ``inspect``, the backup ``exec``,
-  ``cp`` and ``rm`` from a scripted host state. It refuses what real compose would refuse:
-  a compose file that does not exist, a missing ``env_file``, an unset required variable.
+  ``pull``, ``image inspect``, ``compose ps/up/down/stop``, ``inspect``, the backup
+  ``exec``, ``cp`` and ``rm`` from a scripted host state, and the one-off ``compose run``
+  containers a rollback uses (spec 034): the revision read, the stream into the backups
+  volume, and ``restore-backup``. It refuses what real compose would refuse: a compose
+  file that does not exist, a missing ``env_file``, an unset required variable. Its live
+  database has a schema revision, a candidate can be scripted to migrate it at startup,
+  and an image started on a revision it does not know fails, as the application does.
 * ``RecordingLock``: records every directory ``deployment_lock`` is taken in. On POSIX it
   delegates to the real ``fcntl`` lock, so CI exercises it on every deployment; elsewhere
   it only records, because ``fcntl`` does not exist there.
@@ -26,18 +30,21 @@ Windows as well as on Linux CI.
 
 from __future__ import annotations
 
+import ast
 import builtins
 import contextlib
 import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import types
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -45,11 +52,53 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_PY = REPO_ROOT / "deploy" / "deploy.py"
 KIT_COMPOSE = REPO_ROOT / "deploy" / "compose.yml"
+BACKUPS_PY = REPO_ROOT / "backend" / "src" / "portfolio" / "domain" / "backups.py"
 POSIX = os.name == "posix"
 
 # Stands in for exchange credentials in secrets.env. It must never appear anywhere the
 # script writes, prints or passes to Docker.
 SENTINEL_ENV_LINE = b"SENTINEL_VALUE=never-leave-secrets-env-4417\n"
+
+# A row count the fake restore-backup prints. Spec 029 keeps the rows per table out of every
+# log, and deploy.py's message reaches a public Actions log, so this number must appear
+# nowhere deploy.py writes, prints or raises (spec 034, R5).
+SENTINEL_ROW_COUNT = 7319004417
+
+
+def application_backup_name_pattern() -> re.Pattern[str]:
+    """``BACKUP_NAME_PATTERN`` as the application defines it, read without importing it.
+
+    ``tests/deploy`` is standard library only, and the application's package needs its
+    dependencies installed, so the module is parsed with ``ast`` and the one string passed
+    to ``re.compile`` is compiled here. Anything but that exact shape fails loudly, rather
+    than letting a test check names against a pattern of its own.
+    """
+    module = ast.parse(BACKUPS_PY.read_text(encoding="utf-8"))
+    for node in module.body:
+        if isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        else:
+            continue
+        if not (isinstance(target, ast.Name) and target.id == "BACKUP_NAME_PATTERN"):
+            continue
+        assert isinstance(value, ast.Call), "BACKUP_NAME_PATTERN is no longer a call"
+        function = value.func
+        assert (
+            isinstance(function, ast.Attribute)
+            and function.attr == "compile"
+            and isinstance(function.value, ast.Name)
+            and function.value.id == "re"
+        ), "BACKUP_NAME_PATTERN is no longer re.compile(...)"
+        assert len(value.args) == 1 and not value.keywords, "re.compile gained flags"
+        (pattern,) = value.args
+        assert isinstance(pattern, ast.Constant) and isinstance(pattern.value, str)
+        return re.compile(pattern.value)
+    raise AssertionError(f"BACKUP_NAME_PATTERN is not defined in {BACKUPS_PY}")
+
+
+BACKUP_NAME = application_backup_name_pattern()
 
 LEGACY_ATTEMPT_IDS = (
     "20260901T101500Z-0123456789ab",
@@ -139,6 +188,7 @@ class Container:
     id: str
     image: str
     health: str
+    state: str = "running"
 
 
 @dataclass
@@ -152,6 +202,17 @@ class Call:
     compose_file: str | None = None
     compose_bytes: bytes | None = None
     compose_args: tuple[str, ...] = ()
+    # What the command was given as stdin: the file, and its bytes when the call was made.
+    input_file: Path | None = None
+    stdin: bytes | None = None
+    # The application container running when the call was made: a writer of the database.
+    writer: str | None = None
+    # The live database, as (bytes, schema revision), and whether a -wal holding frames lay
+    # beside it, when the call was made.
+    database: tuple[bytes | None, str | None] = (None, None)
+    wal: bool = False
+    # What the command printed, when it succeeded.
+    output: str | None = None
 
     @property
     def image(self) -> str | None:
@@ -159,6 +220,14 @@ class Call:
 
 
 UP_ARGS = ("up", "--detach", "--wait", "--wait-timeout", "180", "app")
+# What every one-off container of a rollback starts with (spec 034, R3).
+RUN_ARGS = ("run", "--rm", "--no-deps", "-T", "app")
+DATABASE_PATH = "/app/data/portfolio.db"
+BACKUPS_PATH = "/app/backups"
+# The schema revision every release's migrations know, and the one the fake live database
+# starts at. A release that migrates is scripted with ``FakeDocker.migrations``.
+BASE_REVISION = "0011_extended_keys"
+_UNKNOWN = object()
 
 
 class FakeDocker:
@@ -179,6 +248,41 @@ class FakeDocker:
         self.unexpected: list[tuple[str, ...]] = []
         self.on_healthy: Callable[[Container], None] | None = None
         self._counter = 0
+        # The live database's Alembic revision (None: no single alembic_version row), and
+        # whether a -wal holding frames lies beside it.
+        self.revision: str | None = BASE_REVISION
+        self.wal = False
+        # image -> the revision its startup migrates the database to (upgrade_to_head).
+        self.migrations: dict[str, str] = {}
+        # image -> revisions it knows beyond BASE_REVISION and its own migration.
+        self.knows: dict[str, set[str]] = {}
+        # The revision each snapshot held, by its bytes: what a copy streamed back holds.
+        self.snapshot_revisions: dict[bytes, str | None] = {}
+        # The backups volume, /app/backups: copy name -> bytes.
+        self.backups: dict[str, bytes] = {}
+        self.safety_copies: list[str] = []
+        self.restored: list[str] = []
+        # Every (image, revision) an image was started on and refused, as the application
+        # refuses a revision its migrations do not know.
+        self.refused_starts: list[tuple[str, str | None]] = []
+        self.stopped: list[str] = []
+        # compose stop ends the application uncleanly (it was killed after the grace
+        # period), so the -wal it held stays beside the database.
+        self.unclean_stop = False
+        self.fail_stop = False
+        # The one-off container that reads the revision cannot run at all.
+        self.fail_revision_read = False
+        self.fail_stream = False
+        # The stream ends early (a pipe cut short) and says how much it wrote: less.
+        self.short_stream = False
+        self.fail_restore = False
+        # restore-backup restores and prints its report, then is killed: run() quotes the
+        # stdout of a command that failed with nothing on stderr.
+        self.restore_killed_after_report = False
+        # What restore-backup says of the live database it replaced, as portfolio.cli does:
+        # "safety" (a safety copy was taken), "damaged" (moved aside) or "none" (no file).
+        self.restore_outcome = "safety"
+        self._stamps = 0
 
     # -- scripting ----------------------------------------------------------------------
 
@@ -202,15 +306,56 @@ class FakeDocker:
     def of_kind(self, kind: str) -> list[Call]:
         return [call for call in self.calls if call.kind == kind]
 
+    def image_knows(self, image: str, revision: str | None) -> bool:
+        """Whether ``image``'s migrations know ``revision``: the base, its own migration and
+        whatever ``knows`` adds. A database with no revision is one it would create."""
+        return (
+            revision is None
+            or revision == BASE_REVISION
+            or revision == self.migrations.get(image)
+            or revision in self.knows.get(image, set())
+        )
+
+    def _copy_name(self) -> str:
+        """A copy name the application would mint, for the safety copy restore-backup takes."""
+        while True:
+            self._stamps += 1
+            instant = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC) + timedelta(seconds=self._stamps)
+            name = f"portfolio-{instant:%Y%m%dT%H%M%S%f}Z.sqlite3"
+            if name not in self.backups:
+                return name
+
     # -- the fake -----------------------------------------------------------------------
 
-    def __call__(self, args: list[str], *, env: dict[str, str] | None = None) -> str:
+    def __call__(
+        self,
+        args: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        input_file: Path | None = None,
+    ) -> str:
         argv = tuple(args)
+        # Read when the command starts, as a subprocess reading its stdin would.
+        stdin = None if input_file is None else Path(input_file).read_bytes()
         portfolio_env = {k: v for k, v in (env or {}).items() if k.startswith("PORTFOLIO_")}
-        if argv[:2] == ("docker", "compose"):
-            return self._compose(argv, portfolio_env)
-        call = Call(kind="unexpected", argv=argv, env=portfolio_env)
+        call = Call(
+            kind="unexpected",
+            argv=argv,
+            env=portfolio_env,
+            input_file=None if input_file is None else Path(input_file),
+            stdin=stdin,
+            writer=self.running,
+            database=(self.database, self.revision),
+            wal=self.wal,
+        )
         self.calls.append(call)
+        call.output = self._answer(call)
+        return call.output
+
+    def _answer(self, call: Call) -> str:
+        argv = call.argv
+        if argv[:2] == ("docker", "compose"):
+            return self._compose(call)
         if argv[:2] == ("docker", "pull") and len(argv) == 3:
             call.kind = "pull"
             if argv[2] not in self.published:
@@ -233,7 +378,13 @@ class FakeDocker:
                     }
                 ]
             )
-        if argv[:2] == ("docker", "exec") and argv[3:5] == ("python", "-c") and len(argv) == 7:
+        if (
+            argv[:2] == ("docker", "exec")
+            and argv[3:5] == ("python", "-c")
+            and len(argv) == 8
+            and argv[5] == getattr(deploy, "SNAPSHOT_SCRIPT", None)
+            and argv[6] == DATABASE_PATH
+        ):
             call.kind = "exec-backup"
             if argv[2] != self.running:
                 raise deploy.DeploymentError("No such container")
@@ -241,9 +392,10 @@ class FakeDocker:
                 raise deploy.DeploymentError("database disk image is malformed")
             if self.database is None:
                 return "absent"
-            self.inner_files[argv[6]] = self.database
+            self.inner_files[argv[7]] = self.database
             self.snapshots.append(self.database)
-            return "ok"
+            self.snapshot_revisions[self.database] = self.revision
+            return "ok" if self.revision is None else f"ok {self.revision}"
         if argv[:2] == ("docker", "cp") and len(argv) == 4:
             call.kind = "cp"
             container_id, _, inner = argv[2].partition(":")
@@ -264,9 +416,15 @@ class FakeDocker:
         self.unexpected.append(argv)
         raise deploy.DeploymentError(f"the fake Docker does not know {argv!r}")
 
-    def _compose(self, argv: tuple[str, ...], env: dict[str, str]) -> str:
-        call = Call(kind="compose-unexpected", argv=argv, env=env)
-        self.calls.append(call)
+    @staticmethod
+    def _require_env_file(env: dict[str, str]) -> None:
+        env_file = env.get("PORTFOLIO_SECRETS_ENV_FILE", "")
+        if env_file and not Path(env_file).is_file():
+            raise deploy.DeploymentError(f"env file {env_file} not found")
+
+    def _compose(self, call: Call) -> str:
+        argv, env = call.argv, call.env
+        call.kind = "compose-unexpected"
         if len(argv) < 7 or argv[2] != "--project-name" or argv[4] != "--file":
             self.unexpected.append(argv)
             raise deploy.DeploymentError(f"unexpected compose invocation {argv!r}")
@@ -284,23 +442,151 @@ class FakeDocker:
             return self.running or ""
         if verb == UP_ARGS:
             call.kind = "compose-up"
-            env_file = env.get("PORTFOLIO_SECRETS_ENV_FILE", "")
-            if env_file and not Path(env_file).is_file():
-                raise deploy.DeploymentError(f"env file {env_file} not found")
+            self._require_env_file(env)
             image = env["PORTFOLIO_IMAGE"]
+            actual = self.substitute.get(image, image)
+            if self.database is not None and not self.image_knows(actual, self.revision):
+                # The application migrates at startup (upgrade_to_head) and cannot start on
+                # a revision its migrations do not know: the container restarts, failing.
+                self.refused_starts.append((actual, self.revision))
+                self.start(actual, "unhealthy")
+                raise deploy.DeploymentError(
+                    "container portfolio-app-prod-app-1 exited (1): Can't locate revision "
+                    f"identified by '{self.revision}'"
+                )
             health = "unhealthy" if image in self.unhealthy else "healthy"
-            container = self.start(self.substitute.get(image, image), health)
+            container = self.start(actual, health)
+            if self.database is not None:
+                self.wal = True  # The application holds it open, in WAL mode.
+                target = self.migrations.get(actual)
+                if target is not None and target != self.revision:
+                    # Migrated at startup, before the health check can pass or fail.
+                    self.revision = target
+                    migrated = f"live database migrated to {target} by {container.id}\n"
+                    self.database = migrated.encode()
             if image in self.fail_up or health != "healthy":
                 raise deploy.DeploymentError("container portfolio-app-prod-app-1 is unhealthy")
             if self.database is not None:
                 self.database = f"live database once {container.id} ran {image}\n".encode()
             return ""
+        if verb == ("stop", "app"):
+            call.kind = "compose-stop"
+            if self.fail_stop:
+                raise deploy.DeploymentError("Command failed (1): Error response from daemon")
+            if self.running is not None:
+                container = self.containers[self.running]
+                container.state = "exited"
+                self.stopped.append(container.id)
+                self.running = None
+                # A clean stop closes the database, and SQLite removes the -wal with the last
+                # connection. A container killed after its grace period leaves it.
+                self.wal = self.wal and self.unclean_stop
+            return ""
         if verb == ("down",):
             call.kind = "compose-down"
             self.running = None
+            self.wal = False
             return ""
+        if verb[: len(RUN_ARGS)] == RUN_ARGS:
+            self._require_env_file(env)
+            return self._one_off(call, verb[len(RUN_ARGS) :], env["PORTFOLIO_IMAGE"])
         self.unexpected.append(argv)
         raise deploy.DeploymentError(f"unexpected compose verb {verb!r}")
+
+    def _one_off(self, call: Call, command: tuple[str, ...], image: str) -> str:
+        """A ``compose run --rm --no-deps -T app <command>`` container of ``image``."""
+        revision_script = getattr(deploy, "REVISION_SCRIPT", None)
+        stream_script = getattr(deploy, "STREAM_SCRIPT", None)
+        if command == ("python", "-c", revision_script, DATABASE_PATH):
+            call.kind = "compose-run-revision"
+            if self.fail_revision_read:
+                raise deploy.DeploymentError(
+                    "Command failed (125): Error response from daemon: no space left on device"
+                )
+            if self.database is None:
+                return "absent"
+            if self.running is None:
+                # Opened read-write and closed last: SQLite recovers what a -wal holds into
+                # the file and removes it. With the application still running, it stays.
+                self.wal = False
+            if self.revision is None:
+                raise deploy.DeploymentError(
+                    "Command failed (1): expected exactly one row in alembic_version"
+                )
+            return self.revision
+        if len(command) == 5 and command[:4] == ("python", "-c", stream_script, BACKUPS_PATH):
+            call.kind = "compose-run-stream"
+            name = command[4]
+            if call.stdin is None:
+                self.unexpected.append(call.argv)
+                raise deploy.DeploymentError("the stream was given nothing on stdin")
+            if self.fail_stream:
+                raise deploy.DeploymentError(
+                    "Command failed (1): [Errno 28] No space left on device"
+                )
+            if name in self.backups:
+                raise deploy.DeploymentError(f"Command failed (1): {name} already exists")
+            written = call.stdin[: len(call.stdin) // 2] if self.short_stream else call.stdin
+            self.backups[name] = written
+            return f"ok {len(written)}"
+        if len(command) == 5 and command[:4] == ("python", "-m", "portfolio", "restore-backup"):
+            call.kind = "compose-run-restore"
+            return self._restore(command[4], image)
+        self.unexpected.append(call.argv)
+        raise deploy.DeploymentError(f"the fake compose run does not know {command!r}")
+
+    def _restore(self, name: str, image: str) -> str:
+        """``python -m portfolio restore-backup <name>``, as spec 029 and portfolio.cli do it.
+
+        It refuses before it writes anything: while a -wal is beside the live database
+        (step 1), a name that is not a copy in the volume (step 2), a copy without one
+        revision or with one this image does not know (step 3). On success it prints what
+        the real command prints, row counts included.
+        """
+        revision: Any = _UNKNOWN
+        if name in self.backups:
+            revision = self.snapshot_revisions.get(self.backups[name], _UNKNOWN)
+        refusal = None
+        if self.fail_restore:
+            refusal = f"{name} did not pass its integrity check"
+        elif self.wal:
+            refusal = "the database is open: a -wal file is beside it. Stop the application"
+        elif not BACKUP_NAME.fullmatch(name) or name not in self.backups:
+            refusal = f"{name} is not a backup in {BACKUPS_PATH}"
+        elif revision is _UNKNOWN or revision is None:
+            refusal = f"{name} does not hold exactly one schema revision"
+        elif not self.image_knows(image, revision):
+            refusal = f"{name} is at revision {revision}, which this version does not know"
+        if refusal is not None:
+            # The command prints no counts when it refuses; run() reports its stderr.
+            raise deploy.DeploymentError(f"Command failed (1): Refusing to restore: {refusal}")
+        lines = [f"Restored {name}."]
+        if self.restore_outcome == "none" or self.database is None:
+            lines.append("There was no database to copy first, so no safety copy was taken.")
+        elif self.restore_outcome == "damaged":
+            moved = f"{DATABASE_PATH}.damaged-{self._copy_name()[10:-8]}"
+            lines.append(
+                "The live database opened but did not pass its own check, so no safety copy "
+                f"was taken: it was moved aside to {moved}. Keep it until the restore is "
+                "checked, then delete it."
+            )
+        else:
+            safety = self._copy_name()
+            self.backups[safety] = self.database
+            self.snapshot_revisions.setdefault(self.database, self.revision)
+            self.safety_copies.append(safety)
+            lines.append(f"The database as it was before is in the safety copy {safety}.")
+        self.database = self.backups[name]
+        self.revision = revision
+        self.wal = False
+        self.restored.append(name)
+        lines.append("Rows per table after the restore:")
+        counts = (("accounts", 3), ("exchange_fills", SENTINEL_ROW_COUNT), ("wallets", 2))
+        lines.extend(f"  {table}: {rows}" for table, rows in counts)
+        report = "\n".join(lines)
+        if self.restore_killed_after_report:
+            raise deploy.DeploymentError(f"Command failed (137): {report}")
+        return report
 
 
 class RecordingLock:

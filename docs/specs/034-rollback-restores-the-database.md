@@ -106,9 +106,10 @@ cover the one change most likely to break a deployment: a migration.
   - A carried snapshot exists only when the live deployment could not be snapshotted, and
     it may be older than writes made since. Restoring it automatically could replace days
     of data without anyone deciding to.
-  - With no own snapshot and a migrated database, the state is `not_restored`. The rollback
-    still tries the previous image, which fails as today, but now with a message that says
-    why.
+  - With no own snapshot, there is no revision to compare with, so any existing database
+    counts as moved and the state is `not_restored`, whether or not the candidate migrated.
+    The rollback still tries the previous image. If it comes up, the candidate had not
+    migrated. If it does not, the message now says why.
 - **R7. The streamed copy and the safety copy stay in the backups volume** as ordinary
   copies. They are listed by `list-backups` and rotated by the scheduled retention like any
   other. The snapshot also stays in `failed/`, as today.
@@ -123,6 +124,22 @@ cover the one change most likely to break a deployment: a migration.
   and later. The live image is newer, and a rollback target is always the live image, so
   this holds for every rollback from now on. It is stated in the docstring, not checked at
   run time.
+
+- **R11. A restore needs the snapshot's revision.**
+  - An own snapshot whose `alembic_version` holds no single revision gives `not_restored`,
+    and nothing is restored.
+  - `restore-backup` would refuse such a copy anyway. Attempting it would end
+    `restore_failed`, and the previous image would not be started, where today's code
+    would start it.
+- **R12. Only a failed restore skips the previous image's `up`.**
+  - If stopping the candidate or reading the live revision fails, nothing has been
+    restored or changed. The result gets `database = "unread"` and `database_error`, and
+    the rollback goes on to start the previous image exactly as before this change.
+  - Without this, a compose file that compose rejects (for example) would end
+    `rollback=failed`, although the candidate's `up` never touched the running container
+    and production is still up.
+  - When the stream or `restore-backup` fails, the revision is known to have moved, so the
+    previous image cannot start. It is not started, and the state is `restore_failed`.
 
 ## Design
 
@@ -143,8 +160,10 @@ All of it is in `deploy/deploy.py`.
      `database = "restored"`;
    - different, with no own snapshot → `database = "not_restored"` (R6).
 4. Start the previous image and verify it, exactly as today.
-5. Any exception in steps 1-4 → `rollback = "failed"` with `rollback_error`, as today. When
-   the restore itself raised, `database = "restore_failed"`.
+5. If steps 1 or 2 raise → `database = "unread"` with `database_error`, then step 4 as
+   today (R12). If the stream or the restore raises → `database = "restore_failed"`,
+   `rollback = "failed"` with `rollback_error`, and step 4 is skipped. If step 4 raises →
+   `rollback = "failed"`, as today.
 
 **The result and the error message.**
 - `result` gains `database`, `database_revision` (before), `database_revision_live`
@@ -152,7 +171,7 @@ All of it is in `deploy/deploy.py`.
   when it is known.
 - The error message becomes
   `Deployment failed; rollback=<...>; database=<...>; evidence=<...>`. `database=` appears
-  only when the rollback got as far as reading the revision.
+  whenever there was a previous deployment to roll back to, `unread` included (R12).
 
 **Rejected alternatives.**
 - A restore implemented in `deploy.py`: rejected in R4.
@@ -187,8 +206,13 @@ Added by this spec:
      revision;
    - the stream writer produces a file whose bytes equal its input, under a name the
      application's `BACKUP_NAME_PATTERN` accepts.
-9. No row count and no output of `restore-backup` appears in the error message, in
-   `result.json` or in `last-attempt.json`. The secrets sentinel still appears nowhere.
+9. No row count `restore-backup` prints appears in the error message, in `result.json` or
+   in `last-attempt.json`. Its refusal or error text may appear in `rollback_error`, which
+   stays on the host, never in the message. The secrets sentinel still appears nowhere.
+10. If stopping the candidate or reading the revision fails, the result is
+    `database=unread` with `database_error`. The previous image's `up` is still attempted,
+    and when it comes up the outcome is `rollback=healthy`.
+11. An own snapshot with no single revision gives `database=not_restored`, with no restore.
 
 ## Test plan
 
@@ -200,6 +224,8 @@ Added by this spec:
 | 6 | `restore-backup` fails: `rollback=failed`, `database=restore_failed`, `failed/database.sqlite3` present, and the previous image not started on the migrated database |
 | 7 | A carried snapshot only (the previous deployment unhealthy at snapshot time) and a migrated database: `not_restored`, with no restore |
 | 8 | The real scripts, executed with `sys.executable` on SQLite files under a temporary directory. The copy-name check reads `BACKUP_NAME_PATTERN` from `backend/src/portfolio/domain/backups.py` with `ast`, because `tests/deploy` is standard-library only |
+| 10 | `compose stop` fails, and separately the revision read fails: `database=unread`, `database_error` set, the previous `up` called, `rollback=healthy` |
+| 11 | The fake snapshot reports bare `ok` (no revision) and the candidate migrates: `not_restored`, with no stream and no restore |
 | 9 | The fake `restore-backup` prints rows-per-table lines with a sentinel count. The test asserts that the sentinel appears in no message, no JSON and no captured stdout or stderr. The existing secrets-sentinel checks run on the new paths |
 | 4 | `test_deploy_docs.py`: the section names the restore and the `database=` states |
 | — | Every existing test in `tests/deploy/` still passes. The ones that pin the old rollback sequence change only to follow the new steps, never to weaken what they check |
@@ -208,7 +234,7 @@ Added by this spec:
 
 | Agent | Owns |
 |---|---|
-| backend-dev | `deploy/deploy.py`, `docs/deployment.md` (the rolling-back section and the troubleshooting rows) |
+| backend-dev | `deploy/deploy.py`, `docs/deployment.md` |
 | tester | `tests/deploy/**`, including `deploy_harness.py`'s `FakeDocker` (`compose stop`, `compose run`, stdin, and revisions on the fake database) |
 | tech lead | this spec |
 | reviewer | nothing |

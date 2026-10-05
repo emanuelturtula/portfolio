@@ -52,8 +52,26 @@ Safety properties, in the order they are enforced:
   deleted before the copy replacing it is fsynced under its final name;
 * the new container must report healthy *and* be running the exact digest, otherwise the
   previous deployment is restored;
+* before the previous deployment starts again, the candidate is stopped and the live
+  database's schema revision is read; if the candidate moved it, the attempt's own
+  snapshot is put back with the previous image's own ``restore-backup``, which keeps a
+  safety copy of the migrated database, and a restore that fails leaves the previous image
+  unstarted rather than starting it on a database it cannot read. A stop or a revision
+  read that fails has changed nothing, so it leaves the decision to the rollback as
+  before: the previous image is started;
 * every file this script writes is written to a temporary file and then renamed over the
-  old one, so a crash leaves the old file or the new one, never a torn one.
+  old one, so a crash leaves the old file or the new one, never a torn one. That holds in
+  the backups volume too: the snapshot a rollback restores lands there through a
+  ``.partial`` file, fsynced and renamed.
+
+A rollback that restores leaves two copies in the backups volume, beside the scheduled
+ones and rotated with them: the snapshot it restored, under a copy's name, and the safety
+copy ``restore-backup`` took of the migrated database. The snapshot also stays in
+``failed/``. ``result.json`` says which happened in ``database``: ``unchanged``,
+``restored``, ``not_restored`` (the revision moved, or could not be compared, and the
+attempt has no snapshot of its own with a revision to put back), ``restore_failed``, or
+``unread`` (stopping the candidate or reading the revision failed). See
+``roll_back_database`` (spec 034).
 """
 
 from __future__ import annotations
@@ -82,7 +100,114 @@ RUN_URL = re.compile(rf"https://github\.com/{re.escape(REPOSITORY)}/actions/runs
 ENVIRONMENTS = {"prod": "8083"}
 PROJECT_PREFIX = "portfolio-app"
 DATABASE = "/app/data/portfolio.db"
+# The scheduled copies' directory in the container, on the backups volume: the compose
+# file's PORTFOLIO_BACKUP_DIR, and where restore-backup looks for the copy it is named.
+BACKUP_DIRECTORY = "/app/backups"
 WAIT_TIMEOUT_SECONDS = "180"
+# An Alembic revision as the application names them (0010_exchange_balances). A value read
+# from a database that is not one is never trusted into a record or a comparison.
+DATABASE_REVISION = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+# A copy's name, as the application's BACKUP_NAME_PATTERN (domain/backups.py) accepts it:
+# the UTC instant it was started, to the microsecond.
+COPY_NAME = re.compile(r"portfolio-[0-9]{8}T[0-9]{12}Z\.sqlite3")
+# What restore-backup prints before the rows per table, which no record may hold (spec 034
+# R5). Only ever looked for in a failure's diagnostic; see roll_back_database.
+ROWS_REPORT = "Rows per table"
+# docker compose run, for a one-off container of the service: removed when it exits, with
+# no other service started, no terminal and no published port. The service's volumes,
+# user and env_file are kept, which is the point.
+ONE_OFF = ("run", "--rm", "--no-deps", "-T", "app")
+
+# The scripts below run in a container, with the image's Python, as ``python -c SCRIPT
+# ARGS...``. Each takes its paths as arguments, so the tests run the very same text with the
+# host's Python against real SQLite files (spec 034, R9). Standard library only, and no
+# ``assert``: a check must hold under ``python -O`` too.
+
+# Copies the live database (argv[1]) to argv[2] with SQLite's backup API, from a read-only
+# connection, in one step: one read transaction, so the copy is consistent while the
+# application writes. The copy is made one self-contained file (journal_mode=DELETE: the
+# backup copies page 1, whose header would otherwise say WAL), checked, and its schema
+# revision printed: "ok <revision>", or "ok" when alembic_version does not hold exactly one
+# row -- no reason to refuse a deployment. "absent" when there is no database yet.
+SNAPSHOT_SCRIPT = """\
+import os, pathlib, sqlite3, sys
+database, copy = sys.argv[1], sys.argv[2]
+if not os.path.exists(database):
+    print("absent")
+    sys.exit(0)
+source = sqlite3.connect(pathlib.Path(database).resolve().as_uri() + "?mode=ro", uri=True)
+target = sqlite3.connect(copy)
+source.backup(target, pages=-1)
+source.close()
+if target.execute("PRAGMA journal_mode=DELETE").fetchall() != [("delete",)]:
+    sys.exit("the copy could not be made one file")
+if target.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+    sys.exit("the copy did not pass PRAGMA integrity_check")
+try:
+    rows = target.execute("SELECT version_num FROM alembic_version").fetchall()
+except sqlite3.OperationalError:
+    rows = []
+target.close()
+if len(rows) == 1:
+    print("ok", rows[0][0])
+else:
+    print("ok")
+"""
+
+# Prints the schema revision of the database at argv[1], or "absent" when there is none.
+# Opened read-write, without creating it: after an unclean stop a -wal still holds committed
+# transactions, and a read-write connection that closes last recovers them into the file
+# and removes the -wal, which restore-backup would otherwise read as an open database and
+# refuse (spec 029's release_wal; spec 034 R3). Fails unless alembic_version holds one row.
+REVISION_SCRIPT = """\
+import os, pathlib, sqlite3, sys
+database = sys.argv[1]
+if not os.path.exists(database):
+    print("absent")
+    sys.exit(0)
+connection = sqlite3.connect(pathlib.Path(database).resolve().as_uri() + "?mode=rw", uri=True)
+rows = connection.execute("SELECT version_num FROM alembic_version").fetchall()
+connection.close()
+if len(rows) != 1:
+    sys.exit("alembic_version holds %d rows, not one" % len(rows))
+print(rows[0][0])
+"""
+
+# Writes stdin into the directory argv[1] under the copy name argv[2], the way the
+# application writes a scheduled copy: into ".portfolio-<stamp>.partial", fsynced, renamed,
+# and the directory fsynced. The application's own clean-up removes a .partial a crash
+# left, once it is an hour old. Refuses a name that is not a copy's, or one already taken.
+# Prints "ok <bytes written>", which the caller compares with the file it sent.
+STREAM_SCRIPT = """\
+import os, re, shutil, sys
+directory, name = sys.argv[1], sys.argv[2]
+match = re.fullmatch(r"portfolio-([0-9]{8}T[0-9]{12}Z)[.]sqlite3", name)
+if match is None:
+    sys.exit("not a copy's name")
+final = os.path.join(directory, name)
+partial = os.path.join(directory, ".portfolio-" + match.group(1) + ".partial")
+if os.path.lexists(final):
+    sys.exit(name + " already exists")
+target = open(partial, "xb")
+try:
+    with target:
+        shutil.copyfileobj(sys.stdin.buffer, target)
+        target.flush()
+        os.fsync(target.fileno())
+        size = target.tell()
+    if os.path.lexists(final):
+        sys.exit(name + " already exists")
+    os.rename(partial, final)
+except BaseException:
+    if os.path.lexists(partial):
+        os.remove(partial)
+    raise
+if os.name == "posix":
+    descriptor = os.open(directory, os.O_RDONLY)
+    os.fsync(descriptor)
+    os.close(descriptor)
+print("ok", size)
+"""
 
 ROOT_NAME = "portfolio-app"
 LEGACY_ROOT_NAME = "portfolio-app-deploy"
@@ -138,15 +263,23 @@ def command_name(args: list[str]) -> str:
     return " ".join(args[:3] if args[1:2] == ["image"] else args[:2])
 
 
-def run(args: list[str], *, env: dict[str, str] | None = None) -> str:
+def run(
+    args: list[str], *, env: dict[str, str] | None = None, input_file: Path | None = None
+) -> str:
     """Run a command and return its output. Every docker call goes through here.
 
     Its failures are reported without the command's arguments, and docker's own output
     is redacted: both can spell out absolute paths under the home directory.
+
+    ``input_file``, when given, is opened in binary and becomes the command's stdin. It is
+    how a rollback hands a database copy to a one-off container: a bind mount of a 0600 file
+    the deploy user owns cannot be read by the container's user, and ``docker cp`` would
+    leave the copy owned by root (spec 034).
     """
+    stdin = None if input_file is None else open(input_file, "rb")
     try:
         return subprocess.run(
-            args, env=env, check=True, text=True, capture_output=True,
+            args, env=env, stdin=stdin, check=True, text=True, capture_output=True,
             timeout=COMMAND_TIMEOUT_SECONDS,
         ).stdout.strip()
     except subprocess.CalledProcessError as error:
@@ -159,6 +292,9 @@ def run(args: list[str], *, env: dict[str, str] | None = None) -> str:
         raise DeploymentError(
             f"{command_name(args)} did not finish within {COMMAND_TIMEOUT_SECONDS} seconds"
         ) from None
+    finally:
+        if stdin is not None:
+            stdin.close()
 
 
 def read_json(path: Path) -> Manifest:
@@ -451,10 +587,17 @@ def prepare_secrets_env_file(root: Path, environment: str) -> Path:
     return path
 
 
-def compose(manifest: Manifest, compose_file: Path, secrets_file: Path, *args: str) -> str:
+def compose(
+    manifest: Manifest,
+    compose_file: Path,
+    secrets_file: Path,
+    *args: str,
+    input_file: Path | None = None,
+) -> str:
     """Run ``docker compose`` for the deployment ``manifest`` describes.
 
     The files come from the layout, never from the manifest, which records no paths.
+    ``input_file`` becomes the command's stdin, as ``run`` describes.
     """
     environment = os.environ.copy()
     environment.update(
@@ -474,6 +617,7 @@ def compose(manifest: Manifest, compose_file: Path, secrets_file: Path, *args: s
             *args,
         ],
         env=environment,
+        input_file=input_file,
     )
 
 
@@ -489,33 +633,44 @@ def verify_running(manifest: Manifest, compose_file: Path, secrets_file: Path) -
     return str(container)
 
 
+class Snapshot(NamedTuple):
+    """A copy of the live database ``backup`` took.
+
+    ``revision`` is the Alembic revision the copy holds, read from the copy itself, or None
+    when its ``alembic_version`` does not hold exactly one revision. A rollback compares it
+    with the live database's to tell whether the candidate migrated (spec 034, R1).
+    """
+
+    revision: str | None
+
+
 def backup(
     previous: Manifest, compose_file: Path, secrets_file: Path, destination: Path, tag: str
-) -> bool:
-    """Copy the live SQLite database to ``destination``; return whether there was one.
+) -> Snapshot | None:
+    """Copy the live SQLite database to ``destination``; None when there was nothing to copy.
 
     Uses sqlite3's own backup API inside the running container rather than copying the
     file, so the snapshot is consistent even while the application is writing, and
-    verifies it with an integrity check before accepting it.
+    verifies it with an integrity check before accepting it. ``SNAPSHOT_SCRIPT`` has the
+    steps. The copy is written into the data volume, beside the database, and removed once
+    ``docker cp`` has brought it out.
     """
     try:
         container = verify_running(previous, compose_file, secrets_file)
     except DeploymentError:
-        return False  # Nothing healthy to back up; this deployment may well be the fix.
+        return None  # Nothing healthy to back up; this deployment may well be the fix.
     inner_path = f"/app/data/deploy-backup-{tag}.sqlite3"
-    script = (
-        "import os,sqlite3,sys\n"
-        f"if not os.path.exists({DATABASE!r}): print('absent'); sys.exit(0)\n"
-        f"source=sqlite3.connect('file:{DATABASE}?mode=ro',uri=True)\n"
-        "target=sqlite3.connect(sys.argv[1]); source.backup(target)\n"
-        "assert target.execute('PRAGMA integrity_check').fetchone()[0]=='ok'\n"
-        "target.close(); source.close(); print('ok')"
+    output = run(
+        ["docker", "exec", container, "python", "-c", SNAPSHOT_SCRIPT, DATABASE, inner_path]
     )
-    if run(["docker", "exec", container, "python", "-c", script, inner_path]) == "absent":
-        return False
+    if output == "absent":
+        return None
+    status, _, revision = output.partition(" ")
+    if status != "ok":
+        raise DeploymentError("The database snapshot did not report that it succeeded")
     run(["docker", "cp", f"{container}:{inner_path}", str(destination)])
     run(["docker", "exec", container, "rm", "-f", inner_path])
-    return True
+    return Snapshot(revision if DATABASE_REVISION.fullmatch(revision) else None)
 
 
 def check_run_order(
@@ -1036,6 +1191,147 @@ def record_failure(prod: Path, result: Manifest, carry: Path | None = None) -> s
     return display(failed)
 
 
+def copy_name(instant: datetime) -> str:
+    """The name the application gives a copy started at ``instant``, which must be aware.
+
+    ``portfolio-YYYYMMDDTHHMMSSffffffZ.sqlite3`` in UTC: the only shape its
+    ``BACKUP_NAME_PATTERN`` accepts, and so the only one ``restore-backup`` restores.
+    """
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ValueError("A copy's instant must be timezone-aware")
+    return f"portfolio-{instant.astimezone(UTC):%Y%m%dT%H%M%S%f}Z.sqlite3"
+
+
+def safety_copy_name(output: str) -> str | None:
+    """The safety copy ``restore-backup`` reports in ``output``, or None.
+
+    Read from the one line that mentions a safety copy, and only as a copy's name: nothing
+    else of that output may be recorded (spec 034, R5). None when no line, or more than one,
+    mentions it, or the line names no single copy -- there was no live database to copy, or
+    it was too damaged to copy and was moved aside instead.
+    """
+    lines = [line for line in output.splitlines() if "safety copy" in line]
+    if len(lines) != 1:
+        return None
+    names = re.findall(rf"\b{COPY_NAME.pattern}\b", lines[0])
+    return names[0] if len(names) == 1 else None
+
+
+def roll_back_database(
+    prod: Path,
+    candidate: Manifest,
+    candidate_compose: Path,
+    previous: Live,
+    secrets_file: Path,
+    result: Manifest,
+) -> None:
+    """Put the database back as the previous deployment left it, if the candidate moved it.
+
+    The application migrates its database forward when it starts, never backwards, and an
+    image that does not know the database's revision refuses to start. So a candidate that
+    migrated and then failed would leave the previous image a database it cannot start on.
+    Spec 034:
+
+    1. Stop the candidate, so that nothing writes while the revision is read or the
+       database replaced. Compose does not restart a container it stopped, and the ``up``
+       that follows replaces it.
+    2. Read the live revision in a one-off container of the previous image (the same image,
+       volumes and user the rollback starts), with ``REVISION_SCRIPT``.
+    3. Compare it with the revision of the attempt's own snapshot:
+       - equal: ``unchanged``, and nothing is touched;
+       - different, with no snapshot of the attempt's own, or one holding no single
+         revision: ``not_restored``. A carried snapshot can be older than writes made
+         since, and replacing them is a person's call (R6); a snapshot without one
+         revision is one ``restore-backup`` refuses (R11);
+       - different, with one: stream the snapshot into the backups volume under a copy's
+         name (``STREAM_SCRIPT``), then restore it with the previous image's own
+         ``restore-backup`` (spec 029), which checks the copy and that the image knows its
+         revision, takes a safety copy of the migrated database first, and writes through
+         the backup API. ``restored``.
+
+    Only a failed restore raises (R12). A stream or restore that fails is
+    ``restore_failed``: the revision is known to have moved, so the previous image is not
+    started on a database it cannot read. A stop or revision read that fails has changed
+    nothing, so it is ``unread``, with ``database_error``, and returns: the rollback starts
+    the previous image as it did before this step existed. Every field goes into ``result``
+    as soon as it is known, so a failure part-way still records how far this got.
+
+    ``restore-backup`` prints the rows per table, which spec 029 keeps out of every log, and
+    the error message reaches a public Actions log: nothing of its output but the safety
+    copy's name ever enters ``result`` (R5).
+
+    Needs a previous image that has ``restore-backup``: v0.29.0 or later (R10). A rollback
+    target is always the live image, and every one from now on is newer than that, so this
+    is stated here rather than checked.
+
+    The ``run`` options are Docker Compose's documented ones (``docker compose run``
+    reference, read 2026-10-05): ``--rm`` removes the container and overrides its restart
+    policy, ``--no-deps`` starts no linked service, ``-T`` allocates no terminal, stdin is
+    attached by default (``--interactive``), no port of the service is published, and the
+    service's volumes and environment apply. Assumed, not documented: ``stop`` of a service
+    with no container succeeds and changes nothing.
+    """
+    try:
+        compose(candidate, candidate_compose, secrets_file, "stop", "app")
+        output = compose(
+            previous.manifest, previous.compose_file, secrets_file,
+            *ONE_OFF, "python", "-c", REVISION_SCRIPT, DATABASE,
+        )
+        live = None if output == "absent" else output
+        if live is not None and not DATABASE_REVISION.fullmatch(live):
+            raise DeploymentError("The live database's schema revision could not be read")
+    except Exception as error:
+        # Nothing has been restored or changed, so this decides nothing: the rollback goes
+        # on as it did before this step existed (R12). A compose file compose rejects, for
+        # one, fails here although the live container was never touched.
+        result["database"] = "unread"
+        result["database_error"] = reason(error)
+        return
+    result["database_revision_live"] = live
+    if live == candidate.get("database_revision"):
+        result["database"] = "unchanged"
+        return
+    if not candidate.get("backup") or candidate.get("database_revision") is None:
+        # No snapshot of its own, or one holding no single revision, which restore-backup
+        # would refuse: nothing this attempt can put back (R6, R11).
+        result["database"] = "not_restored"
+        return
+    snapshot = prod / "incoming" / "database.sqlite3"
+    # Stamped when the restore starts, as the copy's name records when it was taken.
+    name = copy_name(datetime.now(UTC))
+    try:
+        streamed = compose(
+            previous.manifest, previous.compose_file, secrets_file,
+            *ONE_OFF, "python", "-c", STREAM_SCRIPT, BACKUP_DIRECTORY, name,
+            input_file=snapshot,
+        )
+        if streamed != f"ok {snapshot.stat().st_size}":
+            raise DeploymentError("The snapshot did not reach the backups volume whole")
+        result["database_restored_from"] = name
+        restored = compose(
+            previous.manifest, previous.compose_file, secrets_file,
+            *ONE_OFF, "python", "-m", "portfolio", "restore-backup", name,
+        )
+    except Exception as failure:
+        result["database"] = "restore_failed"
+        # The command prints its report on stdout, and run() quotes stdout when stderr is
+        # empty: a restore that reported and was then killed would put the rows per table
+        # into rollback_error. Of that report only the safety copy's name is kept, which is
+        # where the migrated database now is. Refusals and errors go to stderr, and are kept.
+        if ROWS_REPORT in str(failure):
+            safety = safety_copy_name(str(failure))
+            if safety is not None:
+                result["database_safety_copy"] = safety
+            raise DeploymentError(
+                "restore-backup failed after it reported a result; its output is not recorded"
+            ) from None
+        raise
+    safety = safety_copy_name(restored)
+    if safety is not None:
+        result["database_safety_copy"] = safety
+    result["database"] = "restored"
+
+
 def deploy(
     environment: str,
     image: str,
@@ -1137,17 +1433,22 @@ def deploy_locked(
 
     snapshot = incoming / "database.sqlite3"
     candidate["backup"] = False
+    # The schema revision this attempt's snapshot holds: the one the live deployment ran
+    # on. A rollback compares the database with it to tell whether this attempt migrated.
+    candidate["database_revision"] = None
     if previous is not None:
         try:
             # docker cp writes in place, so it writes a temporary name: only a finished,
             # fsynced copy is ever called database.sqlite3.
             partial = incoming / ".database.sqlite3.tmp"
-            if backup(previous.manifest, previous.compose_file, secrets, partial, attempt):
+            taken = backup(previous.manifest, previous.compose_file, secrets, partial, attempt)
+            if taken is not None:
                 fsync_file(partial)
                 write_atomic(incoming / "snapshot.json", snapshot_record(attempt))
                 os.replace(partial, snapshot)
                 fsync_directory(incoming)
                 candidate["backup"] = True
+                candidate["database_revision"] = taken.revision
         except Exception as failure:
             evidence = record_failure(
                 prod,
@@ -1186,6 +1487,9 @@ def deploy_locked(
         result = dict(candidate, status="failed", error=reason(failure))
         try:
             if previous is not None:
+                # The candidate may have migrated the database, which the previous image
+                # could not start on; this stops it and, if so, puts the snapshot back.
+                roll_back_database(prod, candidate, candidate_compose, previous, secrets, result)
                 compose(
                     previous.manifest,
                     previous.compose_file,
@@ -1206,8 +1510,11 @@ def deploy_locked(
             result["rollback"] = "failed"
             result["rollback_error"] = reason(rollback_failure)
         evidence = record_failure(prod, result, carry)
+        # The state only, never a revision, a copy's name or an error's text: this line
+        # reaches the public Actions log, and failed/result.json on the host has the rest.
+        database = f"; database={result['database']}" if "database" in result else ""
         raise DeploymentError(
-            f"Deployment failed; rollback={result['rollback']}; evidence={evidence}"
+            f"Deployment failed; rollback={result['rollback']}{database}; evidence={evidence}"
         ) from failure
 
     candidate.update(status="healthy", deployed_at=datetime.now(UTC).isoformat())
