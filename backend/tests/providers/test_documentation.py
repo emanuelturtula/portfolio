@@ -723,17 +723,18 @@ def test_the_document_records_the_confirmed_bingx_facts(phrase: str) -> None:
 
 
 def test_the_bingx_section_links_the_documentation_and_states_the_retention_and_why() -> None:
-    """The 365-day bound is declared, not measured, and the section says why.
+    """The 90-day bound is stated, and the section says why a year was not kept.
 
     The why is the probe's reading of fills more than a week old against the documented 7
-    days, and BingX's only longer statement, a year, from its support centre. Spec 017's R5
-    keeps the owner's account out of the repository, so the section states the relation --
-    "more than a week" -- and never the account's own figures.
+    days, BingX's only longer statement, a year, from its support centre, and the first live
+    sync finding that windows older than about 90 days are answered with the wrong fills.
+    Spec 017's R5 keeps the owner's account out of the repository, so the section states the
+    relation -- "more than a week" -- and never the account's own figures.
     """
     section = flattened(bingx_section())
 
     assert BINGX_DOCS_URL.search(section), "no link into bingx-api.github.io"
-    assert re.search(r"\b365[ -]days?\b", section), "the retention is not stated in days"
+    assert re.search(r"\b90[ -]days?\b", section), "the retention is not stated in days"
     assert re.search(r"more than a week|older than a week", section), (
         "the fills the probe read past the documented 7 days"
     )

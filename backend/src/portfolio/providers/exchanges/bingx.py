@@ -54,8 +54,11 @@ fact below names its source:
   namespaced `"{symbol}:{id}"` and the cursor is a time, which is correct under either
   scheme. See `parse_fill` and `parse_fills_page`.
 * **Retention.** "Only the past 7 days" (V3, V1) is disproved by the probe, which read fills
-  more than a week old. A year is the bound declared, and it is a bound, not a measurement.
-  See `BINGX_CAPABILITIES`.
+  more than a week old. **90 days is the bound declared**, from a fourth probe on 2026-10-05
+  (the first against the running application): a window starting 90 days ago was honoured,
+  and every window starting 120 days ago or earlier **silently ignored both bounds** and
+  answered the account's newest fills instead, with code 0. Where between 90 and 120 days
+  the edge lies is not measured. See `BINGX_CAPABILITIES`.
 * **The largest page.** V3 says "Default 500, maximum 1000" and, on the same page,
   "limit = 500". This provider asks for 500 and calls exactly 500 full.
 * **What the venue answers for a window older than it keeps.** Nothing maps to
@@ -306,7 +309,7 @@ longest base in that list (17).
 
 BINGX_CAPABILITIES: Final = ExchangeCapabilities(
     exchange_key=ExchangeKey.BINGX,
-    retention=timedelta(days=365),
+    retention=timedelta(days=90),
     max_query_window=timedelta(days=30),
     page_size=PAGE_LIMIT,
     cursor_kind=CursorKind.TIME,
@@ -315,17 +318,22 @@ BINGX_CAPABILITIES: Final = ExchangeCapabilities(
 )
 """What BingX can do, as far as the documentation and the probe establish it.
 
-* **`retention` is 365 days: a declared bound, not a measured one.** V3 and V1 both say
-  "Can only check data within the past 7 days range", and the probe disproved it: a
-  time-bounded query returned fills more than a week old, and spans of 14, 30, 90 and
-  365 days
-  ending now all answered code 0 with every fill. The only longer statement BingX makes is
-  its support centre's, that trade records are "available for up to one year", about the
-  web export. Declaring more would claim history the venue may not return; declaring the
-  documented 7 would drop the owner's own fills. With a year, `history_truncated` tells the
-  owner that nothing before a year ago is promised, which is true.
-* **`max_query_window` is 30 days.** Spans up to 365 days were accepted, so this is
-  headroom, not a limit: a first backfill is 13 windows.
+* **`retention` is 90 days: the longest span a window is known to be honoured from.** V3
+  and V1 both say "Can only check data within the past 7 days range", and the probe
+  disproved it: a time-bounded query returned fills more than a week old, and spans of 14,
+  30, 90 and 365 days ending now all answered code 0 with every fill. **A year was declared
+  first, from the support centre's "available for up to one year" about the web export, and
+  the first live sync (2026-10-05) disproved it.** Windows starting 120 days ago or earlier
+  came back with every one of the account's newest fills, none of them inside the window,
+  while 30-to-0 and 90-to-30 days ago were answered correctly (the latter empty). The venue
+  does not refuse a window it no longer keeps, it ignores the bounds, which is why
+  `assemble_fill_page`'s check that every fill lies inside the window is what caught it. The
+  edge is somewhere between 90 and 120 days, and 90 is the end of the measured range, so
+  that is the bound. Declaring more would send windows the venue answers with the wrong
+  fills; `history_truncated` tells the owner that nothing before 90 days ago is read here,
+  and the owner's older history comes from outside the live sync.
+* **`max_query_window` is 30 days.** Spans up to 365 days ending now were accepted, so this
+  is headroom, not a limit: a first backfill is 3 or 4 windows.
 * `page_size` is `PAGE_LIMIT`, for the reason given there.
 * **`cursor_kind` is `TIME`**: the next page starts at the newest fill's millisecond. See
   `parse_fills_page` for why not `fromId`.
@@ -400,9 +408,11 @@ Notes on individual rows, from reading both documentation sites on 2026-09-27:
   `fills: []`, so `100204` ("data not found", "query time span is too wide") is a request
   this code should not have built.
 * **Nothing maps to `ExchangeRetentionWindowError`.** What BingX answers for a window older
-  than it keeps is unknown. If it is an error code, it is unmapped and loud, and the first
-  real case gets a mapping. If it is an empty success, it is indistinguishable from no
-  trades, which is why the declared retention sits well outside the owner's history.
+  than it keeps is now known: code 0 and the account's newest fills, bounds ignored, never
+  an error code. So there is nothing to map, and the page is refused as an
+  `ExchangeSchemaError` by `assemble_fill_page` because its fills are outside the window.
+  That refusal is the only thing standing between a retention that is declared too long and
+  fills filed under the wrong window, so it must stay.
 """
 
 

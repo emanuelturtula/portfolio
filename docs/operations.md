@@ -940,7 +940,7 @@ interval rule as the balance timer applies (section 11): the startup run happens
 newest exchange run, of any status, started more than one interval ago.
 
 **The first sync is a backfill.** It reads everything from the history start -- clamped to
-what the venue keeps, 90 days at Bitget and a year at BingX -- newest first, in windows the
+what the venue keeps, 90 days at Bitget and at BingX -- newest first, in windows the
 venue accepts, one page at a time. Each page is committed with its checkpoint, so a restart
 in the middle loses at most the page in flight and the next run resumes where the last one
 stopped. Later runs read from where the previous plan ended, reaching five minutes back to
@@ -962,8 +962,8 @@ If the clock is wrong anyway:
   right.
 - **Behind**: the venue refuses requests as well, beyond its window. Once corrected, the
   sync re-reads from where the slow clock left the plan. That costs requests and inserts
-  nothing twice. Only a clock behind by more than the venue's retention (90 days at Bitget,
-  a year at BingX) loses history, and `history_truncated` then says so.
+  nothing twice. Only a clock behind by more than the venue's retention (90 days at each
+  venue) loses history, and `history_truncated` then says so.
 
 ### Reading the account list
 
@@ -988,10 +988,14 @@ the process has one, never what it is.
 | `last_error` | the kind and detail of the latest attempt, when that attempt failed. A run that skipped the account does not replace it |
 
 `history_truncated: true` with the history start unset is the normal state at both venues:
-you asked for everything, and Bitget keeps 90 days. At BingX this application **assumes** a
-year. BingX's API documentation says 7 days, which it does not enforce. The only year BingX
-states is its support centre's, about exporting trade history from the website, and the same
-article says some regions and risk-controlled accounts get 30 days.
+you asked for everything, and Bitget keeps 90 days. At BingX this application reads **90
+days**, measured on 2026-10-05: a window older than that is not refused, it is answered with
+the account's newest fills and both time bounds ignored, and the sync refuses such a page
+(`N fill(s) have an executed_at outside the requested window`). BingX's API documentation
+says 7 days, which it does not enforce, and its support centre says a year, about exporting
+trade history from the website, which the API does not follow. The same article says some
+regions and risk-controlled accounts get 30 days. Trades older than 90 days have to come
+from somewhere else, such as a one-time import.
 
 ### What an account's status means
 
