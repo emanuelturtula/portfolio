@@ -8,8 +8,9 @@ this is the moment the write is attempted.
 Wired as a ``PreToolUse`` hook on ``Write|Edit``. Reads the hook payload on stdin and exits
 2 with an explanation to deny the write.
 
-Testnet addresses and extended keys are deliberately allowed: test fixtures are required to
-use them.
+Testnet addresses and extended public keys are deliberately allowed: test fixtures are
+required to use them. An extended private key is refused on every network, testnet
+included: no fixture needs one, and a test that must have one builds it at run time.
 """
 
 from __future__ import annotations
@@ -36,6 +37,16 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "a mainnet extended public key, which reveals every address of a wallet",
         re.compile(r"\b(?:xpub|ypub|zpub)[1-9A-HJ-NP-Za-km-z]{100,112}\b"),
+    ),
+    (
+        # Every SLIP-0132 private prefix, mainnet and test, single-signature and multisig:
+        # the list in spec 031 (R2), and the same one its extended-private-key gitleaks rule
+        # uses. Unlike the public rule above, the test prefixes are not excluded.
+        "an extended private key, which controls the funds of a wallet",
+        re.compile(
+            r"\b(?:xprv|yprv|zprv|tprv|uprv|vprv|Yprv|Zprv|Uprv|Vprv)"
+            r"[1-9A-HJ-NP-Za-km-z]{100,112}\b"
+        ),
     ),
     (
         "a private LAN IP address, which is infrastructure detail",
