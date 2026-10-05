@@ -22,6 +22,7 @@ import { fakePortfolio } from '@/test/fakePortfolio';
 import { healthyPortfolio } from '@/test/fixtures';
 import { renderApp } from '@/test/render';
 import { fakeSession, server, TEST_USERNAME } from '@/test/server';
+import { GAINING_SUMMARY } from '@/test/summaryFixtures';
 
 /**
  * Criterion 6 of #16: no credential input exists anywhere in the UI.
@@ -192,6 +193,13 @@ const ROUTE_CASES: readonly RouteCase[] = [
     route: '/',
     visit: '/',
     signedIn: true,
+    ready: () => screen.findByRole('region', { name: 'Holdings table' }),
+    passwordInputs: 0,
+  },
+  {
+    route: '/details',
+    visit: '/details',
+    signedIn: true,
     ready: () => screen.findByRole('region', { name: 'Total value' }),
     passwordInputs: 0,
   },
@@ -247,7 +255,7 @@ function serve(signedIn: boolean, exchanges: FakeExchangesOptions = EXCHANGES_SC
   const scenario = healthyPortfolio();
   server.use(
     ...session.handlers,
-    ...fakePortfolio({ ...scenario, session }).handlers,
+    ...fakePortfolio({ ...scenario, summary: GAINING_SUMMARY, session }).handlers,
     ...fakeExchanges({ ...exchanges, session }).handlers,
     ...fakeAccounting({ session }).handlers,
     ...fakeAdjustments({

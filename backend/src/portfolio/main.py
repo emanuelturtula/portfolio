@@ -25,6 +25,7 @@ from portfolio.api.routers import (
     balances,
     exchanges,
     health,
+    portfolio,
     wallets,
 )
 from portfolio.config import get_settings
@@ -880,6 +881,7 @@ def create_app() -> FastAPI:
     # `/accounting/adjustments` beside `/accounting/positions`: two routers under one prefix,
     # and no path of one is a path of the other.
     app.include_router(adjustments.router, prefix=API_PREFIX)
+    app.include_router(portfolio.router, prefix=API_PREFIX)
 
     # Mounted last and at the root: it matches every path outside `/api`, so a route
     # registered after it there would be unreachable. It never matches one under `/api`,

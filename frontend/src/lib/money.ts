@@ -260,3 +260,25 @@ export function isZeroMoney(value: Money): boolean {
 export function equalsMoney(a: Money, b: Money): boolean {
   return new Decimal(a).equals(new Decimal(b));
 }
+
+/** Whether `value` is below zero. A negative zero is not. */
+export function isNegativeMoney(value: Money): boolean {
+  const decimal = new Decimal(value);
+  return decimal.isNegative() && !decimal.isZero();
+}
+
+/**
+ * A {@link Money} as a JavaScript number, for one purpose only: **placing a mark on a chart**.
+ *
+ * A chart library positions an arc or a point with floating-point geometry, and no amount of
+ * care upstream changes that. What this function bounds is where the loss can land: in the
+ * pixels of a mark, never in a figure a person reads. Every label, legend and tooltip beside
+ * the chart renders the original string through {@link formatMoney}, so the number this
+ * returns is never shown.
+ *
+ * It is the one place in `src/` allowed to call `toNumber()`; `eslint.config.js` refuses it
+ * everywhere else, beside `parseFloat` and `Number()`.
+ */
+export function toChartNumber(value: Money): number {
+  return new Decimal(value).toNumber();
+}

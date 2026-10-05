@@ -5,9 +5,11 @@ import {
   equalsMoney,
   formatMoney,
   fromBaseUnits,
+  isNegativeMoney,
   isZeroMoney,
   money,
   plainMoney,
+  toChartNumber,
   type FormatMoneyOptions,
 } from '@/lib/money';
 
@@ -536,5 +538,36 @@ describe('plainMoney', () => {
     expect(() => plainMoney(money('1e-18'))).toThrow(TypeError);
     expect(() => plainMoney(money('1,234.5'))).toThrow(TypeError);
     expect(() => plainMoney(money(''))).toThrow(TypeError);
+  });
+});
+
+describe('isNegativeMoney', () => {
+  it.each([
+    ['-0.000000000000000001', true],
+    ['-4230.000000000000000000', true],
+    ['0', false],
+    ['-0', false],
+    ['-0.000000000000000000', false],
+    ['0.000000000000000001', false],
+  ])('%s is negative: %s', (value, expected) => {
+    expect(isNegativeMoney(money(value))).toBe(expected);
+  });
+});
+
+describe('toChartNumber', () => {
+  it('places a share where its digits say, to the precision a pixel needs', () => {
+    expect(toChartNumber(money('97.4001'))).toBe(97.4001);
+    expect(toChartNumber(money('2.5999'))).toBe(2.5999);
+    expect(toChartNumber(money('0.000000000000000000'))).toBe(0);
+  });
+
+  it('is approximate past what a double holds, which is why nothing shows it', () => {
+    // Twenty-four significant digits do not fit in fifty-three bits: the coordinate drops the
+    // tail. The label beside the mark is formatted from the string, which keeps it.
+    const exact = '123456.123456789012345678';
+    expect(String(toChartNumber(money(exact)))).not.toBe(exact);
+    expect(formatMoney(money(exact), { maximumFractionDigits: 18 })).toBe(
+      '123,456.123456789012345678',
+    );
   });
 });

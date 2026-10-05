@@ -1,6 +1,8 @@
 import { onTestFinished } from 'vitest';
 import { http, HttpResponse, type HttpHandler } from 'msw';
 
+import { PORTFOLIO_SUMMARY_PATH, type PortfolioSummary } from '@/api/portfolio';
+
 import {
   currentBalances,
   NOW,
@@ -14,6 +16,7 @@ import {
   type WalletResponse,
 } from './fixtures';
 import { problem, refuseNonJsonWrite, server, unauthorized } from './server';
+import { missing, portfolioSummary } from './summaryFixtures';
 
 export const WALLETS_PATH = '/api/wallets';
 export const WALLET_PATH = '/api/wallets/:walletId';
@@ -134,6 +137,12 @@ export interface FakePortfolioOptions {
    */
   readonly onSync?: (fake: FakePortfolio) => SyncTriggeredResponse;
   /**
+   * What `GET /api/portfolio/summary` answers. When omitted, it is derived from the active
+   * wallets the way the backend answers before any run has read them: nothing held, nothing
+   * invested, and each wallet's chain named as unread.
+   */
+  readonly summary?: PortfolioSummary;
+  /**
    * The session these endpoints belong to. When given, every request made
    * while it is signed out is answered `401`, as the backend's deny-by-default
    * middleware answers it. Without this, a query rebuilt in the instant
@@ -152,6 +161,8 @@ export interface FakePortfolio {
   wallets(): readonly WalletResponse[];
   current(): CurrentBalancesResponse;
   runs(): readonly SyncRunResponse[];
+  summary(): PortfolioSummary;
+  setSummary(summary: PortfolioSummary | undefined): void;
   setCurrent(current: CurrentBalancesResponse | CurrentView | undefined): void;
   setRuns(runs: readonly SyncRunResponse[]): void;
   /** The next create of this address answers a 422 on `["body", "address"]`. */
@@ -174,7 +185,7 @@ export interface FakePortfolio {
 }
 
 /**
- * A stateful fake of the wallet registry and the balance endpoints.
+ * A stateful fake of the wallet registry, the balance endpoints and the dashboard's summary.
  *
  * Writes go through {@link refuseNonJsonWrite}, the same guard the backend
  * applies, so a client that stops sending `Content-Type: application/json` on
@@ -188,6 +199,7 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
   let wallets: WalletResponse[] = (options.wallets ?? []).map((row) => ({ ...row }));
   let current: CurrentBalancesResponse | CurrentView | undefined = options.current;
   let runs: SyncRunResponse[] = [...(options.runs ?? [])];
+  let summary: PortfolioSummary | undefined = options.summary;
   const rejections = new Map<string, AddressRejectionType>();
   /** What each wallet created here was registered with, for the duplicate check. */
   const canonicalOf = new Map<number, string>();
@@ -227,10 +239,22 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     });
   }
 
+  function derivedSummary(): PortfolioSummary {
+    const chains = new Set(wallets.filter((row) => !row.archived).map((row) => row.chain_key));
+
+    return portfolioSummary({
+      missing: [...chains].sort().map((chain) => missing('wallet_unread', chain)),
+    });
+  }
+
   const fake: FakePortfolio = {
     handlers: [],
     requests,
     wallets: () => wallets,
+    summary: () => summary ?? derivedSummary(),
+    setSummary: (next) => {
+      summary = next;
+    },
     current: () => {
       if (current === undefined) {
         return derivedCurrent();
@@ -283,6 +307,7 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     http.all(WALLETS_PATH, requireSession),
     http.all(WALLET_PATH, requireSession),
     http.all('/api/balances/*', requireSession),
+    http.all(PORTFOLIO_SUMMARY_PATH, requireSession),
     http.get(WALLETS_PATH, async ({ request }) => {
       await record(request);
       const includeArchived = new URL(request.url).searchParams.get('include_archived') === 'true';
@@ -425,6 +450,11 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
       const limit = rawLimit === null ? 20 : Number.parseInt(rawLimit, 10);
 
       return HttpResponse.json({ runs: runs.slice(0, limit) });
+    }),
+
+    http.get(PORTFOLIO_SUMMARY_PATH, async ({ request }) => {
+      await record(request);
+      return HttpResponse.json(fake.summary());
     }),
 
     http.post(BALANCES_SYNC_PATH, async ({ request }) => {

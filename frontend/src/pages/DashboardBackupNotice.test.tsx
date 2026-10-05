@@ -10,16 +10,17 @@ import { fakePortfolio } from '@/test/fakePortfolio';
 import { healthyPortfolio } from '@/test/fixtures';
 import { currentPath, renderApp, settle } from '@/test/render';
 import { fakeSession, server, TEST_USERNAME } from '@/test/server';
+import { GAINING_SUMMARY } from '@/test/summaryFixtures';
 
 /**
- * The backup warning in its place on the dashboard (spec 029): above the value section, and
- * ending with a link that reaches the Health page's account of what happened.
+ * The backup warning in its place on the dashboard (spec 029): above the figures, and ending
+ * with a link that reaches the Health page's account of what happened.
  */
 function openDashboard(backup: BackupStatus): () => number {
   const served = serveBackup(backup);
   server.use(
     ...fakeSession({ initialUser: TEST_USERNAME }).handlers,
-    ...fakePortfolio(healthyPortfolio()).handlers,
+    ...fakePortfolio({ ...healthyPortfolio(), summary: GAINING_SUMMARY }).handlers,
     ...fakeAccounting().handlers,
     ...fakeExchanges().handlers,
     served.handler,
@@ -35,15 +36,15 @@ function backupAlert(): HTMLElement | undefined {
 }
 
 describe('the dashboard and the backup warning', () => {
-  it('puts the warning first, above the value and the invested sections', async () => {
+  it('puts the warning first, above the figures and the holdings', async () => {
     openDashboard(failedBackup);
 
     const total = await screen.findByRole('region', { name: 'Total value' });
-    const invested = await screen.findByRole('heading', { name: 'Invested', level: 2 });
+    const holdings = await screen.findByRole('region', { name: 'Holdings' });
     const alert = await screen.findByText(/The last scheduled backup failed\./u);
 
     expect(alert.compareDocumentPosition(total) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(alert.compareDocumentPosition(invested) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(alert.compareDocumentPosition(holdings) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.getByRole('main').firstElementChild).toBe(alert);
   });
 

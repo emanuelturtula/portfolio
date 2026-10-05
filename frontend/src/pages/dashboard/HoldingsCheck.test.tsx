@@ -214,7 +214,7 @@ function openDashboard(options: OpenOptions = {}): Setup {
   );
   server.use(...(options.overrides ?? []));
 
-  renderApp(['/']);
+  renderApp(['/details']);
 
   return { user, accounting, exchanges };
 }
@@ -2531,7 +2531,7 @@ describe('HoldingsCheck: its requests', () => {
 });
 
 describe('HoldingsCheck: after an exchange sync', () => {
-  it('shows the comparison the sync left as soon as the owner returns to the dashboard', async () => {
+  it('shows the comparison the sync left as soon as the owner returns to the details page', async () => {
     // Witness for the `['accounting']` invalidation reaching the reconciliation. The clock is
     // frozen, so the comparison cached before the sync is still fresh by `staleTime` on
     // return, and without the invalidation it would be served as it was: everything matches.
@@ -2562,7 +2562,7 @@ describe('HoldingsCheck: after an exchange sync', () => {
     await user.click(await screen.findByRole('button', { name: 'Sync now' }));
     await screen.findByText(/^The sync /);
 
-    await user.click(within(nav).getByRole('link', { name: 'Dashboard' }));
+    await user.click(within(nav).getByRole('link', { name: 'Details' }));
 
     await waitFor(async () => {
       expect(await positionHeader('BTC')).toHaveAccessibleName(`BTC ${BADGE}`);

@@ -111,7 +111,7 @@ describe('privacy', () => {
     // Copying an address is a clipboard write, not a request.
     await user.click(within(archivedRow).getByRole('button', { name: COPY_ADDRESS }));
 
-    // Dashboard: every read, and a refresh.
+    // Dashboard: its summary, and a refresh.
     const nav = screen.getByRole('navigation', { name: 'Main' });
     await user.click(within(nav).getByRole('link', { name: 'Dashboard' }));
     await screen.findByRole('region', { name: 'Total value' });
@@ -121,6 +121,11 @@ describe('privacy', () => {
     });
     await settle();
 
+    // Details: every read behind the dashboard's figures.
+    await user.click(within(nav).getByRole('link', { name: 'Details' }));
+    await screen.findByRole('region', { name: 'Total value' });
+    await settle();
+
     // The positive control: the recorder saw the flow, including the writes
     // addressed by id. An empty list would pass the assertion below for the
     // wrong reason.
@@ -128,6 +133,7 @@ describe('privacy', () => {
     expect(paths).toContain('/api/wallets?include_archived=true');
     expect(paths).toContain('/api/wallets/4');
     expect(paths).toContain('/api/wallets/1');
+    expect(paths).toContain('/api/portfolio/summary');
     expect(paths).toContain('/api/balances/current');
     expect(paths).toContain('/api/balances/runs?limit=2');
     expect(paths).toContain('/api/balances/sync');

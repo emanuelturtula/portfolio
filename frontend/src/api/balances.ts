@@ -72,6 +72,10 @@ export function useSyncBalances(): UseMutationResult<SyncTriggered, unknown, voi
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: () => apiFetch<SyncTriggered>(SYNC_PATH, { method: 'POST' }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['balances'] }),
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['balances'] }),
+        queryClient.invalidateQueries({ queryKey: ['portfolio'] }),
+      ]),
   });
 }

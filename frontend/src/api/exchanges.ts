@@ -189,6 +189,7 @@ export function useSyncExchanges(): UseMutationResult<ExchangeSyncTriggered, unk
       Promise.all([
         queryClient.invalidateQueries({ queryKey: ['exchanges'] }),
         queryClient.invalidateQueries({ queryKey: ['accounting'] }),
+        queryClient.invalidateQueries({ queryKey: ['portfolio'] }),
       ]),
   });
 }

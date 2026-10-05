@@ -83,6 +83,7 @@ describe('the money coercion lint rule', () => {
     ['unary +', 'export const amount = +"1.10";'],
     ['Number.parseFloat', 'export const amount = Number.parseFloat("1.10");'],
     ['Number.parseInt', 'export const amount = Number.parseInt("110", 10);'],
+    ['toNumber()', 'export const amount = new Decimal("1.10").toNumber();'],
   ])('rejects %s in a directory that handles money', async (_label, code) => {
     const errors = await moneyErrors(code, BANNED_FILE);
 
@@ -149,6 +150,18 @@ describe('the money coercion lint rule', () => {
       expect(await moneyErrors('export const page = Number("2");', filePath)).toHaveLength(0);
     },
   );
+
+  it('allows toNumber() in the money module alone, and nothing else there', async () => {
+    // `toChartNumber` turns an amount into a chart coordinate: the one sanctioned exit. The
+    // exemption is for that call only; the module that exists to keep money out of floating
+    // point still may not reach for `Number()`.
+    const toNumber = 'export const x = new Decimal("1.10").toNumber();';
+    expect(await moneyErrors(toNumber, 'src/lib/money.ts')).toHaveLength(0);
+    expect(await moneyErrors(toNumber, 'src/pages/dashboard/AllocationDonut.tsx')).toHaveLength(1);
+    expect(await moneyErrors('export const x = Number("1.10");', 'src/lib/money.ts')).toHaveLength(
+      1,
+    );
+  });
 
   it('exempts test files, so a test may write the violation it proves', async () => {
     expect(

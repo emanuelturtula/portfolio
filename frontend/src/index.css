@@ -1,13 +1,29 @@
-/* Deliberately minimal: the walking skeleton proves the toolchain, not a
-   design system. Colours follow the user's light/dark preference. */
+/* Colours follow the user's light/dark preference. The neutrals and the series slots are the
+   dataviz reference palette's (#154): a page plane, a slightly lifted surface for cards, ink in
+   three strengths and a hairline. Each mode is its own selected set, not an inversion. */
 :root {
-  --font-sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --color-text: #1b1b1f;
-  --color-muted: #55555f;
-  --color-background: #ffffff;
-  --color-border: #e2e2e6;
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --color-text: #0b0b0b;
+  --color-muted: #52514e;
+  --color-page: #f9f9f7;
+  --color-surface: #fcfcfb;
+  /* Kept as the page plane: a sticky table cell paints it to hide what scrolls beneath. */
+  --color-background: var(--color-page);
+  --color-border: #e1e0d9;
+  --color-hairline: rgb(11 11 11 / 10%);
   --color-error: #a11b2b;
   --color-warning: #8a5a00;
+  --color-gain: #006300;
+  --color-loss: var(--color-error);
+  --shadow-card: 0 1px 2px rgb(11 11 11 / 4%), 0 4px 16px rgb(11 11 11 / 4%);
+  --radius-card: 0.875rem;
+  --radius-control: 0.5rem;
+
+  /* Chart series, fixed per asset in `lib/assetColors.ts`. */
+  --series-orange: #eb6834;
+  --series-aqua: #1baf7a;
+  --series-blue: #2a78d6;
+  --series-other: #898781;
 
   color-scheme: light dark;
   font-family: var(--font-sans);
@@ -16,19 +32,28 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --color-text: #f2f2f5;
-    --color-muted: #b6b6c0;
-    --color-background: #16161a;
-    --color-border: #303038;
+    --color-text: #ffffff;
+    --color-muted: #c3c2b7;
+    --color-page: #0d0d0d;
+    --color-surface: #1a1a19;
+    --color-border: #2c2c2a;
+    --color-hairline: rgb(255 255 255 / 10%);
     --color-error: #ff8b8b;
     --color-warning: #f0b429;
+    --color-gain: #0ca30c;
+    --shadow-card: none;
+
+    --series-orange: #d95926;
+    --series-aqua: #199e70;
+    --series-blue: #3987e5;
+    --series-other: #898781;
   }
 }
 
 body {
   margin: 0;
   color: var(--color-text);
-  background-color: var(--color-background);
+  background-color: var(--color-page);
 }
 
 .app {
@@ -47,11 +72,13 @@ body {
   justify-content: space-between;
   gap: 1rem;
   border-bottom: 1px solid var(--color-border);
-  padding: 1.5rem 0;
+  padding: 1.25rem 0;
 }
 
 .app-header h1 {
-  font-size: 1.5rem;
+  font-size: 1.25rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
   margin: 0;
 }
 
@@ -67,6 +94,8 @@ body {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
+  color: var(--color-muted);
+  font-size: 0.875rem;
 }
 
 .account .state-error {
@@ -104,12 +133,24 @@ body {
 
 button {
   font: inherit;
-  padding: 0.5rem 1rem;
-  border: 1px solid var(--color-border);
-  border-radius: 0.25rem;
-  background-color: var(--color-background);
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.5;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-control);
+  background-color: var(--color-surface);
   color: var(--color-text);
   cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--color-muted);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--color-text);
+  outline-offset: 2px;
 }
 
 button:disabled,
@@ -160,17 +201,30 @@ button[aria-disabled='true'] {
 nav[aria-label='Main'] {
   display: flex;
   flex-wrap: wrap;
-  gap: 1rem;
+  gap: 0.25rem;
 }
 
+/* The current page is a filled pill in bold: the shape and the weight say it, not a colour. */
 nav[aria-label='Main'] a {
-  color: var(--color-text);
+  padding: 0.3rem 0.75rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--color-muted);
+  font-size: 0.875rem;
+  font-weight: 500;
   text-decoration: none;
 }
 
+nav[aria-label='Main'] a:hover {
+  color: var(--color-text);
+}
+
 nav[aria-label='Main'] a.active {
-  font-weight: 600;
-  text-decoration: underline;
+  border-color: var(--color-hairline);
+  background-color: var(--color-surface);
+  box-shadow: var(--shadow-card);
+  color: var(--color-text);
+  font-weight: 650;
 }
 
 table {
@@ -794,5 +848,318 @@ p.state-error[role='alert'] {
     margin-left: 0;
     border-radius: 0.5rem;
     line-height: 1.25;
+  }
+}
+
+/* Dashboard (#154). */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.page-head {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 1rem;
+}
+
+.state-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.25rem;
+}
+
+.overview {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.card,
+.kpi {
+  min-width: 0;
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-card);
+  background-color: var(--color-surface);
+  box-shadow: var(--shadow-card);
+}
+
+.card {
+  padding: 1.25rem 1.25rem 1rem;
+}
+
+.card > h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+/* Three across or one per row, never two and one: a lone third card reads as an afterthought,
+   and the P/L is the figure that matters most. */
+.kpi-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+}
+
+@media (min-width: 40rem) {
+  .kpi-row {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+.kpi {
+  padding: 1rem 1.25rem 1.15rem;
+}
+
+.kpi-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 1.5rem;
+}
+
+.kpi-label {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+/* The figure in the system sans with proportional digits, as a hero figure is set. A number
+   too long for the card wraps rather than widen it. */
+.kpi-value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.4rem;
+  margin-top: 0.35rem;
+  font-size: clamp(1.5rem, 1.25rem + 1vw, 1.875rem);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.kpi-unit {
+  color: var(--color-muted);
+  font-size: 0.875rem;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.kpi-gain .kpi-value > data,
+.kpi-gain .kpi-delta {
+  color: var(--color-gain);
+}
+
+.kpi-loss .kpi-value > data,
+.kpi-loss .kpi-delta {
+  color: var(--color-loss);
+}
+
+/* The return beside the P/L: the arrow and the sign carry the direction, the colour is on top. */
+.kpi-delta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-left: auto;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  background-color: color-mix(in srgb, currentColor 10%, transparent);
+  font-size: 0.875rem;
+  font-weight: 600;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.chip {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.chip-warning {
+  color: var(--color-warning);
+}
+
+.note {
+  margin: 0 0 1rem;
+  color: var(--color-muted);
+  font-size: 0.875rem;
+}
+
+.overview .note {
+  margin: 0;
+}
+
+.note-warning {
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--color-hairline);
+  border-left: 3px solid var(--color-warning);
+  border-radius: var(--radius-control);
+  background-color: var(--color-surface);
+}
+
+.note-warning strong {
+  color: var(--color-warning);
+}
+
+.note-error {
+  color: var(--color-error);
+}
+
+.note a {
+  color: inherit;
+  font-weight: 500;
+  text-underline-offset: 2px;
+}
+
+/* The donut beside the table when both fit, above it when they do not. */
+.holdings-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem 2rem;
+}
+
+.holdings-body .table-scroll {
+  flex: 1 1 22rem;
+  min-width: 0;
+  margin: 0;
+}
+
+.holdings-table th,
+.holdings-table td {
+  padding: 0.6rem 0.5rem;
+  vertical-align: middle;
+}
+
+/* A figure never breaks across lines: "100.00 %" on two reads as two things. */
+.holdings-table td {
+  white-space: nowrap;
+}
+
+.holdings-table thead th {
+  color: var(--color-muted);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.holdings-table tbody tr:last-child > * {
+  border-bottom: 0;
+}
+
+.holdings-table tbody th {
+  font-weight: 600;
+}
+
+.asset-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.swatch {
+  display: inline-block;
+  flex: none;
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 3px;
+}
+
+.donut {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0 auto;
+}
+
+.donut-chart {
+  width: 200px;
+  height: 200px;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.35rem 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.8125rem;
+}
+
+.legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.legend-asset {
+  font-weight: 600;
+}
+
+.legend-share {
+  color: var(--color-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-tooltip {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-control);
+  background-color: var(--color-surface);
+  box-shadow: var(--shadow-card);
+  color: var(--color-text);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-tooltip span {
+  color: var(--color-muted);
+}
+
+.footnote {
+  margin: 0.75rem 0 0;
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+}
+
+/* On a phone the five holding columns need every pixel: a tighter card and tighter cells let
+   them fit 375 px, and the region still scrolls a figure too long to. */
+@media (max-width: 40rem) {
+  .card {
+    padding: 1rem 1rem 0.75rem;
+  }
+
+  .holdings-table {
+    font-size: 0.8125rem;
+  }
+
+  .holdings-table th,
+  .holdings-table td {
+    padding: 0.5rem 0.3rem;
   }
 }
