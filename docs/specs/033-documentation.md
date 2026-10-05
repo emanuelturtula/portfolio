@@ -1,0 +1,119 @@
+# 033 — The documentation, brought up to what was built
+
+Issue: #26
+Status: in progress
+
+## Problem
+
+The documents were written issue by issue, alongside the code each issue added. Three
+things follow from that:
+
+- **They are deep where an issue went deep, and silent where none did.** `docs/architecture.md`
+  covers money, layering and authentication, but says nothing about the provider
+  abstractions, which every chain, price source and exchange is built on.
+- **The README still describes the skeleton.** It says "Status: early" and lists V1 as
+  planned, with no screenshot.
+- **Nobody has read each document whole, against the code, since it was first written.**
+  A sentence that was true when its issue merged can stop being true when a later issue
+  changes the code it describes.
+
+## Scope
+
+The issue's criteria, each followed by what it means here.
+
+1. **`README.md` describes what the application actually does, with a real screenshot.**
+   - What V1 does today; how to run it; where each document is.
+   - The screenshot is of the real application, taken from a local build on a scratch
+     database: test-network wallets, and exchange history and adjustments made up for the
+     picture. The caption says so. Nothing in it is the owner's data (R2).
+2. **`docs/architecture.md` covers the layering, the money representation decision and the
+   provider abstractions.** Layering and money are there today. The missing section covers:
+   - the three provider families (chains, prices, exchanges);
+   - the protocol each implements;
+   - the shared HTTP client and rate limiter they all go through;
+   - capability declarations;
+   - who calls a provider and when (the schedulers and the services);
+   - the extended-key scanner.
+
+   It points to `docs/providers.md` for the detail instead of repeating it.
+3. **`docs/accounting.md` is complete with worked examples.** The eleven worked examples are
+   already executed by `backend/tests/domain/accounting/test_worked_examples.py`.
+   - Read the document against the engine, the reconciliation and the adjustments as they
+     are now.
+   - Add an example only where a behaviour the engine has is not illustrated. Every new
+     example goes under `## Worked examples`, so that the existing test runs it.
+4. **`docs/providers.md` records, per provider:**
+   - the endpoints used;
+   - the rate limits and retention windows actually confirmed;
+   - explicitly, what remains unverified.
+
+   Each provider gets a summary table at the top of its section. Every vendor fact in the
+   table is one of three things:
+   - *confirmed*, saying how and when;
+   - *measured*, against the live service, saying when;
+   - *unverified*, saying what would confirm it.
+
+   The detailed sections stay where they are.
+
+   Providers: Bitcoin Esplora (mempool.space, blockstream.info), the Kaspa REST API, each
+   price source, Bitget and BingX.
+5. **`docs/deployment.md` matches the current pipeline.** Read it against:
+   - `.github/workflows/delivery.yml`, `ci.yml` and `remote-deploy.yml`;
+   - `deploy/deploy.py` and `deploy/compose.yml`;
+   - `scripts/next_version.py`.
+
+   That includes the 30-minute backend job bound (#131) and the removal of the legacy
+   deployment (#25, spec 032).
+6. **No hostnames, IP addresses, real addresses or personal identifiers anywhere in the
+   docs.**
+   - This covers every file under `docs/` plus `README.md`, specs included.
+   - Addresses in examples are test-network ones or written placeholders.
+7. **Every document is in English.**
+
+## Rulings
+
+- **R1. The code is the source of truth.**
+  - When a document and the code disagree, the document changes.
+  - If the code looks wrong, the writer does not fix it here. They report it, and the tech
+    lead files an issue.
+- **R2. The screenshot shows no data of the owner's.**
+  - The database is a scratch copy holding only test-network wallets and invented
+    exchange history.
+  - The image is checked for addresses, keys and amounts before it is committed.
+  - Its file is a PNG under `docs/images/`.
+- **R3. Specs are records, not documentation to keep current.**
+  - A spec in `docs/specs/` describes what an issue decided when it merged, and is not
+    rewritten here.
+  - It is only scanned for criterion 6.
+- **R4. `docs/operations.md` is not rewritten.** It is not among the criteria. Two open
+  pull requests from other sessions touch it. It is scanned for criteria 6 and 7, and
+  anything wrong in it is reported, not edited.
+- **R5. Sentences pinned by documentation tests.** Many tests read a document and assert a
+  sentence in it. A writer who changes a pinned sentence:
+  - updates that test in the same change, and only to follow the new wording, never to
+    weaken what it checks;
+  - names every such test in their report.
+
+## File ownership
+
+| Agent | Owns |
+|---|---|
+| tech lead | `README.md`, `docs/images/**`, this spec |
+| writer-architecture | `docs/architecture.md`, and the tests that read it (`backend/tests/security/test_no_float.py`, for its pinned sentences only) |
+| writer-accounting | `docs/accounting.md`, `docs/adr/0001-weighted-average-cost-basis.md`, and the documentation tests that read `accounting.md` |
+| writer-providers | `docs/providers.md`, and the documentation tests that read it |
+| writer-deployment | `docs/deployment.md`, and the documentation tests that read it, including `tests/deploy/test_deploy_docs.py` |
+| reviewer | nothing; reads every document against the code |
+| tester | runs the full gate on the final tree |
+
+A test that reads two of these documents, for example `test_reconciliation_documentation.py`,
+which reads `accounting.md` and `providers.md`, can only be edited by one writer at a time.
+The writer who needs it asks the tech lead first.
+
+## Acceptance
+
+All seven criteria hold, with three checks on top:
+- the full gate passes;
+- the reviewer finds no claim a document makes that the code contradicts;
+- a scan of `README.md` and `docs/**` finds no hostname, IP address, mainnet address,
+  extended key or personal identifier.
