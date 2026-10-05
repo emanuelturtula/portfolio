@@ -60,10 +60,18 @@ def backend_steps(fast: bool, scratch: Path) -> list[Step]:
     if not (BACKEND / "pyproject.toml").exists():
         return []
     domain_report = scratch / "coverage.json"
+    # The full gate runs the suite as the `Backend tests` job in CI does: one pytest-xdist
+    # worker per CPU, with their coverage combined into the one report the floor reads.
     pytest_args = (
         ["-q", "-x"]
         if fast
-        else ["--cov", "--cov-report=term-missing", f"--cov-report=json:{domain_report}"]
+        else [
+            "--numprocesses=auto",
+            "--dist=worksteal",
+            "--cov",
+            "--cov-report=term-missing",
+            f"--cov-report=json:{domain_report}",
+        ]
     )
     steps: list[Step] = [
         ("ruff check", ["uv", "run", "ruff", "check", "."], BACKEND),

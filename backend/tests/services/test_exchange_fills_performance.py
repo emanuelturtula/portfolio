@@ -27,6 +27,7 @@ four assets, three quote assets, fees in four assets with both signs, two venues
 from __future__ import annotations
 
 import gc
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -194,10 +195,14 @@ def fastest_rounds(
     """The fastest of `RATIO_ROUNDS` rounds for each function, the rounds interleaved.
 
     Interleaved so that a machine that slows down halfway slows every function alike, and the
-    collector is off so that a collection lands in no one's round.
+    collector is off so that a collection lands in no one's round. So is this thread's trace
+    function, whoever installed it, and both are put back afterwards: the test below says why
+    `no_cover` alone does not get that far.
     """
     best = [float("inf")] * len(functions)
+    tracer = sys.gettrace()
     gc.disable()
+    sys.settrace(None)
     try:
         for _ in range(RATIO_ROUNDS):
             for position, function in enumerate(functions):
@@ -206,6 +211,7 @@ def fastest_rounds(
                     function(left, right)
                 best[position] = min(best[position], time.perf_counter() - started)
     finally:
+        sys.settrace(tracer)
         gc.enable()
     return best
 
@@ -217,6 +223,12 @@ def test_money_add_stays_a_small_multiple_of_a_plain_decimal_add(record_property
     `no_cover` because coverage traces `money.add`'s Python lines and not the C `__add__` it
     is compared with, which would measure the instrument rather than the code: under the
     gate's coverage the new `add` reads about 39x. Production runs uninstrumented.
+
+    Under pytest-xdist, as CI runs the suite, `no_cover` stops less than it says. pytest-cov
+    7.1 starts a coverage instance in each worker before it knows it is a worker, then its
+    worker instance on top; `no_cover` pauses only the second, and the first resumes tracing
+    for the length of the test. Measured that way, the new `add` read 48.6x and failed. So
+    `fastest_rounds` takes the trace function off the thread for the timed rounds itself.
 
     The control is in the same test: the algorithm R1 replaced fails the same bound, in the
     same process, so a bound that has stopped telling the two apart fails here rather than

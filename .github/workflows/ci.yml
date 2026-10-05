@@ -123,12 +123,27 @@ jobs:
           working-directory: backend
       - run: uv sync --locked
         working-directory: backend
+      - name: Runner CPU
+        # The same 9,467 tests took 10.6 min on one runner and 16.0 on another on 2026-10-04,
+        # so a duration means little without the machine it ran on. Printed for the next
+        # person who measures this job.
+        run: lscpu | grep -E '^(Model name|CPU\(s\)|Thread\(s\) per core|Core\(s\) per socket):'
       - name: pytest with coverage
         working-directory: backend
         # The reports are for the steps after it -- the JSON for the domain floor, the
         # Cobertura XML for the changed lines -- and go to the runner's temporary directory
         # so that nothing lands in the checkout.
-        run: uv run pytest --cov --cov-report=term-missing --cov-report="json:$RUNNER_TEMP/coverage.json" --cov-report="xml:$RUNNER_TEMP/coverage.xml"
+        #
+        # `--numprocesses=auto` is one pytest-xdist worker per CPU the runner reports. Each
+        # worker measures its own share, and pytest-cov combines them before it writes any
+        # report, so both floors and the changed-lines step read one run. Checked against a
+        # serial run of the same commit: the same lines and branches, file by file.
+        # `--dist=worksteal` lets an idle worker take queued tests from a busy one; the
+        # Hypothesis and performance tests run for seconds where most run for milliseconds,
+        # and it finished 15% sooner than the default split. `--durations=25` puts the
+        # slowest tests in the log, so the next time this job grows, the log already says
+        # where.
+        run: uv run pytest --numprocesses=auto --dist=worksteal --durations=25 --cov --cov-report=term-missing --cov-report="json:$RUNNER_TEMP/coverage.json" --cov-report="xml:$RUNNER_TEMP/coverage.xml"
       - name: Domain coverage floor
         # Criterion 13 of #17: 95% of lines and 90% of branches under src/portfolio/domain/,
         # on top of the repository-wide floor in backend/pyproject.toml, which one number

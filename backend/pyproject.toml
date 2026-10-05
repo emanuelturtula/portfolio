@@ -48,6 +48,9 @@ dev = [
     # Coverage of the lines a pull request changes, backend and frontend (#23): it reads the
     # backend's Cobertura XML and the frontend's LCOV, so CI installs it once, from here.
     "diff-cover",
+    # Runs the suite across every CPU in CI and in the full gate: one process took 10 to 16
+    # minutes on a GitHub runner, and the deploy waits for it. See the `test-backend` job.
+    "pytest-xdist",
 ]
 
 [build-system]
@@ -141,11 +144,14 @@ pythonpath = ["src"]
 # 30 s is sized against the slowest tests and against the tests that wait on purpose. The
 # slowest is the 20,000-fill budget guard in
 # `tests/services/test_exchange_fills_performance.py` (#93): about 12 s with coverage and
-# about 3.5 s without, most of it planting the fills. No other test has been measured above
-# 2.2 s. Among those, which is slowest changes between runs: a cold mypy run in
-# `tests/providers/test_protocol.py`, the Hypothesis codec test in
-# `tests/domain/test_addresses.py`, or one of the lifespan tests. The tests that wait on purpose bound their own waits at 5 to 10 s, so they
-# still fail first, with a better message. The ceiling cuts a hang, not a slow runner.
+# about 3.5 s without, most of it planting the fills. That is the test run on its own.
+# Measured again on 2026-10-04, with coverage, on the development machine: 24 s inside a
+# whole serial run, and 14 s inside one of four pytest-xdist workers, which runs a quarter of
+# the suite. Next, in the serial run: the published million-`a` vector in
+# `tests/domain/test_ripemd160.py` at 15 s, and two Hypothesis tests in
+# `tests/providers/exchanges/test_fill_converts_to_trade.py` at 11 and 12.5 s; everything
+# else under 10 s. The tests that wait on purpose bound their own waits at 5 to 10 s, so
+# they still fail first, with a better message. The ceiling cuts a hang, not a slow runner.
 #
 # `thread`, on every platform, and never the `signal` default that Linux would otherwise
 # get. `signal` raises the timeout inside whatever the main thread is running, and in
@@ -154,13 +160,23 @@ pythonpath = ["src"]
 # Hypothesis test, it is caught as an ordinary failure, and the input is replayed with
 # the one alarm already spent, so the replay hangs with nothing left to stop it. `thread`
 # does neither: it dumps every stack and ends the process from outside, whatever the
-# test was doing. The price is that the run stops at the first hang, which is the right
-# response to a hang.
+# test was doing. Run serially, the run stops at the first hang. Under pytest-xdist, as CI
+# and the full gate run it, the process is a worker: xdist reports the test as failed with
+# "worker crashed while running" and its name, starts a replacement, and the run goes on.
+#
+# `faulthandler_timeout` is what keeps "with every thread's stack" true under xdist.
+# pytest-timeout writes its dump to the worker's terminal, and xdist points a worker's
+# stdout at the null device, so that dump is lost. pytest's own faulthandler writes to
+# stderr, which a worker keeps, and it does so from a C thread that needs no GIL, so a hang
+# that holds the GIL still gets its stacks. Two seconds before the ceiling, so the dump is
+# out before the worker is ended. A test that takes between 28 and 30 s passes with a dump
+# beside it, which is a test worth looking at anyway.
 #
 # `--strict-config` above means that losing the plugin fails the run rather than silently
 # dropping these lines.
 timeout = 30
 timeout_method = "thread"
+faulthandler_timeout = 28
 
 [tool.coverage.run]
 # A directory, not the package name. Coverage matches a package source against the

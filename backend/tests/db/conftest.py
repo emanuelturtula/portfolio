@@ -22,9 +22,9 @@ import pytest
 from anyio import to_thread
 from sqlalchemy import create_engine
 
-from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import create_database_engine
 from tests.logging_harness import preserved_logging
+from tests.sqlite_harness import copy_migrated_template
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -96,9 +96,14 @@ async def engine(database_url: str) -> AsyncIterator[AsyncEngine]:
 
 
 @pytest.fixture
-async def migrated_database_url(database_url: str) -> str:
-    """A file-backed database already migrated to head."""
-    await to_thread.run_sync(upgrade_to_head, database_url)
+async def migrated_database_url(database_url: str, database_path: Path) -> str:
+    """A file-backed database already migrated to head.
+
+    A copy of the file the migrations wrote once for this process, for the reason
+    `tests/sqlite_harness.py` gives. The suites about the migrations themselves run them
+    from `database_url`, an empty file, and never come through here.
+    """
+    await to_thread.run_sync(copy_migrated_template, database_path)
     return database_url
 
 
