@@ -12,9 +12,14 @@ caught by this one.
 
 No key-shaped string exists in this file. Every candidate is assembled at run time from a
 prefix and a generated body, so the shape is in neither the source nor its ``.pyc``, where
-a working-tree gitleaks scan would find it. The file is also named so that it does not end
-in ``guard_sensitive_write.py``, a suffix the guard exempts, which means the guard inspects
-every write to this file like any other.
+a working-tree gitleaks scan would find it.
+
+The guard exempts three files, the gitleaks configuration and the two scanners, because they
+must contain the very patterns it refuses. It recognises them by their whole file name, and
+that is pinned in both directions: the three stay exempt whichever separator the path uses,
+and a file whose name merely ends in one of theirs, such as ``test_guard_sensitive_write.py``,
+is inspected like any other. Until that was fixed the exemption was a suffix match, which is
+why this file is not called ``test_guard_sensitive_write.py`` itself.
 
 The hook is loaded from its file and driven through ``main()`` exactly as Claude Code
 drives it, JSON on stdin and a verdict in the exit code, but in-process. One test runs the
@@ -66,10 +71,40 @@ REAL_BODY_LENGTH = 107
 
 FIXTURE_PATH = "backend/tests/fixtures/keys.py"
 
+# The files the guard exempts, where they sit in the repository.
+EXEMPT_FILES = (
+    ".gitleaks.toml",
+    ".claude/hooks/guard_sensitive_write.py",
+    "scripts/secret_scan.py",
+)
+
+# Names that end in an exempt file's name without being it. A suffix match exempted each one.
+LOOK_ALIKES = (
+    "tests/agent/test_guard_sensitive_write.py",
+    "backend/tests/test_secret_scan.py",
+    "notes.gitleaks.toml",
+)
+
 
 def key_shaped(prefix: str, length: int = REAL_BODY_LENGTH) -> str:
     """Build a key-shaped string at run time, cycling the whole Base58 alphabet."""
     return "".join((prefix, *itertools.islice(itertools.cycle(BASE58), length)))
+
+
+def spellings(relative: str) -> dict[str, str]:
+    """``relative`` spelled as each kind of path a ``Write`` or ``Edit`` call may carry.
+
+    Claude Code on Windows sends absolute backslash paths, and a path can mix both
+    separators when a relative one is appended to a Windows root.
+    """
+    parts = relative.split("/")
+    return {
+        "relative, forward slashes": "/".join(parts),
+        "relative, backslashes": "\\".join(parts),
+        "absolute POSIX": "/".join(("", "work", "portfolio", *parts)),
+        "absolute Windows": "\\".join(("C:", "work", "portfolio", *parts)),
+        "absolute Windows, mixed": "\\".join(("C:", "work", "portfolio", "/".join(parts))),
+    }
 
 
 def load_hook() -> ModuleType:
@@ -163,13 +198,77 @@ class PublicKeysAreAllowed(GuardSensitiveWriteTests):
         self.assert_refused_for(write(key_shaped("xpub")), PUBLIC_KEY_REASON)
 
 
+class OnlyTheScannerFilesAreExempt(GuardSensitiveWriteTests):
+    """The exemption matches a file's whole name, never a suffix of it."""
+
+    content = f"KEY = {key_shaped('xprv')!r}\n"
+
+    def test_the_content_is_refused_in_an_ordinary_file(self) -> None:
+        # Without this, the exempt cases below would pass just as well if nothing refused
+        # the content at all.
+        self.assert_refused_for(write(self.content), PRIVATE_KEY_REASON)
+
+    def test_the_exempt_names_are_exactly_those_of_the_scanner_files(self) -> None:
+        names = [relative.rpartition("/")[2] for relative in EXEMPT_FILES]
+        self.assertEqual(sorted(self.hook.EXEMPT_FILE_NAMES), sorted(names))
+        for relative in EXEMPT_FILES:
+            with self.subTest(file=relative):
+                self.assertTrue((REPO_ROOT / relative).is_file(), f"{relative} has moved")
+
+    def test_no_other_tracked_file_has_an_exempt_name(self) -> None:
+        # The exemption follows a name wherever the file sits, so a second file with one of
+        # these names would be exempt as well. Adding one has to be a deliberate act.
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout.split("\0")
+        names = self.hook.EXEMPT_FILE_NAMES
+        exempt = [path for path in tracked if self.hook.file_name(path) in names]
+        self.assertEqual(sorted(exempt), sorted(EXEMPT_FILES))
+
+    def test_the_scanner_files_are_exempt_with_either_separator(self) -> None:
+        for relative in EXEMPT_FILES:
+            for spelling, path in spellings(relative).items():
+                with self.subTest(file=relative, spelling=spelling):
+                    code, message = self.run_hook(write(self.content, path))
+                    self.assertEqual(code, ALLOWED, message)
+
+    def test_a_name_that_only_ends_in_an_exempt_name_is_inspected(self) -> None:
+        for relative in LOOK_ALIKES:
+            for spelling, path in spellings(relative).items():
+                with self.subTest(file=relative, spelling=spelling):
+                    self.assert_refused_for(write(self.content, path), PRIVATE_KEY_REASON)
+
+    def test_a_name_that_differs_only_in_case_is_inspected(self) -> None:
+        # The suffix match was case-sensitive, so folding case would loosen the exemption.
+        for relative in EXEMPT_FILES:
+            directory, _, name = relative.rpartition("/")
+            path = "/".join(part for part in (directory, name.upper()) if part)
+            with self.subTest(path=path):
+                self.assert_refused_for(write(self.content, path), PRIVATE_KEY_REASON)
+
+    def test_a_look_alike_edit_is_inspected(self) -> None:
+        tool_input = {
+            "file_path": spellings(LOOK_ALIKES[0])["absolute Windows"],
+            "old_string": "KEY = None",
+            "new_string": self.content,
+        }
+        self.assert_refused_for(tool_input, PRIVATE_KEY_REASON)
+
+
 class TheRealScript(unittest.TestCase):
     """Claude Code reads the verdict from the exit code, so run the file as it does."""
 
-    def run_script(self, content: str) -> subprocess.CompletedProcess[str]:
+    def run_script(
+        self, content: str, path: str = FIXTURE_PATH
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(HOOK)],
-            input=payload(write(content)),
+            input=payload(write(content, path)),
             capture_output=True,
             text=True,
             timeout=30,
@@ -183,6 +282,19 @@ class TheRealScript(unittest.TestCase):
 
     def test_a_test_network_public_key_exits_0_silently(self) -> None:
         result = self.run_script(key_shaped("tpub"))
+        self.assertEqual(result.returncode, ALLOWED, result.stderr)
+        self.assertEqual(result.stderr, "")
+
+    def test_a_look_alike_windows_path_exits_2_with_the_reason(self) -> None:
+        path = spellings(LOOK_ALIKES[0])["absolute Windows"]
+        result = self.run_script(key_shaped("tprv"), path)
+        self.assertEqual(result.returncode, REFUSED, result.stderr)
+        self.assertIn(PRIVATE_KEY_REASON, result.stderr)
+        self.assertIn(path, result.stderr)
+
+    def test_a_scanner_file_windows_path_exits_0_silently(self) -> None:
+        path = spellings(EXEMPT_FILES[1])["absolute Windows"]
+        result = self.run_script(key_shaped("tprv"), path)
         self.assertEqual(result.returncode, ALLOWED, result.stderr)
         self.assertEqual(result.stderr, "")
 
