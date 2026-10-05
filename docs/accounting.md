@@ -12,10 +12,11 @@ so this document cannot drift from the engine without a build failing.
 
 ## The model in one page
 
-**Cash is the unit of account.** The configured cash assets (by default `USDT` and `USDC`) are
-pinned at a unit cost of exactly 1. Every cost, basis, proceeds and P&L figure is in these
-"cash units", which in practice means US dollars. Cash is never inventoried: it has no position
-and never runs short.
+**Cash is the unit of account.** The cash assets, `USDT` and `USDC`, are pinned at a unit cost
+of exactly 1. Every cost, basis, proceeds and P&L figure is in these "cash units", which in
+practice means US dollars. Cash is never inventoried: it has no position and never runs short.
+The engine takes the set of cash assets as configuration (`AccountingConfig`). The application
+always uses this default pair, and no setting changes it.
 
 **Each other asset has one pool**, across every venue and wallet. A pool holds:
 
@@ -31,7 +32,9 @@ and never runs short.
 **The events are replayed in one total order**: time, then source, then id, then kind (trade,
 adjustment or transfer) for the rare tie between kinds. Same-millisecond fills therefore
 always come out the same way, whatever order the database returned them in. A fill read twice
-counts once.
+counts once. Two events that share a kind, a source and an id but differ in content are
+refused, and replay computes nothing. Only corrupt input can hold them: the database's unique
+constraints keep stored rows from it.
 
 ### A trade, whatever its pair
 
@@ -41,7 +44,17 @@ A trade gives one asset and receives another. The fee folds in according to wher
 |---|---|
 | the asset received | Less is received. The cost is unchanged, so the unit cost rises. |
 | the asset given | More is given. |
-| a third asset | That asset's pool pays it, at its carried cost. |
+| a third asset | That asset's pool pays it, at its carried cost. A cash asset pays it at its amount. |
+
+A zero fee is no fee, whatever asset it names.
+
+**A fee is signed, and a negative one is a rebate.**
+
+- It folds into the same place as a fee, the other way: more is received, or less is given.
+- In a third asset, a cash rebate is worth a negative amount. Any other is acquired, at
+  unknown cost (example 13).
+- Neither venue's import records a rebate today. Each refuses a fee reported with a rebate's
+  sign, until a real one shows what it looks like (`docs/providers.md`).
 
 Then one of four things happens:
 
@@ -49,18 +62,27 @@ Then one of four things happens:
 |---|---|---|---|
 | cash | an asset | a buy | The asset's basis rises by the cash given, fees included. |
 | an asset | cash | a sale | The asset's pool gives up the proportional basis. Realized P&L is the proceeds, net of fees, minus that basis. |
-| an asset | another asset | a swap | The given asset's basis, plus the fee, moves to the received asset. Nothing is realized, because no price exists to realize it at. If some of the units given had unknown cost, the received units split in the same proportion, and so does the fee: the unknown share of the fee goes to `unallocated_costs`, not onto the few units of known cost. |
+| an asset | another asset | a swap | The given asset's basis, plus the fee, moves to the received asset. Nothing is realized, because no price exists to realize it at. If some of the units given had unknown cost, the received units split in the same proportion, and so does the fee: the unknown share of the fee goes to `unallocated_costs`, not onto the few units of known cost (example 12). |
 | cash | cash | a conversion | Nothing changes, since both sides are pinned at 1. A fee is recorded in `unallocated_costs`. |
 
 **When a short history shows, the engine says so rather than guessing:**
 
-- **A sale larger than the pool.** It takes everything the pool holds and emits a
-  `NegativeInventory` warning naming the asset, the moment and the shortfall. The pool never
-  goes below zero.
+- **A disposal larger than the pool**: a sale, the given side of a swap, or a fee paid in the
+  asset. It takes everything the pool holds and emits a `NegativeInventory` warning naming the
+  asset, the moment and the shortfall. The pool never goes below zero.
 - **A fee in a third asset whose cost is unknown.** It emits an `UnattributedFee` warning,
   and the trade's non-cash asset is flagged. On a buy or a swap, that asset's basis leaves
   the fee out. On a sale, its proceeds are overstated by the fee. A conversion has no such
   asset, so only the warning remains.
+
+**Three flags say which figures not to take at face value.** The API serves each in lower
+case, such as `history_incomplete`.
+
+| Flag | Set when | Clears |
+|---|---|---|
+| `HISTORY_INCOMPLETE` | A disposal of the asset was larger than its pool. | Never. The realized P&L of that disposal was computed against a history that is missing something, and nothing later can say what. |
+| `UNATTRIBUTED_FEE` | A fee charged to the asset, paid in a third asset, could not be valued. | Never, for the same reason. |
+| `UNKNOWN_BASIS` | Some of the quantity held has no known cost. | Once those units are gone. |
 
 **A short history does not always show.** Suppose a buy is older than the venue's retention
 and the coins are still held. Every later sale then fits inside the recorded pool, so nothing
@@ -69,10 +91,15 @@ the events alone. Comparing the replayed quantity with the balances actually hel
 reveals it: that comparison is the holdings check, described under "Checking the history
 against the balances held" below. An opening balance (example 9) is how to repair it.
 
-**Rounding happens in one place**, a division rounded once, half to even, to 18 decimals. The
-other side of every split is computed by subtraction, so nothing leaks. When a pool is emptied,
-it gives up all of its remaining basis. The rounding residue of every earlier partial sale
-therefore lands in the realized P&L of the sale that empties it.
+**Rounding happens in two places**, each a single rounding, half to even, to 18 decimals:
+
+- a division, which is how every split is taken;
+- an adjustment's total cost, its unit cost times its quantity.
+
+The other side of every split is computed by subtraction, so nothing leaks. When a pool is
+emptied, it gives up all of its remaining basis. The rounding residue of every earlier partial
+sale therefore lands in the realized P&L of the sale that empties it. The average cost is a
+third, for display only: it is rounded the same way and never fed back into the basis.
 
 ## Worked examples
 
@@ -279,6 +306,9 @@ Add "11:00, transfer 0.5 BTC from the venue to a wallet" to example 1. Every fig
 warning is unchanged. Weighted average pools an asset across locations, so moving it is not an
 accounting event. Only the input fingerprint and the event count change, because the input did.
 
+No import records a transfer today: the recompute replays the fills and the manual
+adjustments, and nothing else. This example is why none is missed.
+
 ### 11. A stablecoin conversion
 
 | Time | Event |
@@ -288,21 +318,83 @@ accounting event. Only the input fingerprint and the event count change, because
 No position exists, since both sides are cash. The fee has no asset to attach to, so it goes to
 `unallocated_costs`, which is 0.1.
 
+### 12. A swap from units of unknown cost splits its fee
+
+A swap like example 7's, from a pool that holds units of unknown cost, and with a fee in a
+third asset:
+
+| Time | Event |
+|---|---|
+| 09:00 | Adjustment: 1 BTC held, cost unknown |
+| 10:00 | Buy 1 BTC for 30,000 USDT |
+| 11:00 | Buy 200,000 KAS for 1 BTC, fee 2 USDT (pair KAS/BTC) |
+
+The pool holds 2 BTC, 1 of them of unknown cost, so everything the swap does splits in half:
+
+- **The BTC given.** 1 × 1 ÷ 2 = 0.5 BTC of known cost leaves, taking 15,000 of basis, and
+  0.5 BTC of unknown cost leaves with it.
+- **The KAS received** splits in the same proportion: 100,000 at known cost, and 100,000 at
+  unknown cost.
+- **The fee.** USDT is cash, so the fee is worth its amount, 2. It splits like the quantity.
+  Half joins the basis of the known KAS. The other half belongs to the KAS of unknown cost, so
+  it goes to `unallocated_costs`. Charged in full to the known half, it would inflate their
+  average, and the more so the smaller that half was.
+
+| | BTC | KAS |
+|---|---|---|
+| quantity | 1 | 200,000 |
+| unknown-basis quantity | 0.5 | 100,000 |
+| cost basis | 15,000 | 15,001 |
+| average cost | 30,000 | 0.15001 |
+| flags | `UNKNOWN_BASIS` | `UNKNOWN_BASIS` |
+
+`unallocated_costs` is 1, and nothing is realized, as in example 7. Had all of the BTC given
+been of unknown cost, all of the KAS received would be too, and the whole fee, 2, would go to
+`unallocated_costs`.
+
+### 13. A rebate
+
+| Time | Event |
+|---|---|
+| 10:00 | Buy 1 BTC for 30,000 USDT, rebate 3 USDT |
+| 11:00 | Buy 1,000 KAS for 100 USDT, rebate 1 BGB |
+
+A rebate is a fee with a negative sign, and it folds into the same place a fee would:
+
+- **The BTC buy.** The rebate is in the asset given, so 29,997 USDT goes out, and that is the
+  basis.
+- **The KAS buy.** The rebate is in a third asset that is not cash, so the BGB pool acquires
+  it. Nothing says what that 1 BGB cost, so it is held at unknown cost, and BGB carries
+  `UNKNOWN_BASIS`. The KAS basis is the 100 given.
+
+| | BTC | KAS | BGB |
+|---|---|---|---|
+| quantity | 1 | 1,000 | 1 |
+| unknown-basis quantity | 0 | 0 | 1 |
+| cost basis | 29,997 | 100 | 0 |
+| average cost | 29,997 | 0.1 | — |
+| flags | — | — | `UNKNOWN_BASIS` |
+
+No warning is emitted, and `unallocated_costs` is 0. Neither venue's import records a rebate
+today; see "A trade, whatever its pair".
+
 ## What the result carries
 
 | Field | Contents |
 |---|---|
 | `positions` | One per non-cash asset any trade or adjustment touched, sorted by symbol. Each has the pool fields above and its flags. |
-| `warnings` | `NegativeInventory` and `UnattributedFee`, in event order. They are returned, never logged. |
+| `warnings` | `NegativeInventory` and `UnattributedFee`, in event order. Within one trade they follow the order its legs are worked in: the given leg, then a fee in a third asset, then the received leg. They are returned, never logged. |
 | `lots` | One per acquisition, with its cost as this method attributed it. #19 persists them, so that a FIFO pass can later sit beside this one. |
-| `unallocated_costs` | Known costs that belong to no position: conversion fees, value given in a swap whose received quantity has no known-cost part, and the share of a swap's fee that belongs to received units of unknown cost. |
+| `unallocated_costs` | Known costs that belong to no position: conversion fees, value given in a swap whose received quantity has no known-cost part, and the share of a swap's fee that belongs to received units of unknown cost (example 12). |
 | `input_fingerprint` | A SHA-256 over the method, the engine version, the cash assets and every event. Equal fingerprints mean an equal answer, so #19 can skip a recompute. |
+| `event_count` | The events replayed, after a repeated one is dropped. |
+| `method`, `engine_version` | What computed it: `weighted_average`, at an engine version that changes with any change that can give a different answer for the same events. |
 
 Taken together, the figures always reconcile. Current basis, minus realized P&L, minus
 unmatched proceeds, plus unallocated costs, equals the net cash the trades put in plus the known
-cost of the adjustments of non-cash assets. For a conversion, the net cash counts only its fee,
-since both sides are pinned at 1. The property tests hold this exactly for random event
-sequences, with no tolerance.
+cost of the adjustments of non-cash assets. For a conversion, the net cash counts only a fee
+paid in cash, since both sides are pinned at 1. The property tests hold this exactly for random
+event sequences, with no tolerance.
 
 ## Where the figures are stored and served
 
@@ -315,15 +407,22 @@ The engine computes; #19 keeps and serves the result (spec
   the result's three lists, every amount at eighteen places as the engine returns it. It is
   derived data: deleting it loses nothing that a recompute cannot rebuild from the fills and
   the manual adjustments.
-- **Recomputed at startup, after every exchange sync that stored a fill, and after every
-  change to a manual adjustment**, and skipped when the fingerprint is unchanged. A new engine
-  version changes every fingerprint, so an upgrade always recomputes. A stored fill or
-  adjustment that cannot become an event fails the recompute and leaves the previous snapshot
-  in place, rather than being skipped. `docs/operations.md`, section 15, covers the log lines
-  and what a failure means.
+- **Recomputed by three triggers, and never on a read:**
+  - at startup;
+  - after an exchange sync that stored a fill, and after any exchange sync while the last
+    recompute had failed, so that a transient failure clears at the next sync;
+  - after every change to a manual adjustment, before the response.
+
+  A recompute whose fingerprint is unchanged writes nothing. A new engine version changes every
+  fingerprint, so an upgrade always recomputes. A stored fill or adjustment that cannot become
+  an event fails the recompute and leaves the previous snapshot in place, rather than being
+  skipped. `docs/operations.md`, section 15, covers the log lines and what a failure means.
 - **Served by `GET /api/accounting/positions`**, valued at the cached **USD** price of each
-  asset. The unit of account is USDT/USDC pinned at 1, so USD is the currency the figures are
-  already in.
+  asset that has one. The unit of account is USDT/USDC pinned at 1, so USD is the currency the
+  figures are already in.
+  - **Only a chain's native asset, BTC or KAS, has a price**, because those are the only pairs
+    the price refresh fetches. Any other asset has no market value, and the reason given is
+    `unsupported_pair`.
   - `market_value` is the price times every unit held.
   - `unrealized_pnl` and `unrealized_return_pct` cover only the known-cost part, the only part
     with a cost to compare against.
@@ -335,10 +434,14 @@ The engine computes; #19 keeps and serves the result (spec
     sums.
   - The dashboard shows the unmatched proceeds beside realized P&L whenever a position
     carries any, and names the assets they come from. An asset held only as unknown-cost
-    units and then sold in full is left with no flag and a realized P&L of zero, so this
-    figure is the only place on the dashboard where its sales show.
-  - The arithmetic is `portfolio.domain.accounting.value_position`, pure and exact like the
-    engine.
+    units and then sold in full is left with no flag and a realized P&L of zero. This figure,
+    and the "Unmatched proceeds" mark beside that asset where the dashboard names the assets
+    no longer held, are the only places its sales show.
+  - Beside the positions it serves the snapshot's warnings, `unallocated_costs`,
+    `event_count` and `computed_at`, which is `null` before the first snapshot; and
+    `last_recompute`, the last recompute attempt since the process started.
+  - The arithmetic is `portfolio.domain.accounting.value_position` and `value_portfolio`, pure
+    and exact like the engine.
 
 ## Checking the history against the balances held
 
@@ -686,11 +789,11 @@ is its identity in the replay, and ids are never reused.
 
 ### Unknown cost is not zero
 
-- **Without a `unit_cost`** (omitted, or `null`), the quantity counts toward the position but
-  not toward its cost. While those units are held, the asset shows the `unknown_basis` flag and
-  the quantity in `unknown_basis_quantity`, and the totals leave the asset out and name it. A
-  later sale of those units realizes nothing, and its proceeds go to `unmatched_proceeds`
-  (example 8).
+- **Without a `unit_cost`** (left out of a create, or `null`), the quantity counts toward the
+  position but not toward its cost. While those units are held, the asset shows the
+  `unknown_basis` flag and the quantity in `unknown_basis_quantity`, and the totals leave the
+  asset out and name it. A later sale of those units realizes nothing, and its proceeds go to
+  `unmatched_proceeds` (example 8).
 - **With a `unit_cost` of zero**, the cost is known to be nothing, as for an airdrop recorded
   that way. A later sale reports its whole proceeds as profit.
 
@@ -698,12 +801,20 @@ Enter zero only when the coins really cost nothing. When the cost is not known, 
 the position then says that it does not know, rather than reporting a profit that did not
 happen.
 
-The API refuses what the engine could not replay, and stores nothing: a quantity that is not
-above zero, a negative cost, more than 18 decimal places, a cost times a quantity too large to
-represent, a date later than now or without a time zone, and a symbol that is not the venue's
-own spelling (`BTC`, never `btc`). The cash assets USDC and USDT are refused too: they are the
-unit of account, and an adjustment of one changes nothing. The error names the field and the
-rule, never the value.
+The API refuses an adjustment that the engine could not replay, or that makes no sense to
+record, and stores nothing. The error names the field and the rule, never the value. It
+refuses:
+
+- a quantity that is not above zero, or a negative cost;
+- an amount with more than 18 decimal places or more than 20 digits before the point, or a
+  cost times a quantity too large to represent;
+- an amount sent as a JSON number rather than a string;
+- a date later than now, or without a time zone;
+- a symbol that is not the venue's own spelling, 1 to 20 upper-case letters or digits (`BTC`,
+  never `btc`);
+- the cash assets USDC and USDT, which are the unit of account: an adjustment of one changes
+  nothing;
+- a note that is missing, blank or longer than 500 characters.
 
 ### Example: resolving a `negative_inventory` warning
 

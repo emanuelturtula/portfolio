@@ -36,9 +36,10 @@ rules are in `docs/accounting.md`.
      It also keeps the proceeds that no recorded cost stands behind out of realized P&L.
 3. **Transfers are free.** Moving coins between a venue and a wallet relocates quantity, and
    the average is untouched. Lot methods have to carry lots across locations.
-4. **Stablecoins are the unit of account.** The configured cash assets (USDT and USDC by
-   default) are pinned at a unit cost of exactly 1. That makes "invested in BTC" a
-   dollar-equivalent figure instead of a basis expressed in another basis.
+4. **Stablecoins are the unit of account.** The cash assets, USDT and USDC, are pinned at a
+   unit cost of exactly 1. The engine takes the set as configuration, and the application
+   uses that default. That makes "invested in BTC" a dollar-equivalent figure instead of a
+   basis expressed in another basis.
 5. **No price is invented.** No historical price source exists.
    - A crypto-to-crypto swap therefore carries the given asset's cost over to the received
      asset, and realizes nothing.
@@ -68,10 +69,11 @@ figure on a tax return, and it must not be used to file one.
 - **Incomplete history shows as flags wherever replay can detect it.** That covers a sale
   beyond the recorded holdings, units of unknown cost, and a fee whose cost is unknown.
 - **A gap that no sale exceeds cannot be detected from the events alone.** Only comparing
-  replay's quantity with the balances actually held can show it, and #19 should consider
-  doing that.
+  replay's quantity with the balances actually held can show it. The holdings check of #104
+  is that comparison (`docs/accounting.md`, "Checking the history against the balances
+  held").
 - **The designed way to fill the hole is the manual adjustments of #18**: an opening balance,
-  with or without a known cost.
+  with or without a known cost, entered on the Adjustments page (#111).
 - **A depeg is invisible.** So is the spread of a USDC/USDT conversion, because both sides are
   pinned at 1.
 - The result depends only on the events, the configuration and the engine version. Its

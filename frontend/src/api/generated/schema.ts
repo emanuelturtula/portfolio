@@ -119,7 +119,8 @@ export interface paths {
          *     ones left out with their reason. Every amount is a JSON string.
          *
          *     With no snapshot yet the answer is still `200`, with `computed_at: null` and empty lists:
-         *     the first recompute runs at startup and after every exchange sync that stores a fill.
+         *     a recompute runs at startup, after an exchange sync that stores a fill, and after an
+         *     adjustment is created, changed or deleted.
          */
         get: operations["readAccountingPositions"];
         put?: never;
