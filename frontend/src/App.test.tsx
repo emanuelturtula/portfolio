@@ -75,19 +75,22 @@ describe('App', () => {
 
     const main = await screen.findByRole('main');
     expect(
-      await within(main).findByRole('heading', { name: /no wallets yet/i }),
+      await within(main).findByRole('heading', { name: 'Nothing to show yet' }),
     ).toBeInTheDocument();
-    // The invested section below settles to its own empty state; until it has, its skeleton
-    // is a `status` of its own, and the assertion below would be about a race.
-    expect(
-      await within(main).findByRole('heading', { name: 'No trades imported yet' }),
-    ).toBeInTheDocument();
+    expect(within(main).getByRole('link', { name: 'Add a wallet' })).toHaveAttribute(
+      'href',
+      '/wallets',
+    );
+    expect(within(main).getByRole('link', { name: 'Connect an exchange' })).toHaveAttribute(
+      'href',
+      '/exchanges',
+    );
     // An empty state, not a failure and not a permanent loading state.
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
-  it('the header links to the dashboard, the wallets, the exchanges and the adjustments', async () => {
+  it('the header links to the dashboard, the details, the wallets, the exchanges and the adjustments', async () => {
     const user = userEvent.setup();
     server.use(
       ...fakeSession({ initialUser: TEST_USERNAME }).handlers,
@@ -98,22 +101,26 @@ describe('App', () => {
 
     const nav = await screen.findByRole('navigation', { name: 'Main' });
     const dashboard = within(nav).getByRole('link', { name: 'Dashboard' });
+    const details = within(nav).getByRole('link', { name: 'Details' });
     const wallets = within(nav).getByRole('link', { name: 'Wallets' });
     const exchanges = within(nav).getByRole('link', { name: 'Exchanges' });
     const adjustments = within(nav).getByRole('link', { name: 'Adjustments' });
     expect(dashboard).toHaveAttribute('href', '/');
+    expect(details).toHaveAttribute('href', '/details');
     expect(wallets).toHaveAttribute('href', '/wallets');
     expect(exchanges).toHaveAttribute('href', '/exchanges');
     // The bare page: the link carries no asset, so the form it opens is empty.
     expect(adjustments).toHaveAttribute('href', '/adjustments');
-    // In that order: Exchanges comes after Wallets, and Adjustments is the fourth (spec 027).
+    // In that order: Details sits beside the dashboard it explains (#154), Exchanges comes
+    // after Wallets, and Adjustments is last (spec 027).
     expect(
       within(nav)
         .getAllByRole('link')
         .map((link) => link.textContent),
-    ).toEqual(['Dashboard', 'Wallets', 'Exchanges', 'Adjustments']);
+    ).toEqual(['Dashboard', 'Details', 'Wallets', 'Exchanges', 'Adjustments']);
     // The current page is marked for assistive technology, not by colour alone.
     expect(dashboard).toHaveAttribute('aria-current', 'page');
+    expect(details).not.toHaveAttribute('aria-current');
     expect(wallets).not.toHaveAttribute('aria-current');
     expect(exchanges).not.toHaveAttribute('aria-current');
     expect(adjustments).not.toHaveAttribute('aria-current');
@@ -153,13 +160,13 @@ describe('App', () => {
       'aria-current',
       'page',
     );
-    for (const other of ['Dashboard', 'Wallets', 'Exchanges']) {
+    for (const other of ['Dashboard', 'Details', 'Wallets', 'Exchanges']) {
       expect(within(nav).getByRole('link', { name: other })).not.toHaveAttribute('aria-current');
     }
 
     await user.click(within(nav).getByRole('link', { name: 'Dashboard' }));
 
-    expect(await screen.findByRole('heading', { name: /no wallets yet/i })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Nothing to show yet' })).toBeInTheDocument();
     expect(currentPath()).toBe('/');
     expect(within(nav).getByRole('link', { name: 'Adjustments' })).not.toHaveAttribute(
       'aria-current',

@@ -104,6 +104,7 @@ __all__ = [
     "SyncRunStatus",
     "SyncTrigger",
     "build_exchange_service",
+    "fill_line_of",
     "history_truncated",
 ]
 """The run vocabulary and the domain enums are **re-exported** for `api/schemas/exchanges.py`,
@@ -206,8 +207,8 @@ def _bound(field: FillRangeField, value: datetime | None) -> datetime | None:
         raise InvalidFillRangeError(field, f"{field} {UNREPRESENTABLE_BOUND_RULE}") from None
 
 
-def _line_of(record: FillViewRecord) -> FillLine:
-    """The fields of a stored fill that its totals need."""
+def fill_line_of(record: FillViewRecord) -> FillLine:
+    """The fields of a stored fill that its totals need. The portfolio summary reads it too."""
     return FillLine(
         base_asset=record.base_asset,
         quote_asset=record.quote_asset,
@@ -271,7 +272,7 @@ def _fills_page(
     return FillsPage(
         fills=tuple(_view_of(record) for record in selected[offset : offset + limit]),
         total_count=len(selected),
-        totals=total_fills(_line_of(record) for record in selected),
+        totals=total_fills(fill_line_of(record) for record in selected),
     )
 
 

@@ -59,6 +59,7 @@ async function invalidateWalletsAndBalances(queryClient: QueryClient): Promise<v
   await Promise.all([
     queryClient.invalidateQueries({ queryKey: [WALLETS_QUERY_KEY_ROOT] }),
     queryClient.invalidateQueries({ queryKey: ['balances'] }),
+    queryClient.invalidateQueries({ queryKey: ['portfolio'] }),
   ]);
 }
 

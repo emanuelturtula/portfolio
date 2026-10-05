@@ -34,6 +34,31 @@ import tseslint from 'typescript-eslint';
 const noNumberCoercionMessage =
   'Monetary values arrive from the API as strings and must never be coerced into a JavaScript number: IEEE-754 doubles cannot represent them exactly. Use the decimal helpers instead of parseFloat, parseInt, Number() or unary +.';
 
+const coercionSelectors = [
+  // Targets the `Number(value)` call specifically, so that
+  // `Number.isFinite` and friends stay available.
+  {
+    selector: 'CallExpression[callee.name="Number"]',
+    message: noNumberCoercionMessage,
+  },
+  // Unary `+` is the same coercion spelled differently: `+value` calls
+  // the same `ToNumber` abstract operation `Number(value)` does.
+  {
+    selector: 'UnaryExpression[operator="+"]',
+    message: noNumberCoercionMessage,
+  },
+];
+
+/**
+ * `decimal.js`'s `toNumber()` is the same coercion behind a method call, which the three rules
+ * above cannot see. A chart needs it, so it is allowed in exactly one function,
+ * `toChartNumber` in `src/lib/money.ts`, and refused everywhere else.
+ */
+const toNumberSelector = {
+  selector: 'CallExpression[callee.property.name="toNumber"]',
+  message: `${noNumberCoercionMessage} For a chart coordinate, use toChartNumber from src/lib/money.ts.`,
+};
+
 export default tseslint.config(
   globalIgnores(['dist', 'coverage', 'src/api/generated']),
   {
@@ -92,21 +117,16 @@ export default tseslint.config(
         { object: 'Number', property: 'parseFloat', message: noNumberCoercionMessage },
         { object: 'Number', property: 'parseInt', message: noNumberCoercionMessage },
       ],
-      'no-restricted-syntax': [
-        'error',
-        // Targets the `Number(value)` call specifically, so that
-        // `Number.isFinite` and friends stay available.
-        {
-          selector: 'CallExpression[callee.name="Number"]',
-          message: noNumberCoercionMessage,
-        },
-        // Unary `+` is the same coercion spelled differently: `+value` calls
-        // the same `ToNumber` abstract operation `Number(value)` does.
-        {
-          selector: 'UnaryExpression[operator="+"]',
-          message: noNumberCoercionMessage,
-        },
-      ],
+      'no-restricted-syntax': ['error', ...coercionSelectors, toNumberSelector],
+    },
+  },
+  {
+    // The one exemption from the `toNumber()` ban: `toChartNumber`, which turns an amount
+    // into a chart coordinate and is documented as never being shown. Every other selector
+    // still applies here.
+    files: ['src/lib/money.ts'],
+    rules: {
+      'no-restricted-syntax': ['error', ...coercionSelectors],
     },
   },
   // Must stay last: it switches off every rule that would fight Prettier.

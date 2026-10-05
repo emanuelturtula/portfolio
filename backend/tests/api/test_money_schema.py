@@ -418,6 +418,9 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         # How the scheduled backups stand (#22). No money crosses it: a state, instants, a
         # count and an error kind, and no configuration value.
         "/api/health/detail",
+        # The dashboard's summary (#154): total value, net invested, P/L and each holding's
+        # share. Every amount a string.
+        "/api/portfolio/summary",
     }
 
 

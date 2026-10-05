@@ -460,6 +460,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/portfolio/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Total value, net invested and P/L in USDT, with every holding and its share
+         * @description Return what is held, what it is worth, and what went into it.
+         *
+         *     **Reads what is stored; asks no chain, venue or price source anything.** A figure that
+         *     could not include something -- an unread wallet, an unpriced asset, a fill not quoted in
+         *     cash -- names it in `missing` rather than counting it as zero. Every amount is a JSON
+         *     string.
+         */
+        get: operations["readPortfolioSummary"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/wallets": {
         parameters: {
             query?: never;
@@ -1597,6 +1622,28 @@ export interface components {
             version: string;
         };
         /**
+         * HoldingResponse
+         * @description One asset held: how much, its price, its value and its share of the total.
+         *
+         *     `price`, `value` and `share_pct` are `null` together when nothing prices the asset, never
+         *     a zero; `share_pct` alone is `null` when the total is zero.
+         */
+        HoldingResponse: {
+            /** Asset */
+            asset: string;
+            /** Price */
+            price: string | null;
+            /**
+             * Quantity
+             * @example 1234.56789012
+             */
+            quantity: string;
+            /** Share Pct */
+            share_pct: string | null;
+            /** Value */
+            value: string | null;
+        };
+        /**
          * LastRecomputeResponse
          * @description The last recompute attempt since the process started. In memory: a restart clears it.
          *
@@ -1624,6 +1671,34 @@ export interface components {
             username: string;
         };
         /**
+         * MissingKind
+         * @description What a summary figure could not include, or could only include as it last stood.
+         *
+         *     The member is its own wire form. `Missing.subject` says which one:
+         *
+         *     * `wallet_unread` -- a wallet on chain `subject` has never been read: it adds nothing.
+         *     * `wallet_stale` -- a wallet on chain `subject` is counted at a reading that is no longer
+         *       current: its chain failed in the latest balance run, or the reading is over a day old.
+         *     * `exchange_unread` -- venue `subject`'s balances have never been read: it adds nothing.
+         *     * `exchange_stale` -- venue `subject` is counted at a reading that is no longer current:
+         *       the last read failed, its fill sync is not `ok`, or the reading is over a day old.
+         *     * `unpriced` -- asset `subject` is held and has no price: it adds nothing to the value.
+         *     * `stale_price` -- asset `subject` is valued at a price over an hour old.
+         *     * `fill_not_in_cash` -- fills quoted in `subject`, which is not cash, are not in the
+         *       invested figure.
+         * @enum {string}
+         */
+        MissingKind: "wallet_unread" | "wallet_stale" | "exchange_unread" | "exchange_stale" | "unpriced" | "stale_price" | "fill_not_in_cash";
+        /**
+         * MissingResponse
+         * @description Something a figure could not include as current, and which chain, venue or asset.
+         */
+        MissingResponse: {
+            kind: components["schemas"]["MissingKind"];
+            /** Subject */
+            subject: string;
+        };
+        /**
          * NotComparedReason
          * @description Why an exchange account's balances are left out of the comparison. Its wire form.
          *
@@ -1649,6 +1724,46 @@ export interface components {
             current_password: string;
             /** New Password */
             new_password: string;
+        };
+        /**
+         * PortfolioSummaryResponse
+         * @description The dashboard's figures, in USDT.
+         *
+         *     * `total_value` -- every tracked, non-cash asset held, in the wallets and on the
+         *       exchanges, at its cached price.
+         *     * `invested` -- the net cash the exchange fills put in: spent on buys, plus fees paid in
+         *       cash, minus received from sells. Negative when sales brought back more than buys cost.
+         *     * `pnl` -- `total_value - invested`; `pnl_pct` its percentage of `invested`, `null` when
+         *       `invested` is not above zero.
+         *     * `holdings` -- largest value first, the unpriced ones last.
+         *     * `missing` -- what the figures could not include, or include only as last read. Empty
+         *       means they are whole and current.
+         *     * `untracked` -- assets held that nothing prices, left out of every figure.
+         */
+        PortfolioSummaryResponse: {
+            /** Holdings */
+            holdings: components["schemas"]["HoldingResponse"][];
+            /**
+             * Invested
+             * @example 1234.56789012
+             */
+            invested: string;
+            /** Missing */
+            missing: components["schemas"]["MissingResponse"][];
+            /**
+             * Pnl
+             * @example 1234.56789012
+             */
+            pnl: string;
+            /** Pnl Pct */
+            pnl_pct: string | null;
+            /**
+             * Total Value
+             * @example 1234.56789012
+             */
+            total_value: string;
+            /** Untracked */
+            untracked: string[];
         };
         /**
          * PositionFlag
@@ -2837,6 +2952,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthDetailResponse"];
+                };
+            };
+        };
+    };
+    readPortfolioSummary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortfolioSummaryResponse"];
                 };
             };
         };

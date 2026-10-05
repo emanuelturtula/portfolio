@@ -6,6 +6,7 @@ import { logout, sessionQueryKey, useSession } from '@/api/session';
 import { RequireSession } from '@/components/RequireSession';
 import { AdjustmentsPage } from '@/pages/AdjustmentsPage';
 import { DashboardPage } from '@/pages/DashboardPage';
+import { DetailsPage } from '@/pages/DetailsPage';
 import { ExchangesPage } from '@/pages/ExchangesPage';
 import { HealthPage } from '@/pages/HealthPage';
 import { LoginPage } from '@/pages/LoginPage';
@@ -19,7 +20,7 @@ import { WalletsPage } from '@/pages/WalletsPage';
  * `/login` is the only public route. Everything else - including the
  * catch-all - is wrapped in `RequireSession`, per the route table in
  * docs/specs/004-login-page-and-app-shell.md, extended by #11 for `/wallets`, by #16 for
- * `/exchanges` and by #111 for `/adjustments`.
+ * `/exchanges`, by #111 for `/adjustments` and by #154 for `/details`.
  */
 export function App() {
   return (
@@ -37,6 +38,14 @@ export function App() {
             element={
               <RequireSession>
                 <DashboardPage />
+              </RequireSession>
+            }
+          />
+          <Route
+            path="/details"
+            element={
+              <RequireSession>
+                <DetailsPage />
               </RequireSession>
             }
           />
@@ -103,6 +112,7 @@ function MainNav() {
       <NavLink to="/" end>
         Dashboard
       </NavLink>
+      <NavLink to="/details">Details</NavLink>
       <NavLink to="/wallets">Wallets</NavLink>
       <NavLink to="/exchanges">Exchanges</NavLink>
       <NavLink to="/adjustments">Adjustments</NavLink>

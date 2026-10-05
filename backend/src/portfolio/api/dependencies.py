@@ -48,6 +48,7 @@ from portfolio.services.health import (
     build_health_service,
 )
 from portfolio.services.password_hasher import PasswordHasher
+from portfolio.services.portfolio import PortfolioService, build_portfolio_service
 from portfolio.services.reconciliation import ReconciliationService, build_reconciliation_service
 from portfolio.services.sync_coordinator import SyncCoordinator
 from portfolio.services.wallets import WalletService, build_wallet_service
@@ -235,6 +236,18 @@ async def get_reconciliation_service(request: Request) -> AsyncIterator[Reconcil
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
     async with sessionmaker() as session:
         yield build_reconciliation_service(session)
+
+
+async def get_portfolio_service(request: Request) -> AsyncIterator[PortfolioService]:
+    """Open a session for this request and hand the router the portfolio service.
+
+    Read-only, like `get_reconciliation_service`: the summary is built from what the syncs and
+    the price refresh stored, so the session is never committed here and closing it discards
+    nothing. The service's clock is the default one.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_portfolio_service(session)
 
 
 async def get_adjustment_service(request: Request) -> AsyncIterator[AdjustmentService]:

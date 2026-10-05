@@ -139,7 +139,7 @@ function openDashboard(options: OpenOptions = {}): Setup {
   );
   server.use(...(options.overrides ?? []));
 
-  renderApp(['/']);
+  renderApp(['/details']);
 
   return { user, accounting, exchanges };
 }
@@ -2235,7 +2235,7 @@ describe('InvestedSection: beside the value section', () => {
 });
 
 describe('InvestedSection: after an exchange sync', () => {
-  it('shows the snapshot the sync recomputed as soon as the owner returns to the dashboard', async () => {
+  it('shows the snapshot the sync recomputed as soon as the owner returns to the details page', async () => {
     // Witness for the `['accounting']` invalidation. The clock is frozen, so the positions
     // cached before the sync are still fresh by `staleTime` on return, and without the
     // invalidation they would be served as they were: "No positions".
@@ -2265,7 +2265,7 @@ describe('InvestedSection: after an exchange sync', () => {
     await user.click(await screen.findByRole('button', { name: 'Sync now' }));
     await screen.findByText(/^The sync /);
 
-    await user.click(within(nav).getByRole('link', { name: 'Dashboard' }));
+    await user.click(within(nav).getByRole('link', { name: 'Details' }));
 
     expect(dataValues(cell(await positionRow('BTC'), 'Invested (USD)'))).toEqual([
       '52500.000000000000000000',
