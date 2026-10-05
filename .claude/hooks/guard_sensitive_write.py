@@ -82,12 +82,24 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 
-# The security tests and the scanner configuration necessarily contain these patterns.
-EXEMPT_PATHS = (
+# The scanner configuration and the scanners themselves necessarily contain these patterns.
+# Each is compared with the whole name of the file being written, never as a suffix: a
+# suffix would also exempt every file whose name merely ends in one, such as a test called
+# test_guard_sensitive_write.py, and this guard would never inspect a write to it.
+EXEMPT_FILE_NAMES = (
     ".gitleaks.toml",
     "guard_sensitive_write.py",
     "secret_scan.py",
 )
+
+
+def file_name(path: str) -> str:
+    """The last component of ``path``, after either separator.
+
+    Claude Code on Windows sends backslash paths, so splitting on ``/`` alone would leave
+    the whole path as the name and the real scanner files would lose their exemption.
+    """
+    return path.replace("\\", "/").rpartition("/")[2]
 
 
 def content_of(tool_input: dict[str, object]) -> str:
@@ -120,7 +132,7 @@ def main() -> int:
         return 0
 
     path = str(tool_input.get("file_path", ""))
-    if any(path.endswith(exempt) for exempt in EXEMPT_PATHS):
+    if file_name(path) in EXEMPT_FILE_NAMES:
         return 0
 
     content = content_of(tool_input)
