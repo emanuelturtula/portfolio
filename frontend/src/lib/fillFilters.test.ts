@@ -36,8 +36,8 @@ function params(query: string): URLSearchParams {
 }
 
 describe('the page size', () => {
-  it('is 50, fixed', () => {
-    expect(FILLS_PAGE_SIZE).toBe(50);
+  it('is 5, fixed', () => {
+    expect(FILLS_PAGE_SIZE).toBe(5);
   });
 });
 
@@ -333,7 +333,7 @@ describe('dayRangeToInstants', () => {
 
 describe('fillsQuery', () => {
   it('asks for the first page of everything with no filter', () => {
-    expect(fillsQuery(NO_FILTERS, 1).toString()).toBe('limit=50&offset=0');
+    expect(fillsQuery(NO_FILTERS, 1).toString()).toBe('limit=5&offset=0');
   });
 
   it('sends the venues, the two instants, and the page as an offset', () => {
@@ -346,17 +346,17 @@ describe('fillsQuery', () => {
     expect(query.getAll('exchange')).toEqual(['bingx', 'bitget']);
     expect(query.get('from')).toBe('2026-03-28T23:00:00.000Z');
     expect(query.get('to')).toBe('2026-03-29T22:00:00.000Z');
-    expect(query.get('limit')).toBe('50');
-    expect(query.get('offset')).toBe('100');
+    expect(query.get('limit')).toBe('5');
+    expect(query.get('offset')).toBe('10');
   });
 
   it('sends only the bound that is set', () => {
     inTimeZone('UTC');
     expect(fillsQuery({ ...NO_FILTERS, toDay: '2026-03-01' }, 1).toString()).toBe(
-      'to=2026-03-02T00%3A00%3A00.000Z&limit=50&offset=0',
+      'to=2026-03-02T00%3A00%3A00.000Z&limit=5&offset=0',
     );
     expect(fillsQuery({ ...NO_FILTERS, fromDay: '2026-03-01' }, 2).toString()).toBe(
-      'from=2026-03-01T00%3A00%3A00.000Z&limit=50&offset=50',
+      'from=2026-03-01T00%3A00%3A00.000Z&limit=5&offset=5',
     );
   });
 });

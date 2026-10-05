@@ -41,7 +41,7 @@ export function SyncHistoryDisclosure({ runs, exchanges }: SyncHistoryDisclosure
   const open = ownerChoice ?? syncHistoryNeedsAttention(newest, exchanges);
 
   return (
-    <section aria-labelledby="sync-history-heading">
+    <section className="card" aria-labelledby="sync-history-heading">
       <h3 id="sync-history-heading">Sync history</h3>
       {runs.isPending && <Skeleton label="Loading sync history…" />}
       {runs.isError && (

@@ -594,7 +594,7 @@ describe('useExchangeFills', () => {
     const [query] = fake.fillQueries();
     expect(query?.toString()).toBe(
       'exchange=bitget&from=2026-03-01T00%3A00%3A00.000Z&to=2026-04-01T00%3A00%3A00.000Z' +
-        '&limit=50&offset=50',
+        '&limit=5&offset=5',
     );
   });
 

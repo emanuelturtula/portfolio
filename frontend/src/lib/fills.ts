@@ -132,21 +132,24 @@ export function describeFillScope(totalCount: number, filters: FillFilters): str
   return `${plural(totalCount, 'fill')} on ${venues} ${describeDays(filters)}.`;
 }
 
-/** "Showing 51 to 100 of 812", for the 1-based `page` of `total` fills. */
-export function describeShowing(page: number, total: number): string {
-  const first = (page - 1) * FILLS_PAGE_SIZE + 1;
-  const last = Math.min(page * FILLS_PAGE_SIZE, total);
+/**
+ * "Showing 6 to 10 of 812", for the 1-based `page` of `total` rows, `pageSize` to a page: the
+ * fills' own size unless another list, such as the run log, pages by its own.
+ */
+export function describeShowing(page: number, total: number, pageSize = FILLS_PAGE_SIZE): string {
+  const first = (page - 1) * pageSize + 1;
+  const last = Math.min(page * pageSize, total);
   return `Showing ${formatCount(first)} to ${formatCount(last)} of ${formatCount(total)}`;
 }
 
-/** How many pages `total` fills make. Only asked when there are some. */
-export function pageCount(total: number): number {
-  return Math.ceil(total / FILLS_PAGE_SIZE);
+/** How many pages `total` rows make, `pageSize` to a page. Only asked when there are some. */
+export function pageCount(total: number, pageSize = FILLS_PAGE_SIZE): number {
+  return Math.ceil(total / pageSize);
 }
 
 /** "Page 2 of 17". */
-export function describePage(page: number, total: number): string {
-  return `Page ${formatCount(page)} of ${formatCount(pageCount(total))}`;
+export function describePage(page: number, total: number, pageSize = FILLS_PAGE_SIZE): string {
+  return `Page ${formatCount(page)} of ${formatCount(pageCount(total, pageSize))}`;
 }
 
 /**

@@ -16,7 +16,7 @@ interface HealthSectionProps {
  */
 export function HealthSection({ headingId, title, children }: HealthSectionProps) {
   return (
-    <section aria-labelledby={headingId}>
+    <section className="card" aria-labelledby={headingId}>
       <h3 id={headingId}>{title}</h3>
       {children}
     </section>

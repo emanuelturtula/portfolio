@@ -2,14 +2,19 @@ import { describe, expect, it } from 'vitest';
 
 import {
   addMoney,
+  barLength,
+  compareMoney,
   equalsMoney,
   formatMoney,
   fromBaseUnits,
   isNegativeMoney,
   isZeroMoney,
+  maxMoney,
   money,
+  moneyOrNull,
   plainMoney,
   toChartNumber,
+  toneOf,
   type FormatMoneyOptions,
 } from '@/lib/money';
 
@@ -569,5 +574,78 @@ describe('toChartNumber', () => {
     expect(formatMoney(money(exact), { maximumFractionDigits: 18 })).toBe(
       '123,456.123456789012345678',
     );
+  });
+});
+
+describe('moneyOrNull', () => {
+  it('keeps a figure exactly, and passes a missing one through as null', () => {
+    expect(moneyOrNull('123456.123456789012345678')).toBe('123456.123456789012345678');
+    expect(moneyOrNull(null)).toBeNull();
+  });
+});
+
+describe('compareMoney', () => {
+  it('orders by value, not by the characters of the string', () => {
+    // As strings, "9" sorts after "10".
+    expect(compareMoney(money('9'), money('10'))).toBe(-1);
+    expect(compareMoney(money('10'), money('9'))).toBe(1);
+  });
+
+  it('sees the eighteenth place, and no difference in how a value is written', () => {
+    expect(compareMoney(money('0.000000000000000001'), money('0'))).toBe(1);
+    expect(compareMoney(money('1.5'), money('1.500000000000000000'))).toBe(0);
+  });
+});
+
+describe('toneOf', () => {
+  it.each([
+    ['0.000000000000000001', 'gain'],
+    ['37500.000000000000000000', 'gain'],
+    ['-0.000000000000000001', 'loss'],
+    ['0', 'flat'],
+    ['-0.000000000000000000', 'flat'],
+  ] as const)('%s is a %s', (value, tone) => {
+    expect(toneOf(money(value))).toBe(tone);
+  });
+});
+
+describe('maxMoney', () => {
+  it('is the largest value, exactly as it was written', () => {
+    expect(maxMoney([money('9'), money('10.500000000000000001'), money('10.5')])).toBe(
+      '10.500000000000000001',
+    );
+  });
+
+  it('is zero for nothing, and for nothing above zero', () => {
+    expect(maxMoney([])).toBe('0');
+    expect(maxMoney([money('-3')])).toBe('0');
+  });
+});
+
+describe('barLength', () => {
+  it('is the share of the longest bar, as a CSS percentage to two places', () => {
+    expect(barLength(money('50'), money('200'))).toBe('25%');
+    expect(barLength(money('1'), money('3'))).toBe('33.33%');
+    expect(barLength(money('2'), money('3'))).toBe('66.67%');
+    expect(barLength(money('200'), money('200'))).toBe('100%');
+  });
+
+  it('works in decimal: a length a double would get wrong comes out exact', () => {
+    // 0.1 + 0.2 over 0.3 is 1.0000000000000002 in floating point.
+    expect(barLength(addMoney(money('0.1'), money('0.2')), money('0.3'))).toBe('100%');
+  });
+
+  it('never runs past the end of its track', () => {
+    expect(barLength(money('300'), money('200'))).toBe('100%');
+  });
+
+  it('draws nothing for a value that is not above zero', () => {
+    expect(barLength(money('0'), money('200'))).toBe('0%');
+    expect(barLength(money('-5'), money('200'))).toBe('0%');
+  });
+
+  it('draws nothing on a scale with nothing on it', () => {
+    expect(barLength(money('5'), money('0'))).toBe('0%');
+    expect(barLength(money('5'), money('-1'))).toBe('0%');
   });
 });

@@ -42,11 +42,12 @@ export function DashboardPage() {
   const sync = useSyncBalances();
 
   return (
-    <>
+    <div className="page">
       <BackupNotice />
       <div className="page-head">
         <button
           type="button"
+          className="button-primary"
           onClick={() => {
             sync.mutate();
           }}
@@ -67,7 +68,7 @@ export function DashboardPage() {
         </p>
       )}
       <Overview summary={summary} />
-    </>
+    </div>
   );
 }
 

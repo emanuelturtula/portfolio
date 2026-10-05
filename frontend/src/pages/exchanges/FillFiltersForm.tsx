@@ -38,7 +38,7 @@ export function FillFiltersForm({ filters, inverted, onChange, onClear }: FillFi
   const syncKey = writeFillFilters(filters, 1).toString();
 
   return (
-    <div className="fill-filters" role="group" aria-label="Transaction filters">
+    <div className="card fill-filters" role="group" aria-label="Transaction filters">
       <fieldset>
         <legend>Exchanges</legend>
         {EXCHANGE_KEYS.map((key) => (

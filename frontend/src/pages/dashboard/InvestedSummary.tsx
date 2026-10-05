@@ -12,7 +12,7 @@ import {
   UNMATCHED_PROCEEDS_EXPLANATION,
   UNMATCHED_PROCEEDS_LABEL,
 } from '@/lib/accounting';
-import { isZeroMoney, money } from '@/lib/money';
+import { isZeroMoney, money, toneOf } from '@/lib/money';
 import { ReturnPercent } from '@/pages/dashboard/ReturnPercent';
 
 interface InvestedSummaryProps {
@@ -25,6 +25,11 @@ interface InvestedSummaryProps {
   readonly positions: readonly Position[];
   readonly quoteCurrency: string;
   readonly unallocatedCosts: string;
+}
+
+/** The class that colours a P&L tile by its sign: the sign in the figure says it first. */
+function toneClass(pnl: string): string {
+  return `kpi-${toneOf(money(pnl))}`;
 }
 
 /**
@@ -83,7 +88,7 @@ export function InvestedSummary({
             ) : (
               <>
                 <Money value={money(totals.total_invested)} options={AMOUNT_FORMAT} />{' '}
-                {quoteCurrency}
+                <span className="kpi-unit">{quoteCurrency}</span>
               </>
             )}
           </dd>
@@ -95,12 +100,13 @@ export function InvestedSummary({
               '—'
             ) : (
               <>
-                <Money value={money(totals.market_value)} options={AMOUNT_FORMAT} /> {quoteCurrency}
+                <Money value={money(totals.market_value)} options={AMOUNT_FORMAT} />{' '}
+                <span className="kpi-unit">{quoteCurrency}</span>
               </>
             )}
           </dd>
         </div>
-        <div>
+        <div className={nothingComparable ? undefined : toneClass(totals.unrealized_pnl)}>
           <dt>Unrealized P&amp;L</dt>
           <dd>
             {nothingComparable ? (
@@ -108,7 +114,7 @@ export function InvestedSummary({
             ) : (
               <>
                 <Money value={money(totals.unrealized_pnl)} options={SIGNED_FORMAT} />{' '}
-                {quoteCurrency}
+                <span className="kpi-unit">{quoteCurrency}</span>
                 <span className="pnl-return">
                   Return <ReturnPercent value={totals.unrealized_return_pct} />
                 </span>
@@ -116,10 +122,11 @@ export function InvestedSummary({
             )}
           </dd>
         </div>
-        <div>
+        <div className={toneClass(totals.realized_pnl)}>
           <dt>Realized P&amp;L</dt>
           <dd>
-            <Money value={money(totals.realized_pnl)} options={SIGNED_FORMAT} /> {quoteCurrency}
+            <Money value={money(totals.realized_pnl)} options={SIGNED_FORMAT} />{' '}
+            <span className="kpi-unit">{quoteCurrency}</span>
           </dd>
         </div>
         {unmatched.length > 0 && (
@@ -128,56 +135,58 @@ export function InvestedSummary({
             <dd>
               {/* An amount that came in, not a gain or a loss: no `+`. A negative one keeps its minus. */}
               <Money value={money(totals.unmatched_proceeds)} options={AMOUNT_FORMAT} />{' '}
-              {quoteCurrency}
+              <span className="kpi-unit">{quoteCurrency}</span>
             </dd>
           </div>
         )}
       </dl>
 
-      {anyStalePrice && <p>These totals include at least one stale price.</p>}
-      {unreliableRealized.length > 0 && (
-        <p>
-          Realized P&amp;L may be inaccurate for {formatList(unreliableRealized)}: the imported
-          history is incomplete, or a fee could not be valued.
-        </p>
-      )}
+      <div className="invested-notes">
+        {anyStalePrice && <p>These totals include at least one stale price.</p>}
+        {unreliableRealized.length > 0 && (
+          <p>
+            Realized P&amp;L may be inaccurate for {formatList(unreliableRealized)}: the imported
+            history is incomplete, or a fee could not be valued.
+          </p>
+        )}
 
-      {unmatched.length > 0 && (
-        <>
-          <p>{UNMATCHED_PROCEEDS_EXPLANATION}</p>
-          <ul className="excluded-list">
-            {unmatched.map((position) => (
-              <li key={position.asset}>
-                <strong>{position.asset}</strong>:{' '}
-                <Money value={money(position.unmatched_proceeds)} options={AMOUNT_FORMAT} />{' '}
-                {quoteCurrency}
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
+        {unmatched.length > 0 && (
+          <>
+            <p>{UNMATCHED_PROCEEDS_EXPLANATION}</p>
+            <ul className="excluded-list">
+              {unmatched.map((position) => (
+                <li key={position.asset}>
+                  <strong>{position.asset}</strong>:{' '}
+                  <Money value={money(position.unmatched_proceeds)} options={AMOUNT_FORMAT} />{' '}
+                  {quoteCurrency}
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
 
-      {totals.excluded.length > 0 && (
-        <>
-          <p>Left out of these totals:</p>
-          <ul className="excluded-list">
-            {groupExclusions(totals.excluded).map(({ reason, assets }) => (
-              <li key={reason}>
-                <strong>{assets.join(', ')}</strong>: {EXCLUSION_REASON_MESSAGES[reason]}
-              </li>
-            ))}
-          </ul>
-          <p>Realized P&amp;L covers every position, including these.</p>
-        </>
-      )}
+        {totals.excluded.length > 0 && (
+          <>
+            <p>Left out of these totals:</p>
+            <ul className="excluded-list">
+              {groupExclusions(totals.excluded).map(({ reason, assets }) => (
+                <li key={reason}>
+                  <strong>{assets.join(', ')}</strong>: {EXCLUSION_REASON_MESSAGES[reason]}
+                </li>
+              ))}
+            </ul>
+            <p>Realized P&amp;L covers every position, including these.</p>
+          </>
+        )}
 
-      {!isZeroMoney(money(unallocatedCosts)) && (
-        <p>
-          Costs not assigned to any asset:{' '}
-          <Money value={money(unallocatedCosts)} options={AMOUNT_FORMAT} /> {quoteCurrency}, from
-          stablecoin conversions or from swaps into units with no known cost.
-        </p>
-      )}
+        {!isZeroMoney(money(unallocatedCosts)) && (
+          <p>
+            Costs not assigned to any asset:{' '}
+            <Money value={money(unallocatedCosts)} options={AMOUNT_FORMAT} /> {quoteCurrency}, from
+            stablecoin conversions or from swaps into units with no known cost.
+          </p>
+        )}
+      </div>
     </>
   );
 }

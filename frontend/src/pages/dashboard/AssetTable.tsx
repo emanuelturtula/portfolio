@@ -1,6 +1,7 @@
 import type { CurrentBalances, WalletBalance } from '@/api/balances';
 import { Money } from '@/components/Money';
 import { RelativeTime } from '@/components/RelativeTime';
+import { currencyLabel } from '@/lib/currency';
 import { addMoney, money, type Money as MoneyValue } from '@/lib/money';
 import { PRICE_UNAVAILABLE_MESSAGES, type PriceUnavailable } from '@/lib/prices';
 
@@ -103,7 +104,7 @@ export function AssetTable({ data }: AssetTableProps) {
   const rows = buildAssetRows(data);
 
   return (
-    <section aria-labelledby="assets-heading">
+    <section className="card" aria-labelledby="assets-heading">
       <h2 id="assets-heading">Assets</h2>
       <div
         className="table-scroll balance-scroll"
@@ -141,7 +142,7 @@ export function AssetTable({ data }: AssetTableProps) {
                   {row.price !== null ? (
                     <>
                       <Money value={money(row.price.amount)} options={PRICE_OPTIONS} />{' '}
-                      {data.quote_currency}
+                      {currencyLabel(data.quote_currency)}
                       {row.price.stale && (
                         <>
                           {' '}
@@ -160,7 +161,8 @@ export function AssetTable({ data }: AssetTableProps) {
                     '—'
                   ) : (
                     <>
-                      <Money value={row.value} options={FIAT_OPTIONS} /> {data.quote_currency}
+                      <Money value={row.value} options={FIAT_OPTIONS} />{' '}
+                      {currencyLabel(data.quote_currency)}
                     </>
                   )}
                 </td>

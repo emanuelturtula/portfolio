@@ -297,7 +297,7 @@ export function WalletList() {
   }
 
   return (
-    <section aria-labelledby="wallet-list-heading">
+    <section className="card" aria-labelledby="wallet-list-heading">
       <div className="wallet-list-header">
         <h3 id="wallet-list-heading" ref={headingRef} tabIndex={-1}>
           Your wallets

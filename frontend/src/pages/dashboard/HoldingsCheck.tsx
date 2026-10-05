@@ -35,7 +35,7 @@ function HoldingsCheckBlock({ data, refreshFailure }: HoldingsCheckBlockProps) {
   const readings = balanceReadings(data);
 
   return (
-    <section aria-labelledby={HOLDINGS_CHECK_ID}>
+    <section className="card" aria-labelledby={HOLDINGS_CHECK_ID}>
       <h3 id={HOLDINGS_CHECK_ID}>Holdings check</h3>
       <p>{describeComparison(data.tolerance_pct)}</p>
 

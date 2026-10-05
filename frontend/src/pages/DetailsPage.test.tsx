@@ -306,7 +306,7 @@ describe('DetailsPage: values', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('asks for the backend default currency and renders the one that comes back', async () => {
+  it('asks for its figures in USD and labels them USDT, the currency they are invested in', async () => {
     const scenario = healthyPortfolio();
     const { fake } = openDashboard({
       ...scenario,
@@ -314,15 +314,24 @@ describe('DetailsPage: values', () => {
     });
 
     const total = await totalRegion();
-    expect(total).toHaveTextContent('USD');
+    expect(total).toHaveTextContent(/ USDT$/);
     expect(total).not.toHaveTextContent('EUR');
+    expect(cell(await assetRow('BTC'), 'Value')).toHaveTextContent(/ USDT$/);
 
     const currentReads = fake.requests.filter(
       (entry) => new URL(entry.url).pathname === BALANCES_CURRENT_PATH,
     );
     expect(currentReads.length).toBeGreaterThan(0);
-    // No currency is chosen on the client; the backend's default stands.
-    expect(new URL(currentReads[0]?.url ?? '').search).toBe('');
+    for (const read of currentReads) {
+      expect(new URL(read.url).search).toBe('?quote_currency=USD');
+    }
+  });
+
+  it('labels a currency other than USD as the backend names it', async () => {
+    // The fixtures answer in EUR: whatever comes back is what the figures are in.
+    openDashboard();
+
+    expect(await totalRegion()).toHaveTextContent(/ EUR$/);
   });
 
   it('an asset held in two wallets shows the sum of both', async () => {
@@ -1186,7 +1195,7 @@ describe('DetailsPage: a total with nothing in it', () => {
     const total = await totalRegion();
     expectNoRenderedZero(total);
     expect(total.querySelector('data')).toBeNull();
-    expect(total).toHaveTextContent(/^Total value\s*— - Partial/);
+    expect(total).toHaveTextContent(/^Total value\s*Partial\s*—/);
     // The spec's own rule: a dash in place of the amount, not a sentence and not 0.00.
     expect(total).toHaveTextContent(/2 wallets not yet read/i);
   });
@@ -1263,9 +1272,7 @@ describe('DetailsPage: partial failure', () => {
     // it is a balance the last sync could not refresh.
     const total = await totalRegion();
     expect(dataValues(total)).toContain(HEALTHY.total);
-    expect(total).toHaveTextContent(
-      'This total includes 1 balance the last sync could not refresh.',
-    );
+    expect(total).toHaveTextContent('Includes 1 balance the last sync could not refresh.');
     // Not the whole page: no whole-page error.
     expect(screen.queryByRole('heading', { name: /could not load/i })).not.toBeInTheDocument();
   });
@@ -1276,7 +1283,7 @@ describe('DetailsPage: partial failure', () => {
     openDashboard(withWalletRow(kaspaDownPortfolio(), 1, { observed_at: PREVIOUS_OBSERVED_AT }));
 
     expect(await totalRegion()).toHaveTextContent(
-      'This total includes 2 balances the last sync could not refresh.',
+      'Includes 2 balances the last sync could not refresh.',
     );
   });
 
@@ -1315,9 +1322,7 @@ describe('DetailsPage: partial failure', () => {
 
     const total = await totalRegion();
     // Only the Kaspa wallet that has a value, not the one that has none.
-    expect(total).toHaveTextContent(
-      'This total includes 1 balance the last sync could not refresh.',
-    );
+    expect(total).toHaveTextContent('Includes 1 balance the last sync could not refresh.');
     expect(total).toHaveTextContent(/1 wallet not yet read/i);
   });
 
@@ -1340,9 +1345,7 @@ describe('DetailsPage: partial failure', () => {
     });
 
     const total = await totalRegion();
-    expect(total).toHaveTextContent(
-      'This total includes 1 balance the last sync could not refresh.',
-    );
+    expect(total).toHaveTextContent('Includes 1 balance the last sync could not refresh.');
     expect(total).not.toHaveTextContent(/2 balances/);
   });
 

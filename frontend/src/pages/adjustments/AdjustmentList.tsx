@@ -219,7 +219,7 @@ export function AdjustmentList({ onEdit, onAttempt, onDeleted }: AdjustmentListP
   }
 
   return (
-    <div>
+    <div className="card">
       <h3 id={LIST_HEADING_ID} ref={headingRef} tabIndex={-1}>
         Recorded adjustments
       </h3>

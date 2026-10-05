@@ -134,7 +134,7 @@ describe('privacy', () => {
     expect(paths).toContain('/api/wallets/4');
     expect(paths).toContain('/api/wallets/1');
     expect(paths).toContain('/api/portfolio/summary');
-    expect(paths).toContain('/api/balances/current');
+    expect(paths).toContain('/api/balances/current?quote_currency=USD');
     expect(paths).toContain('/api/balances/runs?limit=2');
     expect(paths).toContain('/api/balances/sync');
     expect(paths).toContain('/api/accounting/positions');

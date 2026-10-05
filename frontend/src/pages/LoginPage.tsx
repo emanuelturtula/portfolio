@@ -74,7 +74,7 @@ export function LoginPage() {
   }
 
   return (
-    <section aria-labelledby="login-heading" className="login">
+    <section aria-labelledby="login-heading" className="card login">
       <h2 id="login-heading">Sign in</h2>
       <form onSubmit={handleSubmit} noValidate>
         <div className="field">
@@ -122,7 +122,7 @@ export function LoginPage() {
           />
         )}
 
-        <button type="submit" disabled={mutation.isPending}>
+        <button type="submit" className="button-primary" disabled={mutation.isPending}>
           Sign in
         </button>
       </form>

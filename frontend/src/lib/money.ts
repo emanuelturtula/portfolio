@@ -208,6 +208,11 @@ export function fromBaseUnits(units: string, decimals: number): Money {
   return money(negative ? `-${unsigned}` : unsigned);
 }
 
+/** `money(value)`, or `null` for a figure the backend sent as `null`. */
+export function moneyOrNull(value: string | null): Money | null {
+  return value === null ? null : money(value);
+}
+
 /** Adds two {@link Money} values with no precision loss and returns another. */
 export function addMoney(a: Money, b: Money): Money {
   // `toString` (and `toJSON`/`valueOf`) switch to exponential notation once the
@@ -265,6 +270,50 @@ export function equalsMoney(a: Money, b: Money): boolean {
 export function isNegativeMoney(value: Money): boolean {
   const decimal = new Decimal(value);
   return decimal.isNegative() && !decimal.isZero();
+}
+
+/** Orders two amounts for `Array.prototype.sort`: negative when `a` is the smaller. */
+export function compareMoney(a: Money, b: Money): number {
+  return new Decimal(a).comparedTo(new Decimal(b));
+}
+
+/** Which way a signed amount points. */
+export type Tone = 'gain' | 'loss' | 'flat';
+
+/**
+ * The direction of a profit, a loss or a return, for the colour drawn under its sign. Never the
+ * only channel: the figure it colours always carries its `+` or `-`.
+ */
+export function toneOf(value: Money): Tone {
+  if (isZeroMoney(value)) {
+    return 'flat';
+  }
+  return isNegativeMoney(value) ? 'loss' : 'gain';
+}
+
+/** The largest of `values`, or zero when there are none. Exact, like every comparison here. */
+export function maxMoney(values: readonly Money[]): Money {
+  return values.reduce<Money>(
+    (largest, value) => (new Decimal(value).greaterThan(new Decimal(largest)) ? value : largest),
+    money('0'),
+  );
+}
+
+/**
+ * How long a bar is on a chart whose longest bar is `max`: `value` as a percentage of it, as a
+ * CSS length such as `"42.5%"`. Worked out in decimal and handed to the stylesheet as a string,
+ * so no figure passes through a float on its way to the screen.
+ *
+ * A bar only grows to the right, from zero: a value at or below zero, or a scale with nothing
+ * on it, has no length at all (`"0%"`), and nothing is ever longer than the whole track.
+ */
+export function barLength(value: Money, max: Money): string {
+  const top = new Decimal(max);
+  const length = new Decimal(value);
+  if (top.lessThanOrEqualTo(0) || length.lessThanOrEqualTo(0)) {
+    return '0%';
+  }
+  return `${Decimal.min(length.dividedBy(top), 1).times(100).toDecimalPlaces(2).toFixed()}%`;
 }
 
 /**

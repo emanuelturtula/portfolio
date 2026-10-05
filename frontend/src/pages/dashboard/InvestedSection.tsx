@@ -19,10 +19,12 @@ import {
   venuesWithFailedSync,
   type EmptyPositions,
 } from '@/lib/accounting';
+import { currencyLabel } from '@/lib/currency';
 import type { ExchangeKey } from '@/lib/exchanges';
 import { FlagLegend } from '@/pages/dashboard/FlagLegend';
 import { HistoryWarnings } from '@/pages/dashboard/HistoryWarnings';
 import { HoldingsCheck } from '@/pages/dashboard/HoldingsCheck';
+import { InvestedChart } from '@/pages/dashboard/InvestedChart';
 import { InvestedSummary } from '@/pages/dashboard/InvestedSummary';
 import { PositionTable } from '@/pages/dashboard/PositionTable';
 
@@ -148,8 +150,9 @@ interface PositionsViewProps {
 }
 
 /**
- * The section when there are positions: how the figures were computed, what to distrust
- * about them, the summary, the held positions and what the history could not account for.
+ * The section when there are positions: when the figures were computed, what to distrust
+ * about them, the summary, a chart of invested against value, the held positions and what the
+ * history could not account for. Every figure is labelled USDT (see `lib/currency.ts`).
  *
  * It reads the holdings check as well, only to mark the positions whose balances exceed their
  * history: a badge on a held row, and a label in the line for those no longer held. The query
@@ -162,11 +165,13 @@ function PositionsView({ data, computedAt, failedVenues }: PositionsViewProps) {
   const closed = data.positions.filter((position) => !isHeld(position));
   const heldExceedsHistory = heldExceedsHistoryAssets(reconciliation.data);
 
+  const quoteCurrency = currencyLabel(data.quote_currency);
+
   return (
     <>
-      <p>
-        Weighted average cost in {data.quote_currency}, computed <RelativeTime value={computedAt} />
-        . Not a tax figure.
+      <p className="page-meta">
+        Weighted average cost in {quoteCurrency}, computed <RelativeTime value={computedAt} />. Not
+        a tax figure.
       </p>
 
       {data.last_recompute?.outcome === 'failed' && (
@@ -186,23 +191,32 @@ function PositionsView({ data, computedAt, failedVenues }: PositionsViewProps) {
       <InvestedSummary
         totals={data.totals}
         positions={data.positions}
-        quoteCurrency={data.quote_currency}
+        quoteCurrency={quoteCurrency}
         unallocatedCosts={data.unallocated_costs}
       />
-      <PositionTable
-        positions={held}
+      <InvestedChart
+        positions={data.positions}
         excluded={data.totals.excluded}
-        quoteCurrency={data.quote_currency}
-        heldExceedsHistory={heldExceedsHistory}
+        quoteCurrency={quoteCurrency}
       />
-      {closed.length > 0 && <p>{describeClosedPositions(closed, heldExceedsHistory)}</p>}
-      <FlagLegend
-        flags={flagsOf(data.positions)}
-        heldExceedsHistory={data.positions.some((position) =>
-          heldExceedsHistory.has(position.asset),
+      <div className="card">
+        <PositionTable
+          positions={held}
+          excluded={data.totals.excluded}
+          quoteCurrency={quoteCurrency}
+          heldExceedsHistory={heldExceedsHistory}
+        />
+        {closed.length > 0 && (
+          <p className="footnote">{describeClosedPositions(closed, heldExceedsHistory)}</p>
         )}
-      />
-      {data.warnings.length > 0 && <HistoryWarnings warnings={data.warnings} />}
+        <FlagLegend
+          flags={flagsOf(data.positions)}
+          heldExceedsHistory={data.positions.some((position) =>
+            heldExceedsHistory.has(position.asset),
+          )}
+        />
+        {data.warnings.length > 0 && <HistoryWarnings warnings={data.warnings} />}
+      </div>
     </>
   );
 }
@@ -297,8 +311,10 @@ export function InvestedSection() {
   const exchanges = useExchanges(false);
 
   return (
-    <section aria-labelledby="invested-heading">
-      <h2 id="invested-heading">Invested</h2>
+    <section className="stack" aria-labelledby="invested-heading">
+      <h2 id="invested-heading" className="section-title">
+        Invested
+      </h2>
       <InvestedContent positions={positions} exchanges={exchanges} />
       <HoldingsCheck />
     </section>

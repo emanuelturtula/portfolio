@@ -1,3 +1,5 @@
+import { useState } from 'react';
+
 import type { ExchangeRun } from '@/api/exchanges';
 import { RelativeTime } from '@/components/RelativeTime';
 import {
@@ -7,8 +9,12 @@ import {
   formatRunDuration,
   OUTCOME_LABELS,
   RUN_STATUS_LABELS,
+  RUN_STATUS_TONES,
+  SYNC_RUNS_PAGE_SIZE,
   TRIGGER_LABELS,
 } from '@/lib/exchanges';
+import { pageCount } from '@/lib/fills';
+import { Pagination } from '@/pages/exchanges/Pagination';
 
 /**
  * The Exchanges column. A settled run (`success`, `partial` or `failed`) reads its three
@@ -63,7 +69,7 @@ function fillsCell(run: ExchangeRun): string {
  */
 function DetailsCell({ run }: { readonly run: ExchangeRun }) {
   return (
-    <ul>
+    <ul className="run-details">
       {run.accounts.map((account) => {
         const venue = EXCHANGES[account.exchange_key].name;
         return (
@@ -92,47 +98,71 @@ interface SyncRunTableProps {
  * duration, account and fill counts and per-account detail. An empty log renders a fixed
  * sentence instead of an empty table.
  *
+ * Five runs to a page, newest first, paged here: the log is the last 20 runs and arrives whole,
+ * so paging it costs no request. A poll that brings a new run in moves every row one place
+ * down, and the page the owner is on stays the page they chose.
+ *
  * Seven columns do not fit a phone, so the table sits in a focusable scroll region: the page
  * itself never scrolls sideways. See `PositionTable` for the pattern. The region has a name of
  * its own, not the "Sync history" section's, so the two landmarks are told apart.
  */
 export function SyncRunTable({ runs }: SyncRunTableProps) {
+  const [page, setPage] = useState(1);
+
   if (runs.length === 0) {
     return <p>No exchange sync has run yet.</p>;
   }
 
+  const current = Math.min(page, pageCount(runs.length, SYNC_RUNS_PAGE_SIZE));
+  const shown = runs.slice((current - 1) * SYNC_RUNS_PAGE_SIZE, current * SYNC_RUNS_PAGE_SIZE);
+
   return (
-    <div className="table-scroll" role="region" aria-label="Sync runs" tabIndex={0}>
-      <table>
-        <thead>
-          <tr>
-            <th scope="col">Started</th>
-            <th scope="col">Trigger</th>
-            <th scope="col">Status</th>
-            <th scope="col">Duration</th>
-            <th scope="col">Exchanges</th>
-            <th scope="col">Fills</th>
-            <th scope="col">Details</th>
-          </tr>
-        </thead>
-        <tbody>
-          {runs.map((run) => (
-            <tr key={run.run_id}>
-              <td>
-                <RelativeTime value={run.started_at} />
-              </td>
-              <td>{TRIGGER_LABELS[run.trigger]}</td>
-              <td>{RUN_STATUS_LABELS[run.status]}</td>
-              <td>{formatRunDuration(run.duration_ms)}</td>
-              <td>{exchangesCell(run)}</td>
-              <td>{fillsCell(run)}</td>
-              <td>
-                <DetailsCell run={run} />
-              </td>
+    <>
+      <div className="table-scroll" role="region" aria-label="Sync runs" tabIndex={0}>
+        <table className="run-table">
+          <thead>
+            <tr>
+              <th scope="col">Started</th>
+              <th scope="col">Trigger</th>
+              <th scope="col">Status</th>
+              <th scope="col">Duration</th>
+              <th scope="col">Exchanges</th>
+              <th scope="col">Fills</th>
+              <th scope="col">Details</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody>
+            {shown.map((run) => (
+              <tr key={run.run_id}>
+                <td>
+                  <RelativeTime value={run.started_at} />
+                </td>
+                <td>{TRIGGER_LABELS[run.trigger]}</td>
+                <td>
+                  <span className={`status status-${RUN_STATUS_TONES[run.status]}`}>
+                    {RUN_STATUS_LABELS[run.status]}
+                  </span>
+                </td>
+                <td>{formatRunDuration(run.duration_ms)}</td>
+                <td>{exchangesCell(run)}</td>
+                <td>{fillsCell(run)}</td>
+                <td>
+                  <DetailsCell run={run} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {runs.length > SYNC_RUNS_PAGE_SIZE && (
+        <Pagination
+          page={current}
+          total={runs.length}
+          pageSize={SYNC_RUNS_PAGE_SIZE}
+          label="Sync history pages"
+          onPageChange={setPage}
+        />
+      )}
+    </>
   );
 }

@@ -11,6 +11,7 @@ import { NEVER_SYNCED_MESSAGE, selectSettledRun, type SyncRunSummary } from '@/l
 import { AssetTable } from '@/pages/dashboard/AssetTable';
 import { TotalSummary } from '@/pages/dashboard/TotalSummary';
 import { WalletBalanceTable } from '@/pages/dashboard/WalletBalanceTable';
+import { WalletValueChart } from '@/pages/dashboard/WalletValueChart';
 
 // `settled.status` is typed over every `SyncRunStatus`, `'running'` included, even though
 // `selectSettledRun` never actually returns a running run as `settled` - the coordinator's
@@ -57,8 +58,8 @@ const RUNS_UNAVAILABLE_FALLBACK = 'The run log could not be read.';
 const BALANCES_REFETCH_FALLBACK = 'The server could not be reached.';
 
 /**
- * The portfolio value section of the dashboard: total, per-asset and per-wallet value, a
- * refresh button and a "last updated" indicator. See
+ * The wallets' half of the Details page: the total, a bar per wallet, per-asset and per-wallet
+ * value, a refresh button and a "last updated" indicator, every figure in USDT. See
  * docs/specs/011-wallets-page-value-dashboard.md.
  *
  * It was the whole of `DashboardPage` until the invested section joined it (spec 022), and
@@ -127,7 +128,7 @@ export function ValueSection() {
   const walletsById = new Map((wallets.data ?? []).map((wallet) => [wallet.id, wallet]));
 
   return (
-    <div className="dashboard">
+    <div className="stack">
       {balances.isError && (
         <p role="alert">
           Could not refresh the portfolio:{' '}
@@ -148,28 +149,7 @@ export function ValueSection() {
         </p>
       )}
 
-      <div className="dashboard-toolbar">
-        <button
-          type="button"
-          onClick={() => {
-            syncMutation.mutate();
-          }}
-          disabled={syncMutation.isPending}
-        >
-          Refresh
-        </button>
-        {syncMutation.isPending && (
-          <p role="status">Refreshing balances… this can take a minute.</p>
-        )}
-        {inProgress && runningRun !== undefined && (
-          // Not a live region: `<RelativeTime>` ticks every 30s, and a `role="status"` here
-          // would re-announce "started N minutes ago" on every tick. This is page state to
-          // read on demand, not a transition the owner triggered - unlike the refresh-pending
-          // line above, which is, and keeps its `role="status"`.
-          <p>
-            A sync started <RelativeTime value={runningRun.started_at} /> and has not finished.
-          </p>
-        )}
+      <div className="page-head">
         <p className="last-updated">
           Balances as of {data.as_of === null ? 'never' : <RelativeTime value={data.as_of} />}.{' '}
           {runsKnown &&
@@ -182,17 +162,43 @@ export function ValueSection() {
               </>
             ))}
         </p>
-        {syncMutation.isError && (
-          <p role="alert">
-            Refresh did not complete:{' '}
-            {describeApiError(syncMutation.error, REFRESH_FAILURE_FALLBACK)} A sync may still be
-            running on the server; this page updates when it finishes.
-          </p>
-        )}
+        <button
+          type="button"
+          className="button-primary"
+          onClick={() => {
+            syncMutation.mutate();
+          }}
+          disabled={syncMutation.isPending}
+        >
+          Refresh
+        </button>
       </div>
+      {syncMutation.isPending && (
+        <p className="note" role="status">
+          Refreshing balances… this can take a minute.
+        </p>
+      )}
+      {inProgress && runningRun !== undefined && (
+        // Not a live region: `<RelativeTime>` ticks every 30s, and a `role="status"` here
+        // would re-announce "started N minutes ago" on every tick. This is page state to
+        // read on demand, not a transition the owner triggered - unlike the refresh-pending
+        // line above, which is, and keeps its `role="status"`.
+        <p className="note">
+          A sync started <RelativeTime value={runningRun.started_at} /> and has not finished.
+        </p>
+      )}
+      {syncMutation.isError && (
+        <p role="alert">
+          Refresh did not complete: {describeApiError(syncMutation.error, REFRESH_FAILURE_FALLBACK)}{' '}
+          A sync may still be running on the server; this page updates when it finishes.
+        </p>
+      )}
 
       <TotalSummary data={data} settledRun={settled} freshnessKnown={freshnessKnown} />
-      <AssetTable data={data} />
+      <div className="grid-2">
+        <WalletValueChart data={data} />
+        <AssetTable data={data} />
+      </div>
       <WalletBalanceTable
         data={data}
         walletsById={walletsById}
