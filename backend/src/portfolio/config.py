@@ -81,8 +81,8 @@ def provider_url_violation(url: str) -> str | None:
     Esplora behind basic auth, which is a supported deployment rather than a mistake, and
     a provider URL never reaches a log in the first place: the transport logs
     `request_target`, which emits a scheme, a host and an endpoint label and never sees
-    userinfo at all. **Not `strip_query`**, which is a separate helper for a future
-    exchange provider and is not on this path -- `http.py` warns by name that reaching for
+    userinfo at all. **Not `strip_query`**, which is a separate helper that no provider
+    calls and is not on this path -- `http.py` warns by name that reaching for
     it to log a chain request meets the letter of the rule and leaks anyway, and crediting
     it here would be that confusion written down as reassurance.
 

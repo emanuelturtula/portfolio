@@ -153,7 +153,7 @@ match that manifest, skips its backup (existing behaviour), and deploys normally
 #   ./compose.sh exec app python -m portfolio create-user --username <name>
 set -eu
 cd "$(dirname "$0")"
-export PORTFOLIO_IMAGE='ghcr.io/emanuelturtula/portfolio@sha256:<64 hex>'
+export PORTFOLIO_IMAGE='ghcr.io/<owner>/portfolio@sha256:<64 hex>'
 export PORTFOLIO_PORT='8083'
 export PORTFOLIO_ENVIRONMENT='prod'
 export PORTFOLIO_SECRETS_ENV_FILE="$PWD/secrets.env"

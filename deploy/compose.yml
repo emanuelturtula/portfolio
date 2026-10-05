@@ -7,9 +7,10 @@
 # beside the live copy. Run compose on the host through that script (docs/operations.md),
 # not against this file directly, or compose refuses for want of those variables.
 #
-# The compose project name (portfolio-app-prod) is chosen by deploy.py and deliberately
-# differs from the legacy `portfolio-prod` project, so the old application keeps running
-# untouched until it is decommissioned.
+# The compose project name (portfolio-app-prod) is chosen by deploy.py. It was made to
+# differ from the legacy `portfolio-prod` project so the two could run side by side until
+# the legacy application was decommissioned (#25). It stays as it is: compose names the
+# volumes after the project, so renaming it would start production on empty ones.
 
 services:
   app:
