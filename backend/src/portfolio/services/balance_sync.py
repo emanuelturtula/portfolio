@@ -54,6 +54,28 @@ what keeps criterion 3 true all the way to disk: a snapshot write that fails nee
 rollback, and a rollback that spanned two chains would discard the balances of the chain
 that had already succeeded.
 
+## An extended-key wallet is one wallet, however many addresses it reads (spec 031)
+
+A wallet whose `kind` is `extended_key` is scanned by the chain's provider, which derives its
+addresses and reads every one of them (R5, R10). Its snapshot is the **sum** of what the scan
+read (R7): `confirmed` summed, `pending` summed only when every address reported one. It
+still counts as one wallet in every count of the run.
+
+Its derived addresses are loaded **before** the gather, with the wallets, and handed to the
+scan as plain records; the new ones and the newly used ones come back in the reading and are
+written in **the chain's own commit**, with its snapshot (R6). So a scan that fails, or a
+chain whose write fails, persists none of them, and the next sync starts again from what was
+last committed. That costs time and never a wrong number.
+
+A chain with an extended-key wallet whose provider is not an `ExtendedKeyScanner` fails as
+`internal`. The domain refuses an extended key on any chain but Bitcoin, so this is
+unreachable; it is checked anyway because the alternative to failing is skipping the wallet
+silently, and a skipped wallet reads as a zero.
+
+The per-wallet scan log line carries `wallet_id` and counts, never a key, an address or an
+index. It is INFO when the scan persisted new addresses and DEBUG otherwise, so an unchanged
+wallet does not add a line every fifteen minutes.
+
 ## Every run writes its row before it does any work
 
 The `sync_runs` row is inserted at `status='running'` and **committed** before the first
@@ -80,6 +102,8 @@ from typing import TYPE_CHECKING, Final
 import structlog
 
 from portfolio.domain.addresses import AddressInvalidError
+from portfolio.domain.chains import WalletKind
+from portfolio.providers.base import ExtendedKeyScanner, KnownDerivedAddress
 from portfolio.providers.errors import (
     ProviderError,
     ProviderRateLimitedError,
@@ -89,6 +113,10 @@ from portfolio.providers.errors import (
 )
 from portfolio.providers.http import monotonic_ms
 from portfolio.repositories.balances import BalanceRepository
+from portfolio.repositories.derived_addresses import (
+    DerivedAddressRecord,
+    DerivedAddressRepository,
+)
 from portfolio.repositories.sync_runs import (
     ChainOutcome,
     SyncErrorKind,
@@ -100,16 +128,17 @@ from portfolio.repositories.sync_runs import (
 from portfolio.repositories.wallets import WalletRepository
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from portfolio.db.models import Wallet
-    from portfolio.providers.base import AddressBalance, ChainProvider
+    from portfolio.providers.base import AddressBalance, ChainProvider, ExtendedKeyScan
 
 __all__ = [
     "BalanceSyncService",
     "ChainProviderFor",
+    "ExtendedKeysUnsupportedError",
     "build_balance_sync_service",
     "error_kind_of",
     "utc_now",
@@ -152,6 +181,19 @@ _PROVIDER_ERROR_KINDS: Final[tuple[tuple[type[ProviderError], SyncErrorKind], ..
 )
 
 
+class ExtendedKeysUnsupportedError(TypeError):
+    """A chain holds an extended-key wallet and its provider cannot scan one.
+
+    Unreachable while the domain refuses an extended key on every chain but Bitcoin, and
+    raised anyway: the alternative is to skip the wallet, and a skipped wallet is a balance
+    that silently reads as nothing. It lands in `_read_chain`'s last clause, as `internal`,
+    which is what it is -- a gap in this application, not a vendor's failure.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("This chain's provider cannot scan an extended public key.")
+
+
 def error_kind_of(error: ProviderError) -> SyncErrorKind:
     """Which recorded kind a provider failure is, by its type rather than by its message.
 
@@ -190,6 +232,19 @@ class _WalletReading:
     pending: int | None
     decimals: int
     observed_at: datetime
+    derived: _DerivedChanges | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DerivedChanges:
+    """What an extended-key wallet's scan changed, to be written with its snapshot (R6).
+
+    `scanned` is a count for the log line, and the only thing about the scan that is logged.
+    """
+
+    new: tuple[DerivedAddressRecord, ...]
+    newly_used: tuple[tuple[int, int], ...]
+    scanned: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,11 +279,15 @@ class BalanceSyncService:
         provider_for: ChainProviderFor,
         clock: Callable[[], datetime] = utc_now,
         monotonic: Callable[[], int] = monotonic_ms,
+        derived: DerivedAddressRepository | None = None,
     ) -> None:
         self._session = session
         self._wallets = wallets
         self._runs = runs
         self._balances = balances
+        # Optional, and built over the same session when omitted, because the repository
+        # has one implementation and every caller that predates spec 031 omits it.
+        self._derived = derived if derived is not None else DerivedAddressRepository(session)
         self._provider_for = provider_for
         self._clock = clock
         self._monotonic = monotonic
@@ -297,9 +356,15 @@ class BalanceSyncService:
         await self._session.commit()
         run_id = run.id
 
+        # Before the gather, for the reason the module docstring gives: nothing inside it
+        # may touch the session. Frozen records, so nothing inside it can lazy-load either.
+        known = await self._derived.list_for_wallets(
+            [wallet.id for wallet in wallets if wallet.kind == WalletKind.EXTENDED_KEY.value]
+        )
+
         groups = _group_by_chain(wallets)
         reads = await asyncio.gather(
-            *(self._read_chain(chain_key, group) for chain_key, group in groups)
+            *(self._read_chain(chain_key, group, known) for chain_key, group in groups)
         )
 
         outcomes = [await self._write_chain(run_id, read) for read in reads]
@@ -343,8 +408,13 @@ class BalanceSyncService:
             chains=tuple(outcomes),
         )
 
-    async def _read_chain(self, chain_key: str, wallets: Sequence[Wallet]) -> _ChainRead:
-        """Read one chain's addresses. **Never raises**, which is what isolates the others.
+    async def _read_chain(
+        self,
+        chain_key: str,
+        wallets: Sequence[Wallet],
+        known: Mapping[int, Sequence[DerivedAddressRecord]],
+    ) -> _ChainRead:
+        """Read one chain's wallets. **Never raises**, which is what isolates the others.
 
         The clock is read *before* the request rather than after it, so a snapshot is dated
         no later than the moment it was true. That errs early by however long the chain took
@@ -356,16 +426,45 @@ class BalanceSyncService:
         repeated address -- correctly, since a batch answering about the same thing twice is
         a correlation bug. De-duplicating here means the one read is fanned back out to both
         wallets instead of costing a chain its whole run.
+
+        **Address wallets first, as one batch, then each extended-key wallet in turn**
+        (spec 031). The scans are sequential for the reason the providers' reads are: they
+        share one host's limiter, and a `gather` would turn its floor into a queue. A failure
+        in any of them fails the chain, as a failed batch always has.
         """
         observed_at = self._clock()
+        address_wallets = [w for w in wallets if w.kind != WalletKind.EXTENDED_KEY.value]
+        key_wallets = [w for w in wallets if w.kind == WalletKind.EXTENDED_KEY.value]
         try:
             provider = self._provider_for(chain_key)
-            # `dict.fromkeys` rather than a `set`: it de-duplicates *and* keeps the order
-            # the wallets were registered in, so the request a vendor receives is stable
-            # between runs and a log of two syncs is comparable.
-            addresses = tuple(dict.fromkeys(wallet.address_canonical for wallet in wallets))
-            balances = await provider.fetch_balances(addresses)
-            readings = _fan_out(balances, wallets, observed_at)
+            readings: tuple[_WalletReading, ...] = ()
+            if address_wallets:
+                # `dict.fromkeys` rather than a `set`: it de-duplicates *and* keeps the
+                # order the wallets were registered in, so the request a vendor receives is
+                # stable between runs and a log of two syncs is comparable.
+                addresses = tuple(
+                    dict.fromkeys(wallet.address_canonical for wallet in address_wallets)
+                )
+                balances = await provider.fetch_balances(addresses)
+                readings = _fan_out(balances, address_wallets, observed_at)
+            if key_wallets:
+                if not isinstance(provider, ExtendedKeyScanner):
+                    raise ExtendedKeysUnsupportedError
+                for wallet in key_wallets:
+                    persisted = known.get(wallet.id, ())
+                    scan = await provider.scan_extended_key(
+                        wallet.address_canonical,
+                        [
+                            KnownDerivedAddress(
+                                branch=record.branch,
+                                index=record.child_index,
+                                address=record.address,
+                                used=record.used,
+                            )
+                            for record in persisted
+                        ],
+                    )
+                    readings += (_reading_of_scan(wallet.id, persisted, scan, observed_at),)
         except AddressInvalidError as error:
             # **A third clause, and neither of the other two would have been right.** A
             # provider validates every address before it builds a URL, so a row the wallet
@@ -397,10 +496,13 @@ class BalanceSyncService:
                     status=SyncRunStatus.FAILED,
                     wallets_read=0,
                     error_kind=SyncErrorKind.ADDRESS_REJECTED,
+                    # "Before it was read", not "before any request": since spec 031 a chain's
+                    # address wallets may have been read before one of its extended keys was
+                    # refused. Nothing of the chain is kept either way.
                     detail=(
-                        f"{len(wallets)} wallet(s) on this chain were not read: an address "
-                        f"was refused before any request was made ({error.reason.value}). "
-                        f"{error.message}"
+                        f"{len(wallets)} wallet(s) on this chain were not read: an address or "
+                        f"an extended key was refused before it was read "
+                        f"({error.reason.value}). {error.message}"
                     ),
                 ),
                 readings=(),
@@ -479,6 +581,15 @@ class BalanceSyncService:
                     decimals=reading.decimals,
                     observed_at=reading.observed_at,
                 )
+                if reading.derived is not None:
+                    # In this chain's commit, with the snapshot it produced (R6): both are
+                    # written, or neither is.
+                    await self._derived.apply(
+                        reading.wallet_id,
+                        new=reading.derived.new,
+                        newly_used=reading.derived.newly_used,
+                        created_at=reading.observed_at,
+                    )
             await self._session.commit()
         except Exception as error:
             await self._session.rollback()
@@ -494,7 +605,30 @@ class BalanceSyncService:
                 error_kind=SyncErrorKind.INTERNAL,
                 detail=type(error).__name__,
             )
+        for reading in read.readings:
+            if reading.derived is not None:
+                _log_scan(reading.wallet_id, reading.derived)
         return read.outcome
+
+
+def _log_scan(wallet_id: int, changes: _DerivedChanges) -> None:
+    """One line per committed extended-key wallet: its id and three counts, nothing else.
+
+    INFO when the scan persisted a new address, DEBUG otherwise: a wallet that did not
+    change would otherwise add an INFO line every fifteen minutes, forever. Written after
+    the commit, so an INFO line is a statement about what is on disk.
+
+    **No field name contains `address`**: `redact_sensitive` matches that fragment as a
+    substring of the key and would print every count as `[REDACTED]`.
+    """
+    log = _logger.info if changes.new else _logger.debug
+    log(
+        "balance_sync_extended_key_scanned",
+        wallet_id=wallet_id,
+        derived_scanned=changes.scanned,
+        derived_new=len(changes.new),
+        derived_newly_used=len(changes.newly_used),
+    )
 
 
 def _group_by_chain(wallets: Sequence[Wallet]) -> list[tuple[str, list[Wallet]]]:
@@ -554,6 +688,70 @@ def _fan_out(
     return tuple(readings)
 
 
+def _reading_of_scan(
+    wallet_id: int,
+    persisted: Sequence[DerivedAddressRecord],
+    scan: ExtendedKeyScan,
+    observed_at: datetime,
+) -> _WalletReading:
+    """One extended-key wallet's snapshot, and what its scan changed (R6, R7).
+
+    `confirmed` is the sum over every scanned address. `pending` is the sum when every one
+    of them reported a figure and `None` when any did not -- the meaning a missing
+    `mempool_stats` already has, carried through rather than read as zero. A scan with no
+    used address is a real zero, not an unread wallet. Integers of base units throughout:
+    nothing here is a float or a `Decimal` until `BalanceRepository` scales it.
+
+    New is a position, `(branch, index)`, that was not persisted; newly used is one that
+    was persisted unused and now reads used. Positions rather than address strings, because
+    a position is what the table's unique constraint is on.
+
+    Raises:
+        ProviderResponseError: the scan did not read every persisted address, or read one
+            position twice. Either would make the sum quietly wrong. The message counts and
+            never names.
+    """
+    persisted_used = {(record.branch, record.child_index): record.used for record in persisted}
+    positions = [(address.branch, address.index) for address in scan.addresses]
+    distinct = set(positions)
+    if len(distinct) != len(positions) or not distinct.issuperset(persisted_used):
+        message = (
+            f"The extended-key scan left {len(set(persisted_used) - distinct)} persisted "
+            "address(es) unread, or read one position twice, so its sum cannot be trusted."
+        )
+        raise ProviderResponseError(message)
+
+    new: list[DerivedAddressRecord] = []
+    newly_used: list[tuple[int, int]] = []
+    for address in scan.addresses:
+        position = (address.branch, address.index)
+        was_used = persisted_used.get(position)
+        if was_used is None:
+            new.append(
+                DerivedAddressRecord(
+                    branch=address.branch,
+                    child_index=address.index,
+                    address=address.address,
+                    used=address.used,
+                )
+            )
+        elif address.used and not was_used:
+            newly_used.append(position)
+
+    pendings = [address.pending for address in scan.addresses]
+    reported = [figure for figure in pendings if figure is not None]
+    return _WalletReading(
+        wallet_id=wallet_id,
+        confirmed=sum(address.confirmed for address in scan.addresses),
+        pending=sum(reported) if len(reported) == len(pendings) else None,
+        decimals=scan.decimals,
+        observed_at=observed_at,
+        derived=_DerivedChanges(
+            new=tuple(new), newly_used=tuple(newly_used), scanned=len(scan.addresses)
+        ),
+    )
+
+
 def _run_status(chains: Sequence[ChainOutcome]) -> SyncRunStatus:
     """`success`, `partial` or `failed`, from the chains that were actually attempted.
 
@@ -598,4 +796,5 @@ def build_balance_sync_service(
         provider_for=provider_for,
         clock=clock,
         monotonic=monotonic,
+        derived=DerivedAddressRepository(session),
     )

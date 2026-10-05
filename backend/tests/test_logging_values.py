@@ -35,7 +35,8 @@ from portfolio.logging import (
     ADDRESS_ENDS,
     ADDRESS_PATTERNS,
     ADDRESS_STARTS,
-    EXTENDED_PUBLIC_KEY_PATTERN,
+    EXTENDED_KEY_PATTERN,
+    EXTENDED_PRIVATE_KEY_PREFIXES,
     EXTENDED_PUBLIC_KEY_PREFIXES,
     MAX_REDACTION_PASSES,
     MIN_SUBSTRING_SECRET_LENGTH,
@@ -284,7 +285,12 @@ def test_a_secret_is_matched_literally_not_as_a_pattern() -> None:
 
 
 def test_every_listed_prefix_is_an_alternative_of_the_pattern() -> None:
-    """The mainnet prefixes proven on the pattern's source, not on a committed key."""
+    """The mainnet prefixes proven on the pattern's source, not on a committed key.
+
+    Spec 031 widened the pattern to the private prefixes as well, public first and in the
+    order each tuple declares them, so a private key that reaches a log is redacted like a
+    public one. The pattern was renamed `EXTENDED_KEY_PATTERN` with it.
+    """
     assert EXTENDED_PUBLIC_KEY_PREFIXES == (
         "xpub",
         "ypub",
@@ -297,11 +303,26 @@ def test_every_listed_prefix_is_an_alternative_of_the_pattern() -> None:
         "Upub",
         "Vpub",
     )
-    alternation = re.match(r"\(\?:([A-Za-z|]+)\)", EXTENDED_PUBLIC_KEY_PATTERN.pattern)
+    assert EXTENDED_PRIVATE_KEY_PREFIXES == (
+        "xprv",
+        "yprv",
+        "zprv",
+        "tprv",
+        "uprv",
+        "vprv",
+        "Yprv",
+        "Zprv",
+        "Uprv",
+        "Vprv",
+    )
+    alternation = re.match(r"\(\?:([A-Za-z|]+)\)", EXTENDED_KEY_PATTERN.pattern)
     assert alternation is not None
-    assert alternation.group(1).split("|") == list(EXTENDED_PUBLIC_KEY_PREFIXES)
-    assert EXTENDED_PUBLIC_KEY_PATTERN.pattern.endswith("[1-9A-HJ-NP-Za-km-z]{100,}")
-    assert not EXTENDED_PUBLIC_KEY_PATTERN.flags & re.IGNORECASE
+    assert alternation.group(1).split("|") == [
+        *EXTENDED_PUBLIC_KEY_PREFIXES,
+        *EXTENDED_PRIVATE_KEY_PREFIXES,
+    ]
+    assert EXTENDED_KEY_PATTERN.pattern.endswith("[1-9A-HJ-NP-Za-km-z]{100,}")
+    assert not EXTENDED_KEY_PATTERN.flags & re.IGNORECASE
 
 
 def test_a_testnet_extended_key_is_redacted_wherever_it_occurs() -> None:
@@ -315,6 +336,32 @@ def test_an_extended_key_needs_a_hundred_characters_after_its_prefix() -> None:
 
     assert redacted("tpub" + body[:100]) == REDACTED
     assert redacted("tpub" + body[:99]) == "tpub" + body[:99]
+
+
+def private_shaped(prefix: str) -> str:
+    """A string the pattern reads as a private key: a private prefix over a *public* key's body.
+
+    Assembled at run time with `join`, which CPython does not fold, so no file -- source or
+    `.pyc` -- ever holds a private-key-shaped literal (spec 031, R11). It is no key at all:
+    the version is wrong for the bytes and the checksum fails.
+    """
+    return "".join((prefix, SYNTHETIC_TPUB[4:]))
+
+
+@pytest.mark.parametrize(
+    "prefix", ["xprv", "yprv", "zprv", "tprv", "uprv", "vprv", "Yprv", "Zprv", "Uprv", "Vprv"]
+)
+def test_a_private_extended_key_is_redacted_by_value(prefix: str) -> None:
+    """Spec 031, criterion 7: a private key that reaches a log is redacted like a public one."""
+    value = private_shaped(prefix)
+    assert redacted(value) == REDACTED
+    assert redacted(f"refused {value} at registration") == f"refused {REDACTED} at registration"
+
+
+def test_a_private_prefix_needs_a_hundred_characters_after_it_too() -> None:
+    body = SYNTHETIC_TPUB[4:]
+    assert redacted("".join(("tprv", body[:100]))) == REDACTED
+    assert redacted("".join(("tprv", body[:99]))) == "".join(("tprv", body[:99]))
 
 
 def test_an_extended_key_prefix_is_matched_in_its_own_case() -> None:

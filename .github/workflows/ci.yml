@@ -100,11 +100,16 @@ jobs:
     name: Backend tests
     needs: secrets-scan
     runs-on: ubuntu-latest
-    # Slowest: 157 s, 148 s of it in pytest, and that step grows with every issue. The
-    # 30 s per-test ceiling in backend/pyproject.toml ends a hang inside a test sooner,
-    # with every thread's stack. This bounds everything outside a test: installing,
-    # collecting, and a process that never exits because something left a thread running.
-    timeout-minutes: 15
+    # Slowest completed: 14.1 min, across the 27 completed CI and Delivery runs from
+    # 2026-09-29 to 2026-10-04. Almost all of it is pytest, and that step grows with every
+    # issue. The Delivery run for #130 went past the old 15 and was cancelled before it
+    # deployed. This number is the guard's ceiling (MAX_TIMEOUT_MINUTES), about twice the
+    # slowest run, not five times: five times would be 75 minutes, which no longer bounds
+    # anything. Making the suite faster is the way back under the rule. The 30 s per-test
+    # ceiling in backend/pyproject.toml ends a hang inside a test sooner, with every
+    # thread's stack. This bounds everything outside a test: installing, collecting, and a
+    # process that never exits because something left a thread running.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

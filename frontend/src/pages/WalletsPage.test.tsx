@@ -17,7 +17,14 @@ import {
   type FakePortfolio,
   type FakePortfolioOptions,
 } from '@/test/fakePortfolio';
-import { ADDRESSES, wallet, type WalletResponse } from '@/test/fixtures';
+import {
+  ADDRESSES,
+  EXTENDED_KEYS,
+  MASKED_EXTENDED_KEYS,
+  wallet,
+  type WalletResponse,
+  privateKeyShapedRun,
+} from '@/test/fixtures';
 import { currentPath, renderApp, settle } from '@/test/render';
 import { fakeSession, problem, server, TEST_USERNAME } from '@/test/server';
 
@@ -563,13 +570,14 @@ describe('WalletsPage: hints', () => {
     });
   });
 
-  it('an extended key is hinted at and still sent', async () => {
+  it('an extended public key on Kaspa is hinted at and still sent', async () => {
+    // Spec 031 accepts an extended key on Bitcoin only. On Kaspa the hint still says
+    // single addresses only, and the server is still the one that refuses it.
     const { user, fake } = await openEmptyWalletsPage();
-    const tpub =
-      'tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp';
-    fake.rejectAddress(tpub, 'extended_key');
+    fake.rejectAddress(EXTENDED_KEYS.tpub, 'extended_key');
+    await user.selectOptions(chainSelect(), 'kaspa');
 
-    await user.type(addressInput(), tpub);
+    await user.type(addressInput(), EXTENDED_KEYS.tpub);
 
     expect(addressInput()).toHaveAccessibleDescription(
       expect.stringMatching(/only single addresses are supported/i),
@@ -646,6 +654,356 @@ describe('WalletsPage: hints', () => {
     await settle();
 
     expect(creates(fake)).toHaveLength(0);
+  });
+});
+
+describe('WalletsPage: extended keys (spec 031)', () => {
+  /** The private-key sentence the hint gives, and the field error adds to. */
+  const PRIVATE_KEY_HINT = /this is a private key\. never enter a private key here/i;
+  const NOT_SENT = 'It was not sent, and the field has been cleared.';
+
+  it('an extended public key is hinted at as a scan, sent whole, and listed masked', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+
+    await user.type(addressInput(), EXTENDED_KEYS.vpub);
+
+    expect(addressInput()).toHaveAccessibleDescription(
+      expect.stringMatching(/every address of this wallet will be scanned/i),
+    );
+    expect(addressInput()).toHaveAccessibleDescription(
+      expect.stringMatching(/first scan takes about a minute/i),
+    );
+    expect(submitButton()).toBeEnabled();
+    await user.type(labelInput(), 'Savings');
+    await user.click(submitButton());
+
+    const row = await rowFor('Savings');
+    // The key goes to the backend once, in the body, as typed: it is what the wallet is.
+    expect(creates(fake)).toHaveLength(1);
+    expect(creates(fake)[0]?.body).toEqual({
+      chain_key: 'bitcoin',
+      address: EXTENDED_KEYS.vpub,
+      label: 'Savings',
+    });
+    // What comes back is the mask, shown exactly as served, labelled, with no copy control.
+    expect(row).toHaveTextContent(MASKED_EXTENDED_KEYS.vpub);
+    expect(within(row).getByText('Extended key')).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: COPY_ADDRESS })).not.toBeInTheDocument();
+    expect(within(row).getByRole('button', { name: ARCHIVE })).toBeInTheDocument();
+    // And the whole key is gone from the page: the field is reset and nothing shows it.
+    expect(addressInput()).toHaveValue('');
+    expect(document.body.textContent).not.toContain(EXTENDED_KEYS.vpub);
+    expect(document.body.innerHTML).not.toContain(EXTENDED_KEYS.vpub.slice(4, -4));
+  });
+
+  it('the address field asks the browser not to remember, capitalise or spell-check it', async () => {
+    await openEmptyWalletsPage();
+
+    expect(addressInput()).toHaveAttribute('autocomplete', 'off');
+    expect(addressInput()).toHaveAttribute('autocapitalize', 'off');
+    expect(addressInput()).toHaveAttribute('spellcheck', 'false');
+  });
+
+  /** Every SLIP-0132 private prefix, single-signature and multisig, mainnet and test. */
+  const PRIVATE_PREFIXES = [
+    'xprv',
+    'yprv',
+    'zprv',
+    'tprv',
+    'uprv',
+    'vprv',
+    'Yprv',
+    'Zprv',
+    'Uprv',
+    'Vprv',
+  ] as const;
+
+  /** The address field's alert: the one element a refused private key leaves behind. */
+  function addressAlert(): HTMLElement {
+    return within(addForm()).getByRole('alert');
+  }
+
+  /**
+   * No write was made, and no request of any kind carried the refused string or any part
+   * of it that follows the prefix. Short strings only (R11): a refusal is by prefix, so
+   * nothing key-shaped is ever typed.
+   */
+  function expectNeverSent(fake: FakePortfolio, typed: string, { writes = 0 } = {}): void {
+    expect(fake.requests.filter((entry) => entry.method !== 'GET')).toHaveLength(writes);
+    const refused = typed.trim();
+    for (const entry of fake.requests) {
+      const seen = `${entry.url} ${JSON.stringify(entry.body ?? null)}`.toLowerCase();
+      expect(seen).not.toContain(refused.toLowerCase());
+      expect(seen).not.toContain(refused.slice(0, 4).toLowerCase());
+    }
+  }
+
+  /** The refusal as the owner meets it: an empty field, the sentence, and focus on it. */
+  function expectRefusedAndCleared(): void {
+    expect(addressInput()).toHaveValue('');
+    expectFieldError(addressInput(), NOT_SENT);
+    expectFieldError(addressInput(), PRIVATE_KEY_HINT);
+    expect(addressAlert()).toHaveTextContent(NOT_SENT);
+    // Focus leaves the field, so the rest of a key being typed by hand lands nowhere.
+    expect(addressAlert()).toHaveFocus();
+  }
+
+  it.each([
+    ['bitcoin', 'typed'],
+    ['bitcoin', 'pasted'],
+    ['kaspa', 'typed'],
+    ['kaspa', 'pasted'],
+  ] as const)(
+    'a private key on %s is refused the moment it is %s, and the field is cleared',
+    async (chainKey, how) => {
+      const { user, fake } = await openEmptyWalletsPage();
+      await user.selectOptions(chainSelect(), chainKey);
+
+      if (how === 'typed') {
+        // Keystroke by keystroke: refused at the fourth character, and the four after it
+        // land on the alert, not in the field.
+        await user.type(addressInput(), 'tprv8Zgx');
+      } else {
+        await user.click(addressInput());
+        await user.paste('tprv8Zgx');
+      }
+
+      expectRefusedAndCleared();
+      await settle();
+      expectNeverSent(fake, 'tprv8Zgx');
+    },
+  );
+
+  it.each(PRIVATE_PREFIXES)('a pasted %s key is refused and cleared', async (prefix) => {
+    const { user, fake } = await openEmptyWalletsPage();
+
+    await user.click(addressInput());
+    await user.paste(`${prefix}8Zgx`);
+
+    expectRefusedAndCleared();
+    await settle();
+    expectNeverSent(fake, `${prefix}8Zgx`);
+  });
+
+  it('a private key with padding, in capitals, is refused the same way', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+
+    await user.click(addressInput());
+    await user.paste('  XPRV8Zgx');
+
+    expectRefusedAndCleared();
+    await settle();
+    expectNeverSent(fake, '  XPRV8Zgx');
+  });
+
+  it('Enter after a typed private key submits nothing: it lands on the alert', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+
+    await user.type(addressInput(), '  XPRV8Zgx{Enter}');
+
+    expectRefusedAndCleared();
+    await settle();
+    expect(creates(fake)).toHaveLength(0);
+    expectNeverSent(fake, '  XPRV8Zgx');
+  });
+
+  it('clicking Add after the refusal reports an empty field, and still sends nothing', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+    await user.type(addressInput(), 'zprv8Zgx');
+    expectRefusedAndCleared();
+
+    await user.click(submitButton());
+
+    expectFieldError(addressInput(), 'An address is required.');
+    expectNotDescribedBy(addressInput(), NOT_SENT);
+    await settle();
+    expectNeverSent(fake, 'zprv8Zgx');
+  });
+
+  it('after a refused private key, a public key goes through', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+    await user.type(addressInput(), 'zprv8Zgx');
+    expectRefusedAndCleared();
+
+    await user.click(addressInput());
+    await user.type(addressInput(), EXTENDED_KEYS.tpub);
+    // The first keystroke of a normal value is a normal change: the refusal goes.
+    expectNoFieldError(addressInput(), NOT_SENT);
+    expect(addressInput()).toHaveValue(EXTENDED_KEYS.tpub);
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(creates(fake)).toHaveLength(1);
+    });
+    expect(creates(fake)[0]?.body).toMatchObject({ address: EXTENDED_KEYS.tpub });
+    expect(fake.wallets()[0]).toMatchObject({
+      kind: 'extended_key',
+      address: MASKED_EXTENDED_KEYS.tpub,
+    });
+    expectNeverSent(fake, 'zprv8Zgx', { writes: 1 });
+  });
+
+  const LABEL_REFUSAL =
+    'This is a private key. Never enter a private key here or anywhere else. It was not sent, and the field has been cleared.';
+
+  function labelAlert(): HTMLElement {
+    const alert = document.getElementById('wallet-label-error');
+    if (alert === null) {
+      throw new Error('The label field has no alert.');
+    }
+    return alert;
+  }
+
+  it('a private-key run pasted into the label is refused and cleared, and never sent', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+    const run = privateKeyShapedRun('vprv');
+
+    await user.click(labelInput());
+    await user.paste(`my key: ${run}`);
+
+    expect(labelInput()).toHaveValue('');
+    expect(labelInput()).toHaveAttribute('aria-invalid', 'true');
+    expect(labelInput()).toHaveAttribute('aria-describedby', 'wallet-label-error');
+    expect(labelInput()).toHaveAccessibleDescription(LABEL_REFUSAL);
+    expect(labelAlert()).toHaveAttribute('role', 'alert');
+    expect(labelAlert()).toHaveTextContent(LABEL_REFUSAL);
+    expect(labelAlert()).toHaveFocus();
+    // The label's refusal is the label's: the address field says nothing.
+    expect(addressInput()).not.toHaveAttribute('aria-invalid', 'true');
+    await settle();
+    expectNeverSent(fake, run);
+
+    await user.click(labelInput());
+    await user.type(labelInput(), 'Savings');
+
+    expect(labelInput()).toHaveValue('Savings');
+    expect(labelInput()).not.toHaveAttribute('aria-invalid', 'true');
+    expect(document.getElementById('wallet-label-error')).toBeNull();
+  });
+
+  it('a private prefix typed by hand into the label is refused at the fourth character', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+
+    await user.type(labelInput(), 'uprv8Zgx');
+
+    expect(labelInput()).toHaveValue('');
+    expect(labelAlert()).toHaveTextContent(LABEL_REFUSAL);
+    expect(labelAlert()).toHaveFocus();
+    await settle();
+    expectNeverSent(fake, 'uprv8Zgx');
+  });
+
+  it('a label that only mentions a short private prefix is kept: the ruling looks at the start', async () => {
+    const { user } = await openEmptyWalletsPage();
+
+    await user.type(labelInput(), 'Savings uprv8Zgx more');
+
+    expect(labelInput()).toHaveValue('Savings uprv8Zgx more');
+    expect(labelInput()).not.toHaveAttribute('aria-invalid', 'true');
+  });
+
+  it.each([
+    ['in quotes', (run: string) => `"${run}"`],
+    ['after other text', (run: string) => `my key: ${run}`],
+    ['behind a zero-width space', (run: string) => `${String.fromCodePoint(0x200b)}${run}`],
+  ] as const)('a private-key run pasted %s into the address is refused', async (_where, wrap) => {
+    const { user, fake } = await openEmptyWalletsPage();
+    const run = privateKeyShapedRun('tprv');
+
+    await user.click(addressInput());
+    await user.paste(wrap(run));
+
+    expectRefusedAndCleared();
+    await settle();
+    expectNeverSent(fake, run);
+  });
+
+  it('a public-shaped key whose body carries a private-prefix run is kept and sent', async () => {
+    const { user, fake } = await openEmptyWalletsPage();
+    // Built in memory, test-network prefixes only (R11): `uprv` inside a vpub's body.
+    const publicShaped = `vpub5${privateKeyShapedRun('uprv', 102)}`;
+
+    await user.click(addressInput());
+    await user.paste(publicShaped);
+
+    expect(addressInput()).toHaveValue(publicShaped);
+    expect(addressInput()).toHaveFocus();
+    expectNoFieldError(addressInput(), NOT_SENT);
+    await user.click(submitButton());
+
+    await waitFor(() => {
+      expect(creates(fake)).toHaveLength(1);
+    });
+    expect(creates(fake)[0]?.body).toMatchObject({ address: publicShaped });
+  });
+
+  it.each([
+    ['extended_key_multisig', 'Vpub8Zgx', 'bitcoin'],
+    ['invalid_public_key', 'tpubD6NzVbkrYhZ4', 'bitcoin'],
+    ['extended_key', EXTENDED_KEYS.tpub, 'kaspa'],
+  ] as const)(
+    'the server refusal %s renders under the address field',
+    async (rejection, typed, chainKey) => {
+      const { user, fake } = await openEmptyWalletsPage();
+      fake.rejectAddress(typed, rejection);
+      await user.selectOptions(chainSelect(), chainKey);
+
+      await user.type(addressInput(), typed);
+      await user.click(submitButton());
+
+      await waitFor(() => {
+        expectFieldError(addressInput(), ADDRESS_REJECTIONS[rejection]);
+      });
+      expect(creates(fake)).toHaveLength(1);
+      // Under the field, not at form level as a generic failure.
+      expect(within(addForm()).queryByText(/failed validation/i)).not.toBeInTheDocument();
+    },
+  );
+
+  it('an extended-key wallet is listed masked, labelled, and with no copy control', async () => {
+    openWalletsPage({
+      wallets: [
+        ...threeWallets(),
+        wallet({
+          id: 4,
+          kind: 'extended_key',
+          address: MASKED_EXTENDED_KEYS.vpub,
+          label: 'Savings',
+        }),
+      ],
+    });
+
+    const row = await rowFor('Savings');
+
+    expect(row).toHaveTextContent('Bitcoin');
+    // Shown as served: the mask is not truncated a second time, and has no title to hover.
+    expect(within(row).getByText(MASKED_EXTENDED_KEYS.vpub)).toBeInTheDocument();
+    expect(within(row).getByText(MASKED_EXTENDED_KEYS.vpub)).not.toHaveAttribute('title');
+    expect(within(row).getByText('Extended key')).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: COPY_ADDRESS })).not.toBeInTheDocument();
+    expect(within(row).getByRole('button', { name: 'Archive Savings' })).toBeInTheDocument();
+    // The other rows keep theirs.
+    expect(screen.getAllByRole('button', { name: COPY_ADDRESS })).toHaveLength(3);
+    expect((await rowFor('Cold storage')).textContent).not.toContain('Extended key');
+  });
+
+  it('an unlabelled extended-key wallet is still named by its chain and mask', async () => {
+    openWalletsPage({
+      wallets: [
+        wallet({ id: 5, kind: 'extended_key', address: MASKED_EXTENDED_KEYS.tpub, label: null }),
+      ],
+    });
+
+    const list = await walletList();
+    const [row] = within(list).getAllByRole('listitem');
+    if (row === undefined) {
+      throw new Error('The extended-key wallet is not listed.');
+    }
+
+    expect(row).toHaveTextContent(MASKED_EXTENDED_KEYS.tpub);
+    expect(
+      within(row).getByRole('button', { name: `Archive Bitcoin ${MASKED_EXTENDED_KEYS.tpub}` }),
+    ).toBeInTheDocument();
   });
 });
 

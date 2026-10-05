@@ -40,7 +40,31 @@ export const ADDRESS_REJECTIONS = {
   extended_key: 'This is an extended public key, not an address.',
   wrong_network: 'The address belongs to a different network of this chain.',
   malformed: 'The address is not shaped like an address for this chain.',
+  private_key: 'This is a private key. Never enter it here or anywhere else.',
+  extended_key_multisig: 'Multisig extended public keys are not supported.',
+  invalid_public_key: 'The extended key does not hold a valid public key.',
 } as const;
+
+/**
+ * The six single-signature extended public key prefixes the backend accepts on
+ * Bitcoin (spec 031, R2), exactly as written: the backend does not fold case.
+ */
+export const EXTENDED_PUBLIC_KEY_PREFIXES = [
+  'xpub',
+  'ypub',
+  'zpub',
+  'tpub',
+  'upub',
+  'vpub',
+] as const;
+
+/**
+ * What the backend serves as `address` for an extended-key wallet (spec 031,
+ * R8): the first four characters, U+2026, the last four. Never the whole key.
+ */
+export function maskExtendedKey(key: string): string {
+  return `${key.slice(0, 4)}…${key.slice(-4)}`;
+}
 
 export type AddressRejectionType = keyof typeof ADDRESS_REJECTIONS;
 
@@ -165,6 +189,8 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
   let current: CurrentBalancesResponse | CurrentView | undefined = options.current;
   let runs: SyncRunResponse[] = [...(options.runs ?? [])];
   const rejections = new Map<string, AddressRejectionType>();
+  /** What each wallet created here was registered with, for the duplicate check. */
+  const canonicalOf = new Map<number, string>();
   const holds = new Map<HoldableRoute, Promise<void>>();
   const requests: RecordedRequest[] = [];
 
@@ -312,7 +338,12 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
         ]);
       }
 
-      const existing = wallets.find((row) => row.chain_key === chainKey && row.address === address);
+      const isExtendedKey =
+        chainKey === 'bitcoin' &&
+        EXTENDED_PUBLIC_KEY_PREFIXES.some((prefix) => address.startsWith(prefix));
+      const existing = wallets.find(
+        (row) => row.chain_key === chainKey && (canonicalOf.get(row.id) ?? row.address) === address,
+      );
       if (existing !== undefined) {
         return problem(
           409,
@@ -324,13 +355,15 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
       const created: WalletResponse = {
         id: nextId(),
         chain_key: chainKey,
-        address,
+        kind: isExtendedKey ? 'extended_key' : 'address',
+        address: isExtendedKey ? maskExtendedKey(address) : address,
         label: label === '' ? null : label,
         archived: false,
         created_at: NOW,
         updated_at: NOW,
       };
       wallets = [...wallets, created];
+      canonicalOf.set(created.id, address);
 
       return HttpResponse.json(created, { status: 201 });
     }),

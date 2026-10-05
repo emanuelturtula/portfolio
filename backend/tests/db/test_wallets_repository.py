@@ -27,7 +27,12 @@ from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from portfolio.db.engine import create_session_factory
-from portfolio.db.models import _WALLET_CHAIN_KEY_CHECK, Wallet
+from portfolio.db.models import (
+    _WALLET_CHAIN_KEY_CHECK,
+    _WALLET_KIND_CHAIN_CHECK,
+    _WALLET_KIND_CHECK,
+    Wallet,
+)
 from portfolio.domain.chains import ChainKey
 from portfolio.repositories.wallets import WalletConstraintError, WalletRepository
 from tests.address_vectors import (
@@ -475,9 +480,15 @@ def test_the_chain_key_check_constraint_matches_the_model(
         for constraint in inspect(sync_engine).get_check_constraints("wallets")
     }
 
-    assert set(reflected) == {"ck_wallets_chain_key"}
+    # #24 adds the two `kind` CHECKs; the set stays exact, so a fourth one would fail here.
+    # Their behaviour is exercised in `tests/db/test_extended_keys_migration.py`.
+    assert set(reflected) == {"ck_wallets_chain_key", "ck_wallets_kind", "ck_wallets_kind_chain"}
     assert " ".join(reflected["ck_wallets_chain_key"].split()) == " ".join(
         _WALLET_CHAIN_KEY_CHECK.split()
+    )
+    assert " ".join(reflected["ck_wallets_kind"].split()) == " ".join(_WALLET_KIND_CHECK.split())
+    assert " ".join(reflected["ck_wallets_kind_chain"].split()) == " ".join(
+        _WALLET_KIND_CHAIN_CHECK.split()
     )
 
 
