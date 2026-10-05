@@ -854,9 +854,8 @@ def create_app() -> FastAPI:
     # reads nothing from the file system, so `create_app()` stays free of side effects.
     app.state.backup_service = build_backup_service(settings)
 
-    # Middleware runs before routing, which is the whole point: the SPA is mounted at the
-    # root and matches every path, so a check that ran after routing would see an API
-    # request only when a route happened to exist for it.
+    # Middleware runs before routing, which is the whole point: a check that ran after
+    # routing would see an API request only when a route happened to exist for it.
     app.add_middleware(RequestGuardMiddleware, settings=settings)
     # Added last, so it is the outermost of the application's own middleware: the request id
     # it binds reaches the guard above, every route, and the 500 handler outside them all
@@ -882,8 +881,9 @@ def create_app() -> FastAPI:
     # and no path of one is a path of the other.
     app.include_router(adjustments.router, prefix=API_PREFIX)
 
-    # Mounted last and at the root: it matches every path, so any route registered
-    # after it would be unreachable.
+    # Mounted last and at the root: it matches every path outside `/api`, so a route
+    # registered after it there would be unreachable. It never matches one under `/api`,
+    # which is left to the router (#132).
     mount_spa(app)
 
     return app
