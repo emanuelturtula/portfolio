@@ -1233,13 +1233,19 @@ class GuardTests(HostTestCase):
     def test_the_backup_is_the_integrity_checked_sqlite_backup(self) -> None:
         self.host.deploy(R3)
         (backup,) = self.docker.of_kind("exec-backup")
+        # Spec 034, R9: the script takes the database and the copy as arguments, so the
+        # tests in test_rollback_scripts.py run this very text against real SQLite files.
         script = backup.argv[5]
-        self.assertIn("source.backup(target)", script)
+        self.assertEqual(script, deploy.SNAPSHOT_SCRIPT)
+        self.assertIn("source.backup(target", script)
         self.assertIn("PRAGMA integrity_check", script)
         self.assertIn("mode=ro", script)
+        self.assertIn("PRAGMA journal_mode=DELETE", script)
+        self.assertEqual(backup.argv[6], "/app/data/portfolio.db")
+        self.assertRegex(backup.argv[7], r"\A/app/data/deploy-backup-[^/]+\.sqlite3\Z")
         self.assertEqual(backup.argv[2], self.docker.calls[3].argv[2], "the verified container")
         (rm,) = self.docker.of_kind("exec-rm")
-        self.assertEqual(rm.argv[5], backup.argv[6], "the in-container copy is removed")
+        self.assertEqual(rm.argv[5], backup.argv[7], "the in-container copy is removed")
         self.assertEqual(self.docker.inner_files, {})
 
     @unittest.skipUnless(POSIX, "Windows reports every writable file as 0o666")

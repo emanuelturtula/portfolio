@@ -1,0 +1,312 @@
+# 034 — A rollback restores the database a failed candidate migrated
+
+Issue: #140
+Status: done
+
+## Problem
+
+The application migrates its database forward at startup (`upgrade_to_head`,
+`backend/src/portfolio/main.py:171`) and never backwards. An image that does not know the
+database's Alembic revision refuses to start, with `Can't locate revision identified by ...`.
+
+Suppose a candidate migrates the database and then fails its health check or the digest
+check. `deploy/deploy.py` then starts the previous image on the migrated database. That image
+cannot start, the result is `rollback=failed`, and production stays down until a person
+restores by hand.
+
+The automatic rollback is the reason there is no staging environment, and today it does not
+cover the one change most likely to break a deployment: a migration.
+
+## Scope
+
+- **A revision check before the rollback starts the previous image.** It reads the live
+  database's Alembic revision and compares it with the revision the attempt's own snapshot
+  holds. It never guesses.
+- **A restore when the two differ.** The rollback puts the attempt's own snapshot back as the
+  live database, then starts the previous image as it does today.
+- **The outcome in the result.** `result.json` records it, and so does the one-line error the
+  run log shows.
+- **Documentation.** `docs/deployment.md` is updated: "Neither path undoes a migration" and
+  the troubleshooting rows.
+
+## Non-goals
+
+- **A revert of a change that added a migration still fails to deploy.** The reverted image
+  does not know the database's revision. Its own rollback is healthy, because the database
+  was never changed. Making a revert deployable needs downgrade migrations, or a policy of
+  backward-compatible migrations. Neither belongs in `deploy.py`. The deployment document
+  keeps saying "fix forward".
+- **Restoring from a carried snapshot** (`carried_snapshot`), or when the attempt took none.
+  See R6.
+- **Migrating in a separate step before the swap.** That would change how the application
+  starts, which is a larger decision than this fix needs.
+- **The first deployment on a host** (`rollback=no_previous_deployment`). There is no
+  previous image to start. The database a failed first candidate created stays in the data
+  volume, as today.
+
+## Rulings
+
+- **R1. The revision is read, not inferred.**
+  - The snapshot's revision is read from the copy itself, in the same `docker exec` that
+    checks its integrity. It is stored on the attempt as `database_revision`.
+  - The live revision is read after the candidate is stopped, from the database in the data
+    volume.
+  - The restore runs only when the two differ, so a candidate that failed without migrating
+    loses nothing.
+  - Comparing the two images' migration heads was rejected. It says whether the candidate
+    *could* have migrated, not whether it did.
+- **R2. The candidate is stopped before anything reads the database.**
+  - The rollback first stops the candidate (`compose stop app`), so no writer remains while
+    the revision is read or the database is replaced.
+  - `restart: unless-stopped` does not restart a container stopped by compose.
+  - The rollback then starts the previous image with the same `up` it uses today, which
+    replaces the stopped container.
+- **R3. The live revision is read by a one-off container of the previous image.**
+  - Command: `compose run --rm --no-deps -T app python -c <script>`, with the previous
+    manifest and compose file. That gives the same volumes, the same user (`app`, uid 1000)
+    and the same image the rollback will start, and publishes no port.
+  - The script opens the database **read-write**, reads `alembic_version` and closes. A
+    read-write connection that closes last recovers a `-wal` an unclean stop left behind.
+    That is what spec 029's `release_wal` does, and it is what lets step 1 of
+    `restore-backup` proceed instead of refusing with "the database is open".
+  - It prints the one revision, or `absent` when there is no database file.
+- **R4. The restore is the previous image's own `restore-backup`.**
+  - First, the snapshot is streamed through stdin into the backups volume under a copy
+    name. The name follows `BACKUP_NAME_PATTERN`: `portfolio-<UTC stamp>.sqlite3`, stamped
+    when the restore starts.
+  - Then `python -m portfolio restore-backup <name>` runs in a one-off container of the
+    previous image.
+  - Why reuse it: spec 029's procedure already handles the hard parts and is tested.
+    - It refuses a copy with a `-wal` that holds frames.
+    - It checks integrity, and checks that the copy's revision is one the restoring image
+      knows. That image is exactly the one the rollback will start.
+    - It takes a safety copy of the live (migrated) database first, so what the candidate
+      wrote is kept, not destroyed.
+    - It writes through the backup API, so no stale `-wal` is replayed, and it verifies row
+      counts.
+  - Writing a second restore into `deploy.py` would be a second way to do the same thing.
+  - The streaming script writes `.portfolio-<stamp>.partial` and fsyncs it, renames it to
+    the final name and fsyncs the directory, the same shape as a scheduled copy.
+  - **The snapshot is made a self-contained file.** `backup()` sets
+    `PRAGMA journal_mode=DELETE` on its copy before the integrity check, as spec 029 step 3
+    does for every copy. Without it, the copy's header says WAL.
+- **R5. Nothing the restore prints leaves the host.**
+  - `restore-backup` prints rows per table. Spec 029 keeps those counts out of every log,
+    and `deploy.py`'s error message reaches the GitHub Actions log of a public repository.
+  - So the result and the message carry only:
+    - the state: `database = "unchanged" | "restored" | "not_restored" | "unread" |
+      "restore_failed"` (`unread` is R12's);
+    - the two revisions;
+    - the restored copy's name;
+    - the safety copy's name, extracted with the copy-name pattern from the one line that
+      names it.
+  - They never carry the command's output.
+  - On a restore failure, `run()`'s existing redacted diagnostic is used. The CLI prints no
+    counts on failure.
+- **R6. Only the attempt's own snapshot is restored.**
+  - A carried snapshot exists only when the live deployment could not be snapshotted, and
+    it may be older than writes made since. Restoring it automatically could replace days
+    of data without anyone deciding to.
+  - With no own snapshot, there is no revision to compare with, so any existing database
+    counts as moved and the state is `not_restored`, whether or not the candidate migrated.
+    The rollback still tries the previous image. If it comes up, the candidate had not
+    migrated. If it does not, the message now says why.
+- **R7. The streamed copy and the safety copy stay in the backups volume** as ordinary
+  copies. They are listed by `list-backups` and rotated by the scheduled retention like any
+  other. The snapshot also stays in `failed/`, as today.
+- **R8. `run()` gains an optional `input_file: Path | None`**, passed to the subprocess as
+  stdin. Every docker call still goes through `run()`, so its timeout, redaction and
+  argument-free error messages apply to the new calls too.
+- **R9. The in-container scripts take their paths as arguments.** This covers the snapshot
+  script, the revision reader and the stream writer. Tests then run the real scripts with
+  the host's Python against real SQLite files, including a database left with a `-wal` by an
+  unclean close. A fake Docker proves the choreography; it cannot prove the scripts.
+- **R10. The restore needs a previous image that has `restore-backup`**, which is v0.29.0
+  and later. The live image is newer, and a rollback target is always the live image, so
+  this holds for every rollback from now on. It is stated in the docstring, not checked at
+  run time.
+
+- **R11. A restore needs the snapshot's revision.**
+  - An own snapshot whose `alembic_version` holds no single revision gives `not_restored`,
+    and nothing is restored.
+  - `restore-backup` would refuse such a copy anyway. Attempting it would end
+    `restore_failed`, and the previous image would not be started, where today's code
+    would start it.
+- **R12. Only a failed restore skips the previous image's `up`.**
+  - If stopping the candidate or reading the live revision fails, nothing has been
+    restored or changed. The result gets `database = "unread"` and `database_error`, and
+    the rollback goes on to start the previous image exactly as before this change.
+  - Without this, a compose file that compose rejects (for example) would end
+    `rollback=failed`, although the candidate's `up` never touched the running container
+    and production is still up.
+  - When the stream or `restore-backup` fails, the revision is known to have moved, so the
+    previous image cannot start. It is not started, and the state is `restore_failed`.
+
+Added after review:
+
+- **R13. A previous deployment that is still running is never stopped.**
+  - Before it stops anything, the rollback checks the previous deployment with
+    `verify_running`. If it is running its own image and healthy, the candidate's `up`
+    never replaced the live container.
+  - Migrations run only when the application starts, so a candidate that never started
+    cannot have moved the database. The state is `unchanged`, with no stop and no revision
+    read, and `database_revision_live` is absent.
+  - Without this, a candidate refused before it was created (a compose file compose
+    rejects, a missing image) would stop a healthy production only to start it again.
+  - If that check fails for any reason, the rollback goes on as R2 and R3 describe.
+- **R14. A restore that reported its result happened.**
+  - `restore-backup` prints rows per table only after `restore_copy` returns, and by then
+    the copy has been written and its row counts checked. A command that printed that
+    report and then failed, for example because removing the one-off container failed,
+    has restored the database.
+  - So the state is `restored`, with a fixed `database_error` and none of the output. The
+    rollback goes on to the previous image's `up`.
+  - Only the restore's own failure is read this way, never the stream's.
+- **R15. The stream checks its own size.**
+  - The stream script takes the expected byte count as an argument. It refuses to rename
+    a `.partial` of any other size, and removes that partial.
+  - `deploy.py` still compares the `ok <size>` it prints. That makes two checks, one on
+    each side of the pipe.
+- **R16. The safety copy is recorded whenever `restore-backup` names it, failures included.**
+  - The name is taken only where it follows the words `safety copy`. The output must name
+    exactly one copy that way. That covers the success line and spec 029's failure
+    sentence ("The safety copy … holds the database as it was before the restore").
+  - On `restore_failed`, the name then says where the migrated database went.
+- **R17. A docker call that is given no input reads none.**
+  - `run()` passes `stdin=DEVNULL` when there is no `input_file`.
+  - Over SSH, the deploy's own stdin is the Actions runner's, and a one-off container
+    attaches stdin by default.
+
+## Design
+
+All of it is in `deploy/deploy.py`.
+
+**On the success path.**
+- `backup()` returns the snapshot's revision along with whether there was one. The script
+  prints `ok <revision>` after `journal_mode=DELETE` and `integrity_check`.
+- `deploy_locked` stores the revision as `candidate["database_revision"]`.
+  `current.json` therefore records the revision each deployment started from.
+
+**On the failure path, when there is a previous deployment.**
+0. If the previous deployment is still running and healthy → `database = "unchanged"`, and
+   go straight to step 4 (R13).
+1. Stop the candidate: `compose(candidate, candidate_compose, secrets, "stop", "app")`.
+2. Read the live revision (R3).
+3. Decide:
+   - equal → `database = "unchanged"`;
+   - different, and the attempt has its own snapshot → stream and restore (R4), and
+     `database = "restored"`;
+   - different, with no own snapshot → `database = "not_restored"` (R6).
+4. Start the previous image and verify it, exactly as today.
+5. If steps 1 or 2 raise → `database = "unread"` with `database_error`, then step 4 as
+   today (R12). If the stream or the restore raises → `database = "restore_failed"`,
+   `rollback = "failed"` with `rollback_error`, and step 4 is skipped. If step 4 raises →
+   `rollback = "failed"`, as today.
+
+**The result and the error message.**
+- `result` gains `database`, `database_revision` (before), `database_revision_live`
+  (after), `database_restored_from` and `database_safety_copy` (R5). A field is present only
+  when it is known.
+- The error message becomes
+  `Deployment failed; rollback=<...>; database=<...>; evidence=<...>`. `database=` appears
+  whenever there was a previous deployment to roll back to, `unread` included (R12).
+
+**Rejected alternatives.**
+- A restore implemented in `deploy.py`: rejected in R4.
+- A bind mount of the host snapshot: the container user cannot read a 0600 file owned by
+  the deploy user, and running the container as root would make every file it writes
+  root-owned.
+- `docker cp` into the stopped candidate: the copy lands owned by root.
+
+## Acceptance criteria
+
+From the issue, with this spec's reading in italics.
+
+1. A deployment whose candidate migrates and then fails its health check ends with the
+   previous version running and healthy, and `rollback=ok`. *`deploy.py` has always written
+   `rollback=healthy` for this outcome, and that spelling is kept.*
+2. The database the previous version runs on is the one it left, and the result records
+   that it was restored.
+3. Tested in `tests/deploy/` the way the existing rollback paths are, not assumed.
+4. `docs/deployment.md` "Neither path undoes a migration" is updated to match.
+
+Added by this spec:
+
+5. A candidate that fails without migrating leaves the database untouched:
+   `database=unchanged`, and no restore command runs.
+6. A failed restore ends `rollback=failed`, with `database=restore_failed`, and the snapshot
+   kept in `failed/`.
+7. With no own snapshot and a migrated database, the state is `database=not_restored`, and
+   nothing is restored.
+8. The real scripts work against real SQLite files:
+   - the snapshot script yields a DELETE-mode copy and its revision;
+   - the revision reader recovers a `-wal` left by an unclean close and reports the
+     revision;
+   - the stream writer produces a file whose bytes equal its input, under a name the
+     application's `BACKUP_NAME_PATTERN` accepts.
+9. No row count `restore-backup` prints appears in the error message, in `result.json` or
+   in `last-attempt.json`. Its refusal or error text may appear in `rollback_error`, which
+   stays on the host, never in the message. The secrets sentinel still appears nowhere.
+10. If stopping the candidate or reading the revision fails, the result is
+    `database=unread` with `database_error`. The previous image's `up` is still attempted,
+    and when it comes up the outcome is `rollback=healthy`.
+11. An own snapshot with no single revision gives `database=not_restored`, with no restore.
+12. A previous deployment still running and healthy when the rollback starts is neither
+    stopped nor read: `database=unchanged`, with no `database_revision_live` (R13).
+13. A `restore-backup` that printed its report and then failed gives `database=restored`
+    with `database_error`, and the previous image is started (R14).
+14. A short stream leaves neither the final copy nor a `.partial` (R15). A failed restore
+    that names its safety copy records it in `database_safety_copy` (R16). A call without
+    `input_file` gets no stdin (R17).
+
+## Test plan
+
+| # | Test (in `tests/deploy/`) |
+|---|---|
+| 1, 2 | `test_deploy_rotation.py` (or a new `test_deploy_migration_rollback.py`): the fake candidate migrates the live database and then fails health. Asserts, in order: the candidate is stopped; the revision read; the stream; `restore-backup`; the previous image's `up`. Also asserts `rollback=healthy` and `database=restored`, that the live database afterwards is the attempt's snapshot, and that every field is in `failed/result.json` |
+| 1 | The same with a candidate that fails the digest check rather than health |
+| 5 | The candidate fails without migrating: `database=unchanged`, with no stream and no `restore-backup` call |
+| 6 | `restore-backup` fails: `rollback=failed`, `database=restore_failed`, `failed/database.sqlite3` present, and the previous image not started on the migrated database |
+| 7 | A carried snapshot only (the previous deployment unhealthy at snapshot time) and a migrated database: `not_restored`, with no restore |
+| 8 | The real scripts, executed with `sys.executable` on SQLite files under a temporary directory. The copy-name check reads `BACKUP_NAME_PATTERN` from `backend/src/portfolio/domain/backups.py` with `ast`, because `tests/deploy` is standard-library only |
+| 10 | `compose stop` fails, and separately the revision read fails: `database=unread`, `database_error` set, the previous `up` called, `rollback=healthy` |
+| 11 | The fake snapshot reports bare `ok` (no revision) and the candidate migrates: `not_restored`, with no stream and no restore |
+| 9 | The fake `restore-backup` prints rows-per-table lines with a sentinel count. The test asserts that the sentinel appears in no message, no JSON and no captured stdout or stderr. The existing secrets-sentinel checks run on the new paths |
+| 4 | `test_deploy_docs.py`: the section names the restore and the `database=` states |
+| 12 | `verify_running(previous)` passes at rollback: `unchanged`, no `stop`, no one-off `run` |
+| 13 | The fake `restore-backup` prints its report and exits non-zero: `restored`, `database_error`, the previous `up` called, `rollback=healthy`, and no count anywhere |
+| 14 | The real stream script given fewer bytes than its argument; `safety_copy_name` on both sentences, on none, on two and on a copy name not after "safety copy"; `run()` with no `input_file` gives a child EOF on stdin |
+| — | Every existing test in `tests/deploy/` still passes. The ones that pin the old rollback sequence change only to follow the new steps, never to weaken what they check |
+
+## File ownership
+
+| Agent | Owns |
+|---|---|
+| backend-dev | `deploy/deploy.py`, `docs/deployment.md` |
+| tester | `tests/deploy/**`, including `deploy_harness.py`'s `FakeDocker` (`compose stop`, `compose run`, stdin, and revisions on the fake database) |
+| tech lead | this spec |
+| reviewer | nothing |
+
+`FakeDocker` is the tester's. The backend-dev writes the implementation against the contract
+in this spec, and runs the existing suite and the tester's new tests as they land. Changing
+`run()`'s signature (R8) means `FakeDocker.__call__` must accept `input_file`, so the tester
+does that first.
+
+## Risks
+
+- **This runs against production, but only on a failed deployment.** The success path changes
+  only the snapshot script: `journal_mode=DELETE` and printing the revision. A mistake there
+  fails the backup step, which refuses the deployment before the running service is touched.
+- **`compose run` against real Docker is not exercised in CI.** The scripts are proven for
+  real (criterion 8), and the choreography by the fake. The command shapes follow Docker
+  Compose's documented `run` options. If a Docker engine is available locally, the tester
+  rehearses the stream and the revision read against a real container.
+  - None was available when this was built, so there was no rehearsal. Every way the new
+    steps can fail ends no worse than before this change:
+    - a stop or read failure is `unread`, and the rollback runs as it did (R12);
+    - a stream or restore failure keeps the previous image off a database it cannot start
+      on, which is what happened anyway.
+- **Mutation testing:** not run locally, per the project policy since 2026-10-05.
+  - The first verification round ran one sweep anyway, against that policy. It killed 28
+    of 31 mutants; the other 3 are equivalent.
+  - The review fixes were not swept.

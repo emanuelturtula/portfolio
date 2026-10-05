@@ -54,6 +54,32 @@ def code_in(text: str) -> Iterator[tuple[int, str, str]]:
                 yield number, "inline", span
 
 
+def section_in(text: str, heading: str) -> str:
+    """The lines from ``heading`` up to the next heading of its level or higher, outside
+    fences. Raises if the heading is not there."""
+    level = len(heading) - len(heading.lstrip("#"))
+    found: list[str] = []
+    fenced = False
+    for line in text.splitlines():
+        if FENCE.match(line):
+            fenced = not fenced
+        elif not fenced and HEADING.match(line):
+            if found and len(line) - len(line.lstrip("#")) <= level:
+                break
+            if line.rstrip() == heading:
+                found.append(line)
+                continue
+        if found:
+            found.append(line)
+    if not found:
+        raise AssertionError(f"{heading!r} is not a heading")
+    return "\n".join(found)
+
+
+# Spec 034's states, R12's "unread" included.
+DATABASE_STATES = ("unchanged", "restored", "not_restored", "restore_failed", "unread")
+
+
 def headed_lines(path: Path) -> Iterator[tuple[int, str, str]]:
     return headed_lines_in(path.read_text(encoding="utf-8"))
 
@@ -160,6 +186,74 @@ class OperatorDocsTests(unittest.TestCase):
         doc = deploy.__doc__ or ""
         for name in ("~/portfolio-app/", "compose.sh", "backup/", "failed/", "last-attempt.json"):
             self.assertIn(name, doc)
+
+    def test_rolling_back_describes_the_restore_and_every_database_state(self) -> None:
+        # Spec 034, criterion 4: the automatic rollback now undoes a migration.
+        text = section_in((DOCS / "deployment.md").read_text(encoding="utf-8"), "## Rolling back")
+        self.assertNotIn("Neither path undoes a migration", text, "no longer true")
+        self.assertRegex(text, re.compile(r"\brestor(?:e|es|ed|ing)\b", re.IGNORECASE))
+        for state in DATABASE_STATES:
+            with self.subTest(state=state):
+                self.assertRegex(text, rf"(?:`|database=){state}(?![\w])")
+
+    def test_the_troubleshooting_rows_name_every_database_state(self) -> None:
+        # Spec 034, scope: the rows an operator matches the one-line error against.
+        text = section_in(
+            (DOCS / "deployment.md").read_text(encoding="utf-8"), "## When something fails"
+        )
+        for state in DATABASE_STATES:
+            with self.subTest(state=state):
+                self.assertRegex(text, rf"database={state}(?![\w])")
+
+    def test_step_8_starts_the_previous_deployment_unless_the_restore_failed(self) -> None:
+        # Spec 034: a failed restore leaves the previous image unstarted, on purpose.
+        text = section_in(
+            (DOCS / "deployment.md").read_text(encoding="utf-8"), "## What happens on the host"
+        )
+        self.assertIn("unless the restore failed", " ".join(text.split()))
+
+    def test_the_safety_copy_holds_everything_written_since_the_snapshot(self) -> None:
+        # It holds the live database as restore-backup found it: what the candidate wrote,
+        # and what the previous version wrote after the snapshot, before the candidate ran.
+        text = " ".join(
+            section_in(
+                (DOCS / "deployment.md").read_text(encoding="utf-8"), "## Rolling back"
+            ).split()
+        )
+        self.assertIn("written since the snapshot", text)
+        for stale in ("Nothing the candidate wrote is deleted", "holds what the candidate wrote"):
+            self.assertNotIn(stale, text, "no longer the whole of it")
+
+    def test_the_scheduled_copies_section_says_a_rollback_adds_to_them(self) -> None:
+        # A rollback that restores writes two copies into the backups volume.
+        docs = " ".join((DOCS / "deployment.md").read_text(encoding="utf-8").split())
+        self.assertNotIn("neither reads nor changes the scheduled copies", docs, "no longer true")
+        text = " ".join(
+            section_in(
+                (DOCS / "deployment.md").read_text(encoding="utf-8"),
+                "### Not the deployment's backup, and why both exist",
+            ).split()
+        )
+        self.assertIn("safety copy", text)
+
+    def test_the_section_reader_stops_at_the_next_heading(self) -> None:
+        sample = "\n".join(
+            [
+                "## Rolling back",
+                "restored here",
+                "```",
+                "## not a heading inside a fence",
+                "```",
+                "### A subsection belongs to it",
+                "## When something fails",
+                "not_restored there",
+            ]
+        )
+        text = section_in(sample, "## Rolling back")
+        self.assertIn("A subsection", text)
+        self.assertNotIn("not_restored", text)
+        with self.assertRaises(AssertionError):
+            section_in(sample, "## Missing")
 
     def test_the_rules_catch_what_they_are_for(self) -> None:
         # A guard nobody has seen fail is a guard nobody knows the state of.
