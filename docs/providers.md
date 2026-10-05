@@ -1849,8 +1849,8 @@ a measurement of the live service, on 2026-09-26 and 2026-09-27.
 | fills | `GET https://open-api.bingx.com/openApi/spot/v1/trade/myTrades`, signed, no `symbol`, labelled `exchange_fills` | **confirmed** 2026-09-27, V3 and V1; **measured** by the probe |
 | balances | `GET /openApi/spot/v1/account/balance`, signed, labelled `exchange_balances` | **confirmed** 2026-10-01, V3. Never called with a real key |
 | rate limit | fills: 5 a second per UID. Balances: 5 a second per UID and 3 a second per IP | **confirmed** 2026-09-27 and 2026-10-01; the `X-RateLimit-Requests-*` headers **measured** present by the probe. The transport's one request a second per host is what paces |
-| retention | 365 days declared, because the documented 7 days is wrong | the 7 days **disproved** by the probe: older fills came back, and spans to 365 days answered. The year is **unverified**: BingX states one only for its web export, and nothing short of a fill older than a year can settle it |
-| query window | 30 days declared; spans to 365 days were accepted | **measured** by the probe |
+| retention | 90 days declared. The documented 7 days is wrong, and the year first declared was too long | the 7 days **disproved** by the probe: older fills came back, and spans to 365 days ending now answered. **Measured** on 2026-10-05, by the first live sync and a read-only probe run against the running application: a window starting 90 days ago was answered correctly, and every window starting 120 days ago or earlier was answered with code 0 and the account's newest fills, **both bounds silently ignored**. The edge lies between 90 and 120 days and is not narrowed further |
+| query window | 30 days declared; spans to 365 days ending now were accepted | **measured** by the probe |
 | page size | 500, the smaller of the two maxima V3 states | the two maxima **confirmed** 2026-09-27; `limit` of 1 and 5 **measured** as honoured |
 | bounds | `startTime` and `endTime` both inclusive; the cursor is a time | **measured** by the probe |
 | still open | a page past the first, a second symbol in one answer, and history older than the probe's two weeks | **unverified**. The owner's first sync past each is the check; `docs/operations.md` section 14 says how for the second symbol |
@@ -1881,7 +1881,7 @@ a measurement of the live service, on 2026-09-26 and 2026-09-27.
 |---|---|---|---|
 | endpoint | `GET /openApi/spot/v1/trade/myTrades` on `https://open-api.bingx.com`, signed, key permission "Read" (V3, V1) | answered as documented | yes |
 | `symbol` required? | V3: "No". V1: yes | V1 is **wrong**: without `symbol` the answer is code 0, with every fill and a `symbol` on each | never sent |
-| retention | "Can only check data within the past 7 days range" (V3, V1) | **wrong**, disproved: a time-bounded query returned fills more than a week old, and spans of 14, 30, 90 and 365 days ending now all answered code 0 with every fill | 365 days, below |
+| retention | "Can only check data within the past 7 days range" (V3, V1) | **wrong**, disproved: a time-bounded query returned fills more than a week old, and spans of 14, 30, 90 and 365 days ending now all answered code 0 with every fill. **But** a window wholly older than about 90 days is answered with the newest fills and no bounds (2026-10-05, below) | 90 days, below |
 | no time bounds | "the data of the past 24 hours is returned by default" (V3, V1) | **wrong**: it returns from the oldest fill, ascending, and `limit=5` gave the oldest five | bounds are always sent |
 | `startTime`, `endTime` | milliseconds (V3); whether inclusive is not stated | **both inclusive**, with a symbol and without one: `[T, T]` returns the fill at `T`; `[T+1, ...]` and `[..., T-1]` do not | `[since, until - 1 ms]` |
 | order within a page | "sorted by time field, from smallest to largest" (V3, V1) | ascending by time and by id | the cursor takes the newest millisecond by value, so the order within a page does not matter |
@@ -1923,8 +1923,8 @@ Sources, each read on 2026-09-27 unless stated:
 |---|---|
 | whether trade ids are unique across symbols -- the account traded one symbol | namespaces every id `"{symbol}:{id}"`, and pages by time, which is right under either scheme |
 | whether "no `symbol` returns every symbol" holds for an account with two symbols | V3 documents it, and a `symbol` on each fill implies it, but no probe has seen two. The owner's first sync after trading a second symbol is the check -- `docs/operations.md` section 14 says how |
-| whether the venue keeps fills older than a year | declares a year, which the owner's history sits well inside |
-| what the venue answers for a window older than it keeps | nothing maps to `ExchangeRetentionWindowError`. An unmapped error code is loud; an empty success is not, which is why the declared retention matters |
+| where between 90 and 120 days the venue stops honouring a window | declares 90, the end of the measured range |
+| whether the venue still holds fills older than that | the live sync cannot read them; history older than the retention comes from outside it (the owner's backfill) |
 | which of the two page maxima the venue enforces | asks for 500 and calls exactly 500 full |
 | a silent cap below 500 | assumed not to exist: `limit=5` was honoured exactly, and nothing suggests one. A capped page would look complete and lose the rest of its window |
 
@@ -1955,18 +1955,28 @@ follows, the oldest windows will come back empty, and nothing will say so.
 
 #### Decisions
 
-**Capabilities.** `retention` 365 days, `max_query_window` 30 days, `page_size` 500,
+**Capabilities.** `retention` 90 days, `max_query_window` 30 days, `page_size` 500,
 `cursor_kind` `time`, `rate_limit` 5 per 1000 ms, `requires_symbol` false and
 `candidate_symbols()` empty.
 
-- **Why 365 days.** It is a declared bound, not a measured one. The documented 7 days is
-  disproved, and at 7 the owner's own fills older than a week would never be read. The only longer statement BingX makes is the support article's "records are only
-  available for up to one year", about the web export. Declaring more would claim history
-  the venue may not return; declaring `None` would promise history back to 2009. With a
-  year, `history_truncated` tells the owner that nothing before a year ago is promised,
-  which is true.
-- **Why 30 days a window.** Spans up to 365 days were accepted, so it is headroom, not a
-  limit. A first backfill is 13 windows of one or two requests each.
+- **Why 90 days.** The documented 7 days is disproved, and at 7 the owner's own fills older
+  than a week would never be read. The only longer statement BingX makes is the support
+  article's "records are only available for up to one year", about the web export, and a
+  year was declared first. **The first live sync (2026-10-05) disproved it.** BingX does not
+  refuse a window it no longer keeps: it answers code 0 with the account's newest fills and
+  ignores both `startTime` and `endTime`. A read-only probe run in the application's
+  container, printing only counts and times relative to now, asked thirteen consecutive
+  30-day windows back from now and one one-hour window 200 days back. The two newest
+  windows (the second empty) were answered correctly, and every window starting 120 days
+  ago or earlier returned every one of the account's fills, none inside the window. The
+  edge is between 90 and 120 days. 90 is the end of the range measured as honoured, so it
+  is the bound; declaring `None` would promise history back to 2009. `history_truncated`
+  tells the owner that nothing before 90 days ago is read by the live sync.
+  **`assemble_fill_page`'s refusal of a fill outside its window is what caught this and
+  must stay**: with it removed, the same fills would have been filed under every old window.
+  Nothing maps to `ExchangeRetentionWindowError`, because the venue sends no error code.
+- **Why 30 days a window.** Spans up to 365 days ending now were accepted, so it is
+  headroom, not a limit. A first backfill is 3 or 4 windows of one or two requests each.
 - The rate limit is declarative; the shared transport's floor of one request a second per
   host is stricter. The transport reads neither `X-RateLimit-Requests-*` header:
   `parse_rate_limit` knows only the `ratelimit-*` and `x-ratelimit-*` trios. At one request a
@@ -2218,7 +2228,7 @@ owner's first sync with #15 is the first run of the provider itself against the 
 | a venue may report failures, auth included, on a 200, where an unmapped code is a schema error | Bitget's map is keyed by code under any status, so a mapped code on a 200 is classified too | **confirmed by the probe**: every error it saw arrived on a 200. The map is keyed by code, auth codes included | -- |
 | timestamps are epoch milliseconds | **confirmed** for `ACCESS-TIMESTAMP`, `startTime` and `endTime`; `cTime` is documented both ways and read as milliseconds (a seconds value fails the page) | **confirmed** for `timestamp`, `startTime`, `endTime` and `time`; the server-time endpoint answers in seconds, and is not used | -- |
 | each venue pages in one of the four `CursorKind` shapes | **confirmed**: `trade_id_before`, over `idLessThan` | `time`, over `startTime`: `fromId` exists, but would be wrong silently if ids are per symbol | -- |
-| each venue's retention, maximum query window, page size and rate limit | **confirmed**: 90 days, 90 days (30 declared, on purpose), 100, 10/s per UID | the documented 7 days **disproved**; 365 declared as a bound. Spans to 365 days accepted (30 declared). 500 of two stated maxima. 5/s per UID | the owner's first sync past one page |
+| each venue's retention, maximum query window, page size and rate limit | **confirmed**: 90 days, 90 days (30 declared, on purpose), 100, 10/s per UID | the documented 7 days **disproved**; a year was declared first and the first live sync cut it to 90 days: older windows are answered with the wrong fills (2026-10-05). Spans to 365 days ending now accepted (30 declared). 500 of two stated maxima. 5/s per UID | the owner's first sync past one page |
 | trade ids are unique per account across symbols | **not documented**. One cursor pages every symbol, which only works if they are; a collision within a page is refused, and across windows #15 refuses a same-id fill whose accounting fields differ, as a `conflict` that stops the account | **not established**, and probably not: ids are namespaced `"{symbol}:{id}"`, and the cursor is a time | the first account with two symbols |
 | which string each venue signs, and in which encoding | **confirmed**: `timestamp + "GET" + path + "?" + query`, HMAC-SHA256, Base64. No published vector; the tests compute theirs outside the code | **confirmed and accepted live**: the sorted query with `timestamp`, HMAC-SHA256, lower-case hex. V3's recipe is one of the two golden vectors | -- |
 | `RETENTION_MARGIN` of five minutes is enough | **not measurable without a key.** "The last three months" in `40704` may be 89 days; if so the oldest window is refused as `ExchangeRetentionWindowError` and #15 steps it a day later (`RETENTION_STEP`, itself a guess) | not measured: what BingX answers past its retention is unknown, and nothing maps to the retention error | the owner's first sync |

@@ -188,14 +188,17 @@ def test_the_venue_constants_are_the_documented_ones() -> None:
 def test_the_capabilities_are_the_specs() -> None:
     """Spec 017's declaration, field by field, from a literal written by hand.
 
-    365 days is a declared bound, not a measured one: the documented 7 days was disproved by
-    the probe reading fills older than that. 30-day windows are headroom below the 365-day
-    spans the probe saw accepted. 5 a second per UID is the documented myTrades budget.
+    90 days is where the first live sync (2026-10-05) measured the venue honouring a
+    window: one starting 90 days ago was answered correctly, and every one starting 120
+    days ago or earlier was answered with the account's newest fills, bounds ignored. The
+    documented 7 days was disproved by the earlier probe. 30-day windows are headroom below
+    the 365-day spans the probe saw accepted ending now. 5 a second per UID is the documented
+    myTrades budget.
     """
     assert (
         ExchangeCapabilities(
             exchange_key=ExchangeKey.BINGX,
-            retention=timedelta(days=365),
+            retention=timedelta(days=90),
             max_query_window=timedelta(days=30),
             page_size=500,
             cursor_kind=CursorKind.TIME,
@@ -722,6 +725,25 @@ async def test_a_fill_outside_the_window_is_refused(executed_ms: int) -> None:
     error = await refused(fake)
 
     assert type(error) is ExchangeSchemaError
+
+
+async def test_a_window_older_than_the_venue_keeps_is_refused_not_filed_under_it() -> None:
+    """What BingX answered on 2026-10-05 for a window starting 120 days back or more.
+
+    Code 0 and the account's newest fills, both bounds ignored, so every fill lies after the
+    window. The window is refused whole: a retention declared too long must fail loudly
+    rather than file recent fills under an old window.
+    """
+    day_ms = 86_400_000
+    fake = scripted(
+        VenueFill(trade_id=1, executed_ms=WINDOW_UNTIL_MS + 100 * day_ms),
+        VenueFill(trade_id=2, executed_ms=WINDOW_UNTIL_MS + 110 * day_ms),
+    )
+
+    error = await refused(fake)
+
+    assert type(error) is ExchangeSchemaError
+    assert error.detail == "2 fill(s) have an executed_at outside the requested window"
 
 
 async def test_a_window_longer_than_thirty_days_costs_no_request() -> None:
@@ -1852,24 +1874,26 @@ async def test_a_window_starting_before_the_epoch_sends_zero() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# The retention bound: a first backfill reaches back a year, and says so
+# The retention bound: a first backfill reaches back 90 days, and says so
 # --------------------------------------------------------------------------------------
 
-#: 2023-10-01T00:00:00Z. 365 days before it is 2022-10-01T00:00:00Z (no 29 February in
-#: between), and five minutes later is 00:05:00Z: `date -u -d 2022-10-01T00:05:00Z +%s` ->
-#: 1664582700.
+#: 2023-10-01T00:00:00Z. 90 days before it is 2023-07-03T00:00:00Z (July has 31 days, August
+#: 31 and September 30), and five minutes later is 00:05:00Z:
+#: `date -u -d 2023-07-03T00:05:00Z +%s` -> 1688342700.
 RETENTION_NOW: Final = datetime(2023, 10, 1, tzinfo=UTC)
 
 
-async def test_retention_clamps_a_first_backfill_to_a_year() -> None:
-    """A backfill from 2009 is clamped to a year and five minutes ago, and truncation says so.
+async def test_retention_clamps_a_first_backfill_to_90_days() -> None:
+    """A backfill from 2009 is clamped to 90 days and five minutes ago, and truncation says so.
 
-    The clamped start is also a window the provider sends as it is.
+    90 days is the oldest start the venue was measured honouring: older windows are answered
+    with the account's newest fills and both bounds ignored (2026-10-05). The clamped start is
+    also a window the provider sends as it is.
     """
     clamp = clamp_to_retention(HISTORY_GENESIS, now=RETENTION_NOW, capabilities=BINGX_CAPABILITIES)
 
     assert clamp.clamped
-    assert clamp.effective_since == datetime(2022, 10, 1, 0, 5, tzinfo=UTC)
+    assert clamp.effective_since == datetime(2023, 7, 3, 0, 5, tzinfo=UTC)
     assert history_truncated(HISTORY_GENESIS, clamp.effective_since) is True
     assert history_truncated(clamp.effective_since, clamp.effective_since) is False
 
@@ -1881,11 +1905,14 @@ async def test_retention_clamps_a_first_backfill_to_a_year() -> None:
 
     assert page.fills == ()
     (params,) = fake.params()
-    assert params["startTime"] == "1664582700000"
+    assert params["startTime"] == "1688342700000"
 
 
 def test_nothing_maps_to_the_retention_class() -> None:
-    """What BingX answers for a window older than it keeps is unknown, so nothing is guessed."""
+    """BingX answers a window it no longer keeps with code 0 and the wrong fills, not an error.
+
+    There is no retention code to map. The out-of-window refusal above is what catches it.
+    """
     assert ExchangeRetentionWindowError not in set(BINGX_ERROR_MAP.values())
 
 

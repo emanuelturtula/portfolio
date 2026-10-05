@@ -105,7 +105,7 @@ See [docs/deployment.md](docs/deployment.md).
 ## Contributing
 
 This is a personal project and pull requests are not being accepted. The working agreement
-for the agents and for me is in [CLAUDE.md](CLAUDE.md).
+for Claude Code and for me is in [CLAUDE.md](CLAUDE.md).
 
 ## License
 
