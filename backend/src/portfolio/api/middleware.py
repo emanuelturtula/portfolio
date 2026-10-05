@@ -66,6 +66,15 @@ JSON_MEDIA_TYPE: Final = "application/json"
 ORIGIN_REJECTED_DETAIL: Final = "The request origin is missing or not allowed."
 CONTENT_TYPE_REJECTED_DETAIL: Final = "Requests that change state must be JSON."
 
+LOGGED_PATH_LIMIT: Final = 256
+"""The most of a refused request's path that `request_refused` writes, in characters.
+
+The path is the client's to choose, and every refusal comes before a session has been
+checked or because there is none: written whole, it let an anonymous request make the
+application write a 200 KB line, every time. The API's own paths are a fraction of this, so
+a path that reaches it was not written by the web application.
+"""
+
 _logger = structlog.get_logger(__name__)
 
 
@@ -95,6 +104,24 @@ def requires_session(path: str) -> bool:
     that is one character away from a public path is the right side to err on.
     """
     return is_api_path(path) and path not in PUBLIC_API_PATHS
+
+
+def logged_path(path: str) -> dict[str, str | int | bool]:
+    """The fields `request_refused` writes for `path`, never more than `LOGGED_PATH_LIMIT` of it.
+
+    A path that fits is written as it is, under `path`. A longer one is written as its first
+    `LOGGED_PATH_LIMIT` characters cut back to the last `/` in them, beside
+    `path_truncated=True` and `path_length`, its length in characters before the cut.
+
+    Cut back to a `/` rather than at the limit, so that no segment is written in part. The
+    value redaction finds an address by its pattern, and an address cut short can fall under
+    the shortest length a pattern matches and be written as it is; a whole segment holding
+    one is redacted as it always was. A credential holding a `/` can still be cut in two.
+    """
+    if len(path) <= LOGGED_PATH_LIMIT:
+        return {"path": path}
+    kept = path[: path.rfind("/", 0, LOGGED_PATH_LIMIT) + 1]
+    return {"path": kept, "path_truncated": True, "path_length": len(path)}
 
 
 class RequestGuardMiddleware(BaseHTTPMiddleware):
@@ -164,16 +191,17 @@ class RequestGuardMiddleware(BaseHTTPMiddleware):
         return None
 
     def _refuse(self, request: Request, error: AppError, reason: str) -> Response:
-        """Render a rejection, and log it with the path but never the query string.
+        """Render a rejection, and log it with a bounded path but never the query string.
 
         One provider signs its requests in the query string, so a full URL is never a safe
-        thing to log anywhere in this application; the habit is kept here too.
+        thing to log anywhere in this application; the habit is kept here too. The path goes
+        through `logged_path`: the client chose it, and no session vouches for the client.
         """
         _logger.warning(
             "request_refused",
             status=error.status,
             reason=reason,
-            path=request.url.path,
+            **logged_path(request.url.path),
             method=request.method,
         )
         return problem_response(error.as_problem(instance=request.url.path))

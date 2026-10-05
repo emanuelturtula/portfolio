@@ -16,7 +16,8 @@ logger, yielding to the event loop between them -- and one that raises. What is 
   read off its own OpenAPI document; a documentation path's own path; `spa` outside `/api`;
   `unmatched` for a path under `/api` that routing never matched or never reached;
 * **a 200 KB adversarial path from a client with no session is answered within a second**
-  (R13, M1), the record that carries it written.
+  (R13, M1), and its `request_refused` line stays under 1 KB: at most `LOGGED_PATH_LIMIT`
+  characters of the path, cut back to a `/` so no segment is written in part, and its length.
 """
 
 from __future__ import annotations
@@ -35,9 +36,11 @@ import anyio
 import pytest
 import structlog
 from httpx import ASGITransport, AsyncClient
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from structlog.testing import capture_logs
 
-from portfolio.api.middleware import is_api_path
+from portfolio.api.middleware import LOGGED_PATH_LIMIT, is_api_path, logged_path
 from portfolio.api.request_context import (
     HEALTH_CHECK_PATH,
     REQUEST_COMPLETED_EVENT,
@@ -50,8 +53,9 @@ from portfolio.api.request_context import (
 )
 from portfolio.config import Settings
 from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_TIME_COST
-from portfolio.logging import REQUEST_ID_KEY, configure_logging
+from portfolio.logging import REQUEST_ID_KEY, ValueRedactor, configure_logging
 from portfolio.main import create_app
+from tests.address_vectors import BIP173_TESTNET_P2WPKH
 from tests.api.test_accounting import settled
 from tests.auth.conftest import BASE_URL, JSON_HEADERS, sign_in
 from tests.logging_harness import preserved_logging
@@ -167,6 +171,7 @@ def test_the_names_are_the_specs() -> None:
     assert UNMATCHED_ROUTE == "unmatched"
     assert HEALTH_CHECK_PATH == "/api/health"
     assert REQUEST_ID_KEY == "request_id"
+    assert LOGGED_PATH_LIMIT == 256  # docs/operations.md, section 18
 
 
 # --------------------------------------------------------------------------------------
@@ -490,10 +495,15 @@ async def test_an_unmatched_api_path_never_logs_its_path(
 #: 200 KB of what made the old URL rule rescan a run: 12 s for `a.`, 27 s for `a://` (R13).
 ADVERSARIAL_PATH_SIZE: Final = 200_000
 ANSWERED_WITHIN_SECONDS: Final = 1.0
+#: The most one `request_refused` line may take, whatever the path: at most
+#: `LOGGED_PATH_LIMIT` characters of it, the fields beside it and the JSON around them, with
+#: room to spare. With the path written whole it was over 200 KB.
+REFUSED_LINE_MAX_BYTES: Final = 1024
 
 
-async def anonymous_get(app: FastAPI, path: str) -> tuple[int, dict[str, str]]:
-    """`GET path` with no cookie, as a raw ASGI call: the status and the headers.
+async def anonymous_call(app: FastAPI, method: str, path: str) -> tuple[int, dict[str, str]]:
+    """`method path` with no cookie, no `Origin` and no body, as a raw ASGI call: the status
+    and the headers.
 
     Not through `httpx`, which refuses a URL over 64 KB before sending it. A server does not:
     uvicorn's `httptools` parser hands the application a path of any length.
@@ -502,7 +512,7 @@ async def anonymous_get(app: FastAPI, path: str) -> tuple[int, dict[str, str]]:
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
-        "method": "GET",
+        "method": method,
         "scheme": "https",
         "path": path,
         "raw_path": path.encode(),
@@ -526,28 +536,118 @@ async def anonymous_get(app: FastAPI, path: str) -> tuple[int, dict[str, str]]:
     return start["status"], headers
 
 
+@pytest.mark.parametrize(
+    ("method", "status", "reason"),
+    [("GET", 401, "no_session"), ("POST", 403, "origin")],
+    ids=["no session", "no origin"],
+)
 @pytest.mark.parametrize("unit", ["a.", "a://", "tb1", "kaspatest:"])
-async def test_an_anonymous_request_with_a_long_adversarial_path_is_answered_quickly(
-    unit: str, api_environment: Path, restored: None, capsys: pytest.CaptureFixture[str]
+async def test_an_anonymous_200_kb_path_is_answered_quickly_and_logged_in_a_bounded_line(
+    unit: str,
+    method: str,
+    status: int,
+    reason: str,
+    api_environment: Path,
+    restored: None,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """R13 (M1), end to end: a client with no session chooses the path `request_refused`
-    logs, and the redaction runs on the event loop every request shares. One second is
-    generous; a rule that rescans took tens."""
+    """R13 (M1), end to end, and the line it writes: a client with no session chooses the
+    path `request_refused` logs. Written whole, each such request made the application write
+    a 200 KB line; now it writes at most `LOGGED_PATH_LIMIT` characters of it, and its length.
+
+    Both refusals: the session check's, and the write guard's, which comes first and covers
+    every path, the API's or not. One second is generous; a redaction rule that rescanned took
+    tens. The rules' own time on 200 KB is pinned in `tests/test_logging_values.py`, since
+    the path they see here is no longer that long."""
     del api_environment, restored
     path = "/api/" + unit * (ADVERSARIAL_PATH_SIZE // len(unit))
     async with served(capsys) as (app, _client):
         started = time.perf_counter()
-        status, headers = await anonymous_get(app, path)
+        answered, headers = await anonymous_call(app, method, path)
         elapsed = time.perf_counter() - started
-    entries = lines(capsys)
+    written = capsys.readouterr().out.splitlines()
     request_id = headers[REQUEST_ID_HEADER.lower()]
+    mine = [
+        (raw, entry)
+        for raw in written
+        if raw.strip() and (entry := json.loads(raw)).get(REQUEST_ID_KEY) == request_id
+    ]
 
-    assert status == 401
+    assert answered == status
     assert elapsed < ANSWERED_WITHIN_SECONDS
-    # The record the rule ran over was written, path and all, so the time is the rule's.
-    mine = [entry for entry in entries if entry.get(REQUEST_ID_KEY) == request_id]
-    assert [entry["event"] for entry in mine] == ["request_refused", REQUEST_COMPLETED_EVENT]
-    assert len(mine[0]["path"]) >= ADVERSARIAL_PATH_SIZE
+    assert [entry["event"] for _raw, entry in mine] == [
+        "request_refused",
+        REQUEST_COMPLETED_EVENT,
+    ]
+    [(raw, refused), _completed] = mine
+    assert len(raw.encode()) <= REFUSED_LINE_MAX_BYTES, len(raw.encode())
+    assert refused["reason"] == reason
+    assert refused["path_truncated"] is True
+    assert refused["path_length"] == len(path)
+    assert path.startswith(refused["path"])
+    assert refused["path"].endswith("/")
+    assert len(refused["path"]) <= LOGGED_PATH_LIMIT
+
+
+# --------------------------------------------------------------------------------------
+# What `request_refused` writes of a path
+# --------------------------------------------------------------------------------------
+
+
+def test_a_path_that_fits_is_written_whole_and_alone() -> None:
+    at_the_limit = "/api/" + "a" * (LOGGED_PATH_LIMIT - len("/api/"))
+
+    assert len(at_the_limit) == LOGGED_PATH_LIMIT
+    assert logged_path(at_the_limit) == {"path": at_the_limit}
+    assert logged_path("/api/wallets") == {"path": "/api/wallets"}
+
+
+def test_a_longer_path_is_cut_back_to_the_last_slash_within_the_limit() -> None:
+    one_over = "/api/" + "a" * (LOGGED_PATH_LIMIT - len("/api/") + 1)
+    segments = "/api/wallets/" + "b" * LOGGED_PATH_LIMIT + "/balances"
+
+    assert logged_path(one_over) == {
+        "path": "/api/",
+        "path_truncated": True,
+        "path_length": LOGGED_PATH_LIMIT + 1,
+    }
+    assert logged_path(segments) == {
+        "path": "/api/wallets/",
+        "path_truncated": True,
+        "path_length": len(segments),
+    }
+
+
+def test_an_address_the_limit_falls_inside_is_left_out_whole() -> None:
+    """Why the cut goes back to a `/`. Ten characters of an address are fewer than the value
+    redaction recognises, so a cut at the limit would write them as they are."""
+    head = "/api/" + "a" * (LOGGED_PATH_LIMIT - len("/api/") - 11) + "/"
+    path = head + BIP173_TESTNET_P2WPKH + "/balances"
+    assert len(head) == LOGGED_PATH_LIMIT - 10
+
+    # The control: cut at the limit and redacted, it ends in the address's first ten.
+    cut_at_the_limit = ValueRedactor([]).redact_text(path[:LOGGED_PATH_LIMIT])
+    assert cut_at_the_limit.endswith(BIP173_TESTNET_P2WPKH[:10])
+    assert logged_path(path)["path"] == head
+
+
+@settings(max_examples=300, deadline=None)
+@given(st.text(alphabet="/a.:é", max_size=3 * LOGGED_PATH_LIMIT).map(lambda rest: "/" + rest))
+def test_what_is_written_is_the_longest_run_of_whole_segments_within_the_limit(
+    path: str,
+) -> None:
+    fields = logged_path(path)
+    written = fields["path"]
+    assert isinstance(written, str)
+
+    assert len(written) <= LOGGED_PATH_LIMIT
+    assert path.startswith(written)
+    if len(path) <= LOGGED_PATH_LIMIT:
+        assert fields == {"path": path}
+    else:
+        assert fields == {"path": written, "path_truncated": True, "path_length": len(path)}
+        assert written.endswith("/")
+        assert "/" not in path[len(written) : LOGGED_PATH_LIMIT]
 
 
 # --------------------------------------------------------------------------------------
