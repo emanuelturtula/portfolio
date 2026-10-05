@@ -106,6 +106,29 @@ which is a visible line in a diff and a deliberate act.
 *Enforced by:* a contract test that walks every registered route and asserts `401` without
 a cookie, plus a second test pinning the allowlist's exact contents.
 
+## What no gate checks
+
+These have no mechanical enforcement, or only part of one, so they rest on reading this.
+
+- **Datetimes are timezone-aware UTC.** Ruff's `DTZ` rules catch a naive constructor, not a
+  naive value that arrives from somewhere else, and a naive datetime in a time-ordered event
+  log corrupts the accounting silently. `domain` takes the clock as an argument.
+- **A vendor API is verified before anything is built on it.** Check the endpoint path,
+  parameters, pagination, rate limits and retention window against the vendor's own live
+  documentation, never a third-party wrapper, and record what was confirmed in
+  `docs/providers.md`. Docstrings separate what was confirmed from what was assumed. The
+  `needs-verification` label means exactly this.
+- **A data-driven view renders four states**: loading, empty, error and success. "Nothing
+  added yet" and "the sync failed" mean opposite things and must not look alike.
+- **A missing price or an unreachable provider is never rendered as zero.** A portfolio that
+  shows 0 when an API is down is worse than one that shows an error, because it is believed.
+  Show the staleness; show the failure.
+- **Profit and loss are distinguishable without colour**: a sign or a label, not only red and
+  green. Errors get `role="alert"`, and a loading state is announced, not a bare spinner.
+- **Every diff is reviewed as an adversary before its pull request**: secrets first, then
+  money as a float, then a correctness bug with a concrete failing input, then layering, then
+  criteria no test proves, then error paths that swallow. `/work-issue` spells it out.
+
 ## Running things
 
 ```bash
@@ -133,9 +156,10 @@ merge, which is why the rollback path exists and why it is tested rather than as
 
 ## Working on an issue
 
-`/work-issue <N>` in an interactive session. The tech lead reads the issue, writes a spec to
-`docs/specs/`, spawns the teammates the issue's labels call for, and drives through to an
-open pull request. See `.claude/agents/` for the roles and `.claude/skills/` for each step.
+`/work-issue <N>` takes an issue to an open pull request in one session: a branch, a short
+spec in `docs/specs/` for a feature, a test-first implementation, the full gate, a review of
+the diff, and the pull request. The steps are in `.claude/skills/work-issue/`.
 
-Two agents editing one file overwrite each other, so the tech lead assigns disjoint file
-ownership before any implementation starts.
+There is no agent team. One context that has already read the code costs a fraction of five
+that each read it again, and a single writer needs no file ownership split between writers.
+`/code-review` gives a large change a second pass with a fresh context.
