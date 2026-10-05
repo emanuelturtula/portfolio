@@ -786,4 +786,13 @@ p.state-error[role='alert'] {
     padding: 0.1rem 0.5rem;
     font-size: 0.8125rem;
   }
+
+  /* An extended key's badge: the `.address` gap already spaces it from the key, so its own
+     margin would only widen the column. Shaped like the position table's badges, which wrap in
+     a narrow column too. */
+  .balance-table .address .badge {
+    margin-left: 0;
+    border-radius: 0.5rem;
+    line-height: 1.25;
+  }
 }
