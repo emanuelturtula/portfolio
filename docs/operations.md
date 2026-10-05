@@ -1977,6 +1977,24 @@ the request's response headers.
 container's health check calls every thirty seconds. It replaces uvicorn's access line, which
 is no longer written: the access line carried the raw path and query.
 
+### `request_refused`, a request turned away before any route
+
+At `WARNING`, written before the request's `request_completed` line, with the same
+`request_id`:
+
+| Field | Meaning |
+|---|---|
+| `status` | `401` or `403`. |
+| `reason` | `no_session`: no session cookie. `session_invalid`: a cookie that names no live session. `origin`: a request that changes state without the configured `Origin`. `content_type`: one that changes state and is not JSON. |
+| `method` | `GET`, `POST`, ... |
+| `path` | The path asked for, never the query string, and **at most 256 characters of it**. A longer path is cut back to the last `/` within its first 256, so no part of a segment is written. |
+| `path_truncated` | `true`, only on a path that was cut. |
+| `path_length` | Only on a path that was cut: its full length, in characters. |
+
+The path is the one thing in these lines that a client with no session chooses. Written whole,
+one request could make the application write a line as long as the path, 200 KB and more.
+A `path_truncated` line is never the web application's: the API's own paths are far shorter.
+
 ### What is redacted
 
 Two rules run on every record, the libraries' included, immediately before it is rendered.
