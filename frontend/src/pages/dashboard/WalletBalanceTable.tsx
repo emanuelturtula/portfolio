@@ -4,6 +4,7 @@ import { Address } from '@/components/Address';
 import { Money } from '@/components/Money';
 import { RelativeTime } from '@/components/RelativeTime';
 import { chainDisplayName } from '@/lib/chains';
+import { currencyLabel } from '@/lib/currency';
 import {
   assessFreshness,
   freshnessMessage,
@@ -203,7 +204,7 @@ export function WalletBalanceTable({
   freshnessKnown,
 }: WalletBalanceTableProps) {
   return (
-    <section aria-labelledby="wallet-balances-heading">
+    <section className="card" aria-labelledby="wallet-balances-heading">
       <h2 id="wallet-balances-heading">Wallets</h2>
       <div
         className="table-scroll balance-scroll"
@@ -226,7 +227,7 @@ export function WalletBalanceTable({
                 key={wallet.wallet_id}
                 wallet={wallet}
                 walletRecord={walletsById.get(wallet.wallet_id)}
-                quoteCurrency={data.quote_currency}
+                quoteCurrency={currencyLabel(data.quote_currency)}
                 settledRun={settledRun}
                 freshnessKnown={freshnessKnown}
               />

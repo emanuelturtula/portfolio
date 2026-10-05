@@ -109,13 +109,13 @@ describe('describeFillScope', () => {
 
 describe('pagination words', () => {
   it.each([
-    [1, 812, 'Showing 1 to 50 of 812', 'Page 1 of 17'],
-    [2, 812, 'Showing 51 to 100 of 812', 'Page 2 of 17'],
-    [17, 812, 'Showing 801 to 812 of 812', 'Page 17 of 17'],
-    [1, 50, 'Showing 1 to 50 of 50', 'Page 1 of 1'],
-    [2, 51, 'Showing 51 to 51 of 51', 'Page 2 of 2'],
+    [1, 812, 'Showing 1 to 5 of 812', 'Page 1 of 163'],
+    [2, 812, 'Showing 6 to 10 of 812', 'Page 2 of 163'],
+    [163, 812, 'Showing 811 to 812 of 812', 'Page 163 of 163'],
+    [1, 5, 'Showing 1 to 5 of 5', 'Page 1 of 1'],
+    [2, 6, 'Showing 6 to 6 of 6', 'Page 2 of 2'],
     [1, 1, 'Showing 1 to 1 of 1', 'Page 1 of 1'],
-    [21, 1234, 'Showing 1,001 to 1,050 of 1,234', 'Page 21 of 25'],
+    [201, 1234, 'Showing 1,001 to 1,005 of 1,234', 'Page 201 of 247'],
   ])('page %i of %i fills', (page, total, showing, pageWords) => {
     expect(describeShowing(page, total)).toBe(showing);
     expect(describePage(page, total)).toBe(pageWords);
@@ -123,14 +123,21 @@ describe('pagination words', () => {
 
   it.each([
     [1, 1],
-    [49, 1],
-    [50, 1],
-    [51, 2],
-    [100, 2],
-    [101, 3],
-    [812, 17],
+    [4, 1],
+    [5, 1],
+    [6, 2],
+    [10, 2],
+    [11, 3],
+    [812, 163],
   ])('%i fills make %i pages', (total, pages) => {
     expect(pageCount(total)).toBe(pages);
+  });
+
+  it('counts in another page size when given one, as the sync history does', () => {
+    expect(describeShowing(2, 51, 50)).toBe('Showing 51 to 51 of 51');
+    expect(describePage(2, 51, 50)).toBe('Page 2 of 2');
+    expect(pageCount(51, 50)).toBe(2);
+    expect(pageCount(50, 50)).toBe(1);
   });
 });
 

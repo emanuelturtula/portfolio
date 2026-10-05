@@ -114,20 +114,17 @@ const ENTRY_WITHOUT_ASSET = {
   note: VALID_ENTRY.note,
 };
 
-const INTRODUCTION =
-  'An adjustment records coins the imported history does not show, such as an opening balance ' +
-  "bought before an exchange's history begins, or coins acquired off an exchange. See " +
-  '"Recording what the history does not show" in docs/accounting.md.';
+const INTRODUCTION = 'Coins the imported history does not show.';
 
 describe('the adjustments page', () => {
-  it('is headed "Adjustments" and says what an adjustment is, naming the documentation', async () => {
+  it('is headed "Adjustments" and says in one line what an adjustment is', async () => {
     openAdjustmentsPage();
 
     const page = await adjustmentsPage();
 
     expect(within(page).getByRole('heading', { level: 2, name: 'Adjustments' })).toBeVisible();
     expect(within(page).getByText(INTRODUCTION).tagName).toBe('P');
-    // In plain text: the documentation is a file in the repository, not a page to link to.
+    // Nothing on the page is a link: the documentation is a file in the repository.
     await loadedTable();
     expect(within(page).queryByRole('link')).toBeNull();
   });

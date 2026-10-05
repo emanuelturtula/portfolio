@@ -772,7 +772,7 @@ describe('Transactions: totals', () => {
 
   it('are the whole filtered set, not the page on screen: the client sums nothing', async () => {
     // 60 fills of 0.001 BTC at 60,000: 0.06 BTC and 3,600 USDT in all. The second page holds
-    // ten rows, worth 0.01 BTC and 600 USDT, and the totals must not move.
+    // five rows, worth 0.005 BTC and 300 USDT, and the totals must not move.
     const rows = manyFills(60);
     const { user } = openTransactions({ exchanges: venuesFor(rows), runs: [], fills: rows });
     const section = await transactions();
@@ -783,16 +783,16 @@ describe('Transactions: totals', () => {
       expect(text(cell(btc, 'Fills'))).toBe('60');
       expect(dataIn(cell(btc, 'Bought'))).toHaveAttribute('value', '0.060000000000000000');
       expect(text(summaryValue(await totals(), 'USDT spent'))).toBe('3,600.00 USDT');
-      // The scope counts every match too, not the 50 or 10 rows on screen.
+      // The scope counts every match too, not the 5 rows on screen.
       expect(within(section).getByText('60 fills on all exchanges at any date.')).toBeTruthy();
     };
 
     await assertTotals();
     await user.click(within(pagination(section)).getByRole('button', { name: 'Next' }));
     await waitFor(() => {
-      expect(pagination(section)).toHaveTextContent('Showing 51 to 60 of 60');
+      expect(pagination(section)).toHaveTextContent('Showing 6 to 10 of 60');
     });
-    expect(bodyRows(await fillsTable())).toHaveLength(10);
+    expect(bodyRows(await fillsTable())).toHaveLength(5);
     await assertTotals();
   });
 
@@ -921,7 +921,7 @@ describe('Transactions: filters and the URL', () => {
     const section = await transactions();
 
     await waitFor(() => {
-      expect(pagination(section)).toHaveTextContent('Showing 51 to 60 of 60');
+      expect(pagination(section)).toHaveTextContent('Showing 6 to 10 of 60');
     });
     expect(within(filtersGroup(section)).getByRole('checkbox', { name: 'Bitget' })).toBeChecked();
     expect(
@@ -935,8 +935,8 @@ describe('Transactions: filters and the URL', () => {
     expect(query.get('from')).toBe('2026-02-28T23:00:00.000Z');
     // 31 March is after the switch to CEST (UTC+2): the end is 1 April 00:00 CEST.
     expect(query.get('to')).toBe('2026-03-31T22:00:00.000Z');
-    expect(query.get('limit')).toBe('50');
-    expect(query.get('offset')).toBe('50');
+    expect(query.get('limit')).toBe('5');
+    expect(query.get('offset')).toBe('5');
   });
 
   it('ignores what the URL cannot mean, and asks for everything', async () => {
@@ -947,7 +947,7 @@ describe('Transactions: filters and the URL', () => {
     await fillsTable();
 
     // Nothing the backend would refuse is ever sent: the fake answers a refused query 422.
-    expect(lastFillQuery(fake).toString()).toBe('limit=50&offset=0');
+    expect(lastFillQuery(fake).toString()).toBe('limit=5&offset=0');
     expect(ids(await fillsTable())).toHaveLength(5);
   });
 
@@ -990,7 +990,7 @@ describe('Transactions: filters and the URL', () => {
     );
     const section = await transactions();
     await waitFor(() => {
-      expect(pagination(section)).toHaveTextContent('Showing 51 to 60 of 60');
+      expect(pagination(section)).toHaveTextContent('Showing 6 to 10 of 60');
     });
 
     const clear = formClearButton(section);
@@ -1001,9 +1001,9 @@ describe('Transactions: filters and the URL', () => {
       expect(currentPath()).toBe('/exchanges');
     });
     await waitFor(() => {
-      expect(pagination(section)).toHaveTextContent('Showing 1 to 50 of 60');
+      expect(pagination(section)).toHaveTextContent('Showing 1 to 5 of 60');
     });
-    expect(lastFillQuery(fake).toString()).toBe('limit=50&offset=0');
+    expect(lastFillQuery(fake).toString()).toBe('limit=5&offset=0');
     expect(dateInput(section, 'From')).toHaveValue('');
     expect(dateInput(section, 'To')).toHaveValue('');
     // With nothing left to clear it is held, not removed, so focus stays on it.
@@ -1035,7 +1035,7 @@ describe('Transactions: filters and the URL', () => {
     );
     const section = await transactions();
     await waitFor(() => {
-      expect(pagination(section)).toHaveTextContent('Showing 51 to 63 of 63');
+      expect(pagination(section)).toHaveTextContent('Showing 6 to 10 of 63');
     });
 
     await user.click(within(filtersGroup(section)).getByRole('checkbox', { name: 'Bitget' }));
@@ -1044,7 +1044,7 @@ describe('Transactions: filters and the URL', () => {
       expect(currentPath()).toBe('/exchanges?exchange=bitget');
     });
     await waitFor(() => {
-      expect(pagination(section)).toHaveTextContent('Showing 1 to 50 of 60');
+      expect(pagination(section)).toHaveTextContent('Showing 1 to 5 of 60');
     });
     expect(lastFillQuery(fake).get('offset')).toBe('0');
 
@@ -1110,7 +1110,7 @@ describe('Transactions: filters and the URL', () => {
     const section = await transactions();
 
     expect(ids(await fillsTable())).toHaveLength(5);
-    expect(lastFillQuery(fake).toString()).toBe('limit=50&offset=0');
+    expect(lastFillQuery(fake).toString()).toBe('limit=5&offset=0');
     expect(dateInput(section, 'From')).toHaveValue('');
     expect(dateInput(section, 'To')).toHaveValue('');
   });
@@ -1312,8 +1312,8 @@ describe('Transactions: local days', () => {
  */
 
 describe('Transactions: pagination', () => {
-  it('pages through 120 fills 50 at a time, held at both ends', async () => {
-    const rows = manyFills(120);
+  it('pages through 12 fills 5 at a time, held at both ends', async () => {
+    const rows = manyFills(12);
     const { user, fake } = openTransactions({ exchanges: venuesFor(rows), runs: [], fills: rows });
     const section = await transactions();
     await fillsTable();
@@ -1321,30 +1321,30 @@ describe('Transactions: pagination', () => {
     const previous = () => within(nav()).getByRole('button', { name: 'Previous' });
     const next = () => within(nav()).getByRole('button', { name: 'Next' });
 
-    expect(nav()).toHaveTextContent('Showing 1 to 50 of 120');
+    expect(nav()).toHaveTextContent('Showing 1 to 5 of 12');
     expect(nav()).toHaveTextContent('Page 1 of 3');
-    expect(bodyRows(await fillsTable())).toHaveLength(50);
+    expect(bodyRows(await fillsTable())).toHaveLength(5);
     expectHeld(previous());
     expectPressable(next());
     // Newest first: the first page opens on the last fill.
-    expect(ids(await fillsTable())[0]).toBe('10000120');
+    expect(ids(await fillsTable())[0]).toBe('1000012');
 
     await user.click(next());
     await waitFor(() => {
-      expect(nav()).toHaveTextContent('Showing 51 to 100 of 120');
+      expect(nav()).toHaveTextContent('Showing 6 to 10 of 12');
     });
     expect(currentPath()).toBe('/exchanges?page=2');
-    expect(lastFillQuery(fake).get('offset')).toBe('50');
+    expect(lastFillQuery(fake).get('offset')).toBe('5');
     expectPressable(previous());
     expectPressable(next());
-    expect(ids(await fillsTable())[0]).toBe('1000070');
+    expect(ids(await fillsTable())[0]).toBe('100007');
 
     await user.click(next());
     await waitFor(() => {
-      expect(nav()).toHaveTextContent('Showing 101 to 120 of 120');
+      expect(nav()).toHaveTextContent('Showing 11 to 12 of 12');
     });
     expect(nav()).toHaveTextContent('Page 3 of 3');
-    expect(bodyRows(await fillsTable())).toHaveLength(20);
+    expect(bodyRows(await fillsTable())).toHaveLength(2);
     expectHeld(next());
     expectPressable(previous());
 
@@ -1359,12 +1359,12 @@ describe('Transactions: pagination', () => {
 
     await user.click(previous());
     await waitFor(() => {
-      expect(nav()).toHaveTextContent('Showing 51 to 100 of 120');
+      expect(nav()).toHaveTextContent('Showing 6 to 10 of 12');
     });
     expect(currentPath()).toBe('/exchanges?page=2');
     await user.click(previous());
     await waitFor(() => {
-      expect(nav()).toHaveTextContent('Showing 1 to 50 of 120');
+      expect(nav()).toHaveTextContent('Showing 1 to 5 of 12');
     });
     // Page 1 is the bare URL.
     expect(currentPath()).toBe('/exchanges');
@@ -1388,13 +1388,13 @@ describe('Transactions: pagination', () => {
     expectHeld(within(pagination(section)).getByRole('button', { name: 'Next' }));
   });
 
-  it('exactly 50 fills are one page', async () => {
-    const rows = manyFills(50);
+  it('exactly 5 fills are one page', async () => {
+    const rows = manyFills(5);
     openTransactions({ exchanges: venuesFor(rows), runs: [], fills: rows });
     const section = await transactions();
     await fillsTable();
 
-    expect(pagination(section)).toHaveTextContent('Showing 1 to 50 of 50');
+    expect(pagination(section)).toHaveTextContent('Showing 1 to 5 of 5');
     expectHeld(within(pagination(section)).getByRole('button', { name: 'Next' }));
   });
 
@@ -1408,7 +1408,7 @@ describe('Transactions: pagination', () => {
     const release = fake.hold('fills');
     await user.click(next);
     await waitFor(() => {
-      expect(fake.fillQueries().at(-1)?.get('offset')).toBe('50');
+      expect(fake.fillQueries().at(-1)?.get('offset')).toBe('5');
     });
 
     // The rows asked for under the same filters stay, marked busy, and the buttons stay
@@ -1421,7 +1421,7 @@ describe('Transactions: pagination', () => {
 
     release();
     await waitFor(() => {
-      expect(pagination(section)).toHaveTextContent('Showing 51 to 60 of 60');
+      expect(pagination(section)).toHaveTextContent('Showing 6 to 10 of 60');
     });
     expect((await fillsTable()).closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false');
   });
@@ -1446,7 +1446,7 @@ describe('Transactions: pagination', () => {
   });
 
   it('a page past the end offers the last page instead of nonsense', async () => {
-    const rows = manyFills(60);
+    const rows = manyFills(10);
     const { user } = openTransactions(
       { exchanges: venuesFor(rows), runs: [], fills: rows },
       '/exchanges?page=9',
@@ -1455,11 +1455,11 @@ describe('Transactions: pagination', () => {
 
     const back = await within(section).findByRole('button', { name: 'Go to the last page' });
     expect(section).toHaveTextContent('There is no page 9: the last page is 2.');
-    expect(section).not.toHaveTextContent('Showing 401');
+    expect(section).not.toHaveTextContent('Showing 41');
     expect(within(section).queryByRole('region', { name: 'Fills' })).not.toBeInTheDocument();
     // The totals are the whole set's, whatever the page.
     expect(text(cell(rowNamed(regionTable(await totals(), 'Per asset'), 'BTC'), 'Fills'))).toBe(
-      '60',
+      '10',
     );
 
     await user.click(back);
@@ -1467,7 +1467,7 @@ describe('Transactions: pagination', () => {
       expect(currentPath()).toBe('/exchanges?page=2');
     });
     await waitFor(() => {
-      expect(pagination(section)).toHaveTextContent('Showing 51 to 60 of 60');
+      expect(pagination(section)).toHaveTextContent('Showing 6 to 10 of 10');
     });
   });
 

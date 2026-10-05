@@ -431,7 +431,7 @@ describe('a failed last recompute is shown (criterion 14)', () => {
       expect(recomputeAlert()).not.toBeNull();
     });
     const alert = recomputeAlert();
-    const introduction = within(page).getByText(/^An adjustment records coins/u);
+    const introduction = within(page).getByText(/^Coins the imported history does not show/u);
 
     expect(alert !== null && precedes(introduction, alert)).toBe(true);
     expect(alert !== null && precedes(alert, theForm())).toBe(true);

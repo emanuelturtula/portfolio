@@ -156,7 +156,7 @@ export function WalletForm() {
   }
 
   return (
-    <form onSubmit={handleSubmit} noValidate aria-labelledby="add-wallet-heading">
+    <form className="card" onSubmit={handleSubmit} noValidate aria-labelledby="add-wallet-heading">
       <h3 id="add-wallet-heading">Add a wallet</h3>
 
       <div className="field">
@@ -293,7 +293,7 @@ export function WalletForm() {
         </p>
       ))}
 
-      <button type="submit" disabled={mutation.isPending}>
+      <button type="submit" className="button-primary" disabled={mutation.isPending}>
         Add wallet
       </button>
     </form>

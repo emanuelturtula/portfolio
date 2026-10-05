@@ -1,23 +1,33 @@
-/* Colours follow the user's light/dark preference. The neutrals and the series slots are the
-   dataviz reference palette's (#154): a page plane, a slightly lifted surface for cards, ink in
-   three strengths and a hairline. Each mode is its own selected set, not an inversion. */
+/* One look for every page (#154 set it on the dashboard; the rest follow it): a quiet page
+   plane, figures and charts on lifted cards, ink in three strengths and a hairline. Colours
+   follow the user's light/dark preference, and each mode is its own selected set, not an
+   inversion. The neutrals and the series slots are the dataviz reference palette's. */
 :root {
   --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
   --color-text: #0b0b0b;
   --color-muted: #52514e;
-  --color-page: #f9f9f7;
+  --color-faint: #898781;
+  --color-page: #f4f4f1;
   --color-surface: #fcfcfb;
-  /* Kept as the page plane: a sticky table cell paints it to hide what scrolls beneath. */
-  --color-background: var(--color-page);
+  --color-surface-2: #f0efec;
+  /* A sticky table cell paints this to hide what scrolls beneath it: the card it sits on. */
+  --color-background: var(--color-surface);
   --color-border: #e1e0d9;
   --color-hairline: rgb(11 11 11 / 10%);
   --color-error: #a11b2b;
   --color-warning: #8a5a00;
   --color-gain: #006300;
   --color-loss: var(--color-error);
+  /* Status dots: reserved for state, never a series. Always beside the words that say it. */
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-critical: #d03b3b;
+  --status-neutral: #898781;
   --shadow-card: 0 1px 2px rgb(11 11 11 / 4%), 0 4px 16px rgb(11 11 11 / 4%);
   --radius-card: 0.875rem;
   --radius-control: 0.5rem;
+  --header-blur: rgb(244 244 241 / 82%);
 
   /* Chart series, fixed per asset in `lib/assetColors.ts`. */
   --series-orange: #eb6834;
@@ -28,20 +38,24 @@
   color-scheme: light dark;
   font-family: var(--font-sans);
   line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     --color-text: #ffffff;
     --color-muted: #c3c2b7;
+    --color-faint: #898781;
     --color-page: #0d0d0d;
     --color-surface: #1a1a19;
+    --color-surface-2: #242422;
     --color-border: #2c2c2a;
     --color-hairline: rgb(255 255 255 / 10%);
     --color-error: #ff8b8b;
     --color-warning: #f0b429;
     --color-gain: #0ca30c;
     --shadow-card: none;
+    --header-blur: rgb(13 13 13 / 82%);
 
     --series-orange: #d95926;
     --series-aqua: #199e70;
@@ -50,39 +64,156 @@
   }
 }
 
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
 body {
   margin: 0;
   color: var(--color-text);
   background-color: var(--color-page);
 }
 
-.app {
-  margin: 0 auto;
-  max-width: 60rem;
-  padding: 0 1.5rem 3rem;
+h1,
+h2,
+h3,
+h4,
+h5 {
+  margin: 0 0 0.75rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
 }
 
-/* `flex-wrap`: on a 375 px phone the title, the nav and the account do not fit on one row,
-   and a row that cannot wrap widens the whole page (spec 022, criterion 10). At desktop
-   widths everything still fits on one row and nothing changes. */
+h2 {
+  font-size: 1.125rem;
+}
+
+h3 {
+  font-size: 1rem;
+}
+
+h4,
+h5 {
+  font-size: 0.9375rem;
+}
+
+p {
+  margin: 0 0 0.75rem;
+}
+
+a {
+  color: inherit;
+  text-underline-offset: 2px;
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+}
+
+/* Shell. */
+
+.app {
+  margin: 0 auto;
+  max-width: 72rem;
+  padding: 0 1.5rem 4rem;
+}
+
+/* The header stays in reach while a long page scrolls under it. Brand, navigation and account
+   share one row on a desktop; on a phone the navigation takes a row of its own and scrolls
+   sideways inside it, so the links never wrap into a block and never widen the page. */
 .app-header {
-  display: flex;
-  flex-wrap: wrap;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: 'brand nav account';
   align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  border-bottom: 1px solid var(--color-border);
-  padding: 1.25rem 0;
+  gap: 0.75rem 1.5rem;
+  margin: 0 -1.5rem;
+  padding: 0.875rem 1.5rem;
+  border-bottom: 1px solid var(--color-hairline);
+  background-color: var(--header-blur);
+  backdrop-filter: saturate(1.4) blur(14px);
 }
 
 .app-header h1 {
-  font-size: 1.25rem;
-  font-weight: 650;
-  letter-spacing: -0.01em;
+  grid-area: brand;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
   margin: 0;
+  font-size: 1.125rem;
+}
+
+/* The mark: the three series colours turning, like the donut they paint. */
+.app-header h1::before {
+  content: '';
+  flex: none;
+  width: 1.375rem;
+  height: 1.375rem;
+  border-radius: 0.45rem;
+  background: conic-gradient(
+    from 200deg,
+    var(--series-orange),
+    var(--series-aqua),
+    var(--series-blue),
+    var(--series-orange)
+  );
+}
+
+nav[aria-label='Main'] {
+  grid-area: nav;
+  display: flex;
+  gap: 0.125rem;
+  justify-self: start;
+  max-width: 100%;
+  padding: 0.2rem;
+  border: 1px solid var(--color-hairline);
+  border-radius: 999px;
+  background-color: var(--color-surface-2);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+nav[aria-label='Main']::-webkit-scrollbar {
+  display: none;
+}
+
+/* The current page is a raised pill in bold: the shape and the weight say it, not a colour. */
+nav[aria-label='Main'] a {
+  flex: none;
+  padding: 0.3rem 0.85rem;
+  border-radius: 999px;
+  color: var(--color-muted);
+  font-size: 0.875rem;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+nav[aria-label='Main'] a:hover {
+  color: var(--color-text);
+}
+
+nav[aria-label='Main'] a:focus-visible {
+  outline: 2px solid var(--color-text);
+  outline-offset: -2px;
+}
+
+nav[aria-label='Main'] a.active {
+  background-color: var(--color-surface);
+  box-shadow: 0 1px 2px rgb(11 11 11 / 10%);
+  color: var(--color-text);
+  font-weight: 650;
 }
 
 .account {
+  grid-area: account;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
@@ -91,7 +222,6 @@ body {
 
 .account-controls {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
   color: var(--color-muted);
@@ -103,788 +233,93 @@ body {
   font-size: 0.875rem;
 }
 
+@media (max-width: 48rem) {
+  .app {
+    padding: 0 1rem 3rem;
+  }
+
+  .app-header {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'brand account'
+      'nav nav';
+    margin: 0 -1rem;
+    padding: 0.75rem 1rem 0.625rem;
+  }
+
+  nav[aria-label='Main'] {
+    justify-self: stretch;
+  }
+}
+
 .app-main {
   padding-top: 1.5rem;
 }
 
-.state {
-  color: var(--color-muted);
-}
+/* Pages. */
 
-.state-error {
-  color: var(--color-error);
-}
-
-.state-empty {
-  color: var(--color-muted);
-}
-
-.state-warning {
-  border: 1px solid var(--color-warning);
-  border-radius: 0.25rem;
-  padding: 0.75rem 1rem;
-  margin: 0 0 1rem;
-}
-
-.state-warning h3 {
-  margin-top: 0;
-  color: var(--color-warning);
-}
-
-button {
-  font: inherit;
-  font-size: 0.875rem;
-  font-weight: 500;
-  line-height: 1.5;
-  padding: 0.4rem 0.9rem;
-  border: 1px solid var(--color-hairline);
-  border-radius: var(--radius-control);
-  background-color: var(--color-surface);
-  color: var(--color-text);
-  cursor: pointer;
-}
-
-button:hover:not(:disabled) {
-  border-color: var(--color-muted);
-}
-
-button:focus-visible {
-  outline: 2px solid var(--color-text);
-  outline-offset: 2px;
-}
-
-button:disabled,
-button[aria-disabled='true'] {
-  cursor: not-allowed;
-  opacity: 0.6;
-}
-
-.login {
-  max-width: 22rem;
-}
-
-.field {
+.page,
+.stack {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
-  margin-bottom: 1rem;
-}
-
-.field label {
-  font-weight: 600;
-}
-
-.field input {
-  font: inherit;
-  padding: 0.5rem 0.6rem;
-  border: 1px solid var(--color-border);
-  border-radius: 0.25rem;
-  background-color: var(--color-background);
-  color: var(--color-text);
-}
-
-.health-details {
-  display: grid;
-  gap: 0.25rem 1.5rem;
-  grid-template-columns: max-content auto;
-  margin: 0;
-}
-
-.health-details dt {
-  color: var(--color-muted);
-}
-
-.health-details dd {
-  margin: 0;
-}
-
-nav[aria-label='Main'] {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-}
-
-/* The current page is a filled pill in bold: the shape and the weight say it, not a colour. */
-nav[aria-label='Main'] a {
-  padding: 0.3rem 0.75rem;
-  border: 1px solid transparent;
-  border-radius: 999px;
-  color: var(--color-muted);
-  font-size: 0.875rem;
-  font-weight: 500;
-  text-decoration: none;
-}
-
-nav[aria-label='Main'] a:hover {
-  color: var(--color-text);
-}
-
-nav[aria-label='Main'] a.active {
-  border-color: var(--color-hairline);
-  background-color: var(--color-surface);
-  box-shadow: var(--shadow-card);
-  color: var(--color-text);
-  font-weight: 650;
-}
-
-table {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 0.75rem 0 1.5rem;
-}
-
-th,
-td {
-  text-align: left;
-  padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid var(--color-border);
-}
-
-.badge {
-  display: inline-block;
-  margin-left: 0.5rem;
-  padding: 0.1rem 0.5rem;
-  border: 1px solid var(--color-border);
-  border-radius: 1rem;
-  font-size: 0.75rem;
-  text-transform: uppercase;
-}
-
-.address {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  flex-wrap: wrap;
-}
-
-.address-short {
-  font-family: monospace;
-}
-
-.address-full {
-  font-family: monospace;
-  user-select: all;
-}
-
-.hint {
-  margin: 0.25rem 0 0;
-  color: var(--color-muted);
-  font-size: 0.875rem;
-}
-
-.hint button {
-  margin-left: 0.5rem;
-  padding: 0.1rem 0.5rem;
-  font-size: 0.8rem;
-}
-
-.wallet-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-.wallet-row {
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-  padding: 0.75rem 0;
-  border-bottom: 1px solid var(--color-border);
-}
-
-.wallet-row-main {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  flex-wrap: wrap;
-}
-
-.wallet-chain {
-  font-weight: 600;
-}
-
-.wallet-row-actions {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-}
-
-.confirm-archive {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-}
-
-.wallet-list-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   gap: 1rem;
-}
-
-.dashboard-toolbar {
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
-  margin-bottom: 1rem;
-}
-
-.total-amount {
-  font-size: 1.5rem;
-  font-weight: 600;
-}
-
-.pending {
-  color: var(--color-muted);
-}
-
-.exchanges-toolbar {
-  display: flex;
-  flex-direction: column;
-  /* Spec R14: Sync now must not stretch to the toolbar's width - the flex column default
-     (`align-items: stretch`) would otherwise do exactly that to every direct child. */
-  align-items: flex-start;
-  gap: 0.35rem;
-  margin-bottom: 1rem;
-}
-
-.exchange-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-.exchange-list > li {
-  padding: 0.75rem 0;
-  border-bottom: 1px solid var(--color-border);
-}
-
-/* Invested section (spec 022). */
-
-/* Up to five figures side by side when they fit and stacked when they do not: `auto-fit`
-   decides, so the summary needs no breakpoint of its own. 10rem is what lets the fifth, when
-   there is one, sit beside the other four in the 60rem column; at 375 px it is one column. */
-.invested-summary {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
-  gap: 0.75rem 1.5rem;
-  margin: 0.75rem 0 1rem;
-}
-
-.invested-summary > div {
   min-width: 0;
 }
 
-.invested-summary dt {
-  color: var(--color-muted);
-  font-size: 0.875rem;
-}
-
-.invested-summary dd {
-  margin: 0;
-  font-size: 1.125rem;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere;
-}
-
-.pnl-return {
-  display: block;
-  font-size: 0.875rem;
-  font-weight: 400;
-}
-
-.excluded-list {
-  margin: 0.25rem 0;
-  padding-left: 1.25rem;
-}
-
-/* The scroll container is what keeps a table wider than the screen from widening the page.
-   At 1280 px the table fits the `.app` column and nothing scrolls. */
-.table-scroll {
-  overflow-x: auto;
-  margin: 0.75rem 0 0.5rem;
-}
-
-.table-scroll:focus-visible {
-  outline: 2px solid var(--color-text);
-  outline-offset: 2px;
-}
-
-.position-table,
-.data-table {
-  margin: 0;
-  font-size: 0.875rem;
-}
-
-/* Tighter than the other tables' padding: eight columns have to fit 60rem. Top-aligned, so
-   an asset with three badges keeps its figures on the line of its symbol. */
-.position-table th,
-.position-table td,
-.data-table th,
-.data-table td {
-  padding: 0.5rem 0.4rem;
-  vertical-align: top;
-}
-
-.position-table thead th,
-.data-table thead th {
-  vertical-align: bottom;
-}
-
-/* The sentence that stands where a figure would: "This asset is not priced in this
-   currency." Muted and small, so a column of them does not read as a column of numbers. */
-.position-table .unavailable {
-  display: inline-block;
-  max-width: 10rem;
-  color: var(--color-muted);
-  font-size: 0.8125rem;
-}
-
-.position-table .num,
-.data-table .num {
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-
-/* The asset stays put while the figures scroll under it. It needs its own background, or
-   the cells sliding beneath it show through. */
-.position-table thead th:first-child,
-.position-table tbody th,
-.data-table--sticky thead th:first-child,
-.data-table--sticky tbody th {
-  position: sticky;
-  left: 0;
-  background-color: var(--color-background);
-  box-shadow: 1px 0 0 var(--color-border);
-}
-
-.row-badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  margin-top: 0.25rem;
-}
-
-/* An asset with no flag renders the container with nothing in it; without this its margin
-   alone would make that row taller than it needs to be. */
-.row-badges:empty {
-  display: none;
-}
-
-/* A badge in a narrow first column wraps onto two lines, and a pill that wraps looks like a
-   blob: a smaller radius and a tighter line height keep it a label. */
-.row-badges .badge {
-  margin-left: 0;
-  border-radius: 0.5rem;
-  line-height: 1.25;
-}
-
-.flag-legend {
-  margin: 0.5rem 0 1rem;
-  font-size: 0.875rem;
-}
-
-.flag-legend > div {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem 0.75rem;
-  padding: 0.25rem 0;
-}
-
-.flag-legend dt {
-  flex: 0 0 9rem;
-}
-
-.flag-legend dt .badge {
-  margin-left: 0;
-}
-
-.flag-legend dd {
-  flex: 1 1 16rem;
-  margin: 0;
-  color: var(--color-muted);
-}
-
-.history-warnings {
-  margin: 1rem 0;
-}
-
-.history-warnings summary {
-  cursor: pointer;
-}
-
-/* "Held exceeds history" on a position takes the reader to the holdings check: it keeps the
-   badge's look and says it is a link by being underlined, with or without a pointer. */
-a.badge {
-  color: inherit;
-  text-decoration: underline;
-}
-
-/* Holdings check (spec 025). The finding - balances above the history - has a box and a
-   heading of its own so it cannot be read past; the quiet list is a closed disclosure. The
-   weight is in the border and the words, colour is only on top. */
-.holdings-short {
-  margin: 1rem 0;
-  padding: 0.75rem 1rem;
-  border: 1px solid var(--color-warning);
-  border-radius: 0.25rem;
-}
-
-.holdings-short h4 {
-  margin-top: 0;
-  color: var(--color-warning);
-}
-
-.holdings-over {
-  margin: 1rem 0;
-}
-
-.holdings-over summary {
-  cursor: pointer;
-}
-
-.holdings-readings {
-  margin: 0.25rem 0 1rem;
-  padding-left: 1.25rem;
-}
-
-/* Transactions (spec 024). */
-
-.fill-filters {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 0.75rem 1.5rem;
-  margin: 0.5rem 0 1rem;
-}
-
-.fill-filters fieldset {
-  min-width: 0;
-  margin: 0;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid var(--color-border);
-  border-radius: 0.25rem;
-}
-
-.fill-filters legend {
-  padding: 0 0.25rem;
-  font-weight: 600;
-}
-
-.fill-filters fieldset .hint {
-  margin-top: 0.25rem;
-}
-
-.fill-filter-choice {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  margin-right: 1rem;
-}
-
-.fill-filters .field {
-  margin-bottom: 0;
-}
-
-/* Lined up with the date inputs rather than their labels. */
-.fill-filters-clear {
-  align-self: flex-end;
-}
-
-.fill-filters-note {
-  flex-basis: 100%;
-  margin: 0;
-}
-
-/* The same figures-side-by-side grid as the invested summary, three across. */
-.totals-summary {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
-  gap: 0.75rem 1.5rem;
-  margin: 0.75rem 0 1rem;
-}
-
-.totals-summary > div {
-  min-width: 0;
-}
-
-.totals-summary dt {
-  color: var(--color-muted);
-  font-size: 0.875rem;
-}
-
-.totals-summary dd {
-  margin: 0;
-  font-size: 1.125rem;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere;
-}
-
-/* A figure never breaks mid-number, but the asset beside it may drop to the next line: ten
-   columns are tight in the `.app` column, and the scroll region absorbs what still does not
-   fit on a phone. */
-.data-table data {
-  white-space: nowrap;
-}
-
-/* The moment stays on one line and names the row, so it is what a reader scrolls past. */
-.fill-table tbody th {
-  white-space: nowrap;
-}
-
-.data-table tbody th {
-  font-weight: 400;
-}
-
-.data-table--sticky tbody th {
-  font-weight: 600;
-}
-
-.data-table .unavailable {
-  color: var(--color-muted);
-}
-
-.data-table .order-id {
-  min-width: 8rem;
-  font-family: monospace;
-  overflow-wrap: anywhere;
-}
-
-/* "(3 fills not in USDT)" under the asset: small and muted, wrapping inside the sticky cell. */
-.row-note {
-  display: block;
-  color: var(--color-muted);
-  font-size: 0.75rem;
-  font-weight: 400;
-}
-
-.derived {
-  color: var(--color-muted);
-  font-size: 0.75rem;
-}
-
-.fee-list {
-  margin: 0.25rem 0 1rem;
-  padding-left: 1.25rem;
-  font-variant-numeric: tabular-nums;
-}
-
-.completeness {
-  margin: 0.75rem 0 1rem;
-}
-
-.completeness p {
-  margin: 0;
-}
-
-.completeness ul {
-  margin: 0.25rem 0 0;
-  padding-left: 1.25rem;
-}
-
-/* Rows that are the previous page's, until the next one arrives. */
-[aria-busy='true'] {
-  opacity: 0.6;
-}
-
-.pagination {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem 1.5rem;
-  margin: 0.5rem 0 1.5rem;
-}
-
-.pagination p {
-  margin: 0;
-}
-
-.pagination-buttons {
-  display: flex;
-  gap: 0.5rem;
-}
-
-/* A failing account named above the transactions. */
-p.state-error[role='alert'] {
-  margin: 0.25rem 0;
-}
-
-/* Wide enough that "(3 fills not in USDT)" wraps in two lines rather than four. */
-.data-table--sticky tbody th {
-  min-width: 5.5rem;
-}
-
-/* A day typed outside `min`..`max` stays in the field but is never sent: the border says so. */
-.fill-filters .field input:invalid {
-  border-color: var(--color-error);
-}
-
-/* Manual adjustments (spec 027). */
-
-.field textarea {
-  font: inherit;
-  padding: 0.5rem 0.6rem;
-  border: 1px solid var(--color-border);
-  border-radius: 0.25rem;
-  background-color: var(--color-background);
-  color: var(--color-text);
-  resize: vertical;
-}
-
-/* A form this wide is read in one pass; the page's 60rem would stretch every input across it. */
-.adjustment-form {
-  max-width: 36rem;
-}
-
-/* A message under a field or at the bottom of the form. The words say what is wrong; colour
-   is only on top. */
-.field-error {
-  margin: 0;
-  color: var(--color-error);
-  font-size: 0.875rem;
-}
-
-.form-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-bottom: 1.5rem;
-}
-
-/* The button that sets the date to the one suggested: the app's regular button size, under the
-   hint that explains it, and not stretched across the field like a flex child would be. */
-.suggestion-button {
-  align-self: flex-start;
-}
-
-/* The outcome of the last save or delete. The paragraph is always in the document and its text
-   is swapped, so that a screen reader announces the change; while it is empty it must take no
-   room, and its margins would. */
-.status-line:empty {
-  margin: 0;
-}
-
-/* The owner's own words wrap, keep their line breaks, and never widen the table: the cell
-   takes what the figures leave, and a word longer than that breaks inside it. */
-.adjustment-table td.note {
-  min-width: 10rem;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.adjustment-table td time {
-  white-space: nowrap;
-}
-
-/* "Unknown cost" is a phrase in a figure's column, and wrapped onto two lines it reads as two
-   things. */
-.adjustment-table td.num {
-  white-space: nowrap;
-}
-
-.adjustment-table .row-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-}
-
-.adjustment-table button {
-  padding: 0.25rem 0.6rem;
-  font-size: 0.8125rem;
-}
-
-.adjustment-table .field-error {
-  max-width: 14rem;
-  margin-top: 0.4rem;
-}
-
-/* The Value section's Assets and Wallets tables on a phone (#118). */
-
-/* The region takes the table's own margins and the table gives them up. The region is a scroll
-   container, so the table's margins would no longer collapse through it: this is what keeps the
-   spacing, and so the 1280 px layout, what it was before the region. */
-.balance-scroll {
-  margin: 0.75rem 0 1.5rem;
-}
-
-.balance-table {
-  margin: 0;
-}
-
-/* At the desktop's size the four columns need more than the 327 px a 375 px phone leaves them,
-   and the truncated address alone held the first column at 146 px. Below 40rem the cells tighten
-   to the dense tables' size, and an address or a label breaks anywhere rather than widen its
-   column. A figure still never breaks, so one too long to fit scrolls the table inside its
-   region. Above 40rem nothing here applies. */
-@media (max-width: 40rem) {
-  .balance-table {
-    font-size: 0.875rem;
-  }
-
-  .balance-table th,
-  .balance-table td {
-    padding: 0.5rem 0.4rem;
-  }
-
-  .balance-table .wallet-name,
-  .balance-table .address-short,
-  .balance-table .address-full {
-    overflow-wrap: anywhere;
-  }
-
-  .balance-table .address button {
-    padding: 0.1rem 0.5rem;
-    font-size: 0.8125rem;
-  }
-
-  /* An extended key's badge: the `.address` gap already spaces it from the key, so its own
-     margin would only widen the column. Shaped like the position table's badges, which wrap in
-     a narrow column too. */
-  .balance-table .address .badge {
-    margin-left: 0;
-    border-radius: 0.5rem;
-    line-height: 1.25;
-  }
-}
-
-/* Dashboard (#154). */
-
-.visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
+/* Two blocks on one page (the Details page's value and invested halves) sit further apart than
+   the cards inside each. */
+.page > .stack + .stack,
+.page > .stack + section {
+  margin-top: 1rem;
 }
 
 .page-head {
   display: flex;
-  justify-content: flex-end;
-  margin-bottom: 1rem;
-}
-
-.state-actions {
-  display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem 1.25rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.25rem 1rem;
+  min-height: 2.25rem;
 }
 
-.overview {
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
+/* The page's action stays on the right, on the head's own row or, wrapped, on the next. */
+.page-head > button:last-child {
+  margin-left: auto;
 }
+
+.page-title {
+  margin: 0;
+  font-size: 1.5rem;
+  letter-spacing: -0.02em;
+}
+
+.section-title {
+  margin: 0;
+  font-size: 1.25rem;
+  letter-spacing: -0.015em;
+}
+
+.page-meta,
+.last-updated {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+}
+
+.toolbar-lines:empty {
+  display: none;
+}
+
+.toolbar-lines > p {
+  margin: 0.25rem 0 0;
+}
+
+/* Cards. */
 
 .card,
-.kpi {
+.kpi,
+.invested-summary > div,
+.totals-summary > div {
   min-width: 0;
   border: 1px solid var(--color-hairline);
   border-radius: var(--radius-card);
@@ -896,11 +331,67 @@ p.state-error[role='alert'] {
   padding: 1.25rem 1.25rem 1rem;
 }
 
-.card > h2 {
+.card > h2,
+.card > h3,
+.card > h4,
+.card > h5,
+.card-head h2,
+.card-head h3,
+.card-head h4 {
   margin: 0 0 0.75rem;
   font-size: 1rem;
   font-weight: 650;
 }
+
+.card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.25rem 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.card-head > * {
+  margin: 0;
+}
+
+.card > :last-child {
+  margin-bottom: 0;
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+}
+
+@media (min-width: 56rem) {
+  .grid-2 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* A form beside the list it adds to: the form narrow on the left, the list taking the rest.
+   One column, form first, below a desktop's width. */
+.side-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 1rem;
+}
+
+@media (min-width: 60rem) {
+  .side-layout {
+    grid-template-columns: 22rem minmax(0, 1fr);
+  }
+}
+
+.side-layout form button[type='submit'] {
+  width: 100%;
+}
+
+/* Figures (#154). */
 
 /* Three across or one per row, never two and one: a lone third card reads as an afterthought,
    and the P/L is the figure that matters most. */
@@ -916,7 +407,9 @@ p.state-error[role='alert'] {
   }
 }
 
-.kpi {
+.kpi,
+.invested-summary > div,
+.totals-summary > div {
   padding: 1rem 1.25rem 1.15rem;
 }
 
@@ -928,22 +421,27 @@ p.state-error[role='alert'] {
   min-height: 1.5rem;
 }
 
-.kpi-label {
+.kpi-label,
+.invested-summary dt,
+.totals-summary dt {
   margin: 0;
   color: var(--color-muted);
   font-size: 0.8125rem;
   font-weight: 500;
+  letter-spacing: 0;
 }
 
 /* The figure in the system sans with proportional digits, as a hero figure is set. A number
    too long for the card wraps rather than widen it. */
-.kpi-value {
+.kpi-value,
+.invested-summary dd,
+.totals-summary dd {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   gap: 0.25rem 0.4rem;
-  margin-top: 0.35rem;
-  font-size: clamp(1.5rem, 1.25rem + 1vw, 1.875rem);
+  margin: 0.35rem 0 0;
+  font-size: clamp(1.375rem, 1.2rem + 0.8vw, 1.75rem);
   font-weight: 650;
   letter-spacing: -0.02em;
   line-height: 1.2;
@@ -958,12 +456,16 @@ p.state-error[role='alert'] {
 }
 
 .kpi-gain .kpi-value > data,
-.kpi-gain .kpi-delta {
+.kpi-gain .kpi-delta,
+.invested-summary .kpi-gain dd > data,
+.totals-summary .kpi-gain dd > data {
   color: var(--color-gain);
 }
 
 .kpi-loss .kpi-value > data,
-.kpi-loss .kpi-delta {
+.kpi-loss .kpi-delta,
+.invested-summary .kpi-loss dd > data,
+.totals-summary .kpi-loss dd > data {
   color: var(--color-loss);
 }
 
@@ -983,41 +485,155 @@ p.state-error[role='alert'] {
   white-space: nowrap;
 }
 
+.kpi-note {
+  margin: 0.5rem 0 0;
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+}
+
+/* The figure grids of the Details and Exchanges pages. The invested figures are four, or five:
+   two to a row on a phone and as many as fit beyond. The fill totals are three, side by side at
+   every width, so the net is never a lone tile under the other two. */
+.invested-summary,
+.totals-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 9.5rem), 1fr));
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.totals-summary {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.pnl-return {
+  display: block;
+  width: 100%;
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
 .chip {
-  display: inline-block;
-  padding: 0.05rem 0.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.05rem 0.55rem;
   border: 1px solid currentColor;
   border-radius: 999px;
   font-size: 0.6875rem;
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .chip-warning {
   color: var(--color-warning);
 }
 
-.note {
-  margin: 0 0 1rem;
-  color: var(--color-muted);
-  font-size: 0.875rem;
+/* A state: a dot in the status colour, and the words. Never the colour alone. */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0.15rem 0.6rem 0.15rem 0.5rem;
+  border: 1px solid var(--color-hairline);
+  border-radius: 999px;
+  background-color: var(--color-surface-2);
+  color: var(--color-text);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
-.overview .note {
+.status::before {
+  content: '';
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background-color: var(--status-neutral);
+}
+
+.status-good::before {
+  background-color: var(--status-good);
+}
+
+.status-warning::before {
+  background-color: var(--status-warning);
+}
+
+.status-critical::before {
+  background-color: var(--status-critical);
+}
+
+/* Notes and alerts. A sentence that stands beside the figures: small and muted when it
+   informs, boxed with a coloured edge when it warns. The words say what is wrong; the colour
+   is only on top. */
+
+.note,
+.hint,
+.footnote {
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+}
+
+.note {
   margin: 0;
 }
 
-.note-warning {
+.hint {
+  margin: 0.25rem 0 0;
+}
+
+.hint button {
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+.footnote {
+  margin: 0.75rem 0 0;
+}
+
+.note-warning,
+p[role='alert'],
+.state-warning {
   padding: 0.6rem 0.9rem;
   border: 1px solid var(--color-hairline);
   border-left: 3px solid var(--color-warning);
   border-radius: var(--radius-control);
   background-color: var(--color-surface);
+  color: var(--color-text);
+  font-size: 0.875rem;
 }
 
-.note-warning strong {
+p[role='alert'] {
+  margin: 0;
+  border-left-color: var(--color-error);
+}
+
+.note-warning strong,
+.state-warning h3,
+.state-warning h4 {
   color: var(--color-warning);
+}
+
+.state-warning {
+  margin: 0;
+}
+
+.state-warning h3,
+.state-warning h4 {
+  margin: 0 0 0.25rem;
+  font-size: 0.9375rem;
+}
+
+.state-warning > :last-child {
+  margin-bottom: 0;
 }
 
 .note-error {
@@ -1027,46 +643,399 @@ p.state-error[role='alert'] {
 .note a {
   color: inherit;
   font-weight: 500;
-  text-underline-offset: 2px;
 }
 
-/* The donut beside the table when both fit, above it when they do not. */
-.holdings-body {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 1rem 2rem;
+/* Inline messages keep their place in a form or a row: no box. */
+.field-error,
+.field > p[role='alert'],
+.fill-filters-note.state-error,
+.account p[role='alert'] {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-error);
+  font-size: 0.875rem;
 }
 
-.holdings-body .table-scroll {
-  flex: 1 1 22rem;
-  min-width: 0;
+.field-error {
   margin: 0;
 }
 
-.holdings-table th,
-.holdings-table td {
+/* States: loading, empty and failed. */
+
+.state {
+  color: var(--color-muted);
+}
+
+.state-error {
+  color: var(--color-error);
+}
+
+.state-empty,
+div.state-error {
+  padding: 1.5rem 1.25rem;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-card);
+  background-color: var(--color-surface);
+}
+
+.state-empty > :is(h2, h3, h4, h5),
+div.state-error > :is(h2, h3, h4, h5) {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+}
+
+.state-empty > p,
+div.state-error > p {
+  margin: 0 0 0.75rem;
+  font-size: 0.875rem;
+}
+
+.state-empty > :last-child,
+div.state-error > :last-child {
+  margin-bottom: 0;
+}
+
+.state-empty {
+  color: var(--color-text);
+}
+
+.state-empty > p {
+  color: var(--color-muted);
+}
+
+.state-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.25rem;
+}
+
+/* Loading: a shimmer under the words, which still say what is loading. */
+.state-loading {
+  margin: 0;
+  padding: 1.25rem;
+  border-radius: var(--radius-card);
+  background: linear-gradient(
+      90deg,
+      var(--color-surface) 0%,
+      var(--color-surface-2) 50%,
+      var(--color-surface) 100%
+    )
+    0 0 / 200% 100%;
+  color: var(--color-muted);
+  font-size: 0.875rem;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .state-loading {
+    animation: none;
+  }
+}
+
+/* Rows that are the previous page's, until the next one arrives. */
+[aria-busy='true'] {
+  opacity: 0.6;
+}
+
+/* Controls. */
+
+button {
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.5;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-control);
+  background-color: var(--color-surface);
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--color-muted);
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+.table-scroll:focus-visible {
+  outline: 2px solid var(--color-text);
+  outline-offset: 2px;
+}
+
+button:disabled,
+button[aria-disabled='true'] {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* The one action a page is for: ink on the page plane. */
+.button-primary {
+  border-color: var(--color-text);
+  background-color: var(--color-text);
+  color: var(--color-surface);
+  font-weight: 600;
+}
+
+.button-primary:hover:not(:disabled) {
+  border-color: var(--color-text);
+  background-color: color-mix(in srgb, var(--color-text) 85%, var(--color-surface));
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 1rem;
+}
+
+.field label {
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.field input,
+.field select,
+.field textarea,
+.wallet-list-header input {
+  font: inherit;
+  min-width: 0;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background-color: var(--color-page);
+  color: var(--color-text);
+}
+
+.field textarea {
+  resize: vertical;
+}
+
+input[type='checkbox'] {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  accent-color: var(--color-text);
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0;
+}
+
+/* The outcome of the last save or delete. The paragraph is always in the document and its text
+   is swapped, so that a screen reader announces the change; while it is empty it must take no
+   room, and its margins would. */
+.status-line {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.875rem;
+}
+
+.status-line:empty {
+  display: none;
+}
+
+.login {
+  max-width: 24rem;
+  margin: 2rem auto 0;
+}
+
+.login button[type='submit'] {
+  width: 100%;
+}
+
+/* Disclosures: a chevron that turns, on a summary that reads as a heading. */
+
+details > summary {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 500;
+  list-style: none;
+}
+
+details > summary::-webkit-details-marker {
+  display: none;
+}
+
+details > summary::before {
+  content: '';
+  flex: none;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-right: 2px solid var(--color-muted);
+  border-bottom: 2px solid var(--color-muted);
+  transform: rotate(-45deg);
+  transition: transform 120ms ease;
+}
+
+details[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+details[open] > summary {
+  margin-bottom: 0.75rem;
+}
+
+/* Tables. One style everywhere: muted small headers, hairline rows, figures right-aligned in
+   tabular digits. */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+th,
+td {
+  text-align: left;
   padding: 0.6rem 0.5rem;
-  vertical-align: middle;
+  border-bottom: 1px solid var(--color-hairline);
+  vertical-align: top;
+}
+
+thead th {
+  color: var(--color-muted);
+  font-size: 0.75rem;
+  font-weight: 500;
+  vertical-align: bottom;
+}
+
+tbody tr:last-child > * {
+  border-bottom: 0;
+}
+
+tbody th {
+  font-weight: 600;
+}
+
+/* The scroll container is what keeps a table wider than the screen from widening the page. */
+.table-scroll {
+  overflow-x: auto;
+  margin: 0;
+}
+
+.num,
+.data-table .num,
+.position-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 /* A figure never breaks across lines: "100.00 %" on two reads as two things. */
+.data-table data,
+.position-table data,
+.balance-table data,
 .holdings-table td {
   white-space: nowrap;
 }
 
-.holdings-table thead th {
+.data-table tbody th {
+  font-weight: 400;
+}
+
+.data-table--sticky tbody th {
+  min-width: 5.5rem;
+  font-weight: 600;
+}
+
+/* The asset stays put while the figures scroll under it. It needs its own background, or the
+   cells sliding beneath it show through. */
+.position-table thead th:first-child,
+.position-table tbody th,
+.data-table--sticky thead th:first-child,
+.data-table--sticky tbody th {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background-color: var(--color-background);
+  box-shadow: 1px 0 0 var(--color-hairline);
+}
+
+/* The sentence that stands where a figure would: "This asset is not priced in this
+   currency." Muted and small, so a column of them does not read as a column of numbers. */
+.unavailable,
+.position-table .unavailable {
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+}
+
+.position-table .unavailable {
+  display: inline-block;
+  max-width: 10rem;
+}
+
+.row-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.25rem;
+}
+
+.row-badges:empty {
+  display: none;
+}
+
+.row-note,
+.derived {
+  display: block;
   color: var(--color-muted);
   font-size: 0.75rem;
-  font-weight: 500;
+  font-weight: 400;
 }
 
-.holdings-table tbody tr:last-child > * {
-  border-bottom: 0;
+.derived {
+  display: inline;
 }
 
-.holdings-table tbody th {
+.fill-table tbody th,
+.adjustment-table td time {
+  white-space: nowrap;
+}
+
+.data-table .order-id {
+  min-width: 8rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  overflow-wrap: anywhere;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid var(--color-hairline);
+  border-radius: 0.5rem;
+  background-color: var(--color-surface-2);
+  color: var(--color-muted);
+  font-size: 0.6875rem;
   font-weight: 600;
+  letter-spacing: 0.03em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+/* "Held exceeds history" on a position takes the reader to the holdings check: it keeps the
+   badge's look and says it is a link by being underlined. */
+a.badge {
+  color: inherit;
+  text-decoration: underline;
 }
 
 .asset-cell {
@@ -1081,6 +1050,44 @@ p.state-error[role='alert'] {
   width: 0.75rem;
   height: 0.75rem;
   border-radius: 3px;
+}
+
+/* Dashboard (#154). */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.overview {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+/* The donut beside the table when both fit, above it when they do not. */
+.holdings-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem 2rem;
+}
+
+.holdings-body .table-scroll {
+  flex: 1 1 22rem;
+  min-width: 0;
+}
+
+.holdings-table th,
+.holdings-table td {
+  vertical-align: middle;
 }
 
 .donut {
@@ -1141,25 +1148,666 @@ p.state-error[role='alert'] {
   color: var(--color-muted);
 }
 
-.footnote {
-  margin: 0.75rem 0 0;
+/* Bar charts. Horizontal bars on one scale from zero, the figure at each tip in ink. A row's
+   colour is its asset's; two series are two shades of it, told apart by the legend. Bars are
+   14px with a 4px rounded end and a square baseline. The track keeps room on its right for the
+   figure, so the longest bar's label never runs off the card. */
+
+.bar-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+  margin: 0;
+}
+
+.bar-legend {
+  justify-content: flex-start;
+  color: var(--color-muted);
+}
+
+.swatch-solid {
+  background-color: var(--color-muted);
+}
+
+.swatch-soft {
+  border: 1.5px solid var(--color-muted);
+  background-color: color-mix(in srgb, var(--color-muted) 22%, transparent);
+}
+
+.bar-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.bar-row {
+  --bar-color: var(--series-other);
+
+  display: grid;
+  grid-template-columns: minmax(5rem, 9rem) minmax(0, 1fr);
+  align-items: center;
+  gap: 0.35rem 1rem;
+  padding: 0.25rem 0.375rem;
+  border-radius: var(--radius-control);
+}
+
+.bar-row:hover {
+  background-color: var(--color-surface-2);
+}
+
+.bar-label {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.2rem;
+  min-width: 0;
+  font-size: 0.875rem;
+}
+
+.bar-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.bar-name .swatch {
+  background-color: var(--bar-color);
+}
+
+.bar-sub {
+  color: var(--color-muted);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+
+.bar-tracks {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.bar-track {
+  position: relative;
+  height: 1.125rem;
+  margin-right: 6.5rem;
+}
+
+.bar {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: var(--bar-length);
+  min-width: 3px;
+  height: 0.875rem;
+  border-radius: 0 4px 4px 0;
+  background-color: var(--bar-color);
+  transform: translateY(-50%);
+}
+
+.bar-soft .bar {
+  background-color: color-mix(in srgb, var(--bar-color) 28%, transparent);
+  box-shadow: inset 0 0 0 1.5px var(--bar-color);
+}
+
+.bar-value {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--bar-length, 0%) + 0.5rem);
+  color: var(--color-text);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  transform: translateY(-50%);
+}
+
+.bar-soft .bar-value {
+  color: var(--color-muted);
+}
+
+.bar-track:not([style]) .bar-value {
+  left: 0;
+  color: var(--color-muted);
+}
+
+/* The return under an asset's name: the sign and the arrow say the direction. */
+.delta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0 0.45rem;
+  border-radius: 999px;
+  background-color: color-mix(in srgb, currentColor 10%, transparent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.delta-gain {
+  color: var(--color-gain);
+}
+
+.delta-loss {
+  color: var(--color-loss);
+}
+
+.delta-flat {
+  color: var(--color-muted);
+}
+
+/* On a phone the label goes above its bars, which then take the card's whole width. */
+@media (max-width: 30rem) {
+  .bar-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .bar-label {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .bar-track {
+    margin-right: 5.5rem;
+  }
+}
+
+/* Details: the wallets' value and what went into each position. */
+
+.excluded-list,
+.holdings-readings {
+  margin: 0.25rem 0 0.75rem;
+  padding-left: 1.25rem;
+  font-size: 0.875rem;
+}
+
+.invested-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
   color: var(--color-muted);
   font-size: 0.8125rem;
 }
 
-/* On a phone the five holding columns need every pixel: a tighter card and tighter cells let
-   them fit 375 px, and the region still scrolls a figure too long to. */
+.invested-notes > p,
+.invested-notes > ul {
+  margin: 0;
+}
+
+.invested-notes:empty {
+  display: none;
+}
+
+.flag-legend {
+  margin: 0.75rem 0 0;
+  font-size: 0.8125rem;
+}
+
+.flag-legend > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  padding: 0.25rem 0;
+}
+
+.flag-legend dt {
+  flex: 0 0 9rem;
+}
+
+.flag-legend dd {
+  flex: 1 1 16rem;
+  margin: 0;
+  color: var(--color-muted);
+}
+
+.history-warnings {
+  margin: 0.75rem 0 0;
+}
+
+/* Holdings check (spec 025). The finding - balances above the history - has a box and a heading
+   of its own so it cannot be read past; the quiet list is a closed disclosure. */
+.holdings-short {
+  margin: 0.75rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--color-hairline);
+  border-left: 3px solid var(--color-warning);
+  border-radius: var(--radius-control);
+}
+
+.holdings-short h4 {
+  margin: 0 0 0.35rem;
+  color: var(--color-warning);
+}
+
+.holdings-over {
+  margin: 0.75rem 0 0;
+}
+
+.pending {
+  color: var(--color-muted);
+}
+
+.health-details {
+  display: grid;
+  gap: 0.35rem 1.5rem;
+  grid-template-columns: max-content minmax(0, 1fr);
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.health-details dt {
+  color: var(--color-muted);
+}
+
+.health-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* One item of a health card - a timer, a chain, a venue - headed h4 over its details. */
+.card > div:has(> h4 + .health-details) > h4 {
+  margin: 0 0 0.4rem;
+  font-size: 0.875rem;
+  font-weight: 650;
+}
+
+.card > div:has(> h4 + .health-details) + div:has(> h4 + .health-details) {
+  margin-top: 0.85rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--color-hairline);
+}
+
+/* Addresses and wallets. */
+
+.address {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.address-short,
+.address-full {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  overflow-wrap: anywhere;
+}
+
+.address-full {
+  user-select: all;
+}
+
+.address button {
+  padding: 0.1rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+.wallet-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* A wallet on one line - chain, label, address - with its actions on the right, wrapping under
+   it when the card is too narrow for both. */
+.wallet-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  padding: 0.85rem 0;
+  border-bottom: 1px solid var(--color-hairline);
+}
+
+.wallet-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.wallet-row-main,
+.wallet-row-actions,
+.confirm-archive {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.wallet-row-actions button,
+.confirm-archive button {
+  padding: 0.25rem 0.7rem;
+  font-size: 0.8125rem;
+}
+
+.wallet-chain {
+  font-weight: 650;
+}
+
+.wallet-label,
+.wallet-name {
+  color: var(--color-muted);
+  font-size: 0.875rem;
+}
+
+.wallet-list-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.wallet-list-header h3 {
+  margin: 0;
+}
+
+.wallet-list-header label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+}
+
+/* The Value section's tables on a phone (#118): below 40rem the cells tighten, and an address
+   or a label breaks anywhere rather than widen its column. A figure still never breaks. */
 @media (max-width: 40rem) {
-  .card {
-    padding: 1rem 1rem 0.75rem;
+  .balance-table th,
+  .balance-table td {
+    padding: 0.5rem 0.4rem;
   }
 
-  .holdings-table {
+  .balance-table .wallet-name,
+  .balance-table .address-short,
+  .balance-table .address-full {
+    overflow-wrap: anywhere;
+  }
+}
+
+/* Exchanges (specs 016 and 024). */
+
+.exchanges-toolbar {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
+}
+
+/* The live region is always in the document and empty most of the time: it must not hold a
+   gap open in the page while it says nothing. It is never hidden, or it would stop announcing. */
+.exchanges-toolbar:has(> [role='status']:empty):not(:has(> p)) {
+  margin-top: -1rem;
+}
+
+.exchanges-toolbar > [role='status'] p {
+  margin: 0;
+}
+
+.exchange-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.exchange-list > li {
+  font-size: 0.875rem;
+}
+
+.exchange-list > li > p,
+.exchange-list > li > ol {
+  margin: 0.5rem 0 0;
+}
+
+.exchange-list ol {
+  padding-left: 1.25rem;
+}
+
+.exchange-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.exchange-head h4 {
+  margin: 0;
+  font-size: 1.0625rem;
+}
+
+/* A venue's facts: label over value, two to a row. */
+.stat-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stat-list > li {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.stat-label {
+  color: var(--color-muted);
+  font-size: 0.75rem;
+}
+
+.stat-value {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.fill-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem 1.25rem;
+}
+
+.fill-filters fieldset {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 1rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.fill-filters legend {
+  float: left;
+  width: 100%;
+  margin-bottom: 0.3rem;
+  padding: 0;
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.fill-filters fieldset .hint {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.fill-filter-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background-color: var(--color-page);
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+.fill-filter-choice:has(input:checked) {
+  border-color: var(--color-text);
+  font-weight: 600;
+}
+
+.fill-filters .field {
+  margin-bottom: 0;
+}
+
+/* A day typed outside `min`..`max` stays in the field but is never sent: the border says so. */
+.fill-filters .field input:invalid {
+  border-color: var(--color-error);
+}
+
+.fill-filters-note {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.completeness ul {
+  margin: 0.25rem 0 0;
+  padding-left: 1.25rem;
+}
+
+.fee-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.25rem;
+  margin: 0.25rem 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1.5rem;
+  margin: 0.75rem 0 0;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--color-hairline);
+  color: var(--color-muted);
+  font-size: 0.8125rem;
+}
+
+.pagination p {
+  margin: 0;
+}
+
+.pagination-buttons {
+  display: flex;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.pagination-buttons button {
+  padding: 0.25rem 0.75rem;
+  font-size: 0.8125rem;
+}
+
+/* Every column but the per-account detail is a few words: on one line each. */
+.run-table td:not(:last-child) {
+  white-space: nowrap;
+}
+
+.run-table td:last-child {
+  min-width: 16rem;
+}
+
+.run-details {
+  margin: 0;
+  padding-left: 1rem;
+  font-size: 0.8125rem;
+}
+
+/* Manual adjustments (spec 027). */
+
+.adjustment-form {
+  max-width: 40rem;
+}
+
+/* The button that sets the date to the one suggested: under the hint that explains it, and not
+   stretched across the field like a flex child would be. */
+.suggestion-button {
+  align-self: flex-start;
+}
+
+/* The owner's own words wrap, keep their line breaks, and never widen the table. */
+.adjustment-table td.note {
+  min-width: 10rem;
+  color: var(--color-text);
+  font-size: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.adjustment-table td.num {
+  white-space: nowrap;
+}
+
+.adjustment-table .row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.adjustment-table button {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.8125rem;
+}
+
+.adjustment-table .field-error {
+  max-width: 14rem;
+  margin-top: 0.4rem;
+}
+
+/* On a phone every card gives its content a little more of the width, and every table cell
+   tightens. A region still scrolls a figure too long to fit. */
+@media (max-width: 40rem) {
+  .card {
+    padding: 1rem 0.875rem 0.875rem;
+  }
+
+  .kpi,
+  .invested-summary > div,
+  .totals-summary > div {
+    padding: 0.875rem 1rem 1rem;
+  }
+
+  .invested-summary dd,
+  .totals-summary dd {
+    font-size: 1.125rem;
+  }
+
+  .totals-summary > div {
+    padding: 0.75rem 0.65rem 0.85rem;
+  }
+
+  th,
+  td {
+    padding: 0.5rem 0.35rem;
+  }
+
+  table {
     font-size: 0.8125rem;
   }
 
-  .holdings-table th,
-  .holdings-table td {
-    padding: 0.5rem 0.3rem;
+  .page-title {
+    font-size: 1.3125rem;
   }
 }

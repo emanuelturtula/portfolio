@@ -212,8 +212,22 @@ export function ExchangesPage() {
   const failing = data === undefined ? [] : venuesWithFailedSync(data);
 
   return (
-    <section aria-labelledby="exchanges-heading">
-      <h2 id="exchanges-heading">Exchanges</h2>
+    <section className="page" aria-labelledby="exchanges-heading">
+      <div className="page-head">
+        <h2 id="exchanges-heading" className="page-title">
+          Exchanges
+        </h2>
+        {anyConfigured && (
+          <button
+            type="button"
+            className="button-primary"
+            aria-disabled={syncMutation.isPending ? 'true' : undefined}
+            onClick={handleSyncClick}
+          >
+            Sync now
+          </button>
+        )}
+      </div>
 
       {exchanges.isRefetchError && (
         <p role="alert">
@@ -224,16 +238,10 @@ export function ExchangesPage() {
 
       {anyConfigured && (
         <div className="exchanges-toolbar">
-          <button
-            type="button"
-            aria-disabled={syncMutation.isPending ? 'true' : undefined}
-            onClick={handleSyncClick}
-          >
-            Sync now
-          </button>
           {/* Spec R11: one role="status" element, always in the DOM, whose children swap -
-              a region inserted together with its own text is not reliably announced. */}
-          <div role="status">
+              a region inserted together with its own text is not reliably announced. Spec R14
+              kept Sync now from stretching to the toolbar; it now sits in the page head. */}
+          <div role="status" className="note">
             {syncMutation.isPending &&
               'Syncing exchanges… the first import can take several minutes.'}
             {!syncMutation.isPending && syncMutation.isSuccess && (
@@ -259,8 +267,10 @@ export function ExchangesPage() {
       ))}
 
       {exchanges.isLoadingError ? (
-        <section aria-labelledby="exchanges-accounts-heading">
-          <h3 id="exchanges-accounts-heading">Accounts</h3>
+        <section className="stack" aria-labelledby="exchanges-accounts-heading">
+          <h3 id="exchanges-accounts-heading" className="section-title">
+            Accounts
+          </h3>
           <ErrorState
             headingLevel={4}
             title="Could not load exchanges"

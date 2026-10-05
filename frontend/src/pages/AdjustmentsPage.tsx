@@ -67,17 +67,17 @@ export function AdjustmentsPage() {
   }
 
   return (
-    <section aria-labelledby="adjustments-heading">
-      <h2 id="adjustments-heading">Adjustments</h2>
-      <p>
-        An adjustment records coins the imported history does not show, such as an opening balance
-        bought before an exchange&apos;s history begins, or coins acquired off an exchange. See
-        &quot;Recording what the history does not show&quot; in docs/accounting.md.
-      </p>
+    <section className="page" aria-labelledby="adjustments-heading">
+      <div className="page-head">
+        <h2 id="adjustments-heading" className="page-title">
+          Adjustments
+        </h2>
+        <p className="page-meta">Coins the imported history does not show.</p>
+      </div>
 
       <FailedRecomputeAlert />
 
-      <div ref={formAreaRef}>
+      <div ref={formAreaRef} className="card">
         <AdjustmentForm
           key={target.nonce}
           adjustment={target.adjustment}

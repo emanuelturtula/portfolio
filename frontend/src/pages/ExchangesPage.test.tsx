@@ -316,13 +316,20 @@ function escapeRegExp(value: string): string {
 }
 
 /**
- * Asserts a fact of an entry: its label, then its value, with nothing but
- * punctuation or spacing between them. "Fills stored 1,234" and
- * "Fills stored: 1,234" both pass; "Fills stored 11,234" does not.
+ * Asserts a fact of an entry: the one line of it that starts with its label, then its value,
+ * with nothing but punctuation or spacing between them. "Fills stored 1,234" and
+ * "Fills stored: 1,234" both pass; "Fills stored 11,234" does not. The line is found first so
+ * that what follows the list - a sentence that opens with a number - cannot run into the value.
  */
 function expectFact(item: HTMLElement, label: string, value: string): void {
-  expect(item).toHaveTextContent(
-    new RegExp(`${escapeRegExp(label)}\\W*${escapeRegExp(value)}(?![\\d,])`, 'i'),
+  const fact = within(item)
+    .getAllByRole('listitem')
+    .find((line) => line.textContent.startsWith(label));
+  if (fact === undefined) {
+    throw new Error(`No "${label}" line.`);
+  }
+  expect(fact).toHaveTextContent(
+    new RegExp(`^${escapeRegExp(label)}\\W*${escapeRegExp(value)}(?![\\d,])`, 'i'),
   );
 }
 
@@ -2345,6 +2352,55 @@ describe('ExchangesPage: run log', () => {
 /*
  * Criterion 5: the truncation banner.
  */
+
+describe('ExchangesPage: run log pages', () => {
+  /** Seven finished runs, newest first, told apart by how long each took: 1 to 7 seconds. */
+  function sevenRuns() {
+    return Array.from({ length: 7 }, (_, index) =>
+      finishedRun({ run_id: 20 - index, duration_ms: (index + 1) * 1_000 }),
+    );
+  }
+
+  function durations(table: HTMLTableElement): string[] {
+    return bodyRows(table).map((row) => text(cell(row, 'Duration')));
+  }
+
+  it('shows five runs at a time, in a navigation of its own', async () => {
+    const { user } = openExchanges({ exchanges: [exchange()], runs: sevenRuns() });
+    const history = await historySection();
+    await runTable();
+
+    const nav = within(history).getByRole('navigation', { name: 'Sync history pages' });
+    expect(durations(await runTable())).toEqual([
+      '1 second',
+      '2 seconds',
+      '3 seconds',
+      '4 seconds',
+      '5 seconds',
+    ]);
+    expect(nav).toHaveTextContent('Showing 1 to 5 of 7');
+    expect(nav).toHaveTextContent('Page 1 of 2');
+    expectHeldButton(within(nav).getByRole('button', { name: 'Previous' }));
+
+    await user.click(within(nav).getByRole('button', { name: 'Next' }));
+    expect(durations(await runTable())).toEqual(['6 seconds', '7 seconds']);
+    expect(nav).toHaveTextContent('Showing 6 to 7 of 7');
+    expect(nav).toHaveTextContent('Page 2 of 2');
+    expectHeldButton(within(nav).getByRole('button', { name: 'Next' }));
+
+    await user.click(within(nav).getByRole('button', { name: 'Previous' }));
+    expect(durations(await runTable())).toHaveLength(5);
+    expect(nav).toHaveTextContent('Showing 1 to 5 of 7');
+  });
+
+  it('has no pages for five runs or fewer', async () => {
+    openExchanges({ exchanges: [exchange()], runs: sevenRuns().slice(0, 5) });
+    const history = await historySection();
+
+    expect(bodyRows(await runTable())).toHaveLength(5);
+    expect(within(history).queryByRole('navigation')).not.toBeInTheDocument();
+  });
+});
 
 describe('ExchangesPage: truncation banner', () => {
   it('a truncated venue gets a banner naming effective_since in UTC', async () => {

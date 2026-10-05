@@ -6,6 +6,7 @@ import {
   formatCount,
   remediationFor,
   statusLabel,
+  statusTone,
 } from '@/lib/exchanges';
 import { formatHistoryStart } from '@/lib/time';
 
@@ -139,36 +140,49 @@ function ExchangeRow({ exchange, manualRunInFlight }: ExchangeRowProps) {
   const isManualRetry = exchange.status === 'auth_failed' && exchange.syncing && manualRunInFlight;
 
   return (
-    <li id={`exchange-${exchange.exchange_key}`} aria-labelledby={headingId}>
-      <h4 id={headingId}>{venue}</h4>
-      <p>{statusLabel(exchange, manualRunInFlight)}</p>
+    <li id={`exchange-${exchange.exchange_key}`} className="card" aria-labelledby={headingId}>
+      <div className="exchange-head">
+        <h4 id={headingId}>{venue}</h4>
+        <p className={`status status-${statusTone(exchange)}`}>
+          {statusLabel(exchange, manualRunInFlight)}
+        </p>
+      </div>
 
-      <ul>
+      <ul className="stat-list">
         <li>
-          Last complete sync:{' '}
-          {exchange.last_synced_at === null ? (
-            'Never'
-          ) : (
-            <RelativeTime value={exchange.last_synced_at} />
-          )}
-          .
+          <span className="stat-label">Last complete sync</span>{' '}
+          <span className="stat-value">
+            {exchange.last_synced_at === null ? (
+              'Never'
+            ) : (
+              <RelativeTime value={exchange.last_synced_at} />
+            )}
+          </span>
         </li>
-        <li>Fills stored: {formatCount(exchange.fills_stored)}.</li>
         <li>
-          History complete from:{' '}
-          {exchange.effective_since === null ? (
-            'Not planned yet'
-          ) : exchange.pending_windows > 0 ? (
-            <>
-              {formatHistoryStart(exchange.effective_since)} once the windows still to read are read
-            </>
-          ) : (
-            formatHistoryStart(exchange.effective_since)
-          )}
-          .
+          <span className="stat-label">Fills stored</span>{' '}
+          <span className="stat-value">{formatCount(exchange.fills_stored)}</span>
+        </li>
+        <li>
+          <span className="stat-label">History complete from</span>{' '}
+          <span className="stat-value">
+            {exchange.effective_since === null ? (
+              'Not planned yet'
+            ) : exchange.pending_windows > 0 ? (
+              <>
+                {formatHistoryStart(exchange.effective_since)} once the windows still to read are
+                read
+              </>
+            ) : (
+              formatHistoryStart(exchange.effective_since)
+            )}
+          </span>
         </li>
         {exchange.pending_windows > 0 && (
-          <li>Windows still to read: {formatCount(exchange.pending_windows)}.</li>
+          <li>
+            <span className="stat-label">Windows still to read</span>{' '}
+            <span className="stat-value">{formatCount(exchange.pending_windows)}</span>
+          </li>
         )}
       </ul>
 
@@ -233,8 +247,10 @@ interface ExchangeListProps {
 /** The Accounts section: one list item per venue, each labelled by its venue name. */
 export function ExchangeList({ exchanges, manualRunInFlight }: ExchangeListProps) {
   return (
-    <section aria-labelledby="exchanges-accounts-heading">
-      <h3 id="exchanges-accounts-heading">Accounts</h3>
+    <section className="stack" aria-labelledby="exchanges-accounts-heading">
+      <h3 id="exchanges-accounts-heading" className="section-title">
+        Accounts
+      </h3>
       <ul className="exchange-list">
         {exchanges.map((exchange) => (
           <ExchangeRow

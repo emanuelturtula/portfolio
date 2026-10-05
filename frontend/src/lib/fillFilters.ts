@@ -13,8 +13,11 @@
  */
 import { EXCHANGES, type ExchangeKey } from '@/lib/exchanges';
 
-/** How many fills one page holds. Fixed: the owner does not choose it (spec 024). */
-export const FILLS_PAGE_SIZE = 50;
+/**
+ * How many fills one page holds. Fixed: the owner does not choose it (spec 024). Five, so a
+ * page of trades fits a phone's screen beside the totals and the chart above it.
+ */
+export const FILLS_PAGE_SIZE = 5;
 
 export interface FillFilters {
   /** Empty means every exchange, as the API reads an omitted `exchange`. */

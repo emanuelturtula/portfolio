@@ -270,11 +270,11 @@ function expectNoRenderedZero(element: HTMLElement): void {
 const COLUMNS = [
   'Asset',
   'Quantity',
-  'Average cost (USD)',
-  'Invested (USD)',
-  'Price (USD)',
-  'Market value (USD)',
-  'Unrealized P&L (USD)',
+  'Average cost (USDT)',
+  'Invested (USDT)',
+  'Price (USDT)',
+  'Market value (USDT)',
+  'Unrealized P&L (USDT)',
   'Return',
 ];
 
@@ -284,7 +284,7 @@ const COLUMNS = [
  */
 const STALE_TOTALS = 'These totals include at least one stale price.';
 const UNALLOCATED_LINE =
-  'Costs not assigned to any asset: 0.10 USD, from stablecoin conversions or from swaps ' +
+  'Costs not assigned to any asset: 0.10 USDT, from stablecoin conversions or from swaps ' +
   'into units with no known cost.';
 const NO_TRADES_NEUTRAL = 'Positions appear here once trades are imported from an exchange.';
 
@@ -325,22 +325,22 @@ describe('InvestedSection: the table (criteria 1 and 3)', () => {
     expect(dataValues(cell(btc, 'Quantity'))).toEqual(['1.500000000000000000']);
     expect(cell(btc, 'Quantity').textContent.trim()).toBe('1.5');
 
-    expect(dataValues(cell(btc, 'Average cost (USD)'))).toEqual(['35000.000000000000000000']);
-    expect(cell(btc, 'Average cost (USD)').textContent.trim()).toBe('35,000.00');
+    expect(dataValues(cell(btc, 'Average cost (USDT)'))).toEqual(['35000.000000000000000000']);
+    expect(cell(btc, 'Average cost (USDT)').textContent.trim()).toBe('35,000.00');
 
-    expect(dataValues(cell(btc, 'Invested (USD)'))).toEqual(['52500.000000000000000000']);
-    expect(cell(btc, 'Invested (USD)').textContent.trim()).toBe('52,500.00');
+    expect(dataValues(cell(btc, 'Invested (USDT)'))).toEqual(['52500.000000000000000000']);
+    expect(cell(btc, 'Invested (USDT)').textContent.trim()).toBe('52,500.00');
 
     // The price at the stored scale, twelve places; fresh, so nothing about its age.
-    expect(dataValues(cell(btc, 'Price (USD)'))).toEqual(['60000.000000000000']);
-    expect(cell(btc, 'Price (USD)').textContent.trim()).toBe('60,000.00');
-    expect(cell(btc, 'Price (USD)').querySelector('time')).toBeNull();
+    expect(dataValues(cell(btc, 'Price (USDT)'))).toEqual(['60000.000000000000']);
+    expect(cell(btc, 'Price (USDT)').textContent.trim()).toBe('60,000.00');
+    expect(cell(btc, 'Price (USDT)').querySelector('time')).toBeNull();
 
-    expect(dataValues(cell(btc, 'Market value (USD)'))).toEqual(['90000.000000000000000000']);
-    expect(cell(btc, 'Market value (USD)').textContent.trim()).toBe('90,000.00');
+    expect(dataValues(cell(btc, 'Market value (USDT)'))).toEqual(['90000.000000000000000000']);
+    expect(cell(btc, 'Market value (USDT)').textContent.trim()).toBe('90,000.00');
 
-    expect(dataValues(cell(btc, 'Unrealized P&L (USD)'))).toEqual(['37500.000000000000000000']);
-    expect(cell(btc, 'Unrealized P&L (USD)').textContent.trim()).toBe('+37,500.00');
+    expect(dataValues(cell(btc, 'Unrealized P&L (USDT)'))).toEqual(['37500.000000000000000000']);
+    expect(cell(btc, 'Unrealized P&L (USDT)').textContent.trim()).toBe('+37,500.00');
 
     expect(dataValues(cell(btc, 'Return'))).toEqual(['71.4286']);
     expect(cell(btc, 'Return').textContent.trim()).toBe('+71.43%');
@@ -354,21 +354,21 @@ describe('InvestedSection: the table (criteria 1 and 3)', () => {
     expect(dataValues(cell(eth, 'Quantity'))).toEqual(['2.718281828459045235']);
     // Shown to 8 places, rounded; the exact value is in the attribute.
     expect(cell(eth, 'Quantity').textContent.trim()).toBe('2.71828183');
-    expect(dataValues(cell(eth, 'Invested (USD)'))).toEqual(['8154.845485377135705000']);
-    expect(cell(eth, 'Invested (USD)').textContent.trim()).toBe('8,154.85');
+    expect(dataValues(cell(eth, 'Invested (USDT)'))).toEqual(['8154.845485377135705000']);
+    expect(cell(eth, 'Invested (USDT)').textContent.trim()).toBe('8,154.85');
   });
 
   it('shows an unpriced asset with a reason for its missing value, and no zero', async () => {
     openDashboard();
 
     const eth = await positionRow('ETH');
-    expect(cell(eth, 'Average cost (USD)').textContent.trim()).toBe('3,000.00');
-    expectDash(cell(eth, 'Price (USD)'));
-    expect(cell(eth, 'Market value (USD)').textContent.trim()).toBe(
+    expect(cell(eth, 'Average cost (USDT)').textContent.trim()).toBe('3,000.00');
+    expectDash(cell(eth, 'Price (USDT)'));
+    expect(cell(eth, 'Market value (USDT)').textContent.trim()).toBe(
       MARKET_VALUE_UNAVAILABLE_MESSAGES.unsupported_pair,
     );
-    expect(cell(eth, 'Market value (USD)').querySelector('data')).toBeNull();
-    expectDash(cell(eth, 'Unrealized P&L (USD)'));
+    expect(cell(eth, 'Market value (USDT)').querySelector('data')).toBeNull();
+    expectDash(cell(eth, 'Unrealized P&L (USDT)'));
     expectDash(cell(eth, 'Return'));
   });
 
@@ -382,10 +382,10 @@ describe('InvestedSection: the table (criteria 1 and 3)', () => {
     ]);
     expect(cell(kas, 'Quantity')).toHaveTextContent(/^1,500 \(500 with no known cost\)$/);
     // Average cost, invested and P&L cover the known-cost part; the value covers all 1500.
-    expect(cell(kas, 'Average cost (USD)').textContent.trim()).toBe('0.10');
-    expect(cell(kas, 'Invested (USD)').textContent.trim()).toBe('100.00');
-    expect(cell(kas, 'Market value (USD)').textContent.trim()).toBe('120.00');
-    expect(cell(kas, 'Unrealized P&L (USD)').textContent.trim()).toBe('-20.00');
+    expect(cell(kas, 'Average cost (USDT)').textContent.trim()).toBe('0.10');
+    expect(cell(kas, 'Invested (USDT)').textContent.trim()).toBe('100.00');
+    expect(cell(kas, 'Market value (USDT)').textContent.trim()).toBe('120.00');
+    expect(cell(kas, 'Unrealized P&L (USDT)').textContent.trim()).toBe('-20.00');
     expect(cell(kas, 'Return').textContent.trim()).toBe('-20.00%');
 
     // A holding with every unit of known cost says nothing of the kind.
@@ -418,11 +418,11 @@ describe('InvestedSection: the table (criteria 1 and 3)', () => {
     });
 
     const row = await positionRow('KAS');
-    expect(cell(row, 'Price (USD)').textContent.trim()).toBe('0.08491235');
-    expect(dataValues(cell(row, 'Price (USD)'))).toEqual(['0.084912345678']);
-    expect(cell(row, 'Average cost (USD)').textContent.trim()).toBe('0.08491235');
-    expect(cell(row, 'Invested (USD)').textContent.trim()).toBe('84.91');
-    expect(cell(row, 'Market value (USD)').textContent.trim()).toBe('84.91');
+    expect(cell(row, 'Price (USDT)').textContent.trim()).toBe('0.08491235');
+    expect(dataValues(cell(row, 'Price (USDT)'))).toEqual(['0.084912345678']);
+    expect(cell(row, 'Average cost (USDT)').textContent.trim()).toBe('0.08491235');
+    expect(cell(row, 'Invested (USDT)').textContent.trim()).toBe('84.91');
+    expect(cell(row, 'Market value (USDT)').textContent.trim()).toBe('84.91');
   });
 
   it('shows "—" for invested and unrealized P&L when no unit held has a known cost (N1)', async () => {
@@ -449,16 +449,16 @@ describe('InvestedSection: the table (criteria 1 and 3)', () => {
     });
 
     const row = await positionRow('KAS');
-    expectDash(cell(row, 'Invested (USD)'));
-    expectDash(cell(row, 'Unrealized P&L (USD)'));
-    expectDash(cell(row, 'Average cost (USD)'));
+    expectDash(cell(row, 'Invested (USDT)'));
+    expectDash(cell(row, 'Unrealized P&L (USDT)'));
+    expectDash(cell(row, 'Average cost (USDT)'));
     expectDash(cell(row, 'Return'));
     // What it is worth is known, over every unit.
-    expect(cell(row, 'Market value (USD)').textContent.trim()).toBe('40.00');
+    expect(cell(row, 'Market value (USDT)').textContent.trim()).toBe('40.00');
     expect(cell(row, 'Quantity')).toHaveTextContent(/^500 \(500 with no known cost\)$/);
     expect(row.querySelector('th')).toHaveAccessibleName('KAS Unknown cost Not in totals');
     // A holding with some known cost keeps its figures.
-    expect(cell(await positionRow('BTC'), 'Invested (USD)').textContent.trim()).toBe('52,500.00');
+    expect(cell(await positionRow('BTC'), 'Invested (USDT)').textContent.trim()).toBe('52,500.00');
   });
 
   it('says a value too large to show is missing, and leaves it out as having no market value', async () => {
@@ -477,10 +477,10 @@ describe('InvestedSection: the table (criteria 1 and 3)', () => {
     openDashboard({ positions: positionsResponse({ positions: [btc] }) });
 
     const row = await positionRow('BTC');
-    expect(cell(row, 'Market value (USD)').textContent.trim()).toBe(
+    expect(cell(row, 'Market value (USDT)').textContent.trim()).toBe(
       MARKET_VALUE_UNAVAILABLE_MESSAGES.value_out_of_range,
     );
-    expect(dataValues(cell(row, 'Price (USD)'))).toEqual(['60000.000000000000']);
+    expect(dataValues(cell(row, 'Price (USDT)'))).toEqual(['60000.000000000000']);
     expect(row.querySelector('th')).toHaveAccessibleName('BTC Not in totals');
     const region = await loadedRegion();
     expect(
@@ -525,23 +525,23 @@ describe('InvestedSection: the summary (criterion 2)', () => {
 
     const invested = await summaryValue('Invested');
     expect(dataValues(invested)).toEqual([INVESTED_TOTALS.invested]);
-    expect(invested).toHaveTextContent(/^52,500\.00 USD$/);
+    expect(invested).toHaveTextContent(/^52,500\.00 USDT$/);
 
     const value = await summaryValue('Market value');
     expect(dataValues(value)).toEqual([INVESTED_TOTALS.marketValue]);
-    expect(value).toHaveTextContent(/^90,000\.00 USD$/);
+    expect(value).toHaveTextContent(/^90,000\.00 USDT$/);
 
     const unrealized = await summaryValue('Unrealized P&L');
     expect(dataValues(unrealized)).toEqual([
       INVESTED_TOTALS.unrealizedPnl,
       INVESTED_TOTALS.returnPct,
     ]);
-    expect(unrealized).toHaveTextContent('+37,500.00 USD');
+    expect(unrealized).toHaveTextContent('+37,500.00 USDT');
     expect(unrealized).toHaveTextContent('Return +71.43%');
 
     const realized = await summaryValue('Realized P&L');
     expect(dataValues(realized)).toEqual([INVESTED_TOTALS.realizedPnl]);
-    expect(realized).toHaveTextContent(/^\+7,375\.50 USD$/);
+    expect(realized).toHaveTextContent(/^\+7,375\.50 USDT$/);
   });
 
   it('names what is left out of the totals and why, grouping assets that share a reason', async () => {
@@ -578,7 +578,7 @@ describe('InvestedSection: the summary (criterion 2)', () => {
     // Realized P&L covers every position, so it is a real figure: -250 + 0 + 125.5.
     const realized = await summaryValue('Realized P&L');
     expect(dataValues(realized)).toEqual(['-124.500000000000000000']);
-    expect(realized).toHaveTextContent(/^-124\.50 USD$/);
+    expect(realized).toHaveTextContent(/^-124\.50 USDT$/);
 
     const summary = realized.closest('dl');
     if (summary === null) {
@@ -599,9 +599,9 @@ describe('InvestedSection: the summary (criterion 2)', () => {
     });
 
     expect(dataValues(await summaryValue('Invested'))).toEqual([ZERO]);
-    expect(await summaryValue('Invested')).toHaveTextContent(/^0\.00 USD$/);
+    expect(await summaryValue('Invested')).toHaveTextContent(/^0\.00 USDT$/);
     expect(await summaryValue('Unrealized P&L')).toHaveTextContent('Return —');
-    expect(await summaryValue('Realized P&L')).toHaveTextContent(/^\+125\.50 USD$/);
+    expect(await summaryValue('Realized P&L')).toHaveTextContent(/^\+125\.50 USDT$/);
   });
 
   it('says what costs belong to no asset, naming both of their origins (S3)', async () => {
@@ -624,7 +624,7 @@ describe('InvestedSection: the summary (criterion 2)', () => {
 
     const region = await loadedRegion();
     expect(within(region).getByText(STALE_TOTALS)).toBeInTheDocument();
-    expect(cell(await positionRow('BTC'), 'Price (USD)')).toHaveTextContent(
+    expect(cell(await positionRow('BTC'), 'Price (USDT)')).toHaveTextContent(
       /\(stale, as of 2 hours ago\)$/,
     );
   });
@@ -703,26 +703,26 @@ describe('InvestedSection: the sign of P&L (criterion 4)', () => {
     openDashboard({ positions: kasLossPortfolio() });
 
     const kas = await positionRow('KAS');
-    expect(cell(kas, 'Unrealized P&L (USD)').textContent.trim()).toBe('-40.00');
-    expect(dataValues(cell(kas, 'Unrealized P&L (USD)'))).toEqual(['-40.000000000000000000']);
+    expect(cell(kas, 'Unrealized P&L (USDT)').textContent.trim()).toBe('-40.00');
+    expect(dataValues(cell(kas, 'Unrealized P&L (USDT)'))).toEqual(['-40.000000000000000000']);
     expect(cell(kas, 'Return').textContent.trim()).toBe('-33.33%');
 
     const unrealized = await summaryValue('Unrealized P&L');
-    expect(unrealized).toHaveTextContent('-40.00 USD');
+    expect(unrealized).toHaveTextContent('-40.00 USDT');
     expect(unrealized).toHaveTextContent('Return -33.33%');
     expect(unrealized.textContent).not.toMatch(/\+/);
-    expect(await summaryValue('Realized P&L')).toHaveTextContent(/^-15\.00 USD$/);
+    expect(await summaryValue('Realized P&L')).toHaveTextContent(/^-15\.00 USDT$/);
   });
 
   it('leaves a break-even position unsigned', async () => {
     openDashboard({ positions: breakEvenPortfolio() });
 
     const btc = await positionRow('BTC');
-    expect(cell(btc, 'Unrealized P&L (USD)').textContent.trim()).toBe('0.00');
+    expect(cell(btc, 'Unrealized P&L (USDT)').textContent.trim()).toBe('0.00');
     expect(cell(btc, 'Return').textContent.trim()).toBe('0.00%');
 
     const unrealized = await summaryValue('Unrealized P&L');
-    expect(unrealized).toHaveTextContent('0.00 USD');
+    expect(unrealized).toHaveTextContent('0.00 USDT');
     expect(unrealized).toHaveTextContent('Return 0.00%');
     expect(unrealized.textContent).not.toMatch(/[+-]/);
     expect((await summaryValue('Realized P&L')).textContent).not.toMatch(/[+-]/);
@@ -733,10 +733,10 @@ describe('InvestedSection: the sign of P&L (criterion 4)', () => {
     openDashboard({ positions: tinyPnlPortfolio() });
 
     const btc = await positionRow('BTC');
-    expect(cell(btc, 'Unrealized P&L (USD)').textContent.trim()).toBe('< +0.01');
-    expect(dataValues(cell(btc, 'Unrealized P&L (USD)'))).toEqual(['0.000000004000000000']);
-    expect(await summaryValue('Unrealized P&L')).toHaveTextContent('< +0.01 USD');
-    expect(await summaryValue('Realized P&L')).toHaveTextContent(/^> -0\.01 USD$/);
+    expect(cell(btc, 'Unrealized P&L (USDT)').textContent.trim()).toBe('< +0.01');
+    expect(dataValues(cell(btc, 'Unrealized P&L (USDT)'))).toEqual(['0.000000004000000000']);
+    expect(await summaryValue('Unrealized P&L')).toHaveTextContent('< +0.01 USDT');
+    expect(await summaryValue('Realized P&L')).toHaveTextContent(/^> -0\.01 USDT$/);
     expect(dataValues(await summaryValue('Realized P&L'))).toEqual(['-0.003000000000000000']);
   });
 });
@@ -852,7 +852,7 @@ describe('InvestedSection: flags and exclusions (criteria 5 and 8)', () => {
       '10.000000000000000000',
       '4.000000000000000000',
     ]);
-    expect(cell(sol, 'Market value (USD)').textContent.trim()).toBe(
+    expect(cell(sol, 'Market value (USDT)').textContent.trim()).toBe(
       MARKET_VALUE_UNAVAILABLE_MESSAGES.unsupported_pair,
     );
   });
@@ -899,7 +899,7 @@ describe('InvestedSection: a stale price (criterion 6)', () => {
   it('says the price is stale and when it is from, in a <time> carrying its as_of', async () => {
     openDashboard();
 
-    const price = cell(await positionRow('KAS'), 'Price (USD)');
+    const price = cell(await positionRow('KAS'), 'Price (USDT)');
     expect(dataValues(price)).toEqual(['0.080000000000']);
     expect(price).toHaveTextContent(/^0\.08 \(stale, as of 2 hours ago\)$/);
     const time = price.querySelector('time');
@@ -1099,14 +1099,14 @@ describe('InvestedSection: unmatched proceeds (spec 026)', () => {
       const unmatched = await summaryValue(UNMATCHED_TERM);
       // 21494.417890123456789012: every one of 18 places, where a double keeps 21494.417890123456.
       expect(dataValues(unmatched)).toEqual([UNMATCHED.total]);
-      expect(unmatched).toHaveTextContent(/^21,494\.42 USD$/);
+      expect(unmatched).toHaveTextContent(/^21,494\.42 USDT$/);
       // An amount that came in, not a gain: no plus, although it is positive.
       expect(unmatched.textContent).not.toMatch(/\+/);
 
       // Realized P&L beside it is its own figure, signed as before: 12.25 + 7500 + 125.5.
       const realized = await summaryValue('Realized P&L');
       expect(dataValues(realized)).toEqual(['7637.750000000000000000']);
-      expect(realized).toHaveTextContent(/^\+7,637\.75 USD$/);
+      expect(realized).toHaveTextContent(/^\+7,637\.75 USDT$/);
       // "Beside": the entry right after Realized P&L's, and the last of the summary.
       expect(realized.parentElement?.nextElementSibling).toBe(unmatched.parentElement);
       expect(unmatched.parentElement?.nextElementSibling).toBeNull();
@@ -1144,10 +1144,10 @@ describe('InvestedSection: unmatched proceeds (spec 026)', () => {
       // By asset, as the endpoint sends them - which is neither ascending nor descending by
       // amount. ADA is closed and carries none: not an item.
       expect(items.map((item) => item.textContent)).toEqual([
-        'BTC: 20,000.00 USD',
-        'ETH: 1,234.57 USD',
-        'KAS: -50.25 USD',
-        'XRP: 310.10 USD',
+        'BTC: 20,000.00 USDT',
+        'ETH: 1,234.57 USDT',
+        'KAS: -50.25 USDT',
+        'XRP: 310.10 USDT',
       ]);
       expect(items.map((item) => dataValues(item))).toEqual([
         [UNMATCHED.btc],
@@ -1185,7 +1185,7 @@ describe('InvestedSection: unmatched proceeds (spec 026)', () => {
 
       const unmatched = await summaryValue(UNMATCHED_TERM);
       expect(dataValues(unmatched)).toEqual([stated]);
-      expect(unmatched).toHaveTextContent(/^999\.99 USD$/);
+      expect(unmatched).toHaveTextContent(/^999\.99 USDT$/);
       // And each item is its position's own figure, not a share of the total.
       const { items } = unmatchedBlock(await loadedRegion());
       expect(items.map((item) => dataValues(item))).toEqual([
@@ -1205,15 +1205,15 @@ describe('InvestedSection: unmatched proceeds (spec 026)', () => {
       await positionsTable();
       const unmatched = await summaryValue(UNMATCHED_TERM);
       expect(dataValues(unmatched)).toEqual(['1234.567890123456789012']);
-      expect(unmatched).toHaveTextContent(/^1,234\.57 USD$/);
+      expect(unmatched).toHaveTextContent(/^1,234\.57 USDT$/);
 
       const { explanation, items } = unmatchedBlock(region);
-      expect(items.map((item) => item.textContent)).toEqual(['ETH: 1,234.57 USD']);
+      expect(items.map((item) => item.textContent)).toEqual(['ETH: 1,234.57 USDT']);
       expect(items.map((item) => dataValues(item))).toEqual([['1234.567890123456789012']]);
-      // No caveat and no exclusion here: the explanation follows the summary directly, and
-      // its list is the only one.
+      // No caveat and no exclusion here: the explanation is the first of the notes under the
+      // summary, and its list is the only one.
       expect(within(region).queryByText(/Realized P&L may be inaccurate/)).not.toBeInTheDocument();
-      expect((await summaryList()).nextElementSibling).toBe(explanation);
+      expect((await summaryList()).nextElementSibling?.firstElementChild).toBe(explanation);
       expect(region.querySelectorAll('ul.excluded-list')).toHaveLength(1);
       // No flag anywhere, so no legend: the sentence under the summary explains the mark.
       expect(legend(region)).toEqual([]);
@@ -1319,9 +1319,9 @@ describe('InvestedSection: unmatched proceeds (spec 026)', () => {
         '71.4286',
       ]);
 
-      expect(await summaryValue(UNMATCHED_TERM)).toHaveTextContent(/^20,000\.00 USD$/);
+      expect(await summaryValue(UNMATCHED_TERM)).toHaveTextContent(/^20,000\.00 USDT$/);
       const { items } = unmatchedBlock(region);
-      expect(items.map((item) => item.textContent)).toEqual(['BTC: 20,000.00 USD']);
+      expect(items.map((item) => item.textContent)).toEqual(['BTC: 20,000.00 USDT']);
       expect(items.map((item) => dataValues(item))).toEqual([[UNMATCHED.btc]]);
 
       // The words are on screen twice: the summary's term and the opening of the explanation.
@@ -1367,11 +1367,11 @@ describe('InvestedSection: unmatched proceeds (spec 026)', () => {
 
       const unmatched = await summaryValue(UNMATCHED_TERM);
       expect(dataValues(unmatched)).toEqual(['-50.250000000000000000']);
-      expect(unmatched).toHaveTextContent(/^-50\.25 USD$/);
+      expect(unmatched).toHaveTextContent(/^-50\.25 USDT$/);
 
       const region = await loadedRegion();
       const { list, items } = unmatchedBlock(region);
-      expect(items.map((item) => item.textContent)).toEqual(['ETH: -50.25 USD']);
+      expect(items.map((item) => item.textContent)).toEqual(['ETH: -50.25 USDT']);
       expect(items.map((item) => dataValues(item))).toEqual([['-50.250000000000000000']]);
       expect(list.textContent).not.toMatch(/\+/);
       // Negative is still "carries it": the closed line marks the asset.
@@ -1393,12 +1393,15 @@ describe('InvestedSection: unmatched proceeds (spec 026)', () => {
       expect(await summaryTerms()).toEqual([...FOUR_TERMS, UNMATCHED_TERM]);
       const unmatched = await summaryValue(UNMATCHED_TERM);
       expect(dataValues(unmatched)).toEqual([ZERO]);
-      expect(unmatched).toHaveTextContent(/^0\.00 USD$/);
+      expect(unmatched).toHaveTextContent(/^0\.00 USDT$/);
       expect(unmatched.textContent).not.toMatch(/[+-]/);
 
       const region = await loadedRegion();
       const { list, items } = unmatchedBlock(region);
-      expect(items.map((item) => item.textContent)).toEqual(['ETH: -50.25 USD', 'LTC: 50.25 USD']);
+      expect(items.map((item) => item.textContent)).toEqual([
+        'ETH: -50.25 USDT',
+        'LTC: 50.25 USDT',
+      ]);
       expect(items.map((item) => dataValues(item))).toEqual([
         ['-50.250000000000000000'],
         ['50.250000000000000000'],
@@ -1445,13 +1448,13 @@ describe('InvestedSection: unmatched proceeds (spec 026)', () => {
         });
 
         const unmatched = await summaryValue(UNMATCHED_TERM);
-        expect(unmatched.textContent.trim()).toBe(`${shown} USD`);
+        expect(unmatched.textContent.trim()).toBe(`${shown} USDT`);
         expect(dataValues(unmatched)).toEqual([dust]);
         expect(unmatched.textContent).not.toMatch(/\+|0\.00/);
 
         const region = await loadedRegion();
         const { items } = unmatchedBlock(region);
-        expect(items.map((item) => item.textContent)).toEqual([`XRP: ${shown} USD`]);
+        expect(items.map((item) => item.textContent)).toEqual([`XRP: ${shown} USDT`]);
         expect(items.map((item) => dataValues(item))).toEqual([[dust]]);
         expect(
           within(region).getByText(
@@ -1476,15 +1479,15 @@ describe('InvestedSection: unmatched proceeds (spec 026)', () => {
       expect(await summaryTerms()).toEqual([...FOUR_TERMS, UNMATCHED_TERM]);
       const realized = await summaryValue('Realized P&L');
       expect(dataValues(realized)).toEqual(['-124.500000000000000000']);
-      expect(realized).toHaveTextContent(/^-124\.50 USD$/);
+      expect(realized).toHaveTextContent(/^-124\.50 USDT$/);
       const unmatched = await summaryValue(UNMATCHED_TERM);
       expect(dataValues(unmatched)).toEqual(['0.300000000000000000']);
-      expect(unmatched).toHaveTextContent(/^0\.30 USD$/);
+      expect(unmatched).toHaveTextContent(/^0\.30 USDT$/);
       expectNoRenderedZero(await summaryList());
 
       const region = await loadedRegion();
       const { explanation, list, items } = unmatchedBlock(region);
-      expect(items.map((item) => item.textContent)).toEqual(['ETH: 0.10 USD', 'XRP: 0.20 USD']);
+      expect(items.map((item) => item.textContent)).toEqual(['ETH: 0.10 USDT', 'XRP: 0.20 USDT']);
       expect(items.map((item) => dataValues(item))).toEqual([
         ['0.100000000000000000'],
         ['0.200000000000000000'],
@@ -1517,14 +1520,14 @@ describe('InvestedSection: unmatched proceeds (spec 026)', () => {
       const region = await loadedRegion();
       expect(await within(region).findByText('Nothing is held right now.')).toBeInTheDocument();
       expect(within(region).queryByRole('table')).not.toBeInTheDocument();
-      expect(await summaryValue('Invested')).toHaveTextContent(/^0\.00 USD$/);
-      expect(await summaryValue('Realized P&L')).toHaveTextContent(/^0\.00 USD$/);
+      expect(await summaryValue('Invested')).toHaveTextContent(/^0\.00 USDT$/);
+      expect(await summaryValue('Realized P&L')).toHaveTextContent(/^0\.00 USDT$/);
 
       const unmatched = await summaryValue(UNMATCHED_TERM);
       expect(dataValues(unmatched)).toEqual([UNMATCHED.eth]);
-      expect(unmatched).toHaveTextContent(/^1,234\.57 USD$/);
+      expect(unmatched).toHaveTextContent(/^1,234\.57 USDT$/);
       const { items } = unmatchedBlock(region);
-      expect(items.map((item) => item.textContent)).toEqual(['ETH: 1,234.57 USD']);
+      expect(items.map((item) => item.textContent)).toEqual(['ETH: 1,234.57 USDT']);
       expect(
         within(region).getByText(
           '1 asset no longer held is not listed: ETH (Unmatched proceeds). ' +
@@ -1541,20 +1544,20 @@ describe('InvestedSection: how the figures were computed', () => {
 
     const line = within(await loadedRegion()).getByText(/Weighted average cost in/);
     expect(line.textContent).toBe(
-      'Weighted average cost in USD, computed 15 minutes ago. Not a tax figure.',
+      'Weighted average cost in USDT, computed 15 minutes ago. Not a tax figure.',
     );
     expect(line.querySelector('time')?.getAttribute('datetime')).toBe(COMPUTED_AT);
     expect(line.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
   });
 
   it('keeps each section in its own currency', async () => {
-    // The balances are in EUR, the invested figures in USD: two currencies, each labelled.
+    // The balances are in EUR, the invested figures in USDT: two currencies, each labelled.
     openDashboard();
 
     const total = await screen.findByRole('region', { name: 'Total value' });
     expect(total).toHaveTextContent('EUR');
     expect(total).not.toHaveTextContent('USD');
-    expect(await summaryValue('Invested')).toHaveTextContent('USD');
+    expect(await summaryValue('Invested')).toHaveTextContent('USDT');
     expect(await summaryValue('Invested')).not.toHaveTextContent('EUR');
   });
 
@@ -1582,7 +1585,7 @@ describe('InvestedSection: how the figures were computed', () => {
     // A relative phrase re-announces itself inside a live region (spec 016).
     expect(alert).not.toHaveTextContent(/ago|just now/);
     // The figures stay.
-    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USD)'))).toEqual([
+    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USDT)'))).toEqual([
       '52500.000000000000000000',
     ]);
   });
@@ -1996,7 +1999,7 @@ describe('InvestedSection: empty states (criterion 7)', () => {
       },
     });
 
-    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USD)'))).toEqual([
+    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USDT)'))).toEqual([
       '52500.000000000000000000',
     ]);
   });
@@ -2100,7 +2103,7 @@ describe('InvestedSection: loading and failures (criterion 8)', () => {
       ],
     });
 
-    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USD)'))).toEqual([
+    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USDT)'))).toEqual([
       '52500.000000000000000000',
     ]);
     expect(await loadedRegion()).not.toHaveTextContent(/schema_version|lots/);
@@ -2123,7 +2126,7 @@ describe('InvestedSection: loading and failures (criterion 8)', () => {
       'Could not refresh invested per asset: The database is restarting. Showing what was last loaded.',
     );
     expect(notice.textContent).not.toMatch(/\.\s*\./);
-    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USD)'))).toEqual([
+    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USDT)'))).toEqual([
       '52500.000000000000000000',
     ]);
     expect(within(region).queryByRole('heading', { name: /Could not load/ })).toBeNull();
@@ -2191,7 +2194,7 @@ describe('InvestedSection: beside the value section', () => {
     openDashboard({ portfolio: emptyPortfolio() });
 
     expect(await screen.findByRole('heading', { name: /no wallets yet/i })).toBeInTheDocument();
-    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USD)'))).toEqual([
+    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USDT)'))).toEqual([
       '52500.000000000000000000',
     ]);
   });
@@ -2267,7 +2270,7 @@ describe('InvestedSection: after an exchange sync', () => {
 
     await user.click(within(nav).getByRole('link', { name: 'Details' }));
 
-    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USD)'))).toEqual([
+    expect(dataValues(cell(await positionRow('BTC'), 'Invested (USDT)'))).toEqual([
       '52500.000000000000000000',
     ]);
   });

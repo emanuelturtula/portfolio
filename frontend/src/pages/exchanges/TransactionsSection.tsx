@@ -101,33 +101,35 @@ function FillsView({ data, filters, page, exchanges, busy, onPageChange }: Fills
 
   return (
     <>
-      <p>{describeFillScope(data.total_count, filters)}</p>
+      <p className="page-meta">{describeFillScope(data.total_count, filters)}</p>
       <CompletenessNotice exchanges={exchanges} filters={filters} />
       <FillTotalsView totals={data.totals} />
 
-      <h4 id="fills-heading">Fills</h4>
-      {page > pages ? (
-        <>
-          <p>
-            There is no page {page}: the last page is {pages}.
-          </p>
-          <button
-            type="button"
-            onClick={() => {
-              onPageChange(pages);
-            }}
-          >
-            Go to the last page
-          </button>
-        </>
-      ) : (
-        <>
-          <div aria-busy={busy}>
-            <FillTable fills={data.fills} />
-          </div>
-          <Pagination page={page} total={data.total_count} onPageChange={onPageChange} />
-        </>
-      )}
+      <div className="card">
+        <h4 id="fills-heading">Fills</h4>
+        {page > pages ? (
+          <>
+            <p>
+              There is no page {page}: the last page is {pages}.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                onPageChange(pages);
+              }}
+            >
+              Go to the last page
+            </button>
+          </>
+        ) : (
+          <>
+            <div aria-busy={busy}>
+              <FillTable fills={data.fills} />
+            </div>
+            <Pagination page={page} total={data.total_count} onPageChange={onPageChange} />
+          </>
+        )}
+      </div>
     </>
   );
 }
@@ -230,8 +232,10 @@ export function TransactionsSection({ exchanges }: TransactionsSectionProps) {
   }
 
   return (
-    <section aria-labelledby="transactions-heading">
-      <h3 id="transactions-heading">Transactions</h3>
+    <section className="stack" aria-labelledby="transactions-heading">
+      <h3 id="transactions-heading" className="section-title">
+        Transactions
+      </h3>
       <FillFiltersForm
         filters={filters}
         inverted={inverted}

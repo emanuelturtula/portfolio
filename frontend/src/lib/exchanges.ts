@@ -104,6 +104,38 @@ export function statusLabel(
 }
 
 /**
+ * How loud a state is: the colour of the dot beside its words. Reserved for state and never
+ * used for a series, and never the only channel - the label always says it.
+ */
+export type StatusTone = 'good' | 'warning' | 'critical' | 'neutral';
+
+/**
+ * The tone of a venue's {@link statusLabel}, decided in the same order the label is: what is
+ * not configured or still syncing says nothing good or bad yet, a refused key and a failed
+ * sync are critical, and history still to read is a warning on an account that works.
+ */
+export function statusTone(e: {
+  readonly status: AccountSyncStatus;
+  readonly configured: boolean;
+  readonly syncing: boolean;
+  readonly pending_windows: number;
+}): StatusTone {
+  if (!e.configured) {
+    return 'neutral';
+  }
+  if (e.status === 'auth_failed') {
+    return 'critical';
+  }
+  if (e.syncing) {
+    return 'neutral';
+  }
+  if (e.status === 'ok') {
+    return e.pending_windows > 0 ? 'warning' : 'good';
+  }
+  return e.status === 'error' ? 'critical' : 'neutral';
+}
+
+/**
  * One sentence per `ExchangeSyncErrorKind`, worded so the venue's name reads naturally in
  * it. `internal` names no venue: a defect on this side is not the venue's to be blamed for.
  */
@@ -125,6 +157,18 @@ const ERROR_KIND_SENTENCES: Record<ExchangeSyncErrorKind, (venue: string) => str
 export function errorSentence(kind: ExchangeSyncErrorKind, venue: string): string {
   return ERROR_KIND_SENTENCES[kind](venue);
 }
+
+/** The tone of each run status in the run log, beside its label. */
+export const RUN_STATUS_TONES: Record<SyncRunStatus, StatusTone> = {
+  running: 'neutral',
+  success: 'good',
+  partial: 'warning',
+  failed: 'critical',
+  interrupted: 'warning',
+};
+
+/** How many runs one page of the run log holds. */
+export const SYNC_RUNS_PAGE_SIZE = 5;
 
 export const RUN_STATUS_LABELS: Record<SyncRunStatus, string> = {
   running: 'Running',

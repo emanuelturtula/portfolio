@@ -344,7 +344,7 @@ export function AdjustmentForm({
       ))}
 
       <div className="form-actions">
-        <button type="submit" disabled={save.isPending}>
+        <button type="submit" className="button-primary" disabled={save.isPending}>
           {adjustment === null ? 'Record adjustment' : 'Save changes'}
         </button>
         {adjustment !== null && (

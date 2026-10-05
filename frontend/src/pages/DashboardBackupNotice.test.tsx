@@ -45,7 +45,8 @@ describe('the dashboard and the backup warning', () => {
 
     expect(alert.compareDocumentPosition(total) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(alert.compareDocumentPosition(holdings) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByRole('main').firstElementChild).toBe(alert);
+    // The first thing in the page, which is the one element in the main landmark.
+    expect(screen.getByRole('main').firstElementChild?.firstElementChild).toBe(alert);
   });
 
   it('warns that the directory cannot be read', async () => {

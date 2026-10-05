@@ -15,6 +15,7 @@ import {
 
 import { apiFetch } from '@/api/client';
 import type { components } from '@/api/generated/schema';
+import { VALUATION_CURRENCY } from '@/lib/currency';
 
 export type CurrentBalances = components['schemas']['CurrentBalancesResponse'];
 export type WalletBalance = components['schemas']['WalletBalanceResponse'];
@@ -40,10 +41,17 @@ const REFETCH_INTERVAL_MS = 60_000;
 export const currentBalancesQueryKey = ['balances', 'current'] as const;
 export const runsQueryKey = ['balances', 'runs'] as const;
 
+/**
+ * Valued in USD, which the page labels USDT (see `lib/currency.ts`): the endpoint's own default
+ * is EUR, and every other figure in the app is in USDT.
+ */
 export function useCurrentBalances(): UseQueryResult<CurrentBalances> {
   return useQuery({
     queryKey: currentBalancesQueryKey,
-    queryFn: ({ signal }) => apiFetch<CurrentBalances>(CURRENT_BALANCES_PATH, { signal }),
+    queryFn: ({ signal }) =>
+      apiFetch<CurrentBalances>(`${CURRENT_BALANCES_PATH}?quote_currency=${VALUATION_CURRENCY}`, {
+        signal,
+      }),
     refetchInterval: REFETCH_INTERVAL_MS,
   });
 }

@@ -11,10 +11,14 @@ import { WalletList } from '@/pages/wallets/WalletList';
  */
 export function WalletsPage() {
   return (
-    <section aria-labelledby="wallets-heading">
-      <h2 id="wallets-heading">Wallets</h2>
-      <WalletForm />
-      <WalletList />
+    <section className="page" aria-labelledby="wallets-heading">
+      <h2 id="wallets-heading" className="page-title">
+        Wallets
+      </h2>
+      <div className="side-layout">
+        <WalletForm />
+        <WalletList />
+      </div>
     </section>
   );
 }

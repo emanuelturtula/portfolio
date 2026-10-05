@@ -96,7 +96,7 @@ function BackupsContent() {
  */
 function BackupsSection() {
   return (
-    <section aria-labelledby={BACKUPS_HEADING_ID}>
+    <section className="card" aria-labelledby={BACKUPS_HEADING_ID}>
       <h3 id={BACKUPS_HEADING_ID}>Backups</h3>
       <BackupsContent />
     </section>
@@ -147,18 +147,24 @@ export function HealthPage() {
   }
 
   return (
-    <section aria-labelledby="health-heading">
-      <h2 id="health-heading">Backend health</h2>
-      <dl className="health-details">
-        <dt>Status</dt>
-        <dd>{data.status}</dd>
-        <dt>Version</dt>
-        <dd>{data.version}</dd>
-        <dt>Environment</dt>
-        <dd>{data.environment}</dd>
-      </dl>
-      <BackupsSection />
-      <DetailSections />
+    <section className="page" aria-labelledby="health-heading">
+      <h2 id="health-heading" className="page-title">
+        Backend health
+      </h2>
+      <div className="card">
+        <dl className="health-details">
+          <dt>Status</dt>
+          <dd>{data.status}</dd>
+          <dt>Version</dt>
+          <dd>{data.version}</dd>
+          <dt>Environment</dt>
+          <dd>{data.environment}</dd>
+        </dl>
+      </div>
+      <div className="grid-2">
+        <BackupsSection />
+        <DetailSections />
+      </div>
     </section>
   );
 }

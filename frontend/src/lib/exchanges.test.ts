@@ -11,8 +11,10 @@ import {
   OUTCOME_LABELS,
   remediationFor,
   RUN_STATUS_LABELS,
+  RUN_STATUS_TONES,
   STATUS_LABELS,
   statusLabel,
+  statusTone,
   syncHistoryNeedsAttention,
   TRIGGER_LABELS,
   UNKNOWN_ACCOUNT_FAILURE_MESSAGE,
@@ -326,6 +328,58 @@ describe('the run log labels', () => {
       expect(label.trim()).not.toBe('');
     }
     expect(new Set(labels).size).toBe(labels.length);
+  });
+});
+
+describe('statusTone', () => {
+  const OK_ACCOUNT = {
+    status: 'ok',
+    configured: true,
+    syncing: false,
+    pending_windows: 0,
+  } as const;
+
+  it('is good for an account that works and has its whole history', () => {
+    expect(statusTone(OK_ACCOUNT)).toBe('good');
+  });
+
+  it('is a warning for an account that works with history still to read', () => {
+    expect(statusTone({ ...OK_ACCOUNT, pending_windows: 1 })).toBe('warning');
+  });
+
+  it('is critical for a refused key, even while a sync runs', () => {
+    expect(statusTone({ ...OK_ACCOUNT, status: 'auth_failed' })).toBe('critical');
+    expect(statusTone({ ...OK_ACCOUNT, status: 'auth_failed', syncing: true })).toBe('critical');
+  });
+
+  it('is critical for a failed sync, and says nothing yet while the next one runs', () => {
+    expect(statusTone({ ...OK_ACCOUNT, status: 'error' })).toBe('critical');
+    expect(statusTone({ ...OK_ACCOUNT, status: 'error', syncing: true })).toBe('neutral');
+  });
+
+  it('is neutral for a venue with no credentials, whatever its account row says', () => {
+    expect(statusTone({ ...OK_ACCOUNT, configured: false })).toBe('neutral');
+    expect(statusTone({ ...OK_ACCOUNT, configured: false, status: 'auth_failed' })).toBe('neutral');
+  });
+
+  it('is neutral for a venue that has never synced', () => {
+    expect(statusTone({ ...OK_ACCOUNT, status: 'never_synced' })).toBe('neutral');
+  });
+});
+
+describe('the run log tones', () => {
+  it.each([
+    ['running', 'neutral'],
+    ['success', 'good'],
+    ['partial', 'warning'],
+    ['failed', 'critical'],
+    ['interrupted', 'warning'],
+  ] as const)('a %s run is %s', (status, tone) => {
+    expect(RUN_STATUS_TONES[status]).toBe(tone);
+  });
+
+  it('has a tone for every status', () => {
+    expect(Object.keys(RUN_STATUS_TONES).sort()).toEqual([...ALL_RUN_STATUSES].sort());
   });
 });
 

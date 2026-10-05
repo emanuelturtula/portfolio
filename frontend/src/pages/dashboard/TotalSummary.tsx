@@ -1,5 +1,6 @@
 import type { CurrentBalances } from '@/api/balances';
 import { Money } from '@/components/Money';
+import { currencyLabel } from '@/lib/currency';
 import { assessFreshness, type SyncRunSummary } from '@/lib/freshness';
 import { money } from '@/lib/money';
 
@@ -81,26 +82,31 @@ export function TotalSummary({ data, settledRun, freshnessKnown }: TotalSummaryP
   const unrefreshedCount = countUnrefreshed(data, settledRun, freshnessKnown);
 
   return (
-    <section aria-labelledby="total-heading">
-      <h2 id="total-heading">Total value</h2>
-      <p className="total-amount">
+    <section className="kpi" aria-labelledby="total-heading">
+      <div className="kpi-head">
+        <h2 id="total-heading" className="kpi-label">
+          Total value
+        </h2>
+        {!data.complete && <span className="chip chip-warning">Partial</span>}
+      </div>
+      <p className="kpi-value">
         {!data.complete && !anyValued ? (
           '—'
         ) : (
           <>
-            <Money value={money(data.total)} options={FIAT_OPTIONS} /> {data.quote_currency}
+            <Money value={money(data.total)} options={FIAT_OPTIONS} />{' '}
+            <span className="kpi-unit">{currencyLabel(data.quote_currency)}</span>
           </>
         )}
-        {!data.complete && ' - Partial'}
       </p>
-      {!data.complete && <p>This total does not include {describeMissing(data)}.</p>}
+      {!data.complete && <p className="kpi-note">Does not include {describeMissing(data)}.</p>}
       {unrefreshedCount !== undefined && unrefreshedCount > 0 && (
-        <p>
-          This total includes {unrefreshedCount} balance{unrefreshedCount === 1 ? '' : 's'} the last
-          sync could not refresh.
+        <p className="kpi-note">
+          Includes {unrefreshedCount} balance{unrefreshedCount === 1 ? '' : 's'} the last sync could
+          not refresh.
         </p>
       )}
-      {anyStalePrice && <p>This total includes at least one stale price.</p>}
+      {anyStalePrice && <p className="kpi-note">Includes at least one stale price.</p>}
     </section>
   );
 }
