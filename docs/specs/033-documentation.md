@@ -1,7 +1,7 @@
 # 033 — The documentation, brought up to what was built
 
 Issue: #26
-Status: in progress
+Status: done
 
 ## Problem
 
@@ -117,3 +117,58 @@ All seven criteria hold, with three checks on top:
 - the reviewer finds no claim a document makes that the code contradicts;
 - a scan of `README.md` and `docs/**` finds no hostname, IP address, mainnet address,
   extended key or personal identifier.
+
+## What was done
+
+- **`README.md`**: rewritten around what V1 does, with a screenshot of a local build on a
+  demo database (R2) and an index of the documents.
+- **`docs/architecture.md`**: a new Providers section covering the three families, their
+  protocols and capabilities, the shared client and rate limiter, the extended-key scanner
+  and who calls a provider when. Eight claims the code contradicted were corrected,
+  including the layer order (`db -> config -> domain`).
+- **`docs/accounting.md`** and the ADR: twelve claims corrected. Two new worked examples:
+  a swap from units of unknown cost, and rebates. The existing test executes both.
+- **`docs/providers.md`**: an at-a-glance table per provider, each fact marked confirmed,
+  measured or unverified. Fifteen claims were corrected.
+- **`docs/deployment.md`**: rewritten against the workflows and `deploy/deploy.py`. It
+  includes the version rules, every job's time bound, and the fact that neither rollback
+  path undoes a migration.
+- **Criterion 6 in the specs**: one example in spec 018 named the repository owner's
+  handle, and it is now a placeholder. The BingX probe account is still described as
+  spec 017 decided, with no figures beyond "a few dozen fills in one symbol".
+- **Stale docstrings and comments in code**, corrected because they are documentation too.
+  All are comment or docstring changes, with no code change:
+  - `services/accounting.py` and `api/routers/accounting.py`: the recompute triggers;
+  - `db/types.py`: where the base-unit exponent comes from;
+  - `services/scheduler.py`: four timers, not two;
+  - `providers/exchanges/base.py`: `rate_limit` is read by nothing;
+  - `config.py` and `providers/http.py`: no provider calls `strip_query`;
+  - `.importlinter`, `deploy/compose.yml` and `.github/workflows/remote-deploy.yml`.
+
+## Found, and left for their own issues
+
+R1 kept these out of this change:
+
+1. **A rollback cannot undo a migration.**
+   - The application migrates its database forward at startup.
+   - If a candidate migrates and then fails its health check, the previous image cannot
+     start against the migrated database (`Can't locate revision`). The rollback then
+     reports `rollback=failed`.
+   - Reverting a change that added a migration fails the same way.
+   - `docs/deployment.md` now says so.
+2. **No import-linter contract keeps `fastapi` and `starlette` out of
+   `portfolio.providers`.** It holds by convention only.
+3. **`ExchangeCapabilities.rate_limit` is declared and validated, but nothing reads it.**
+   Either wire it into the sync's pacing or remove it.
+4. **`ChainProvider.health()` has no production caller.** Failover therefore hides a
+   misconfigured instance everywhere but the logs.
+5. **Bitget drops `Retry-After` on a 200 response.** Bitget's `_get` reads it only on a
+   non-200 response, the same defect #115 records for BingX.
+6. **Two open issues may already be resolved by #23.** #49 and #62 need checking.
+7. **`CLAUDE.md` has drifted from the code.**
+   - Rule 4's diagram has no `config` layer.
+   - Rule 3 says the HTTP client logs URLs with the query removed. It logs no path or query
+     at all.
+8. **The tailnet join can use up the deploy job's safety margin.** Its `ping` can wait up
+   to three minutes, which is the whole margin reserved around the 17-minute SSH call.
+   Low risk.
