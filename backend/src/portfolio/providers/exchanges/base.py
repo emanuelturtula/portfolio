@@ -249,13 +249,14 @@ class ExchangeCapabilities:
     | `max_query_window` | splits a range into windows no longer than this |
     | `page_size` | the most fills one page may carry (`assemble_fill_page`) |
     | `cursor_kind` | how it asks for the next page |
-    | `rate_limit` | how far apart it spaces requests |
+    | `rate_limit` | nothing yet: the transport's one request a second per host spaces them |
     | `requires_symbol` | whether it asks per symbol, after `candidate_symbols` |
 
     Four of them are consumed in this module -- `retention` by the clamp, and
     `max_query_window`, `page_size` and `requires_symbol` by the page check -- because a
     capability nothing reads is decoration, and it drifts out of date without anything
-    noticing.
+    noticing. `rate_limit` is the one that is still decoration: declared and checked for
+    shape, read by nothing (`docs/providers.md`, "Not done yet, and who owns it").
     """
 
     exchange_key: ExchangeKey

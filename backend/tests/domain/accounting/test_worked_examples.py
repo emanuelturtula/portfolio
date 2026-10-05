@@ -62,6 +62,8 @@ EXAMPLES: Final = {
     9: "An opening balance with a cost resolves the shortfall",
     10: "A transfer changes nothing",
     11: "A stablecoin conversion",
+    12: "A swap from units of unknown cost splits its fee",
+    13: "A rebate",
 }
 
 #: The result-table row labels the document uses, and the position field each one is.
@@ -339,6 +341,49 @@ def test_example_11_a_stablecoin_conversion() -> None:
     assert result.positions == ()
     assert result.unallocated_costs == Decimal("0.1")
     assert position_tables(sections()[11][1]) == {}
+
+
+def test_example_12_a_swap_from_units_of_unknown_cost_splits_its_fee() -> None:
+    """Spec 019, R11: the fee splits like the quantity, and its unknown share is unallocated."""
+    opening = adjust(key(9, "m1", "manual"), "BTC", "1", None)
+    swap = buy(key(11, "e2"), "KAS", "BTC", "200000", "1", "2", "USDT")
+    result = replayed(opening, buy(key(10, "e1"), "BTC", "USDT", "1", "30000"), swap)
+
+    assert assert_matches_document(12, result) == 10
+    # The prose: half of the fee is unallocated, nothing is realized, nothing warns.
+    assert result.unallocated_costs == Decimal(1)
+    assert {found.realized_pnl for found in result.positions} == {Decimal(0)}
+    assert result.warnings == ()
+    # "Had all of the BTC given been of unknown cost": none of the KAS has a known cost, and
+    # the whole fee is unallocated.
+    all_unknown = replayed(opening, swap)
+    kas = position(all_unknown, "KAS")
+    assert (kas.quantity, kas.unknown_basis_quantity, kas.cost_basis) == (
+        Decimal(200000),
+        Decimal(200000),
+        Decimal(0),
+    )
+    assert all_unknown.unallocated_costs == Decimal(2)
+
+
+def test_example_13_a_rebate() -> None:
+    result = replayed(
+        buy(key(10, "e1"), "BTC", "USDT", "1", "30000", "-3", "USDT"),
+        buy(key(11, "e2"), "KAS", "USDT", "1000", "100", "-1", "BGB"),
+    )
+
+    assert assert_matches_document(13, result) == 15
+    # "No warning is emitted, and `unallocated_costs` is 0."
+    assert result.warnings == ()
+    assert result.unallocated_costs == 0
+    # The BGB rebate is an acquisition of its own, at unknown cost, worked before the KAS.
+    assert [
+        (lot.asset, lot.quantity, lot.cost_basis, lot.unknown_basis_quantity) for lot in result.lots
+    ] == [
+        ("BTC", Decimal(1), Decimal(29997), Decimal(0)),
+        ("BGB", Decimal(1), Decimal(0), Decimal(1)),
+        ("KAS", Decimal(1000), Decimal(100), Decimal(0)),
+    ]
 
 
 def test_a_figure_edited_in_the_document_would_fail() -> None:
