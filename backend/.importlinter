@@ -91,6 +91,10 @@ name = no request path reaches a price provider
 # the service split in #9 bought is that when that endpoint arrives, the contract will still
 # be able to fail: `services/prices.py` is provider-free, so a future "just refresh it if it
 # is stale" is a *new* edge rather than one that was always there.
+#
+# **Since #11 the source end is real too.** `api/routers/balances.py` reaches
+# `services.prices` through `services.balances`, and the contract holds because
+# `services/prices.py` still imports no provider.
 type = forbidden
 source_modules =
     portfolio.api.routers

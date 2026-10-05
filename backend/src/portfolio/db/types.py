@@ -224,8 +224,9 @@ class BaseUnits(TypeDecorator[int]):
     """An on-chain quantity, stored as the integer count of indivisible units.
 
     A satoshi and a sompi cannot be subdivided and every chain API reports them as
-    integers, so there is nothing to round and no reason to store text. `assets.decimals`
-    is the exponent these integers are read with: 8 means the value counts
+    integers, so there is nothing to round and no reason to store text. The `decimals`
+    column stored beside them (`balance_snapshots.decimals`, from the provider's own
+    declaration) is the exponent they are read with: 8 means the value counts
     hundred-millionths.
 
     The ceiling is SQLite's own: a signed 64-bit integer. Confirmed comfortable for V1 --

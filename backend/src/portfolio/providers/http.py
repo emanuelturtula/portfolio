@@ -22,7 +22,7 @@ Two functions, because two different questions are being answered.
 `strip_query` removes the query string, the fragment and any userinfo. That is the rule
 `CLAUDE.md` states, and it exists because one exchange signs its requests *in the query
 string*: the signature and the key that produced it would otherwise ride along in any URL
-that reached a log. It is what a future exchange provider will use.
+that reached a log. It was written for that exchange; no provider calls it.
 
 **For a chain provider that is necessary and not sufficient, and it is worth being precise
 about why.** Both target APIs put the address in the *path*:
@@ -469,10 +469,11 @@ def strip_query(url: httpx.URL | str) -> httpx.URL:
     userinfo because `https://key:secret@host/...` is a credential written in a URL, and
     `httpx` will happily carry one.
 
-    This is the rule `CLAUDE.md` states, available on its own for a future exchange
-    provider. It is **not** what this module's transport logs -- for a chain provider the
-    address is in the path, so `request_target` is stricter. Reaching for this one to log a
-    chain request would meet the letter of the rule and leak the address anyway.
+    This is the rule `CLAUDE.md` states, written for the exchange that signs in the query
+    string; no provider calls it. It is **not** what this module's transport logs -- for a
+    chain provider the address is in the path, so `request_target` is stricter. Reaching for
+    this one to log a chain request would meet the letter of the rule and leak the address
+    anyway.
     """
     return httpx.URL(url).copy_with(query=None, fragment=None, userinfo=b"")
 
