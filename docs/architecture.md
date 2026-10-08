@@ -418,8 +418,8 @@ that is handed its providers rather than building them:
 
 ## The value over time
 
-Spec 037. The dashboard draws what the wallets were worth on each day, and the Details page
-what one wallet was worth. That needs a past price for every day, which `prices` cannot give:
+Spec 037. The dashboard draws what the wallets were worth on each day, and the Wallets page
+what one wallet was worth (the Details page's, until spec 039 folded it in). That needs a past price for every day, which `prices` cannot give:
 it holds one row per pair and is overwritten every hour.
 
 ### The table
