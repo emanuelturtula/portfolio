@@ -394,32 +394,11 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         "/api/balances/current",
         "/api/balances/runs",
         "/api/wallets/{wallet_id}/balances",
-        # Exchange sync (#15): the accounts, a manual sync, and the run log. No money crosses
-        # any of them -- counts and instants only.
-        "/api/exchanges",
-        "/api/exchanges/sync",
-        "/api/exchanges/runs",
-        # The transactions view (#93): the owner's fills and what they add up to. Money crosses
-        # this one, every amount a string, and the venue's trade id never does.
-        "/api/exchanges/fills",
-        # Positions, cost and returns (#19): the owner's holdings and what they are worth,
-        # every amount a string.
-        "/api/accounting/positions",
-        # Manual adjustments (#18): opening balances and off-exchange acquisitions. Amounts
-        # are strings both ways, and a JSON number is refused on the way in.
-        "/api/accounting/adjustments",
-        "/api/accounting/adjustments/{adjustment_id}",
-        # The holdings check (#104): each asset's replayed quantity beside the balances
-        # read. The one response that carries what a venue holds; every quantity a string.
-        "/api/accounting/reconciliation",
-        # When each asset's imported history begins (#111), for the adjustments form's date
-        # hint. No money crosses it: an asset and an instant, and nothing else.
-        "/api/accounting/first-trades",
         # How the scheduled backups stand (#22). No money crosses it: a state, instants, a
         # count and an error kind, and no configuration value.
         "/api/health/detail",
-        # The dashboard's summary (#154): total value, net invested, P/L and each holding's
-        # share. Every amount a string.
+        # The dashboard's summary (#154): total value and each holding's share. Every amount
+        # a string.
         "/api/portfolio/summary",
     }
 
@@ -436,39 +415,6 @@ MONEY_PROPERTIES: Final = frozenset(
         "amount",
         "confirmed",
         "pending",
-        # #19: a position's cost and return, and the portfolio's. The percentage is here too:
-        # it is a quotient of two amounts, and a float would round it the same way.
-        "unknown_basis_quantity",
-        "average_cost",
-        "total_invested",
-        "realized_pnl",
-        "unmatched_proceeds",
-        "market_value",
-        "unrealized_pnl",
-        "unrealized_return_pct",
-        "unallocated_costs",
-        # #93: a fill's quote and fee, and what a set of fills adds up to. `price` is not here:
-        # a position's `price` is an object, and a fill's is covered by the fills tests.
-        "quote_quantity",
-        "usdt_value",
-        "fee_amount",
-        "bought",
-        "sold",
-        "net",
-        "usdt_spent",
-        "usdt_received",
-        "usdt_net",
-        "spent",
-        "received",
-        # #104: the two sides of the holdings check, their parts and their difference. The
-        # tolerance is here too: it is the number a quantity is compared against, and it is
-        # served as the string `"1"`.
-        "history_quantity",
-        "wallet_quantity",
-        "exchange_quantity",
-        "held_quantity",
-        "difference",
-        "tolerance_pct",
     }
 )
 

@@ -5,13 +5,13 @@ dependency is up, so a slow dependency cannot make the container look dead. It i
 because the container's health check calls it before anyone signs in, and it stays that cheap.
 
 `GET /api/health/detail` is the other half: how the scheduled backups stand (#22, spec 029),
-and the other sources beside them (#23, spec 030) -- the four timers, the balance sync per
-chain, the exchange accounts, the prices and the holdings check, each as its last recorded
-attempt left it. **No vendor is called**: the page refetches every minute, and a check that
-asked a chain index or a venue would spend the rate limits the syncs are budgeted against. It
-is **not** in `PUBLIC_API_PATHS`, so the middleware requires a session for it like every other
-path; nothing here had to ask for that. The router parses, calls `HealthService.detail` and
-serializes, and touches no file and no table.
+and the other sources beside them (#23, spec 030) -- the three timers, the balance sync per
+chain and the prices, each as its last recorded attempt left it. **No vendor is called**: the
+page refetches every minute, and a check that asked a chain index or a price source would
+spend the rate limits the syncs are budgeted against. It is **not** in `PUBLIC_API_PATHS`, so
+the middleware requires a session for it like every other path; nothing here had to ask for
+that. The router parses, calls `HealthService.detail` and serializes, and touches no file and
+no table.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from portfolio.config import Settings, get_settings
 from portfolio.services.auth import Principal
 from portfolio.services.health import HealthService
 
-# Declared here rather than in the signature, for the reason the accounting router gives:
+# Declared here rather than in the signature, for the reason the balance router gives:
 # FastAPI resolves these annotations at import time.
 CurrentHealthService = Annotated[HealthService, Depends(get_health_service)]
 CurrentPrincipal = Annotated[Principal, Depends(get_principal)]
@@ -58,7 +58,7 @@ async def get_health(settings: Annotated[Settings, Depends(get_settings)]) -> He
 @router.get(
     "/health/detail",
     operation_id="getHealthDetail",
-    summary="Report how the backups, timers, syncs, prices and holdings check stand",
+    summary="Report how the backups, timers, balance sync and prices stand",
     response_model=HealthDetailResponse,
 )
 async def get_health_detail(

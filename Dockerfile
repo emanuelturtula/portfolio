@@ -58,8 +58,8 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     PORTFOLIO_ENVIRONMENT=prod \
     PORTFOLIO_BACKUP_DIR=/app/backups
 
-# Non-root, with a data directory it owns. The SQLite database is the only permanent record
-# of trade history once an exchange's retention window passes, so the volume matters.
+# Non-root, with a data directory it owns. The SQLite database is the only record of the
+# wallets and their balance history, so the volume matters.
 #
 # /app/backups holds the scheduled copies of that database (#22). It is a directory of its
 # own, and a volume of its own below, so that removing the data volume does not remove the

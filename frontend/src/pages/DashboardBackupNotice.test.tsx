@@ -4,13 +4,11 @@ import { describe, expect, it } from 'vitest';
 
 import type { BackupStatus } from '@/api/health';
 import { failedBackup, okBackup, serveBackup, unreadableBackup } from '@/test/backupFixtures';
-import { fakeAccounting } from '@/test/fakeAccounting';
-import { fakeExchanges } from '@/test/fakeExchanges';
 import { fakePortfolio } from '@/test/fakePortfolio';
 import { healthyPortfolio } from '@/test/fixtures';
 import { currentPath, renderApp, settle } from '@/test/render';
 import { fakeSession, server, TEST_USERNAME } from '@/test/server';
-import { GAINING_SUMMARY } from '@/test/summaryFixtures';
+import { VALUED_SUMMARY } from '@/test/summaryFixtures';
 
 /**
  * The backup warning in its place on the dashboard (spec 029): above the figures, and ending
@@ -20,9 +18,7 @@ function openDashboard(backup: BackupStatus): () => number {
   const served = serveBackup(backup);
   server.use(
     ...fakeSession({ initialUser: TEST_USERNAME }).handlers,
-    ...fakePortfolio({ ...healthyPortfolio(), summary: GAINING_SUMMARY }).handlers,
-    ...fakeAccounting().handlers,
-    ...fakeExchanges().handlers,
+    ...fakePortfolio({ ...healthyPortfolio(), summary: VALUED_SUMMARY }).handlers,
     served.handler,
   );
   renderApp(['/']);

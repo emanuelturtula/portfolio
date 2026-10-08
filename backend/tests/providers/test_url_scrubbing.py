@@ -27,9 +27,6 @@ from portfolio.providers.http import (
     BLOCK_TIP_HEIGHT,
     ENDPOINT_EXTENSION,
     ENDPOINT_LABELS,
-    EXCHANGE_BALANCES,
-    EXCHANGE_FILLS,
-    EXCHANGE_SYMBOL,
     NODE_HEALTH,
     UNLABELLED,
     request_target,
@@ -380,17 +377,11 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     `backend/.importlinter`'s price contract exists to make impossible, observed from the
     other side, and it only works because the two labels are distinguishable.
 
-    Eight at #13. `exchange_fills` is Bitget's signed fills read and `exchange_symbol` its
-    public symbol-info lookup. Two labels because they are two kinds of call: a line saying
-    `exchange_fills` failed is about the key or the account, one saying `exchange_symbol`
-    failed is about a pair the venue no longer lists, and an operator needs to tell which
-    from the log alone, since the path is never in it.
-
-    Nine at #104. `exchange_balances` is the signed read of what a venue's spot account
-    holds, at either venue. Separate from `exchange_fills` because the two fail separately
-    and mean different things when they do: a failed fills read stops an account's sync, a
-    failed balance read only leaves that venue out of the holdings check. BingX signs it in
-    the query string, as it does its fills, so the label is all that may be logged of it.
+    Still six after spec 036. #13 and #104 added three exchange labels -- the signed fills
+    read, the symbol lookup and the spot balance read -- and removing exchange sync removed
+    them with it: a label nothing sends is a line of the allowlist nobody can read a reason
+    for, and it is one more name that would be logged without question if a new caller
+    reused it for something else.
     """
     assert sorted(ENDPOINT_LABELS) == [
         "address_balance",
@@ -398,9 +389,6 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
         "asset_price",
         "asset_prices",
         "block_tip_height",
-        "exchange_balances",
-        "exchange_fills",
-        "exchange_symbol",
         "node_health",
     ]
     assert ADDRESS_BALANCE == "address_balance"
@@ -408,12 +396,7 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     assert ASSET_PRICE == "asset_price"
     assert ASSET_PRICES == "asset_prices"
     assert BLOCK_TIP_HEIGHT == "block_tip_height"
-    assert EXCHANGE_BALANCES == "exchange_balances"
-    assert EXCHANGE_FILLS == "exchange_fills"
-    assert EXCHANGE_SYMBOL == "exchange_symbol"
     assert NODE_HEALTH == "node_health"
-    for label in (EXCHANGE_BALANCES, EXCHANGE_FILLS, EXCHANGE_SYMBOL):
-        assert ENDPOINT_LABEL_PATTERN.match(label), f"{label} does not have a label's shape"
     assert ENDPOINT_LABELS, "an empty allowlist makes every request <unlabelled>"
     assert isinstance(ENDPOINT_LABELS, frozenset), (
         "a mutable set would let any module widen what may be logged at import time, "

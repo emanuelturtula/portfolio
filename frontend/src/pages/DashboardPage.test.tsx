@@ -10,16 +10,14 @@ import { currentPath, renderApp, settle, type ProvidedRender } from '@/test/rend
 import { fakeSession, problem, server, TEST_USERNAME } from '@/test/server';
 import {
   BTC_HOLDING,
-  GAINING_SUMMARY,
   KAS_HOLDING,
-  LOSING_SUMMARY,
   missing,
   portfolioSummary,
   unpricedHolding,
+  VALUED_SUMMARY,
 } from '@/test/summaryFixtures';
 
-const FIGURES = ['Total value', 'Invested', 'Profit / loss'] as const;
-type Figure = (typeof FIGURES)[number];
+type Figure = 'Total value';
 
 interface Opened extends ProvidedRender {
   readonly user: ReturnType<typeof userEvent.setup>;
@@ -57,7 +55,7 @@ async function loaded(): Promise<void> {
   await screen.findByRole('region', { name: 'Total value' });
 }
 
-/** The figure as read: its parts - amount, unit, return - one space apart, or its dash. */
+/** The figure as read: its parts - amount, unit - one space apart, or its dash. */
 function figureText(name: Figure): string {
   const value = figure(name).querySelector('.kpi-value');
   if (value === null) {
@@ -92,90 +90,50 @@ function summaryRequests(fake: FakePortfolio): number {
     .length;
 }
 
-describe('DashboardPage: the figures', () => {
-  it('shows what is held, what went in and the gain, in USDT', async () => {
-    openDashboard(GAINING_SUMMARY);
+describe('DashboardPage: the figure', () => {
+  it('shows what is held is worth, in USDT', async () => {
+    openDashboard(VALUED_SUMMARY);
     await loaded();
 
     expect(figureText('Total value')).toBe('30,770.00 USDT');
-    expect(figureText('Invested')).toBe('30,701.30 USDT');
-    // The direction is in the sign and the arrow, not only in a colour.
-    expect(figureText('Profit / loss')).toBe('+68.70 USDT ▲+0.22 %');
-    expect(figure('Profit / loss')).toHaveClass('kpi-gain');
-    for (const name of FIGURES) {
-      expect(partial(name)).toBe(false);
-    }
-    // Every figure carries the exact string it was formatted from.
+    expect(partial('Total value')).toBe(false);
+    expect(screen.queryByText(/^Incomplete:/)).not.toBeInTheDocument();
+    // The figure carries the exact string it was formatted from.
     expect(within(figure('Total value')).getByText('30,770.00')).toHaveAttribute(
       'value',
-      GAINING_SUMMARY.total_value,
+      VALUED_SUMMARY.total_value,
     );
   });
 
-  it('shows a loss with a minus sign and a down arrow', async () => {
-    openDashboard(LOSING_SUMMARY);
+  it('shows no invested figure and no profit or loss', async () => {
+    openDashboard(VALUED_SUMMARY);
     await loaded();
 
-    expect(figureText('Profit / loss')).toBe('-4,230.00 USDT ▼-12.09 %');
-    expect(figure('Profit / loss')).toHaveClass('kpi-loss');
-  });
-
-  it('shows a P/L of exactly zero with no sign, no arrow and no tone', async () => {
-    openDashboard(
-      portfolioSummary({
-        total_value: '800.000000000000000000',
-        invested: '800.000000000000000000',
-        pnl: '0.000000000000000000',
-        pnl_pct: '0.0000',
-        holdings: [{ ...KAS_HOLDING, share_pct: '100.0000' }],
-      }),
-    );
-    await loaded();
-
-    expect(figureText('Profit / loss')).toBe('0.00 USDT 0.00 %');
-    expect(figure('Profit / loss')).not.toHaveClass('kpi-gain');
-    expect(figure('Profit / loss')).not.toHaveClass('kpi-loss');
-  });
-
-  it('leaves the percentage out when nothing was invested', async () => {
-    // Coins that arrived with no trade: a value, nothing in, and no return to divide by.
-    openDashboard(
-      portfolioSummary({
-        total_value: '800.000000000000000000',
-        pnl: '800.000000000000000000',
-        holdings: [{ ...KAS_HOLDING, share_pct: '100.0000' }],
-      }),
-    );
-    await loaded();
-
-    expect(figureText('Invested')).toBe('0.00 USDT');
-    expect(figureText('Profit / loss')).toBe('+800.00 USDT');
+    expect(screen.queryByRole('region', { name: 'Invested' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Profit / loss' })).not.toBeInTheDocument();
   });
 });
 
-describe('DashboardPage: what a figure is missing', () => {
-  it('marks the value and the P/L partial, and says why in one line', async () => {
+describe('DashboardPage: what the figure is missing', () => {
+  it('marks the value partial, and says why in one line', async () => {
     const { user } = openDashboard(
       portfolioSummary({
         total_value: '29970.000000000000000000',
-        invested: '30701.300000000000000000',
-        pnl: '-731.300000000000000000',
-        pnl_pct: '-2.3820',
         holdings: [{ ...BTC_HOLDING, share_pct: '100.0000' }, unpricedHolding('KAS', '8000')],
-        missing: [missing('exchange_unread', 'bingx'), missing('unpriced', 'KAS')],
+        missing: [missing('wallet_stale', 'bitcoin'), missing('unpriced', 'KAS')],
       }),
     );
     await loaded();
 
     expect(partial('Total value')).toBe(true);
-    expect(partial('Invested')).toBe(false);
-    expect(partial('Profit / loss')).toBe(true);
     // The chip sits beside the figure's name, not in it.
     expect(figure('Total value')).toHaveAccessibleName('Total value');
+    // A partial total is still the amount the backend summed, never recomputed here.
+    expect(figureText('Total value')).toBe('29,970.00 USDT');
 
     const note = screen.getByText(/^Incomplete:/).closest('p');
     expect(note).toHaveTextContent(
-      'Incomplete: BingX balances not read yet; no price for KAS. See details',
+      'Incomplete: Bitcoin balance out of date; no price for KAS. See details',
     );
 
     // The unpriced holding is a row with a dash where a figure would be, not a zero.
@@ -185,23 +143,19 @@ describe('DashboardPage: what a figure is missing', () => {
     expect(currentPath()).toBe('/details');
   });
 
-  it('marks the invested figure and the P/L partial when a trade was not paid in cash', async () => {
-    openDashboard({ ...GAINING_SUMMARY, missing: [missing('fill_not_in_cash', 'BTC')] });
+  it('names a stale price in the line', async () => {
+    openDashboard({ ...VALUED_SUMMARY, missing: [missing('stale_price', 'BTC')] });
     await loaded();
 
-    expect(partial('Total value')).toBe(false);
-    expect(partial('Invested')).toBe(true);
-    expect(partial('Profit / loss')).toBe(true);
+    expect(partial('Total value')).toBe(true);
     expect(screen.getByText(/^Incomplete:/).closest('p')).toHaveTextContent(
-      'trades paid in BTC not counted',
+      'Incomplete: BTC price out of date.',
     );
   });
 
   it('shows a dash, not a zero, when nothing held could be valued', async () => {
     openDashboard(
       portfolioSummary({
-        invested: '30701.300000000000000000',
-        pnl: '-30701.300000000000000000',
         holdings: [unpricedHolding('BTC', '0.4995'), unpricedHolding('KAS', '8000')],
         missing: [missing('unpriced', 'BTC'), missing('unpriced', 'KAS')],
       }),
@@ -209,36 +163,17 @@ describe('DashboardPage: what a figure is missing', () => {
     await loaded();
 
     expect(figureText('Total value')).toBe('—');
-    expect(figureText('Profit / loss')).toBe('—');
-    expect(figureText('Invested')).toBe('30,701.30 USDT');
+    expect(partial('Total value')).toBe(true);
     // No slice to draw, so no chart; the table still lists both.
     expect(screen.queryByRole('figure')).not.toBeInTheDocument();
     expect(holdingRow('BTC')).toBeInTheDocument();
     expect(holdingRow('KAS')).toBeInTheDocument();
   });
-
-  it('names the assets nothing tracks, and does not call the total partial for them', async () => {
-    openDashboard({ ...GAINING_SUMMARY, untracked: ['ZZDUST'] });
-    await loaded();
-
-    expect(screen.getByText('Not tracked, so not counted: ZZDUST.')).toBeInTheDocument();
-    expect(partial('Total value')).toBe(false);
-    expect(screen.queryByText(/^Incomplete:/)).not.toBeInTheDocument();
-  });
-
-  it('shows the footnote alone when untracked dust is all there is', async () => {
-    openDashboard(portfolioSummary({ untracked: ['ZZDUST'] }));
-    await loaded();
-
-    const holdings = screen.getByRole('region', { name: 'Holdings' });
-    expect(within(holdings).queryByRole('table')).not.toBeInTheDocument();
-    expect(within(holdings).getByText('Not tracked, so not counted: ZZDUST.')).toBeInTheDocument();
-  });
 });
 
 describe('DashboardPage: the holdings', () => {
   it('lists each holding with its amount, price, value and share', async () => {
-    openDashboard(GAINING_SUMMARY);
+    openDashboard(VALUED_SUMMARY);
     await loaded();
 
     expect(cells(holdingRow('BTC'))).toEqual(['0.4995', '60,000.00', '29,970.00', '97.40 %']);
@@ -253,7 +188,7 @@ describe('DashboardPage: the holdings', () => {
   });
 
   it('carries every share of the donut as text in its legend', async () => {
-    openDashboard(GAINING_SUMMARY);
+    openDashboard(VALUED_SUMMARY);
     await loaded();
 
     const donut = screen.getByRole('figure', { name: 'Allocation by value' });
@@ -265,7 +200,7 @@ describe('DashboardPage: the holdings', () => {
   });
 
   it('colours an asset the same in the legend and the table', async () => {
-    openDashboard(GAINING_SUMMARY);
+    openDashboard(VALUED_SUMMARY);
     await loaded();
 
     const donut = screen.getByRole('figure', { name: 'Allocation by value' });
@@ -277,7 +212,7 @@ describe('DashboardPage: the holdings', () => {
 
   it('gives no slice to a holding whose share rounds to nothing', async () => {
     openDashboard({
-      ...GAINING_SUMMARY,
+      ...VALUED_SUMMARY,
       holdings: [
         { ...BTC_HOLDING, share_pct: '100.0000' },
         { ...KAS_HOLDING, value: '0.000000000000000000', share_pct: '0.0000' },
@@ -297,7 +232,7 @@ describe('DashboardPage: states', () => {
     const arrived = new Promise<void>((resolve) => {
       release = resolve;
     });
-    openDashboard(GAINING_SUMMARY, {}, [
+    openDashboard(VALUED_SUMMARY, {}, [
       http.get(PORTFOLIO_SUMMARY_PATH, async () => {
         await arrived;
         return undefined;
@@ -314,7 +249,7 @@ describe('DashboardPage: states', () => {
 
   it('says the summary could not be read, and reads it again on request', async () => {
     let fail = true;
-    const { user } = openDashboard(GAINING_SUMMARY, {}, [
+    const { user } = openDashboard(VALUED_SUMMARY, {}, [
       http.get(PORTFOLIO_SUMMARY_PATH, () =>
         fail ? problem(500, 'Internal Server Error', 'The price table is locked.') : undefined,
       ),
@@ -334,7 +269,7 @@ describe('DashboardPage: states', () => {
   });
 
   it('keeps the figures on screen when a later read fails', async () => {
-    const { queryClient } = openDashboard(GAINING_SUMMARY);
+    const { queryClient } = openDashboard(VALUED_SUMMARY);
     await loaded();
 
     server.use(
@@ -351,42 +286,28 @@ describe('DashboardPage: states', () => {
     expect(figureText('Total value')).toBe('30,770.00 USDT');
   });
 
-  it('asks for a wallet or an exchange when there is nothing at all', async () => {
+  it('asks for a wallet when there is nothing at all', async () => {
     openDashboard(undefined, { wallets: [] });
 
     expect(await screen.findByRole('heading', { name: 'Nothing to show yet' })).toBeInTheDocument();
+    expect(screen.getByText('Add a wallet to see your portfolio here.')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Add a wallet' })).toHaveAttribute('href', '/wallets');
-    expect(screen.getByRole('link', { name: 'Connect an exchange' })).toHaveAttribute(
-      'href',
-      '/exchanges',
-    );
     expect(screen.queryByRole('region', { name: 'Total value' })).not.toBeInTheDocument();
   });
 
   it('shows the figures, not the empty state, for wallets no run has read yet', async () => {
-    // Nothing held and nothing invested, but there is something to wait for: an unread
-    // wallet is a gap in the figures, not an empty portfolio.
+    // Nothing held, but there is something to wait for: an unread wallet is a gap in the
+    // figure, not an empty portfolio.
     openDashboard(undefined);
     await loaded();
 
     expect(screen.queryByRole('heading', { name: 'Nothing to show yet' })).not.toBeInTheDocument();
     expect(partial('Total value')).toBe(true);
+    // Nothing is held, so the total is a real zero rather than an empty sum.
+    expect(figureText('Total value')).toBe('0.00 USDT');
     expect(screen.getByText(/^Incomplete:/).closest('p')).toHaveTextContent(
       'Bitcoin wallet not read yet; Kaspa wallet not read yet.',
     );
-  });
-
-  it('shows the figures when everything was sold: something went in', async () => {
-    openDashboard(
-      portfolioSummary({
-        invested: '-120.000000000000000000',
-        pnl: '120.000000000000000000',
-      }),
-    );
-    await loaded();
-
-    expect(figureText('Invested')).toBe('-120.00 USDT');
-    expect(figureText('Profit / loss')).toBe('+120.00 USDT');
     expect(screen.queryByRole('region', { name: 'Holdings' })).not.toBeInTheDocument();
   });
 });
@@ -395,7 +316,7 @@ describe('DashboardPage: refresh', () => {
   it('reads the balances, then reads the summary again', async () => {
     const { user, fake } = openDashboard(undefined, {
       onSync: (portfolio) => {
-        portfolio.setSummary(GAINING_SUMMARY);
+        portfolio.setSummary(VALUED_SUMMARY);
         return triggered(syncRun({ trigger: 'manual' }));
       },
     });
@@ -412,7 +333,7 @@ describe('DashboardPage: refresh', () => {
   });
 
   it('says a refresh is under way, and disables the button meanwhile', async () => {
-    const { user, fake } = openDashboard(GAINING_SUMMARY);
+    const { user, fake } = openDashboard(VALUED_SUMMARY);
     await loaded();
     const release = fake.hold('sync');
 
@@ -431,7 +352,7 @@ describe('DashboardPage: refresh', () => {
   });
 
   it('says a refresh did not complete, without claiming the sync stopped', async () => {
-    const { user } = openDashboard(GAINING_SUMMARY, {}, [
+    const { user } = openDashboard(VALUED_SUMMARY, {}, [
       http.post('/api/balances/sync', () =>
         problem(409, 'Conflict', 'A balance sync is already running.'),
       ),

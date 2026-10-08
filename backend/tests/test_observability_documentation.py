@@ -40,11 +40,9 @@ from portfolio.api.request_context import (
     documentation_paths,
 )
 from portfolio.config import Settings
-from portfolio.domain.exchanges import AccountSyncStatus
 from portfolio.domain.health import (
     LATE_AFTER_INTERVALS,
     PriceHealthState,
-    ReconciliationHealthState,
     SchedulerName,
     SchedulerState,
     SourceState,
@@ -90,9 +88,9 @@ NOT_REDACTED_HEADING: Final = "### What is not redacted"
 UNAVAILABLE_HEADING: Final = "### `unavailable`: a section that could not be read"
 PRODUCTION_ORIGIN: Final = "https://portfolio.example"
 
-#: How many of each credential the document counts: "the bootstrap password, the CoinGecko
-#: key, the three Bitget variables and the two BingX ones".
-DOCUMENTED_CREDENTIALS: Final = {"bootstrap": 1, "coingecko": 1, "bitget": 3, "bingx": 2}
+#: How many of each credential the document counts: "the bootstrap password and the CoinGecko
+#: key".
+DOCUMENTED_CREDENTIALS: Final = {"bootstrap": 1, "coingecko": 1}
 
 
 def read(path: Path) -> str:
@@ -296,8 +294,8 @@ def test_every_value_rule_is_named_with_its_numbers(logs: str) -> None:
         assert f"`{prefix}:`" in by_value, prefix
 
 
-def test_the_credentials_counted_are_every_secret_setting() -> None:
-    """The document counts seven credentials by vendor; the model holds exactly those."""
+def test_the_credentials_counted_are_every_secret_setting(logs: str) -> None:
+    """The document names two credentials by vendor; the model holds exactly those."""
     secrets = [
         name
         for name, field in Settings.model_fields.items()
@@ -311,6 +309,7 @@ def test_the_credentials_counted_are_every_secret_setting() -> None:
     assert counted == DOCUMENTED_CREDENTIALS
     assert len(secrets) == sum(DOCUMENTED_CREDENTIALS.values())
     assert SecretStr.__name__ == "SecretStr"
+    assert "the bootstrap password and the CoinGecko key" in flat(logs)
 
 
 def test_the_second_layer_names_every_floored_vendor(logs: str) -> None:
@@ -370,27 +369,14 @@ def test_the_tick_failure_line_named_is_the_timers(health: str) -> None:
     ("heading", "header", "states"),
     [
         ("### `chains`: the balance sync per chain", "`state`", list(SourceState)),
-        ("### `exchanges`: one entry per account", "`balances_state`", list(SourceState)),
         ("### `prices`", "`state`", [s for s in PriceHealthState if s.value != "unavailable"]),
-        (
-            "### `reconciliation`: the holdings check, in short",
-            "`state`",
-            [s for s in ReconciliationHealthState if s.value != "unavailable"],
-        ),
     ],
-    ids=["chains", "exchanges", "prices", "reconciliation"],
+    ids=["chains", "prices"],
 )
 def test_every_section_state_has_a_row_in_order(
     health: str, heading: str, header: str, states: list[Any]
 ) -> None:
     assert first_column(raw_section(health, heading), header) == [state.value for state in states]
-
-
-def test_the_sync_states_named_are_the_accounts(health: str) -> None:
-    text = flat(raw_section(health, "### `exchanges`: one entry per account"))
-    listed = named(text, "`sync_state` is the fill sync's status --", ", as section 13")
-
-    assert set(listed) == {status.value for status in AccountSyncStatus}
 
 
 def test_the_price_limit_is_the_dashboards(health: str) -> None:
@@ -428,8 +414,4 @@ def test_the_json_example_has_exactly_the_fields_served(health: str, app: FastAP
     assert set(example["chains"]) == fields("ChainsHealthResponse")
     for chain in example["chains"]["items"]:
         assert set(chain) == fields("ChainHealthResponse")
-    assert set(example["exchanges"]) == fields("ExchangesHealthResponse")
-    for account in example["exchanges"]["items"]:
-        assert set(account) == fields("ExchangeHealthResponse")
     assert set(example["prices"]) == fields("PricesHealthResponse")
-    assert set(example["reconciliation"]) == fields("ReconciliationHealthResponse")

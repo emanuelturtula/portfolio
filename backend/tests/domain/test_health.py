@@ -13,27 +13,21 @@ The properties over any input are in `test_health_property.py`, kept short for t
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Final
 
 import pytest
 
-from portfolio.domain.accounting import ReconciliationStatus
 from portfolio.domain.health import (
     LATE_AFTER_INTERVALS,
     PriceHealthState,
-    ReconciliationHealthState,
-    ReconciliationSummary,
     SchedulerName,
     SchedulerState,
     SectionState,
     SourceState,
-    balances_state,
     price_state,
     scheduler_state,
     source_state,
-    summarize_reconciliation,
 )
 
 NOW: Final = datetime(2026, 10, 3, 12, 0, tzinfo=UTC)
@@ -56,7 +50,6 @@ def test_every_state_is_its_wire_form() -> None:
     assert [member.value for member in SchedulerName] == [
         "balance-sync",
         "price-refresh",
-        "exchange-sync",
         "backup",
     ]
     assert [member.value for member in SchedulerState] == ["ok", "late", "stopped", "disabled"]
@@ -66,13 +59,6 @@ def test_every_state_is_its_wire_form() -> None:
         "fresh",
         "stale",
         "never",
-        "unavailable",
-    ]
-    assert [member.value for member in ReconciliationHealthState] == [
-        "match",
-        "mismatch",
-        "incomplete",
-        "not_computed",
         "unavailable",
     ]
 
@@ -256,20 +242,6 @@ def test_a_source_is_what_its_last_attempt_says(succeeded: bool | None, state: S
     assert source_state(succeeded) is state
 
 
-def test_a_failed_balance_read_is_failing_even_with_an_older_reading() -> None:
-    """The reading has stopped being refreshed, so it is not `ok` because one exists."""
-    assert balances_state(read_at=NOW, failed=True) is SourceState.FAILING
-    assert balances_state(read_at=None, failed=True) is SourceState.FAILING
-
-
-def test_a_reading_with_no_failure_is_ok() -> None:
-    assert balances_state(read_at=NOW, failed=False) is SourceState.OK
-
-
-def test_no_reading_and_no_failure_is_never() -> None:
-    assert balances_state(read_at=None, failed=False) is SourceState.NEVER
-
-
 # --------------------------------------------------------------------------------------
 # The prices
 # --------------------------------------------------------------------------------------
@@ -304,153 +276,3 @@ def test_a_price_newer_than_now_is_fresh() -> None:
     latest = NOW + timedelta(minutes=5)
 
     assert price_state(latest, now=NOW, stale_after=STALE_AFTER) is PriceHealthState.FRESH
-
-
-# --------------------------------------------------------------------------------------
-# The holdings check, reduced
-# --------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Asset:
-    status: ReconciliationStatus
-
-
-@dataclass(frozen=True)
-class Venue:
-    not_compared_reason: object | None = None
-
-
-@dataclass(frozen=True)
-class Wallets:
-    stale: int = 0
-    unread: int = 0
-    chain_failed: int = 0
-
-
-@dataclass(frozen=True)
-class View:
-    """A `ReconciliationLike` with literals: what `services.reconciliation` would serve."""
-
-    computed_at: datetime | None = NOW
-    assets: tuple[Asset, ...] = ()
-    exchanges: tuple[Venue, ...] = ()
-    wallets: Wallets = field(default_factory=Wallets)
-
-
-MATCH: Final = Asset(ReconciliationStatus.MATCH)
-SHORT: Final = Asset(ReconciliationStatus.HISTORY_SHORT)
-OVER: Final = Asset(ReconciliationStatus.HISTORY_OVER)
-LEFT_OUT: Final = Venue(not_compared_reason="read_failed")
-
-
-def test_every_asset_matching_and_every_source_compared_is_match() -> None:
-    summary = summarize_reconciliation(View(assets=(MATCH, MATCH), exchanges=(Venue(),)))
-
-    assert summary == ReconciliationSummary(
-        state=ReconciliationHealthState.MATCH,
-        computed_at=NOW,
-        assets_compared=2,
-        assets_mismatched=0,
-        sources_not_compared=0,
-    )
-
-
-def test_a_reconciliation_with_nothing_to_compare_is_match() -> None:
-    """R8: an owner with no history and nothing held has nothing that disagrees."""
-    summary = summarize_reconciliation(View())
-
-    assert summary.state is ReconciliationHealthState.MATCH
-    assert (summary.assets_compared, summary.assets_mismatched, summary.sources_not_compared) == (
-        0,
-        0,
-        0,
-    )
-
-
-@pytest.mark.parametrize("asset", [SHORT, OVER], ids=["history_short", "history_over"])
-def test_any_asset_that_is_not_match_is_mismatch(asset: Asset) -> None:
-    """Both non-match statuses count, `history_over` included, though it is not a finding."""
-    summary = summarize_reconciliation(View(assets=(MATCH, asset, MATCH)))
-
-    assert summary.state is ReconciliationHealthState.MISMATCH
-    assert summary.assets_compared == 3
-    assert summary.assets_mismatched == 1
-
-
-def test_the_mismatched_count_is_every_asset_not_matching() -> None:
-    summary = summarize_reconciliation(View(assets=(SHORT, OVER, MATCH, SHORT)))
-
-    assert summary.assets_mismatched == 3
-    assert summary.assets_compared == 4
-
-
-@pytest.mark.parametrize(
-    ("view", "expected"),
-    [
-        pytest.param(View(exchanges=(Venue(), LEFT_OUT)), 1, id="an exchange not compared"),
-        pytest.param(View(wallets=Wallets(stale=2)), 2, id="stale wallets"),
-        pytest.param(View(wallets=Wallets(unread=3)), 3, id="unread wallets"),
-        pytest.param(View(wallets=Wallets(chain_failed=1)), 1, id="a wallet on a failed chain"),
-    ],
-)
-def test_each_kind_of_source_left_out_makes_it_incomplete(view: View, expected: int) -> None:
-    summary = summarize_reconciliation(
-        View(assets=(MATCH,), exchanges=view.exchanges, wallets=view.wallets)
-    )
-
-    assert summary.state is ReconciliationHealthState.INCOMPLETE
-    assert summary.sources_not_compared == expected
-
-
-def test_the_sources_not_compared_add_up_across_every_kind() -> None:
-    view = View(
-        exchanges=(LEFT_OUT, Venue(), Venue(not_compared_reason="out_of_date")),
-        wallets=Wallets(stale=1, unread=2, chain_failed=3),
-    )
-
-    assert summarize_reconciliation(view).sources_not_compared == 2 + 1 + 2 + 3
-
-
-def test_mismatch_comes_before_incomplete() -> None:
-    """Precedence: a disagreeing asset is the finding, even with a source left out."""
-    view = View(assets=(SHORT,), exchanges=(LEFT_OUT,), wallets=Wallets(unread=1))
-
-    summary = summarize_reconciliation(view)
-
-    assert summary.state is ReconciliationHealthState.MISMATCH
-    assert summary.sources_not_compared == 2
-
-
-def test_not_computed_comes_first_of_all() -> None:
-    """Precedence: with no snapshot, nothing else is judged -- but the sources are counted."""
-    view = View(
-        computed_at=None,
-        assets=(SHORT,),
-        exchanges=(LEFT_OUT,),
-        wallets=Wallets(stale=1),
-    )
-
-    summary = summarize_reconciliation(view)
-
-    assert summary.state is ReconciliationHealthState.NOT_COMPUTED
-    assert summary.computed_at is None
-    assert summary.sources_not_compared == 2
-
-
-def test_not_computed_with_nothing_else_is_not_computed() -> None:
-    summary = summarize_reconciliation(View(computed_at=None))
-
-    assert summary == ReconciliationSummary(
-        state=ReconciliationHealthState.NOT_COMPUTED,
-        computed_at=None,
-        assets_compared=0,
-        assets_mismatched=0,
-        sources_not_compared=0,
-    )
-
-
-def test_the_summary_carries_the_snapshots_instant() -> None:
-    computed_at = datetime(2026, 9, 30, 8, 15, 30, tzinfo=UTC)
-
-    assert summarize_reconciliation(View(computed_at=computed_at)).computed_at == computed_at

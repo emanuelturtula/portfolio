@@ -70,16 +70,16 @@ def test_the_banned_names_are_the_spec_list() -> None:
     assert {"now", "utcnow", "today", "fromtimestamp", "utcfromtimestamp"} == CLOCK_READS
 
 
-def test_the_scan_reaches_the_accounting_engine() -> None:
-    """The walk is only worth what it reaches: the engine's modules, by name."""
+def test_the_scan_reaches_the_modules_that_handle_time() -> None:
+    """The walk is only worth what it reaches: the modules that take an instant, by name."""
     scanned = {path.relative_to(DOMAIN_ROOT).as_posix() for path in domain_modules()}
 
     assert {
         "money.py",
-        "accounting/events.py",
-        "accounting/replay.py",
-        "accounting/fingerprint.py",
-        "accounting/results.py",
+        "auth.py",
+        "backups.py",
+        "health.py",
+        "portfolio.py",
     } <= scanned
 
 

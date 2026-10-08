@@ -159,8 +159,8 @@ class OperatorDocsTests(unittest.TestCase):
         self.assertIn(f"`{LIVE}`", definition)
 
     def test_no_ui_string_or_api_text_tells_an_operator_to_run_docker_compose(self) -> None:
-        # The exchanges page tells the owner how to apply a new key. It is read at the
-        # moment something is broken, so its command has to be the one that works.
+        # A UI string or an API description is read at the moment something is broken, so
+        # any command it gives has to be the one that works.
         sources = [
             *(REPO_ROOT / "frontend" / "src").rglob("*.ts"),
             *(REPO_ROOT / "frontend" / "src").rglob("*.tsx"),
@@ -176,11 +176,6 @@ class OperatorDocsTests(unittest.TestCase):
             if DOCKER_COMPOSE.search(line)
         ]
         self.assertEqual(offenders, [])
-
-    def test_the_exchanges_page_gives_the_live_recreate_command(self) -> None:
-        page = REPO_ROOT / "frontend" / "src" / "pages" / "exchanges" / "ExchangeList.tsx"
-        recreate = f"<code>{LIVE}/compose.sh up -d --force-recreate app</code>"
-        self.assertIn(recreate, page.read_text(encoding="utf-8"))
 
     def test_the_deploy_py_docstring_describes_the_layout(self) -> None:
         doc = deploy.__doc__ or ""

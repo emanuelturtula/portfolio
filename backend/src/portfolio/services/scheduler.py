@@ -2,8 +2,8 @@
 
 One `asyncio.Task` holding a sleep and a tick, and **nothing in this module knows what it is
 running**. It takes two callables -- "when did this last happen" and "do it" -- so the
-application's four timers, the balance sync, the price refresh, the exchange sync and the
-backup, are four instances rather than four loops.
+application's three timers, the balance sync, the price refresh and the backup, are three
+instances rather than three loops.
 
 That generalisation was a choice worth stating, when there were two. The differences between
 them are three injected values; the similarities are the whole class: start, stop, the cancellation

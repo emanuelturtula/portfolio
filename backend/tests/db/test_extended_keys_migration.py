@@ -707,6 +707,15 @@ def test_the_downgrades_copy_of_the_table_is_the_table_this_revision_leaves(
     assert {str(constraint.name) for constraint in declared.constraints} == on_disk
 
 
+def at_this_revision(database_url: str) -> None:
+    """Migrate to this revision and no further.
+
+    A downgrade from head would first run `0012_drop_exchanges_accounting`'s, which rebuilds
+    tables this revision has nothing to do with; the tests below are about this one step.
+    """
+    command.upgrade(build_alembic_config(database_url), REVISION)
+
+
 # --------------------------------------------------------------------------------------
 # The downgrade (R12)
 # --------------------------------------------------------------------------------------
@@ -724,7 +733,7 @@ def test_the_downgrade_refuses_while_an_extended_key_wallet_exists(
     expected_count: int,
 ) -> None:
     """Archived ones included: an archived wallet is one un-archive away from the sync."""
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     keys = (BIP84_ACCOUNT_VPUB, BIP32_TV1_M)
     with sync_engine.begin() as connection:
         ids = seed_history(connection)
@@ -766,7 +775,7 @@ def test_the_downgrade_round_trips_with_no_extended_key_wallet(
     database_url: str, sync_engine: Engine
 ) -> None:
     """The table and the column go; every wallet, snapshot, constraint and index stays."""
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     with sync_engine.begin() as connection:
         seed_history(connection)
     wallets_before = all_rows(sync_engine, "wallets")
@@ -787,7 +796,7 @@ def test_the_downgrade_round_trips_with_no_extended_key_wallet(
     with sync_engine.connect() as connection:
         assert connection.execute(text("PRAGMA foreign_key_check")).all() == []
 
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
 
     assert set(inspect(sync_engine).get_table_names()) == tables_before
     assert all_rows(sync_engine, "wallets") == wallets_before
@@ -799,7 +808,7 @@ def test_the_downgrade_proceeds_once_the_extended_key_wallet_is_removed(
     database_url: str, sync_engine: Engine
 ) -> None:
     """What `docs/operations.md` tells the operator to do, and that it is enough."""
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     with sync_engine.connect() as connection:
         connection.exec_driver_sql("PRAGMA foreign_keys=ON")
         user = insert_user(connection)
@@ -826,7 +835,7 @@ def test_the_offline_downgrade_refuses_outright(
     database_url: str, sync_engine: Engine, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """With no database to count wallets in, a rendered script could strand one."""
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     with sync_engine.begin() as connection:
         seed_history(connection)
     wallets_before = all_rows(sync_engine, "wallets")

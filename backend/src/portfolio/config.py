@@ -5,8 +5,6 @@ image can run in development and in production without a rebuild. Nothing in thi
 carries a default that would be unsafe if it survived into production.
 """
 
-import re
-from datetime import UTC, date, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Final, Literal, Self
@@ -109,106 +107,6 @@ def provider_url_violation(url: str) -> str | None:
     return None
 
 
-def exchange_credentials_violation(
-    variables: tuple[tuple[str, SecretStr | None], ...],
-) -> str | None:
-    """Why one venue's credential variables cannot be used, or `None` if they can.
-
-    `variables` is the venue's `(environment variable, value)` pairs. Three rules, checked in
-    this order:
-
-    1. **No value is blank.** An empty or whitespace credential is a variable somebody set
-       and got wrong, and `Credentials` would refuse it anyway -- on the first sync, where it
-       looks like any other failure, instead of at startup, where it is a rollback.
-    2. **Every value encodes as UTF-8.** On Linux, environment bytes that are not UTF-8
-       arrive as lone surrogates, and such a string passes every other check here. The
-       signing helper then encodes the secret and fails with a bare `UnicodeEncodeError`,
-       whose `args` hold **the whole secret** -- outside the exchange error taxonomy, on the
-       first sync, into any log that renders the exception. Found by review on #14; it holds
-       for every venue, so it is checked here once.
-    3. **All or none.** `None` for every variable means the venue is not configured and is
-       not built. Some set and some not is a credential that cannot sign, and the reason
-       names every variable that is missing.
-
-    **The reason names variables and never a value**, and never a length or a prefix either:
-    a partial credential in a log line is still part of a credential.
-    """
-    for name, value in variables:
-        if value is not None and not value.get_secret_value().strip():
-            return f"{name} is set but blank. Set it to the credential, or unset the variable."
-        if value is not None and not _encodes_as_utf8(value):
-            return (
-                f"{name} holds text that cannot be encoded as UTF-8, usually bytes from a file "
-                "or a terminal in another encoding. Set it again from the original."
-            )
-    missing = [name for name, value in variables if value is None]
-    if missing and len(missing) < len(variables):
-        verb = "is" if len(missing) == 1 else "are"
-        return (
-            f"{' and '.join(missing)} {verb} not set while the other credential variables of "
-            "the same venue are. Set all of them, or none."
-        )
-    return None
-
-
-def _encodes_as_utf8(value: SecretStr) -> bool:
-    """Whether a credential encodes as UTF-8. Never raises, and never lets the value escape.
-
-    A predicate rather than a raise, so the caller's refusal is built after the `except`
-    block has closed and carries no `__context__`: a `UnicodeEncodeError` keeps the whole
-    string it failed on in its `args`, and here that string is a credential.
-    """
-    try:
-        value.get_secret_value().encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
-
-
-HEADER_SAFE_TEXT: Final = re.compile(r"\A[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?\Z")
-"""Text an HTTP header can carry as it is: printable ASCII, no whitespace at either end.
-
-An interior space is allowed -- it is a legal header value, and a user-chosen passphrase may
-hold one. A control character, a line break, a leading or trailing space or tab, and any
-character outside ASCII are not.
-
-**The reason is a leak, measured on #13 with httpx 0.28.1.** A header value h11 refuses
-raises `httpx.LocalProtocolError("Illegal header value b'...'")`, and the message is the
-whole value. That is a `TransportError`, and an exchange provider chains its unavailable
-error `from` a transport error, so the credential would reach any log that renders the
-traceback. A non-ASCII character fails earlier and differently, as a bare
-`UnicodeEncodeError` out of `client.get` -- outside every exchange error class. A trailing
-space pasted into `secrets.env` is the realistic way to get either.
-"""
-
-
-def is_header_safe(value: str) -> bool:
-    """Whether `value` can travel in an HTTP header unchanged. See `HEADER_SAFE_TEXT`."""
-    return HEADER_SAFE_TEXT.match(value) is not None
-
-
-def credential_header_violation(
-    variables: tuple[tuple[str, SecretStr | None], ...],
-) -> str | None:
-    """Why a credential sent in a header cannot be sent, or `None` if every one can.
-
-    `variables` is the `(environment variable, value)` pairs of the credentials a venue
-    sends as header values -- for Bitget the API key and the passphrase, and **not** the
-    secret, which only ever enters an HMAC and may hold anything. An unset variable passes.
-
-    **The reason names the variable and the rule, and never the value**, nor which
-    character or where: the position of a stray character is part of the credential too.
-    """
-    for name, value in variables:
-        if value is not None and not is_header_safe(value.get_secret_value()):
-            return (
-                f"{name} holds a character an HTTP header cannot carry: whitespace at either "
-                "end, a line break or another control character, or a character outside "
-                "printable ASCII. Look for a stray space or line break where it was pasted."
-            )
-    return None
-
-
 class Settings(BaseSettings):
     """Runtime configuration for the backend."""
 
@@ -220,10 +118,10 @@ class Settings(BaseSettings):
         frozen=True,
         # Keep every environment value out of a validation error's `str()` and `repr()`,
         # which is what reaches the log when the container refuses to start. Pydantic elides
-        # the *middle* of the echoed input and keeps both ends. Measured on #13: with the
-        # Bitget key and secret set and the passphrase missing, `str(exc)` carried the key's
-        # first five characters and the secret's last twenty; a passphrase with a trailing
-        # space showed its own tail, which for a short passphrase is most of it. This drops
+        # the *middle* of the echoed input and keeps both ends. Measured on #13: with a set of
+        # API credentials partly set, `str(exc)` carried the first five characters of one
+        # value and the last twenty of another, which for a short secret is most of it. This
+        # drops
         # `input_value` and `input_type` from both renderings. It does **not** change
         # `errors()` or `json()`, which still carry the whole input -- see the docstring of
         # `_refuse_unsafe_configuration`.
@@ -272,7 +170,7 @@ class Settings(BaseSettings):
     bootstrap_username: str = "owner"
 
     # Credentials are never plain `str`. `SecretStr` keeps the value out of reprs,
-    # tracebacks and model dumps, which is what stops an exchange key from reaching the
+    # tracebacks and model dumps, which is what stops a password or an API key from reaching the
     # logs by accident; `logging.py` is the second line of defence, not the first.
     bootstrap_password: SecretStr | None = None
 
@@ -361,43 +259,6 @@ class Settings(BaseSettings):
     # credential format, which is exactly what the paragraph above refuses to do.
     coingecko_api_key: SecretStr | None = None
 
-    # The Bitget API key, its secret and its passphrase: the credentials the spot fills import
-    # signs with. **Read-only**, created by the owner on the venue, and `docs/operations.md`
-    # says how. `SecretStr` for the reason `bootstrap_password` is one, and the API key and the
-    # passphrase are secrets too -- rule 3 names API keys, and the three together are what
-    # reads the owner's trading history. Never persisted, never returned by an endpoint, never
-    # logged: they travel in request headers on the one call that uses them.
-    #
-    # **All three or none.** `None` for all three means the venue is not configured, and
-    # `providers.exchanges.registry.exchange_providers` then does not build it -- absent, not
-    # built and skipped, the rule the CoinGecko key set. Some set and some not is refused at
-    # startup, naming the missing variables.
-    #
-    # **A blank value is refused at startup, unlike the CoinGecko key.** A blank CoinGecko key
-    # reaches its vendor and comes back as a 401 the transport logs, which is the diagnosable
-    # outcome that setting chose. A blank Bitget credential never reaches the venue:
-    # `Credentials` refuses it at construction, so the failure would surface on the first sync
-    # instead of at the start. Refusing it here is the same fact, reported where the
-    # deployment pipeline rolls back.
-    #
-    # **The key and the passphrase must also be text a header can carry** (`HEADER_SAFE_TEXT`):
-    # printable ASCII with no whitespace at either end. Both are sent as header values, and a
-    # value h11 refuses comes back as a transport error whose message is the value itself.
-    # The secret is exempt; it only ever enters an HMAC.
-    bitget_api_key: SecretStr | None = None
-    bitget_api_secret: SecretStr | None = None
-    bitget_api_passphrase: SecretStr | None = None
-
-    # The BingX API key and its secret, for the same import from the second venue (#14).
-    # **Read-only**: a new BingX key is read-only by default, and `docs/operations.md` says to
-    # leave it that way. Everything said of the Bitget three above holds for these two: kept
-    # as `SecretStr`, never persisted, returned or logged, **both or neither**, a blank value
-    # refused at startup, and the key -- which travels in the `X-BX-APIKEY` header -- refused
-    # when a header cannot carry it. The secret is exempt; it only ever enters an HMAC. BingX
-    # keys have no passphrase, so there is no third variable.
-    bingx_api_key: SecretStr | None = None
-    bingx_api_secret: SecretStr | None = None
-
     # The balance scheduler. Three settings, and each answers a question an operator
     # actually has.
     #
@@ -435,33 +296,8 @@ class Settings(BaseSettings):
     price_refresh_enabled: bool = True
     price_refresh_interval_minutes: int = 60
 
-    # The exchange fill sync (#15), on its own timer, switch and grace period, for the reason
-    # the price refresh has its own: it answers to different vendors, and they are the ones
-    # that sign in with the owner's key.
-    #
-    # `history_start` is the earliest date the owner wants fills from, at 00:00 UTC. Unset
-    # means "all of it" -- 2009-01-03 -- and in either case the venue's retention clamps it
-    # further, which `GET /api/exchanges` reports as `requested_since` against
-    # `effective_since`. A date after today's (UTC) is refused at startup: it would plan
-    # nothing, and the owner would read that as a sync that works and finds no trades.
-    # Moving it earlier later is supported -- the next run plans the older range, while
-    # retention still allows it.
-    #
-    # `enabled` switches the timer off and nothing else: `POST /api/exchanges/sync` still
-    # works, as `POST /api/balances/sync` does with its switch off. The timer is also not
-    # built when no venue is configured, so an install without exchange credentials writes no
-    # empty run every fifteen minutes.
-    #
-    # `shutdown_grace_seconds` is the balance sync's ten, and the cost of it running out is
-    # the same: every page is committed as it is read, so a cancelled run loses at most the
-    # page in flight, and the sweep marks the run `interrupted`.
-    exchange_history_start: date | None = None
-    exchange_sync_enabled: bool = True
-    exchange_sync_interval_minutes: int = 15
-    exchange_sync_shutdown_grace_seconds: int = 10
-
-    # Scheduled copies of the database (#22, spec 029). Past an exchange's retention window the
-    # database is the only record of the owner's trades, and of everything entered by hand.
+    # Scheduled copies of the database (#22, spec 029): the wallets, their balance history and
+    # the price cache exist nowhere else.
     #
     # `enabled` switches the timer off and nothing else: `python -m portfolio backup`,
     # `list-backups` and `restore-backup` work either way, for the reason the sync switches
@@ -531,15 +367,6 @@ class Settings(BaseSettings):
           often. The per-host rate limiter would pace the requests, so the symptom is not a
           burst -- it is a process that never stops making them, quietly, for as long as it
           is up.
-        * a partial or blank set of Bitget or BingX credentials cannot sign a request, and would be
-          discovered on the first exchange sync rather than here. `exchange_credentials_violation`
-          says which variable, and never what it holds. Nor can a key or passphrase holding a
-          character no HTTP header can carry -- and that one would also write the value into
-          a transport error's message. `credential_header_violation` says which.
-        * an exchange sync interval below one is the same loop without a sleep, pointed at a
-          venue that signs in with the owner's key; and an exchange history start after
-          today's UTC date plans nothing, which the owner would read as a working sync that
-          found no trades.
         * a backup interval below an hour multiplies the copies kept -- about
           `keep_daily * 1440 / interval` of them, thousands at one minute -- on the disk the
           database lives on, where a full disk stops the application's writes. A `keep_daily`
@@ -643,11 +470,6 @@ class Settings(BaseSettings):
                 self.price_refresh_interval_minutes,
                 "PORTFOLIO_PRICE_REFRESH_ENABLED",
             ),
-            (
-                "PORTFOLIO_EXCHANGE_SYNC_INTERVAL_MINUTES",
-                self.exchange_sync_interval_minutes,
-                "PORTFOLIO_EXCHANGE_SYNC_ENABLED",
-            ),
         ):
             if minutes < 1:
                 message = (
@@ -689,46 +511,6 @@ class Settings(BaseSettings):
             if reason is not None:
                 message = f"{name} is not usable: {reason}"
                 raise ValueError(message)
-        reason = exchange_credentials_violation(
-            (
-                ("PORTFOLIO_BITGET_API_KEY", self.bitget_api_key),
-                ("PORTFOLIO_BITGET_API_SECRET", self.bitget_api_secret),
-                ("PORTFOLIO_BITGET_API_PASSPHRASE", self.bitget_api_passphrase),
-            )
-        )
-        if reason is not None:
-            raise ValueError(reason)
-        reason = credential_header_violation(
-            (
-                ("PORTFOLIO_BITGET_API_KEY", self.bitget_api_key),
-                ("PORTFOLIO_BITGET_API_PASSPHRASE", self.bitget_api_passphrase),
-            )
-        )
-        if reason is not None:
-            raise ValueError(reason)
-        reason = exchange_credentials_violation(
-            (
-                ("PORTFOLIO_BINGX_API_KEY", self.bingx_api_key),
-                ("PORTFOLIO_BINGX_API_SECRET", self.bingx_api_secret),
-            )
-        )
-        if reason is not None:
-            raise ValueError(reason)
-        reason = credential_header_violation((("PORTFOLIO_BINGX_API_KEY", self.bingx_api_key),))
-        if reason is not None:
-            raise ValueError(reason)
-        if (
-            self.exchange_history_start is not None
-            and self.exchange_history_start > datetime.now(UTC).date()
-        ):
-            # The value is not quoted, by the rule every refusal here follows: name the
-            # variable and the rule. The owner has the value in the file they just edited.
-            message = (
-                "PORTFOLIO_EXCHANGE_HISTORY_START is after today's date in UTC. A history "
-                "start in the future would plan nothing to import; set a date on or before "
-                "today, or unset it to import everything the venue still keeps."
-            )
-            raise ValueError(message)
         return self
 
 

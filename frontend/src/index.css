@@ -11,14 +11,10 @@
   --color-page: #f4f4f1;
   --color-surface: #fcfcfb;
   --color-surface-2: #f0efec;
-  /* A sticky table cell paints this to hide what scrolls beneath it: the card it sits on. */
-  --color-background: var(--color-surface);
   --color-border: #e1e0d9;
   --color-hairline: rgb(11 11 11 / 10%);
   --color-error: #a11b2b;
   --color-warning: #8a5a00;
-  --color-gain: #006300;
-  --color-loss: var(--color-error);
   /* Status dots: reserved for state, never a series. Always beside the words that say it. */
   --status-good: #0ca30c;
   --status-warning: #fab219;
@@ -53,7 +49,6 @@
     --color-hairline: rgb(255 255 255 / 10%);
     --color-error: #ff8b8b;
     --color-warning: #f0b429;
-    --color-gain: #0ca30c;
     --shadow-card: none;
     --header-blur: rgb(13 13 13 / 82%);
 
@@ -266,13 +261,6 @@ nav[aria-label='Main'] a.active {
   min-width: 0;
 }
 
-/* Two blocks on one page (the Details page's value and invested halves) sit further apart than
-   the cards inside each. */
-.page > .stack + .stack,
-.page > .stack + section {
-  margin-top: 1rem;
-}
-
 .page-head {
   display: flex;
   flex-wrap: wrap;
@@ -293,12 +281,6 @@ nav[aria-label='Main'] a.active {
   letter-spacing: -0.02em;
 }
 
-.section-title {
-  margin: 0;
-  font-size: 1.25rem;
-  letter-spacing: -0.015em;
-}
-
 .page-meta,
 .last-updated {
   margin: 0;
@@ -317,9 +299,7 @@ nav[aria-label='Main'] a.active {
 /* Cards. */
 
 .card,
-.kpi,
-.invested-summary > div,
-.totals-summary > div {
+.kpi {
   min-width: 0;
   border: 1px solid var(--color-hairline);
   border-radius: var(--radius-card);
@@ -393,23 +373,14 @@ nav[aria-label='Main'] a.active {
 
 /* Figures (#154). */
 
-/* Three across or one per row, never two and one: a lone third card reads as an afterthought,
-   and the P/L is the figure that matters most. */
+/* One figure, the total value, across the page. */
 .kpi-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
 }
 
-@media (min-width: 40rem) {
-  .kpi-row {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-}
-
-.kpi,
-.invested-summary > div,
-.totals-summary > div {
+.kpi {
   padding: 1rem 1.25rem 1.15rem;
 }
 
@@ -421,9 +392,7 @@ nav[aria-label='Main'] a.active {
   min-height: 1.5rem;
 }
 
-.kpi-label,
-.invested-summary dt,
-.totals-summary dt {
+.kpi-label {
   margin: 0;
   color: var(--color-muted);
   font-size: 0.8125rem;
@@ -433,9 +402,7 @@ nav[aria-label='Main'] a.active {
 
 /* The figure in the system sans with proportional digits, as a hero figure is set. A number
    too long for the card wraps rather than widen it. */
-.kpi-value,
-.invested-summary dd,
-.totals-summary dd {
+.kpi-value {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
@@ -455,64 +422,10 @@ nav[aria-label='Main'] a.active {
   letter-spacing: 0;
 }
 
-.kpi-gain .kpi-value > data,
-.kpi-gain .kpi-delta,
-.invested-summary .kpi-gain dd > data,
-.totals-summary .kpi-gain dd > data {
-  color: var(--color-gain);
-}
-
-.kpi-loss .kpi-value > data,
-.kpi-loss .kpi-delta,
-.invested-summary .kpi-loss dd > data,
-.totals-summary .kpi-loss dd > data {
-  color: var(--color-loss);
-}
-
-/* The return beside the P/L: the arrow and the sign carry the direction, the colour is on top. */
-.kpi-delta {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.25rem;
-  margin-left: auto;
-  padding: 0.1rem 0.55rem;
-  border-radius: 999px;
-  background-color: color-mix(in srgb, currentColor 10%, transparent);
-  font-size: 0.875rem;
-  font-weight: 600;
-  letter-spacing: 0;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
 .kpi-note {
   margin: 0.5rem 0 0;
   color: var(--color-muted);
   font-size: 0.8125rem;
-}
-
-/* The figure grids of the Details and Exchanges pages. The invested figures are four, or five:
-   two to a row on a phone and as many as fit beyond. The fill totals are three, side by side at
-   every width, so the net is never a lone tile under the other two. */
-.invested-summary,
-.totals-summary {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 9.5rem), 1fr));
-  gap: 0.75rem;
-  margin: 0;
-}
-
-.totals-summary {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.pnl-return {
-  display: block;
-  width: 100%;
-  color: var(--color-muted);
-  font-size: 0.8125rem;
-  font-weight: 500;
-  letter-spacing: 0;
 }
 
 .chip {
@@ -575,8 +488,7 @@ nav[aria-label='Main'] a.active {
    is only on top. */
 
 .note,
-.hint,
-.footnote {
+.hint {
   color: var(--color-muted);
   font-size: 0.8125rem;
 }
@@ -595,13 +507,8 @@ nav[aria-label='Main'] a.active {
   font-size: 0.8rem;
 }
 
-.footnote {
-  margin: 0.75rem 0 0;
-}
-
 .note-warning,
-p[role='alert'],
-.state-warning {
+p[role='alert'] {
   padding: 0.6rem 0.9rem;
   border: 1px solid var(--color-hairline);
   border-left: 3px solid var(--color-warning);
@@ -616,24 +523,8 @@ p[role='alert'] {
   border-left-color: var(--color-error);
 }
 
-.note-warning strong,
-.state-warning h3,
-.state-warning h4 {
+.note-warning strong {
   color: var(--color-warning);
-}
-
-.state-warning {
-  margin: 0;
-}
-
-.state-warning h3,
-.state-warning h4 {
-  margin: 0 0 0.25rem;
-  font-size: 0.9375rem;
-}
-
-.state-warning > :last-child {
-  margin-bottom: 0;
 }
 
 .note-error {
@@ -646,19 +537,13 @@ p[role='alert'] {
 }
 
 /* Inline messages keep their place in a form or a row: no box. */
-.field-error,
 .field > p[role='alert'],
-.fill-filters-note.state-error,
 .account p[role='alert'] {
   padding: 0;
   border: 0;
   background: none;
   color: var(--color-error);
   font-size: 0.875rem;
-}
-
-.field-error {
-  margin: 0;
 }
 
 /* States: loading, empty and failed. */
@@ -829,26 +714,6 @@ input[type='checkbox'] {
   accent-color: var(--color-text);
 }
 
-.form-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-bottom: 0;
-}
-
-/* The outcome of the last save or delete. The paragraph is always in the document and its text
-   is swapped, so that a screen reader announces the change; while it is empty it must take no
-   room, and its margins would. */
-.status-line {
-  margin: 0;
-  color: var(--color-muted);
-  font-size: 0.875rem;
-}
-
-.status-line:empty {
-  display: none;
-}
-
 .login {
   max-width: 24rem;
   margin: 2rem auto 0;
@@ -933,15 +798,13 @@ tbody th {
 }
 
 .num,
-.data-table .num,
-.position-table .num {
+.data-table .num {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
 /* A figure never breaks across lines: "100.00 %" on two reads as two things. */
 .data-table data,
-.position-table data,
 .balance-table data,
 .holdings-table td {
   white-space: nowrap;
@@ -951,70 +814,18 @@ tbody th {
   font-weight: 400;
 }
 
-.data-table--sticky tbody th {
-  min-width: 5.5rem;
-  font-weight: 600;
-}
-
-/* The asset stays put while the figures scroll under it. It needs its own background, or the
-   cells sliding beneath it show through. */
-.position-table thead th:first-child,
-.position-table tbody th,
-.data-table--sticky thead th:first-child,
-.data-table--sticky tbody th {
-  position: sticky;
-  left: 0;
-  z-index: 1;
-  background-color: var(--color-background);
-  box-shadow: 1px 0 0 var(--color-hairline);
-}
-
 /* The sentence that stands where a figure would: "This asset is not priced in this
    currency." Muted and small, so a column of them does not read as a column of numbers. */
-.unavailable,
-.position-table .unavailable {
+.unavailable {
   color: var(--color-muted);
   font-size: 0.8125rem;
-}
-
-.position-table .unavailable {
-  display: inline-block;
-  max-width: 10rem;
-}
-
-.row-badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  margin-top: 0.25rem;
-}
-
-.row-badges:empty {
-  display: none;
-}
-
-.row-note,
-.derived {
-  display: block;
-  color: var(--color-muted);
-  font-size: 0.75rem;
-  font-weight: 400;
 }
 
 .derived {
   display: inline;
-}
-
-.fill-table tbody th,
-.adjustment-table td time {
-  white-space: nowrap;
-}
-
-.data-table .order-id {
-  min-width: 8rem;
-  font-family: var(--font-mono);
-  font-size: 0.8125rem;
-  overflow-wrap: anywhere;
+  color: var(--color-muted);
+  font-size: 0.75rem;
+  font-weight: 400;
 }
 
 .badge {
@@ -1029,13 +840,6 @@ tbody th {
   letter-spacing: 0.03em;
   line-height: 1.4;
   text-transform: uppercase;
-}
-
-/* "Held exceeds history" on a position takes the reader to the holdings check: it keeps the
-   badge's look and says it is a link by being underlined. */
-a.badge {
-  color: inherit;
-  text-decoration: underline;
 }
 
 .asset-cell {
@@ -1273,32 +1077,6 @@ a.badge {
   color: var(--color-muted);
 }
 
-/* The return under an asset's name: the sign and the arrow say the direction. */
-.delta {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.2rem;
-  padding: 0 0.45rem;
-  border-radius: 999px;
-  background-color: color-mix(in srgb, currentColor 10%, transparent);
-  font-size: 0.75rem;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-.delta-gain {
-  color: var(--color-gain);
-}
-
-.delta-loss {
-  color: var(--color-loss);
-}
-
-.delta-flat {
-  color: var(--color-muted);
-}
-
 /* On a phone the label goes above its bars, which then take the card's whole width. */
 @media (max-width: 30rem) {
   .bar-row {
@@ -1316,76 +1094,7 @@ a.badge {
   }
 }
 
-/* Details: the wallets' value and what went into each position. */
-
-.excluded-list,
-.holdings-readings {
-  margin: 0.25rem 0 0.75rem;
-  padding-left: 1.25rem;
-  font-size: 0.875rem;
-}
-
-.invested-notes {
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
-  color: var(--color-muted);
-  font-size: 0.8125rem;
-}
-
-.invested-notes > p,
-.invested-notes > ul {
-  margin: 0;
-}
-
-.invested-notes:empty {
-  display: none;
-}
-
-.flag-legend {
-  margin: 0.75rem 0 0;
-  font-size: 0.8125rem;
-}
-
-.flag-legend > div {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem 0.75rem;
-  padding: 0.25rem 0;
-}
-
-.flag-legend dt {
-  flex: 0 0 9rem;
-}
-
-.flag-legend dd {
-  flex: 1 1 16rem;
-  margin: 0;
-  color: var(--color-muted);
-}
-
-.history-warnings {
-  margin: 0.75rem 0 0;
-}
-
-/* Holdings check (spec 025). The finding - balances above the history - has a box and a heading
-   of its own so it cannot be read past; the quiet list is a closed disclosure. */
-.holdings-short {
-  margin: 0.75rem 0;
-  padding: 0.75rem 1rem;
-  border: 1px solid var(--color-hairline);
-  border-left: 3px solid var(--color-warning);
-  border-radius: var(--radius-control);
-}
-
-.holdings-short h4 {
-  margin: 0 0 0.35rem;
-  color: var(--color-warning);
-}
-
-.holdings-over {
-  margin: 0.75rem 0 0;
-}
+/* Details: the wallets' value. */
 
 .pending {
   color: var(--color-muted);
@@ -1408,7 +1117,7 @@ a.badge {
   overflow-wrap: anywhere;
 }
 
-/* One item of a health card - a timer, a chain, a venue - headed h4 over its details. */
+/* One item of a health card - a timer or a chain - headed h4 over its details. */
 .card > div:has(> h4 + .health-details) > h4 {
   margin: 0 0 0.4rem;
   font-size: 0.875rem;
@@ -1531,251 +1240,6 @@ a.badge {
   }
 }
 
-/* Exchanges (specs 016 and 024). */
-
-.exchanges-toolbar {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 0.35rem;
-}
-
-/* The live region is always in the document and empty most of the time: it must not hold a
-   gap open in the page while it says nothing. It is never hidden, or it would stop announcing. */
-.exchanges-toolbar:has(> [role='status']:empty):not(:has(> p)) {
-  margin-top: -1rem;
-}
-
-.exchanges-toolbar > [role='status'] p {
-  margin: 0;
-}
-
-.exchange-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
-  gap: 1rem;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.exchange-list > li {
-  font-size: 0.875rem;
-}
-
-.exchange-list > li > p,
-.exchange-list > li > ol {
-  margin: 0.5rem 0 0;
-}
-
-.exchange-list ol {
-  padding-left: 1.25rem;
-}
-
-.exchange-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  margin-bottom: 0.75rem;
-}
-
-.exchange-head h4 {
-  margin: 0;
-  font-size: 1.0625rem;
-}
-
-/* A venue's facts: label over value, two to a row. */
-.stat-list {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.6rem 1rem;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.stat-list > li {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.stat-label {
-  color: var(--color-muted);
-  font-size: 0.75rem;
-}
-
-.stat-value {
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-
-.fill-filters {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 0.75rem 1.25rem;
-}
-
-.fill-filters fieldset {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.35rem 1rem;
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-
-.fill-filters legend {
-  float: left;
-  width: 100%;
-  margin-bottom: 0.3rem;
-  padding: 0;
-  color: var(--color-muted);
-  font-size: 0.8125rem;
-  font-weight: 600;
-}
-
-.fill-filters fieldset .hint {
-  flex-basis: 100%;
-  margin: 0;
-}
-
-.fill-filter-choice {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.35rem 0.75rem;
-  border: 1px solid var(--color-border);
-  border-radius: 999px;
-  background-color: var(--color-page);
-  font-size: 0.875rem;
-  cursor: pointer;
-}
-
-.fill-filter-choice:has(input:checked) {
-  border-color: var(--color-text);
-  font-weight: 600;
-}
-
-.fill-filters .field {
-  margin-bottom: 0;
-}
-
-/* A day typed outside `min`..`max` stays in the field but is never sent: the border says so. */
-.fill-filters .field input:invalid {
-  border-color: var(--color-error);
-}
-
-.fill-filters-note {
-  flex-basis: 100%;
-  margin: 0;
-}
-
-.completeness ul {
-  margin: 0.25rem 0 0;
-  padding-left: 1.25rem;
-}
-
-.fee-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem 1.25rem;
-  margin: 0.25rem 0 0;
-  padding: 0;
-  list-style: none;
-  font-size: 0.875rem;
-  font-variant-numeric: tabular-nums;
-}
-
-.pagination {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem 1.5rem;
-  margin: 0.75rem 0 0;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--color-hairline);
-  color: var(--color-muted);
-  font-size: 0.8125rem;
-}
-
-.pagination p {
-  margin: 0;
-}
-
-.pagination-buttons {
-  display: flex;
-  gap: 0.5rem;
-  margin-left: auto;
-}
-
-.pagination-buttons button {
-  padding: 0.25rem 0.75rem;
-  font-size: 0.8125rem;
-}
-
-/* Every column but the per-account detail is a few words: on one line each. */
-.run-table td:not(:last-child) {
-  white-space: nowrap;
-}
-
-.run-table td:last-child {
-  min-width: 16rem;
-}
-
-.run-details {
-  margin: 0;
-  padding-left: 1rem;
-  font-size: 0.8125rem;
-}
-
-/* Manual adjustments (spec 027). */
-
-.adjustment-form {
-  max-width: 40rem;
-}
-
-/* The button that sets the date to the one suggested: under the hint that explains it, and not
-   stretched across the field like a flex child would be. */
-.suggestion-button {
-  align-self: flex-start;
-}
-
-/* The owner's own words wrap, keep their line breaks, and never widen the table. */
-.adjustment-table td.note {
-  min-width: 10rem;
-  color: var(--color-text);
-  font-size: inherit;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.adjustment-table td.num {
-  white-space: nowrap;
-}
-
-.adjustment-table .row-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-}
-
-.adjustment-table button {
-  padding: 0.25rem 0.6rem;
-  font-size: 0.8125rem;
-}
-
-.adjustment-table .field-error {
-  max-width: 14rem;
-  margin-top: 0.4rem;
-}
-
 /* On a phone every card gives its content a little more of the width, and every table cell
    tightens. A region still scrolls a figure too long to fit. */
 @media (max-width: 40rem) {
@@ -1783,19 +1247,8 @@ a.badge {
     padding: 1rem 0.875rem 0.875rem;
   }
 
-  .kpi,
-  .invested-summary > div,
-  .totals-summary > div {
+  .kpi {
     padding: 0.875rem 1rem 1rem;
-  }
-
-  .invested-summary dd,
-  .totals-summary dd {
-    font-size: 1.125rem;
-  }
-
-  .totals-summary > div {
-    padding: 0.75rem 0.65rem 0.85rem;
   }
 
   th,

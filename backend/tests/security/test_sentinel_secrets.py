@@ -7,19 +7,16 @@ at DEBUG through every path that holds one:
 
 * a failed sign-in and a real one, with the bootstrap password the owner was created from;
 * a balance sync of a registered testnet wallet, against chain indexes that fail;
-* an exchange sync of both venues, each signing with its sentinels, against venues that
-  refuse -- echoing back, as a careless vendor does, the full URL with its query and every
-  header the request carried, keys and signatures included;
-* a price refresh at startup, against price vendors that fail the same way, the CoinGecko
-  key in its header;
+* a price refresh at startup, against price vendors that refuse -- echoing back, as a
+  careless vendor does, the full URL with its query and every header the request carried,
+  the CoinGecko key's header included;
 * a request refused for want of a session whose path and query carry a sentinel;
-* a 500 whose exception message carries every sentinel and a signed URL.
+* a 500 whose exception message carries every sentinel and a URL with a key in its query.
 
 Searched: stdout **and stderr** at the file-descriptor level (`capfd`, spec 030 R13 S3, since
 `logging`'s error fallback writes to stderr), pytest's `caplog`, a root handler of the test's
 own that renders every record in full, and every response body and header. Each sentinel is
-searched whole and as every window of `MIN_SUBSTRING_SECRET_LENGTH` characters, and every
-signature the venues received as every twelve-character window.
+searched whole and as every window of `MIN_SUBSTRING_SECRET_LENGTH` characters.
 
 The positive companions say the search was over something: each credential really reached
 its vendor, each path really ran, and each capture holds the lines its path writes.
@@ -31,7 +28,6 @@ import asyncio
 import json
 import logging
 from typing import TYPE_CHECKING, Final
-from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -56,13 +52,10 @@ if TYPE_CHECKING:
 SENTINELS: Final[dict[str, str]] = {
     "bootstrap_password": "Owner phrase " + "HwRtK" * 6,
     "coingecko_api_key": "CG" + "PbMnQ" * 8,
-    "bitget_api_key": "QzKxW" * 8,
-    "bitget_api_secret": "WjPqZ" * 8,
-    "bitget_api_passphrase": "GfXbL" * 8,
-    "bingx_api_key": "RtLmS" * 8,
-    "bingx_api_secret": "ZkVbT" * 8,
 }
-SIGNATURE_WINDOW: Final = 12
+#: The bootstrap password without its spaces, which is what survives a query string's
+#: percent-encoding unchanged and so what a leaked query would show.
+OWNER_PHRASE_CYCLE: Final = SENTINELS["bootstrap_password"].removeprefix("Owner phrase ")
 BOOM: Final = "/api/test/boom"
 DEADLINE: Final = 10
 
@@ -101,10 +94,6 @@ class CarelessVendors:
         self.requests.append(request)
         echo = f"rejected {request.url} with headers {dict(request.headers)}"
         host = request.url.host
-        if "bitget" in host:
-            return httpx.Response(401, json={"code": "40006", "msg": echo, "data": None})
-        if "bingx" in host:
-            return httpx.Response(200, json={"code": 100001, "msg": echo, "data": {}})
         if "coingecko" in host:
             return httpx.Response(401, json={"status": {"error_message": echo}})
         return httpx.Response(503, text=f"<html><body>{echo}</body></html>")
@@ -112,18 +101,12 @@ class CarelessVendors:
     def headers_named(self, name: str) -> list[str]:
         return [request.headers[name] for request in self.requests if name in request.headers]
 
-    def signatures(self) -> list[str]:
-        signed = self.headers_named("ACCESS-SIGN")
-        for request in self.requests:
-            signed.extend(parse_qs(request.url.query.decode()).get("signature", []))
-        return signed
-
 
 async def boom() -> None:
     message = (
         "a fault carrying every credential: "
         + " ".join(SENTINELS.values())
-        + f" and https://open-api.example.test/x?signature={SENTINELS['bingx_api_secret']}"
+        + f" and https://api.example.test/x?x_cg_demo_api_key={SENTINELS['coingecko_api_key']}"
     )
     raise RuntimeError(message)
 
@@ -189,11 +172,12 @@ async def test_no_sentinel_reaches_any_output(
                     while app.state.price_scheduler.last_tick_finished_at is None:  # noqa: ASYNC110
                         await asyncio.sleep(0.01)
                 refused = await client.get(
-                    f"/api/{SENTINELS['bitget_api_key']}?apiKey={SENTINELS['bingx_api_key']}"
+                    f"/api/{SENTINELS['coingecko_api_key']}",
+                    params={"apiKey": SENTINELS["bootstrap_password"]},
                 )
                 failed_login = await client.post(
                     LOGIN_PATH,
-                    json={"username": "owner", "password": SENTINELS["bitget_api_secret"]},
+                    json={"username": "owner", "password": SENTINELS["coingecko_api_key"]},
                     headers=JSON_HEADERS,
                 )
                 await sign_in(client, phrase=SENTINELS["bootstrap_password"])
@@ -203,7 +187,6 @@ async def test_no_sentinel_reaches_any_output(
                     headers=JSON_HEADERS,
                 )
                 balances = await client.post("/api/balances/sync", headers=JSON_HEADERS)
-                exchanges = await client.post("/api/exchanges/sync", headers=JSON_HEADERS)
                 detail = await client.get("/api/health/detail")
                 crashed = await client.get(BOOM)
                 # Not `refused`: its problem document's `instance` is the path the client
@@ -212,7 +195,6 @@ async def test_no_sentinel_reaches_any_output(
                     failed_login,
                     created,
                     balances,
-                    exchanges,
                     detail,
                     crashed,
                 ):
@@ -226,27 +208,19 @@ async def test_no_sentinel_reaches_any_output(
 
     # The positive companions: every path ran, and every credential reached its vendor.
     assert refused.status_code == 401
-    assert SENTINELS["bingx_api_key"] not in refused.text, "the query is never echoed"
+    assert OWNER_PHRASE_CYCLE not in refused.text, "the query is never echoed"
     assert failed_login.status_code == 401
     assert created.status_code == 201, created.text
     assert balances.status_code == 200, balances.text
-    assert exchanges.status_code == 200, exchanges.text
     assert crashed.status_code == 500
-    assert {account["status"] for account in exchanges.json()["accounts"]} == {"failed"}
-    assert vendors.headers_named("ACCESS-KEY")
-    assert set(vendors.headers_named("ACCESS-KEY")) == {SENTINELS["bitget_api_key"]}
-    assert set(vendors.headers_named("ACCESS-PASSPHRASE")) == {SENTINELS["bitget_api_passphrase"]}
-    assert set(vendors.headers_named("X-BX-APIKEY")) == {SENTINELS["bingx_api_key"]}
+    assert vendors.headers_named("x-cg-demo-api-key")
     assert set(vendors.headers_named("x-cg-demo-api-key")) == {SENTINELS["coingecko_api_key"]}
     assert any("esplora-one.example.test" in str(request.url) for request in vendors.requests)
-    signatures = vendors.signatures()
-    assert any(len(signature) == 64 for signature in signatures), "BingX signed nothing"
     stdout_events = {json.loads(line)["event"] for line in captured.out.splitlines() if line}
     for event in (
         "request_refused",
         "request_completed",
         "unhandled_exception",
-        "exchange_sync_account_failed",
         "price_refresh_incomplete",
     ):
         assert event in stdout_events, f"stdout carried no {event!r}: that path never ran"
@@ -262,12 +236,11 @@ async def test_no_sentinel_reaches_any_output(
     }
     for where, text in everything.items():
         assert_nothing_of(text, SENTINELS.values(), where=where, size=MIN_SUBSTRING_SECRET_LENGTH)
-        assert_nothing_of(text, signatures, where=where, size=SIGNATURE_WINDOW)
 
 
 def test_the_window_search_catches_a_leaked_fragment_and_ignores_the_rest() -> None:
     """The search above is only as good as this: a tail of a secret is a leak."""
-    secret = SENTINELS["bingx_api_secret"]
+    secret = SENTINELS["coingecko_api_key"]
 
     with pytest.raises(AssertionError, match="window of a secret reached stdout"):
         assert_nothing_of(

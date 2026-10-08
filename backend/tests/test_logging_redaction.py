@@ -47,7 +47,7 @@ def redact(event: dict[str, Any]) -> dict[str, Any]:
         "Api-Key",
         "x-api-key",
         "apikey",
-        "bitget_apiKey",
+        "coingecko_apiKey",
         "api_secret",
         "SECRET",
         "client_secret",
@@ -148,7 +148,7 @@ def test_configured_pipeline_writes_no_secret_to_stdout(
         api_key=CANARY_VALUE,
         signature=CANARY_VALUE,
         xpub_account=CANARY_VALUE,
-        exchange="example",
+        vendor="example",
     )
 
     written = capsys.readouterr().out

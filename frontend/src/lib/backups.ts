@@ -4,7 +4,7 @@
  * docs/specs/029-sqlite-backups.md, "Design: frontend".
  *
  * No React anywhere in this module - it is exercised directly by tests, the same split
- * `lib/accounting.ts` and `lib/exchanges.ts` use for the same reason.
+ * `lib/health.ts` uses for the same reason.
  *
  * Both `Record`s are keyed by the generated unions, so a state or an error kind added on the
  * backend fails `tsc` here until it has words. A failure nobody can read the meaning of is a

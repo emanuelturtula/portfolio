@@ -138,8 +138,8 @@ export interface FakePortfolioOptions {
   readonly onSync?: (fake: FakePortfolio) => SyncTriggeredResponse;
   /**
    * What `GET /api/portfolio/summary` answers. When omitted, it is derived from the active
-   * wallets the way the backend answers before any run has read them: nothing held, nothing
-   * invested, and each wallet's chain named as unread.
+   * wallets the way the backend answers before any run has read them: nothing held, and each
+   * wallet's chain named as unread.
    */
   readonly summary?: PortfolioSummary;
   /**

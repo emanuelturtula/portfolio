@@ -6,7 +6,6 @@ import { usePortfolioSummary, type PortfolioSummary } from '@/api/portfolio';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
 import { Skeleton } from '@/components/Skeleton';
-import { isZeroMoney, money } from '@/lib/money';
 import { describeMissing } from '@/lib/portfolio';
 import { BackupNotice } from '@/pages/dashboard/BackupNotice';
 import { Holdings } from '@/pages/dashboard/Holdings';
@@ -16,23 +15,18 @@ import { SummaryCards } from '@/pages/dashboard/SummaryCards';
 const REFRESH_FAILURE_FALLBACK = 'The server could not be reached.';
 const REFETCH_FAILURE_FALLBACK = 'The server could not be reached.';
 
-/** Nothing held, nothing invested, nothing waiting to be read: a new install. */
+/** Nothing held and nothing waiting to be read: a new install. */
 function isEmpty(summary: PortfolioSummary): boolean {
-  return (
-    summary.holdings.length === 0 &&
-    summary.untracked.length === 0 &&
-    summary.missing.length === 0 &&
-    isZeroMoney(money(summary.invested))
-  );
+  return summary.holdings.length === 0 && summary.missing.length === 0;
 }
 
 /**
- * The dashboard (#154): three figures, then what is held and how its value splits.
+ * The dashboard (#154): the total value, then what is held and how its value splits.
  *
  * Every figure comes from `GET /api/portfolio/summary`, so the page has one query and one set of
- * states. What a figure could not include is named in a single line under the figures, and each
- * figure it touches carries a "Partial" chip; the readings, sync state and per-position detail
- * behind them are on the Details page, linked from that line and from the header.
+ * states. What the total could not include is named in a single line under it, and the total
+ * then carries a "Partial" chip; the readings and sync state behind it are on the Details page,
+ * linked from that line and from the header.
  *
  * Above everything, a warning when the scheduled backups failed or stopped (spec 029): it is
  * about the data underneath, not about any one figure.
@@ -101,11 +95,10 @@ function Overview({ summary }: { readonly summary: ReturnType<typeof usePortfoli
     return (
       <EmptyState
         title="Nothing to show yet"
-        description="Add a wallet or connect an exchange to see your portfolio here."
+        description="Add a wallet to see your portfolio here."
         action={
           <div className="state-actions">
             <Link to="/wallets">Add a wallet</Link>
-            <Link to="/exchanges">Connect an exchange</Link>
           </div>
         }
       />
@@ -127,7 +120,7 @@ function Overview({ summary }: { readonly summary: ReturnType<typeof usePortfoli
           <Link to="/details">See details</Link>
         </p>
       )}
-      {(data.holdings.length > 0 || data.untracked.length > 0) && <Holdings summary={data} />}
+      {data.holdings.length > 0 && <Holdings summary={data} />}
     </div>
   );
 }

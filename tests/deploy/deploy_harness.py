@@ -55,7 +55,7 @@ KIT_COMPOSE = REPO_ROOT / "deploy" / "compose.yml"
 BACKUPS_PY = REPO_ROOT / "backend" / "src" / "portfolio" / "domain" / "backups.py"
 POSIX = os.name == "posix"
 
-# Stands in for exchange credentials in secrets.env. It must never appear anywhere the
+# Stands in for application credentials in secrets.env. It must never appear anywhere the
 # script writes, prints or passes to Docker.
 SENTINEL_ENV_LINE = b"SENTINEL_VALUE=never-leave-secrets-env-4417\n"
 

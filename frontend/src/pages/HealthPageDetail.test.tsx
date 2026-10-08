@@ -2,31 +2,18 @@ import { screen, waitFor, within } from '@testing-library/react';
 import { delay, http, HttpResponse } from 'msw';
 import { describe, expect, it } from 'vitest';
 
-import type {
-  ChainHealth,
-  ExchangeHealth,
-  PricesHealth,
-  ReconciliationHealth,
-  SchedulerStatus,
-} from '@/api/health';
-import type { components } from '@/api/generated/schema';
+import type { ChainHealth, PricesHealth, SchedulerStatus } from '@/api/health';
 import { HealthPage } from '@/pages/HealthPage';
 import { HEALTH_DETAIL_PATH, healthDetail, okBackup, serveDetail } from '@/test/backupFixtures';
 import {
   chain,
   emptyChains,
-  emptyExchanges,
-  exchange,
   freshPrices,
   neverPrices,
-  notComputedReconciliation,
-  reconciliation,
   stalePrices,
   timer,
   unavailableChains,
-  unavailableExchanges,
   unavailablePrices,
-  unavailableReconciliation,
   type HealthSections,
 } from '@/test/healthFixtures';
 import { renderWithProviders } from '@/test/render';
@@ -34,15 +21,15 @@ import { problem, server } from '@/test/server';
 import { inTimeZone } from '@/test/timeZone';
 
 /**
- * The Health page's sections after Backups (spec 030): the timers, the balance sync per chain,
- * the exchange accounts, the prices and the reconciliation. Every state of every section is
+ * The Health page's sections after Backups (spec 030): the timers, the balance sync per chain
+ * and the prices. Every state of every section is
  * rendered through the page, from `GET /api/health/detail` as the backend serves it, and read
  * as the owner reads it -- each `<dt>` with the `<dd>` that follows it, each item under its
  * `h4` -- so a value under the wrong label, or in the wrong item, fails.
  */
 
 const UNAVAILABLE = 'Could not be read. The log says why.';
-const SECTION_TITLES = ['Timers', 'Balance sync', 'Exchanges', 'Prices', 'Reconciliation'];
+const SECTION_TITLES = ['Timers', 'Balance sync', 'Prices'];
 
 function renderDetail(sections: Partial<HealthSections> = {}) {
   const served = serveDetail(healthDetail(okBackup, sections));
@@ -91,7 +78,7 @@ describe('HealthPage: the detail sections, as a whole', () => {
     );
     renderWithProviders(<HealthPage />);
 
-    const loading = await screen.findByText('Loading the timers, sources and reconciliation...');
+    const loading = await screen.findByText('Loading the timers and sources...');
 
     expect(loading).toHaveAttribute('role', 'status');
     for (const title of SECTION_TITLES) {
@@ -102,7 +89,7 @@ describe('HealthPage: the detail sections, as a whole', () => {
   it('shows every section in order, each a landmark named by its h3, after Backups', async () => {
     renderDetail();
 
-    await answered('Reconciliation');
+    await answered('Prices');
     const regions = screen
       .getAllByRole('region')
       .map((region) => region.getAttribute('aria-labelledby'));
@@ -136,7 +123,7 @@ describe('HealthPage: the detail sections, as a whole', () => {
     expect(
       screen.getByRole('heading', {
         level: 3,
-        name: 'Could not load the timers, sources and reconciliation',
+        name: 'Could not load the timers and sources',
       }),
     ).toBeVisible();
     expect(detail).toHaveTextContent('The detail could not be read.');
@@ -163,42 +150,39 @@ describe('HealthPage: the detail sections, as a whole', () => {
     renderDetail({ chains: unavailableChains });
 
     const chains = await answered('Balance sync');
-    await answered('Reconciliation');
+    await answered('Prices');
 
     expect(within(chains).getByRole('alert')).toHaveTextContent(UNAVAILABLE);
     expect(screen.getAllByRole('alert')).toHaveLength(1);
-    expect(items(await section('Exchanges'))).toHaveLength(1);
-    expect(items(await section('Timers'))).toHaveLength(4);
+    expect(items(await section('Timers'))).toHaveLength(3);
   });
 
-  it('shows every readable section beside four that could not be read', async () => {
+  it('shows every readable section beside two that could not be read', async () => {
     renderDetail({
       chains: unavailableChains,
-      exchanges: unavailableExchanges,
       prices: unavailablePrices,
-      reconciliation: unavailableReconciliation,
     });
 
-    await answered('Reconciliation');
+    await answered('Prices');
 
-    for (const title of ['Balance sync', 'Exchanges', 'Prices', 'Reconciliation']) {
+    for (const title of ['Balance sync', 'Prices']) {
       const found = await section(title);
       expect(within(found).getByRole('alert')).toHaveTextContent(UNAVAILABLE);
       expect(within(found).queryByRole('term')).not.toBeInTheDocument();
     }
-    expect(items(await section('Timers'))).toHaveLength(4);
+    expect(items(await section('Timers'))).toHaveLength(3);
   });
 });
 
 describe('HealthPage: the timers', () => {
-  it('names the four timers in the order served, each with its state, tick and result', async () => {
+  it('names the three timers in the order served, each with its state, tick and result', async () => {
     inTimeZone('UTC');
     renderDetail();
 
     const timers = await answered('Timers');
 
     expect(items(timers)).toEqual(
-      ['Balance sync', 'Price refresh', 'Exchange sync', 'Backup'].map((name) => [
+      ['Balance sync', 'Price refresh', 'Backup'].map((name) => [
         name,
         [
           ['State', 'OK. The timer is running on schedule.'],
@@ -258,7 +242,7 @@ describe('HealthPage: the timers', () => {
     const both: SchedulerStatus[] = [
       timer({ name: 'backup', state: 'disabled', last_tick_at: null, last_tick_succeeded: null }),
       timer({
-        name: 'exchange-sync',
+        name: 'price-refresh',
         state: 'stopped',
         last_tick_at: null,
         last_tick_succeeded: null,
@@ -269,7 +253,7 @@ describe('HealthPage: the timers', () => {
     expect(items(await answered('Timers'))).toEqual([
       ['Backup', [['State', 'Disabled. This timer is switched off on this server.']]],
       [
-        'Exchange sync',
+        'Price refresh',
         [
           ['State', 'Stopped. The timer is not running.'],
           ['Last tick', 'none since the server started'],
@@ -370,85 +354,6 @@ describe('HealthPage: the balance sync per chain', () => {
   });
 });
 
-describe('HealthPage: the exchange accounts', () => {
-  it('shows the trade sync and the balance read apart, each with its instant (R4)', async () => {
-    inTimeZone('UTC');
-    renderDetail();
-
-    expect(items(await answered('Exchanges'))).toEqual([
-      [
-        'Bitget',
-        [
-          ['Trade sync', 'OK. The last trade sync finished.'],
-          ['Last successful sync', 'Oct 3, 2026, 10:15 AM'],
-          ['Balances', 'OK. The last balance read succeeded.'],
-          ['Balances read', 'Oct 3, 2026, 10:16 AM'],
-        ],
-      ],
-    ]);
-  });
-
-  it.each([
-    ['error', 'Failing. The last trade sync failed.'],
-    [
-      'auth_failed',
-      'Authentication failed. The exchange refused the API key. Scheduled syncs skip this account until a manual sync succeeds.',
-    ],
-    ['never_synced', 'Never synced. No trade sync has finished for this account yet.'],
-  ] as const)('words a trade sync that is %s', async (syncState, words) => {
-    renderDetail({ exchanges: { state: 'ok', items: [exchange({ sync_state: syncState })] } });
-
-    expect(rows(await answered('Exchanges'))[0]).toEqual(['Trade sync', words]);
-  });
-
-  it.each([
-    ['failing', 'Failing. The last balance read failed.'],
-    ['never', 'Never read. No balance has been read for this account yet.'],
-  ] as const)('words a balance read that is %s', async (balancesState, words) => {
-    renderDetail({
-      exchanges: { state: 'ok', items: [exchange({ balances_state: balancesState })] },
-    });
-
-    expect(rows(await answered('Exchanges'))[2]).toEqual(['Balances', words]);
-  });
-
-  it('says never for an account never synced and never read, under each venue name', async () => {
-    const accounts: ExchangeHealth[] = [
-      exchange({
-        exchange_key: 'bingx',
-        sync_state: 'never_synced',
-        last_synced_at: null,
-        balances_state: 'never',
-        balances_read_at: null,
-      }),
-      exchange({ exchange_key: 'bitget' }),
-    ];
-    renderDetail({ exchanges: { state: 'ok', items: accounts } });
-
-    const found = items(await answered('Exchanges'));
-
-    expect(found.map(([name]) => name)).toEqual(['BingX', 'Bitget']);
-    expect(found[0]?.[1]).toEqual([
-      ['Trade sync', 'Never synced. No trade sync has finished for this account yet.'],
-      ['Last successful sync', 'never'],
-      ['Balances', 'Never read. No balance has been read for this account yet.'],
-      ['Balances read', 'never'],
-    ]);
-  });
-
-  it('tells an empty list apart from a section that could not be read', async () => {
-    renderDetail({ exchanges: emptyExchanges });
-
-    const exchanges = await answered('Exchanges');
-
-    expect(within(exchanges).getByRole('heading', { level: 4 })).toHaveTextContent(
-      'No exchange accounts to report yet',
-    );
-    expect(exchanges).toHaveTextContent('No exchange account is set up on this server.');
-    expect(within(exchanges).queryByRole('alert')).not.toBeInTheDocument();
-  });
-});
-
 describe('HealthPage: the prices', () => {
   it.each([
     [freshPrices, 'Fresh. Prices were fetched recently.', 'Oct 3, 2026, 11:50 AM'],
@@ -466,83 +371,5 @@ describe('HealthPage: the prices', () => {
       ['State', words],
       ['Latest fetch', latest],
     ]);
-  });
-});
-
-describe('HealthPage: the reconciliation', () => {
-  type ReconciliationState = components['schemas']['ReconciliationHealthState'];
-
-  it('shows the state, when it was computed and three counts', async () => {
-    inTimeZone('UTC');
-    renderDetail();
-
-    expect(rows(await answered('Reconciliation'))).toEqual([
-      ['State', 'Match. Every asset compared agrees with the balances read.'],
-      ['Computed', 'Oct 3, 2026, 9:05 AM'],
-      ['Assets compared', '4'],
-      ['Assets that differ', '0'],
-      ['Sources not compared', '0'],
-    ]);
-  });
-
-  it.each([
-    [
-      'mismatch',
-      'Mismatch. At least one asset does not agree with the balances read.',
-      { assets_compared: 1234, assets_mismatched: 2, sources_not_compared: 0 },
-      ['1,234', '2', '0'],
-    ],
-    [
-      'incomplete',
-      'Incomplete. A source could not be compared, so the check does not cover everything.',
-      { assets_compared: 3, assets_mismatched: 0, sources_not_compared: 2 },
-      ['3', '0', '2'],
-    ],
-  ] as const)('words a %s and its counts', async (state, words, counts, shown) => {
-    renderDetail({ reconciliation: reconciliation({ state, ...counts }) });
-
-    const found = rows(await answered('Reconciliation'));
-
-    expect(found[0]).toEqual(['State', words]);
-    expect(found.slice(2)).toEqual([
-      ['Assets compared', shown[0]],
-      ['Assets that differ', shown[1]],
-      ['Sources not compared', shown[2]],
-    ]);
-  });
-
-  it('shows no count for a check that was never computed', async () => {
-    renderDetail({ reconciliation: notComputedReconciliation });
-
-    expect(rows(await answered('Reconciliation'))).toEqual([
-      ['State', 'Not computed. The positions have not been computed yet.'],
-      ['Computed', 'never'],
-    ]);
-  });
-
-  it.each<[ReconciliationState, ReconciliationHealth]>([
-    ['match', reconciliation()],
-    ['mismatch', reconciliation({ state: 'mismatch', assets_mismatched: 1 })],
-    ['incomplete', reconciliation({ state: 'incomplete', sources_not_compared: 1 })],
-    ['not_computed', notComputedReconciliation],
-    ['unavailable', unavailableReconciliation],
-  ])('links to the holdings check on the dashboard when it is %s', async (_state, served) => {
-    renderDetail({ reconciliation: served });
-
-    const found = await answered('Reconciliation');
-    const link = within(found).getByRole('link', {
-      name: 'See the holdings check on the dashboard',
-    });
-
-    expect(link).toHaveAttribute('href', '/#holdings-check');
-  });
-
-  it('shows a check that could not be read as an alert, with no state and no count', async () => {
-    renderDetail({ reconciliation: unavailableReconciliation });
-
-    const found = await answered('Reconciliation');
-
-    expect(within(found).getByRole('alert')).toHaveTextContent(UNAVAILABLE);
-    expect(rows(found)).toEqual([]);
   });
 });

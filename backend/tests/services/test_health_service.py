@@ -4,9 +4,8 @@ The service is built with `build_health_service`, exactly as the dependency buil
 migrated SQLite file under `tmp_path` and a clock this test names. Rows are planted through
 the application's own repositories where one exists. What is pinned:
 
-* **each section says what its last recorded attempt says** -- chains, exchanges, prices and
-  the holdings check -- and the timers are served in a fixed order, `disabled` when never
-  built;
+* **each section says what its last recorded attempt says** -- chains and prices -- and the
+  timers are served in a fixed order, `disabled` when never built;
 * **a section that raises is `unavailable` and the others answer**, with
   `health_section_failed` naming the section and the exception's class, never its message;
   the session is rolled back after a failure, a failure of the rollback is swallowed, and a
@@ -30,18 +29,13 @@ from sqlalchemy import text
 from structlog.testing import capture_logs
 
 from portfolio.domain.chains import ChainKey
-from portfolio.domain.exchanges import AccountSyncStatus, ExchangeKey
 from portfolio.domain.health import (
     PriceHealthState,
-    ReconciliationHealthState,
     SchedulerName,
     SchedulerState,
     SectionState,
     SourceState,
 )
-from portfolio.repositories.exchange_balances import ExchangeBalanceRepository
-from portfolio.repositories.exchange_sync_runs import ExchangeSyncErrorKind
-from portfolio.repositories.exchanges import ExchangeAccountRepository
 from portfolio.repositories.prices import PriceRepository
 from portfolio.repositories.sync_runs import (
     ChainOutcome,
@@ -56,23 +50,19 @@ from portfolio.services.health import (
     SCHEDULER_ORDER,
     ChainHealth,
     ChainsHealth,
-    ExchangeHealth,
-    ExchangesHealth,
     HealthDetail,
     HealthSection,
     HealthService,
     PricesHealth,
-    ReconciliationHealth,
     TimerLike,
     build_health_service,
     utc_now,
 )
 from portfolio.services.prices import STALE_AFTER
-from portfolio.services.reconciliation import ReconciliationService, build_reconciliation_service
 from portfolio.services.scheduler import SchedulerStatus
-from tests.accounting_harness import plant_price
 from tests.address_vectors import BIP173_TESTNET_P2WPKH, KASPA_TESTNET_V0
 from tests.balance_harness import insert_user, insert_wallet
+from tests.price_harness import plant_price
 from tests.sqlite_harness import migrated_sessionmaker
 
 if TYPE_CHECKING:
@@ -194,22 +184,13 @@ async def add_wallet(
         )
 
 
-async def add_account(world: World, key: ExchangeKey) -> int:
-    async with world.factory() as session:
-        account = await ExchangeAccountRepository(session).ensure(
-            user_id=world.user_id, exchange_key=key, created_at=NOW - timedelta(days=30)
-        )
-        await session.commit()
-        return account.id
-
-
 # --------------------------------------------------------------------------------------
 # An empty installation
 # --------------------------------------------------------------------------------------
 
 
 async def test_a_fresh_installation_answers_every_section(world: World) -> None:
-    """No timer built, no run, no account, no price, no snapshot: every section still answers."""
+    """No timer built, no run, no price: every section still answers."""
     served = await detail(world)
 
     assert served.backup.state.value == "pending"
@@ -218,15 +199,7 @@ async def test_a_fresh_installation_answers_every_section(world: World) -> None:
     assert all(timer.last_tick_at is None for timer in served.schedulers)
     assert all(timer.last_tick_succeeded is None for timer in served.schedulers)
     assert served.chains == ChainsHealth(state=SectionState.OK, items=())
-    assert served.exchanges == ExchangesHealth(state=SectionState.OK, items=())
     assert served.prices == PricesHealth(state=PriceHealthState.NEVER, latest_fetched_at=None)
-    assert served.reconciliation == ReconciliationHealth(
-        state=ReconciliationHealthState.NOT_COMPUTED,
-        computed_at=None,
-        assets_compared=0,
-        assets_mismatched=0,
-        sources_not_compared=0,
-    )
 
 
 # --------------------------------------------------------------------------------------
@@ -235,7 +208,7 @@ async def test_a_fresh_installation_answers_every_section(world: World) -> None:
 
 
 async def test_each_timer_is_served_as_it_reports_itself_in_a_fixed_order(world: World) -> None:
-    """Handed in out of order, one `None` and one missing: served in the lifespan's order."""
+    """Handed in out of order: served in the lifespan's order, each as it reports itself."""
     ticked = NOW - timedelta(minutes=3)
     balance = FakeTimer(SchedulerStatus(SchedulerState.OK, ticked, True))
     backup = FakeTimer(SchedulerStatus(SchedulerState.LATE, ticked - timedelta(days=3), False))
@@ -245,7 +218,6 @@ async def test_each_timer_is_served_as_it_reports_itself_in_a_fixed_order(world:
         world,
         timers={
             SchedulerName.BACKUP: backup,
-            SchedulerName.EXCHANGE_SYNC: None,
             SchedulerName.BALANCE_SYNC: balance,
             SchedulerName.PRICE_REFRESH: prices,
         },
@@ -254,28 +226,31 @@ async def test_each_timer_is_served_as_it_reports_itself_in_a_fixed_order(world:
     assert [(timer.name, timer.state) for timer in served.schedulers] == [
         (SchedulerName.BALANCE_SYNC, SchedulerState.OK),
         (SchedulerName.PRICE_REFRESH, SchedulerState.STOPPED),
-        (SchedulerName.EXCHANGE_SYNC, SchedulerState.DISABLED),
         (SchedulerName.BACKUP, SchedulerState.LATE),
     ]
     assert served.schedulers[0].last_tick_at == ticked
     assert served.schedulers[0].last_tick_succeeded is True
-    assert served.schedulers[3].last_tick_at == ticked - timedelta(days=3)
-    assert served.schedulers[3].last_tick_succeeded is False
+    assert served.schedulers[2].last_tick_at == ticked - timedelta(days=3)
+    assert served.schedulers[2].last_tick_succeeded is False
     assert served.schedulers[1].last_tick_at is None
 
 
-async def test_a_timer_missing_from_the_mapping_is_disabled(world: World) -> None:
+async def test_a_timer_that_is_none_or_missing_from_the_mapping_is_disabled(world: World) -> None:
+    """`None` is a timer the settings never built; a name left out is the same."""
     only = FakeTimer(SchedulerStatus(SchedulerState.OK, NOW, True))
 
-    served = await detail(world, timers={SchedulerName.PRICE_REFRESH: only})
+    served = await detail(
+        world, timers={SchedulerName.PRICE_REFRESH: only, SchedulerName.BACKUP: None}
+    )
 
     states = {timer.name: timer.state for timer in served.schedulers}
     assert states == {
         SchedulerName.BALANCE_SYNC: SchedulerState.DISABLED,
         SchedulerName.PRICE_REFRESH: SchedulerState.OK,
-        SchedulerName.EXCHANGE_SYNC: SchedulerState.DISABLED,
         SchedulerName.BACKUP: SchedulerState.DISABLED,
     }
+    assert served.schedulers[2].last_tick_at is None
+    assert served.schedulers[2].last_tick_succeeded is None
 
 
 async def test_the_clock_is_read_once_for_the_timers_and_the_prices(world: World) -> None:
@@ -299,9 +274,7 @@ async def test_the_clock_is_read_once_for_the_timers_and_the_prices(world: World
             timers=dict(timers),
             sync_runs=SyncRunRepository(session),
             wallets=WalletRepository(session),
-            exchanges=ExchangeAccountRepository(session),
             prices=PriceRepository(session),
-            reconciliation=build_reconciliation_service(session, clock=lambda: NOW),
             clock=lambda: next(calls),
         )
         served = await service.detail(world.user_id)
@@ -426,65 +399,6 @@ async def test_the_providers_detail_is_never_part_of_a_chains_health(world: Worl
 
 
 # --------------------------------------------------------------------------------------
-# The exchanges
-# --------------------------------------------------------------------------------------
-
-
-async def test_each_account_carries_its_sync_and_its_balance_reading(world: World) -> None:
-    synced_at = NOW - timedelta(minutes=20)
-    read_at = NOW - timedelta(minutes=19)
-    bingx = await add_account(world, ExchangeKey.BINGX)
-    bitget = await add_account(world, ExchangeKey.BITGET)
-    async with world.factory() as session:
-        await ExchangeAccountRepository(session).mark_synced(bitget, synced_at=synced_at)
-        await ExchangeBalanceRepository(session).replace(bitget, [], read_at)
-        await ExchangeAccountRepository(session).set_status(bingx, AccountSyncStatus.AUTH_FAILED)
-        await session.commit()
-
-    served = await detail(world)
-
-    assert served.exchanges == ExchangesHealth(
-        state=SectionState.OK,
-        items=(
-            ExchangeHealth(
-                exchange_key=ExchangeKey.BINGX,
-                sync_state=AccountSyncStatus.AUTH_FAILED,
-                last_synced_at=None,
-                balances_state=SourceState.NEVER,
-                balances_read_at=None,
-            ),
-            ExchangeHealth(
-                exchange_key=ExchangeKey.BITGET,
-                sync_state=AccountSyncStatus.OK,
-                last_synced_at=synced_at,
-                balances_state=SourceState.OK,
-                balances_read_at=read_at,
-            ),
-        ),
-    )
-
-
-async def test_a_failed_balance_read_is_failing_and_keeps_the_last_good_instant(
-    world: World,
-) -> None:
-    read_at = NOW - timedelta(hours=5)
-    bitget = await add_account(world, ExchangeKey.BITGET)
-    async with world.factory() as session:
-        await ExchangeBalanceRepository(session).replace(bitget, [], read_at)
-        await ExchangeBalanceRepository(session).record_failure(
-            bitget, ExchangeSyncErrorKind.UNAVAILABLE
-        )
-        await ExchangeAccountRepository(session).set_status(bitget, AccountSyncStatus.ERROR)
-        await session.commit()
-
-    (account,) = (await detail(world)).exchanges.items
-
-    assert account.sync_state is AccountSyncStatus.ERROR
-    assert account.balances_state is SourceState.FAILING
-    assert account.balances_read_at == read_at
-
-
-# --------------------------------------------------------------------------------------
 # The prices
 # --------------------------------------------------------------------------------------
 
@@ -525,9 +439,7 @@ async def test_the_newest_price_row_is_the_one_judged(world: World) -> None:
 #: Each section, and the read that builds it.
 SECTION_READS: Final = {
     HealthSection.CHAINS: (SyncRunRepository, "chain_histories"),
-    HealthSection.EXCHANGES: (ExchangeAccountRepository, "list_for_user"),
     HealthSection.PRICES: (PriceRepository, "latest_fetched_at"),
-    HealthSection.RECONCILIATION: (ReconciliationService, "reconciliation"),
 }
 
 
@@ -535,7 +447,6 @@ async def plant_every_section(world: World) -> None:
     """Something in each section, so an answering section is visibly not an empty one."""
     await add_wallet(world, ChainKey.BITCOIN, BIP173_TESTNET_P2WPKH)
     await finished_run(world, finished_at=NOW, chains=[ok("bitcoin")])
-    await add_account(world, ExchangeKey.BITGET)
     async with world.factory() as session:
         await plant_price(session, symbol="BTC", amount=Decimal(1), as_of=NOW)
 
@@ -567,21 +478,14 @@ async def test_a_failing_section_is_unavailable_and_the_others_answer(
     assert EXPLOSION not in repr(entries)
     unavailable = {
         HealthSection.CHAINS: served.chains == ChainsHealth(SectionState.UNAVAILABLE, ()),
-        HealthSection.EXCHANGES: served.exchanges == ExchangesHealth(SectionState.UNAVAILABLE, ()),
         HealthSection.PRICES: served.prices == PricesHealth(PriceHealthState.UNAVAILABLE, None),
-        HealthSection.RECONCILIATION: served.reconciliation
-        == ReconciliationHealth(ReconciliationHealthState.UNAVAILABLE, None, None, None, None),
     }
     assert unavailable == {name: name is section for name in HealthSection}
     # The others answered with what was planted, and the backup and the timers regardless.
     if section is not HealthSection.CHAINS:
         assert [chain.state for chain in served.chains.items] == [SourceState.OK]
-    if section is not HealthSection.EXCHANGES:
-        assert [account.exchange_key for account in served.exchanges.items] == [ExchangeKey.BITGET]
     if section is not HealthSection.PRICES:
         assert served.prices.state is PriceHealthState.FRESH
-    if section is not HealthSection.RECONCILIATION:
-        assert served.reconciliation.state is ReconciliationHealthState.NOT_COMPUTED
     assert served.schedulers[0].state is SchedulerState.OK
     assert served.backup.state.value == "pending"
 
@@ -597,15 +501,11 @@ async def test_every_section_failing_at_once_still_answers_the_backup_and_the_ti
 
     assert [entry["section"] for entry in health_section_failures(entries)] == [
         "chains",
-        "exchanges",
         "prices",
-        "reconciliation",
     ]
     assert served.chains.state is SectionState.UNAVAILABLE
-    assert served.exchanges.state is SectionState.UNAVAILABLE
     assert served.prices.state is PriceHealthState.UNAVAILABLE
-    assert served.reconciliation.state is ReconciliationHealthState.UNAVAILABLE
-    assert len(served.schedulers) == 4
+    assert len(served.schedulers) == 3
     assert served.backup.state.value == "pending"
 
 
@@ -643,9 +543,7 @@ def service_with(session: AsyncSession, world: World, after_failure: Recorder) -
         timers={},
         sync_runs=SyncRunRepository(session),
         wallets=WalletRepository(session),
-        exchanges=ExchangeAccountRepository(session),
         prices=PriceRepository(session),
-        reconciliation=build_reconciliation_service(session, clock=lambda: NOW),
         after_failure=after_failure,
         clock=lambda: NOW,
     )
@@ -679,16 +577,13 @@ async def test_with_no_after_failure_a_failed_section_is_still_unavailable(
             timers={},
             sync_runs=SyncRunRepository(session),
             wallets=WalletRepository(session),
-            exchanges=ExchangeAccountRepository(session),
             prices=PriceRepository(session),
-            reconciliation=build_reconciliation_service(session, clock=lambda: NOW),
             clock=lambda: NOW,
         )
         with capture_logs() as entries:
             served = await service.detail(world.user_id)
 
     assert served.chains.state is SectionState.UNAVAILABLE
-    assert served.exchanges.state is SectionState.OK
     assert served.prices.state is PriceHealthState.FRESH
     assert [entry["section"] for entry in health_section_failures(entries)] == ["chains"]
 
@@ -705,7 +600,6 @@ async def test_a_rollback_that_fails_is_swallowed_and_the_next_section_still_ans
 
     assert after.calls == 1
     assert served.chains.state is SectionState.UNAVAILABLE
-    assert served.exchanges.state is SectionState.OK
     assert served.prices.state is PriceHealthState.FRESH
 
 
@@ -734,7 +628,6 @@ async def test_build_health_service_rolls_back_a_session_a_failed_statement_left
 
     assert rolled_back == [True]
     assert served.chains.state is SectionState.UNAVAILABLE
-    assert served.exchanges.state is SectionState.OK
     assert served.prices.state is PriceHealthState.FRESH
 
 

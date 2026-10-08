@@ -1,6 +1,6 @@
 /**
  * The words for the Health page's sections after Backups: the timers, the balance sync per
- * chain, the exchange accounts, the prices and the reconciliation. See
+ * chain and the prices. See
  * docs/specs/030-observability.md, "Design: frontend".
  *
  * No React anywhere in this module - it is exercised directly by tests, the same split
@@ -15,15 +15,7 @@
  * one sentence ({@link UNAVAILABLE_WORDS}) for every section, and the tables are keyed by
  * `Exclude<State, 'unavailable'>` so the type still forces every other state to have words.
  */
-import type {
-  PriceHealthState,
-  ReconciliationHealth,
-  ReconciliationHealthState,
-  SchedulerName,
-  SchedulerState,
-  SourceState,
-} from '@/api/health';
-import { EXCHANGES, formatCount, type AccountSyncStatus, type ExchangeKey } from '@/lib/exchanges';
+import type { PriceHealthState, SchedulerName, SchedulerState, SourceState } from '@/api/health';
 
 /**
  * What a section says when the backend could not build it, whatever the section. The cause
@@ -42,7 +34,6 @@ export const NO_TICK_WORDS = 'none since the server started';
 export const TIMER_NAMES: Record<SchedulerName, string> = {
   'balance-sync': 'Balance sync',
   'price-refresh': 'Price refresh',
-  'exchange-sync': 'Exchange sync',
   backup: 'Backup',
 };
 
@@ -83,36 +74,6 @@ export const CHAIN_STATE_WORDS: Record<SourceState, string> = {
   never: 'Never read. No finished balance sync has an outcome for this chain yet.',
 };
 
-/** The exchange accounts. */
-export const EXCHANGES_EMPTY_WORDS: EmptyWords = {
-  title: 'No exchange accounts to report yet',
-  description: 'No exchange account is set up on this server.',
-};
-
-/**
- * An account's trade sync, by the account's own status. `auth_failed` says what the sync does
- * next, since it is the one state a scheduled run skips: nothing changes by itself.
- */
-export const EXCHANGE_SYNC_WORDS: Record<AccountSyncStatus, string> = {
-  ok: 'OK. The last trade sync finished.',
-  error: 'Failing. The last trade sync failed.',
-  auth_failed:
-    'Authentication failed. The exchange refused the API key. Scheduled syncs skip this account until a manual sync succeeds.',
-  never_synced: 'Never synced. No trade sync has finished for this account yet.',
-};
-
-/** An account's balance read, which is separate from its trade sync. */
-export const EXCHANGE_BALANCES_WORDS: Record<SourceState, string> = {
-  ok: 'OK. The last balance read succeeded.',
-  failing: 'Failing. The last balance read failed.',
-  never: 'Never read. No balance has been read for this account yet.',
-};
-
-/** An exchange's name. The key is the generated union, so every exchange has one. */
-export function exchangeName(exchangeKey: ExchangeKey): string {
-  return EXCHANGES[exchangeKey].name;
-}
-
 /**
  * The prices' freshness. `stale` is the one that matters: every value that uses a price is
  * worth less than it looks, and the page says so rather than showing the old price alone.
@@ -123,53 +84,3 @@ export const PRICES_STATE_WORDS: Record<Exclude<PriceHealthState, 'unavailable'>
     'Stale. Prices have not been fetched recently, so values that use them may be out of date.',
   never: 'Never fetched. No price has been fetched yet.',
 };
-
-/**
- * The reconciliation's state. This is the holdings check summarised: the quantities it
- * compares, and the assets it names, are on the dashboard and not here.
- */
-export const RECONCILIATION_STATE_WORDS: Record<
-  Exclude<ReconciliationHealthState, 'unavailable'>,
-  string
-> = {
-  match: 'Match. Every asset compared agrees with the balances read.',
-  mismatch: 'Mismatch. At least one asset does not agree with the balances read.',
-  incomplete: 'Incomplete. A source could not be compared, so the check does not cover everything.',
-  not_computed: 'Not computed. The positions have not been computed yet.',
-};
-
-/** The link from the reconciliation section to the holdings check on the dashboard. */
-export const RECONCILIATION_LINK_WORDS = 'See the holdings check on the dashboard';
-
-/** What a count reads as when the section served none. */
-export const UNKNOWN_COUNT_WORDS = 'unknown';
-
-/** A count, grouped, or {@link UNKNOWN_COUNT_WORDS} when the section served none. */
-export function countWords(count: number | null): string {
-  return count === null ? UNKNOWN_COUNT_WORDS : formatCount(count);
-}
-
-/** One count the reconciliation section shows, with its label. */
-export interface ReconciliationCount {
-  readonly label: string;
-  readonly value: string;
-}
-
-/**
- * The three counts of a computed reconciliation, or none when it was not computed: a
- * comparison that never ran has compared nothing, and "0 assets compared" beside "Not
- * computed" would read as a result.
- */
-export function reconciliationCounts(
-  reconciliation: ReconciliationHealth,
-): readonly ReconciliationCount[] {
-  if (reconciliation.state === 'not_computed' || reconciliation.state === 'unavailable') {
-    return [];
-  }
-
-  return [
-    { label: 'Assets compared', value: countWords(reconciliation.assets_compared) },
-    { label: 'Assets that differ', value: countWords(reconciliation.assets_mismatched) },
-    { label: 'Sources not compared', value: countWords(reconciliation.sources_not_compared) },
-  ];
-}

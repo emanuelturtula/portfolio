@@ -286,10 +286,10 @@ refusal after the rename says the root was migrated. Anything of your own that r
 
 ## Scheduled backups
 
-Bitget keeps 90 days of fills. Past that window the SQLite database is the only record of the
-owner's trade history, and of everything entered by hand: the wallets and the manual
-adjustments. So the application copies its own database on a timer, once a day by default,
-while it runs. Each copy is taken with SQLite's backup API, which reads one consistent
+The SQLite database is the only record of everything entered by hand -- the wallets and the
+extended public keys -- and of the balance history read from them, which no chain index
+gives back as it was. So the application copies its own database on a timer, once a day by
+default, while it runs. Each copy is taken with SQLite's backup API, which reads one consistent
 snapshot without stopping the application's writes, and is checked with
 `PRAGMA integrity_check` before it is kept. Rotation keeps every copy on the 7 most recent
 days that have one, and the newest copy of each of the 4 most recent ISO weeks that have one.
@@ -297,9 +297,15 @@ days that have one, and the newest copy of each of the 4 most recent ISO weeks t
 restore procedure. The contract is spec 029.
 
 **A copy holds the owner's complete financial data, as the live database does**: every
-imported trade, every wallet address, every manual adjustment, and the owner's account with
+wallet address and extended public key, the balance history, and the owner's account with
 its password hash. It is not encrypted, as the live database is not. Treat a copy as you
 treat the database, wherever it ends up.
+
+A copy taken before migration `0012_drop_exchanges_accounting` (spec 036) holds more: the
+exchange fills imported from Bitget and BingX, and the manual adjustments. That migration
+deleted them from the live database, and Bitget keeps only 90 days of fills, so for anything
+older those copies, and the deployment backup taken just before that release, are the only
+record left. [Operations](operations.md), section 12, says what to keep.
 
 ### Where they are
 
@@ -315,8 +321,8 @@ volume.
 `prod/backup/` ([One backup, and why](#one-backup-and-why)) is the database as it was just
 before the live deployment replaced it. It exists to undo the deployment that is live, the
 next deployment replaces it, and nothing is copied while no deployment happens. A problem
-noticed a week later, such as a bad import, a wrong manual delete or a corrupted file, has no
-copy from before it there. The scheduled copies are for that. Neither replaces the other.
+noticed a week later, such as a wrong manual delete or a corrupted file, has no copy from
+before it there. The scheduled copies are for that. Neither replaces the other.
 
 `deploy.py` never reads or deletes a scheduled copy. A rollback that restores adds two copies
 to the backups volume: the snapshot it restored and the safety copy `restore-backup` took
@@ -428,7 +434,8 @@ key is stored anywhere.
 
 ### 5. Application secrets
 
-Exchange API credentials never pass through GitHub. Write them directly on the host:
+Application credentials -- the bootstrap password, and the CoinGecko key if you use one --
+never pass through GitHub. Write them directly on the host:
 
 ```bash
 install -d -m 700 ~/portfolio-app ~/portfolio-app/prod

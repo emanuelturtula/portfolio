@@ -1,11 +1,9 @@
 """One sync at a time per kind in this process, by **joining** rather than refusing.
 
-Two instances exist: the balance sync (#10) and the exchange sync (#15). The class is generic
-over the summary its runner returns (PEP 695), and the task name and the log-event prefix are
-constructor arguments. **Their defaults are the balance sync's**, `balance-sync` and
-`balance_sync`, so the task name and every log event that instance has always written are
-unchanged; the exchange instance passes `exchange-sync` and `exchange_sync`. Two instances
-share nothing but the class, so a run of one never joins, blocks or drains the other.
+One instance exists: the balance sync (#10). The class is generic over the summary its runner
+returns (PEP 695), and the task name and the log-event prefix are constructor arguments whose
+**defaults are the balance sync's**, `balance-sync` and `balance_sync`. Two instances would
+share nothing but the class, so a run of one would never join, block or drain the other.
 
 A second caller -- the scheduler's tick arriving while a manual sync is still running, or a
 second click on a refresh button -- does not start a second run and does not get a 409. It
@@ -125,8 +123,8 @@ class SyncCoordinator[SummaryT]:
 
     One instance per kind of sync per application, installed on `app.state` by the lifespan.
     Not safe across processes and it does not need to be: there is one instance of this
-    application, and the thing being protected is a burst of requests at a public index or a
-    venue rather than a database invariant.
+    application, and the thing being protected is a burst of requests at a public index
+    rather than a database invariant.
 
     `task_name` names the run's task, and `log_prefix` begins every event this instance logs
     (`<prefix>_failed`, `<prefix>_cancelled_at_shutdown`, `<prefix>_failed_before_shutdown`).

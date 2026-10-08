@@ -82,12 +82,12 @@ export default tseslint.config(
     extends: [reactHooks.configs.flat.recommended, jsxA11y.flatConfigs.recommended],
   },
   {
-    // The invested table scrolls sideways on a phone, and a scroll container a keyboard
+    // A wide table scrolls sideways on a phone (#118), and a scroll container a keyboard
     // cannot focus cannot be scrolled from one. WCAG 2.1.1 asks for exactly that focus stop,
     // and it needs a name, which is why the container is a labelled `region` rather than a
     // bare `div`. `region` is a landmark, so the rule counts it as non-interactive and would
     // refuse the `tabIndex`; the plugin's own recommended options (`tabpanel` and
-    // expression values) are kept and `region` is added to them. See spec 022, "Layout".
+    // expression values) are kept and `region` is added to them.
     files: ['**/*.tsx'],
     rules: {
       'jsx-a11y/no-noninteractive-tabindex': [
