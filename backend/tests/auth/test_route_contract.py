@@ -108,6 +108,10 @@ def test_the_walk_actually_finds_the_routes(auth_app: FastAPI) -> None:
     # #154's one. Not in `PUBLIC_API_PATHS`, so registering it protected it; named so the
     # sweep visibly covers the endpoint that serves what the owner's wallets are worth.
     assert ("GET", "/api/portfolio/summary") in routes
+    # Spec 037's two. Not in `PUBLIC_API_PATHS`, so registering them protected them; named so
+    # the sweep visibly covers the endpoints that serve what the wallets were worth, day by day.
+    assert ("GET", "/api/portfolio/history") in routes
+    assert ("GET", "/api/wallets/{wallet_id}/value-history") in routes
     # #22's one. Not in `PUBLIC_API_PATHS`, unlike `/api/health` beside it, so registering
     # it protected it; named so the sweep visibly covers the endpoint that says whether the
     # owner's data has a recent copy.

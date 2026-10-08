@@ -112,6 +112,44 @@ class BalanceRepository:
         await self._flush()
         return snapshot
 
+    async def daily_closing(self, wallet_ids: Sequence[int]) -> dict[int, list[BalanceSnapshot]]:
+        """Each wallet's last snapshot of every UTC day it was read, oldest first (spec 037, R3).
+
+        "Last" is the latest `observed_at` within the day, ties broken by the higher `id`:
+        the reading nearest the day's end, whatever order the rows were written in. The day is
+        SQLite's `date()` of `observed_at`, which `UtcDateTime` stores in UTC, so it is a UTC
+        day. One statement with a window function; the ordering is on a timestamp and an id,
+        never on a money column. A wallet that was never read is absent from the result.
+        """
+        if not wallet_ids:
+            return {}
+        ranked = (
+            select(
+                BalanceSnapshot.id.label("snapshot_id"),
+                func.row_number()
+                .over(
+                    partition_by=(
+                        BalanceSnapshot.wallet_id,
+                        func.date(BalanceSnapshot.observed_at),
+                    ),
+                    order_by=(BalanceSnapshot.observed_at.desc(), BalanceSnapshot.id.desc()),
+                )
+                .label("rank"),
+            )
+            .where(BalanceSnapshot.wallet_id.in_(wallet_ids))
+            .subquery()
+        )
+        closing = select(ranked.c.snapshot_id).where(ranked.c.rank == 1)
+        rows = await self._session.scalars(
+            select(BalanceSnapshot)
+            .where(BalanceSnapshot.id.in_(closing))
+            .order_by(BalanceSnapshot.wallet_id, BalanceSnapshot.observed_at, BalanceSnapshot.id)
+        )
+        found: dict[int, list[BalanceSnapshot]] = {}
+        for row in rows:
+            found.setdefault(row.wallet_id, []).append(row)
+        return found
+
     async def latest_for_wallets(self, wallet_ids: Sequence[int]) -> dict[int, BalanceSnapshot]:
         """The newest snapshot for each of these wallets, keyed by `wallet_id`.
 

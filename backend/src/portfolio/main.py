@@ -18,7 +18,7 @@ from portfolio.api.dependencies import auth_service_for, install_auth_runtime
 from portfolio.api.errors import register_exception_handlers
 from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware, is_api_path
 from portfolio.api.request_context import RequestContextMiddleware, documentation_paths
-from portfolio.api.routers import auth, balances, health, portfolio, wallets
+from portfolio.api.routers import auth, balances, health, history, portfolio, wallets
 from portfolio.config import get_settings
 from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import (
@@ -34,12 +34,15 @@ from portfolio.logging import configure_logging
 # line that makes `get_chain_provider` able to answer for any chain at all.
 from portfolio.providers import chains as _registered_chain_providers  # noqa: F401
 from portfolio.providers.http import build_http_client
+from portfolio.providers.prices.kraken import KrakenDailyCloses
 from portfolio.providers.prices.registry import price_sources
 from portfolio.providers.registry import get_chain_provider
+from portfolio.repositories.price_history import PriceHistoryRepository
 from portfolio.repositories.prices import PriceRepository
 from portfolio.repositories.sync_runs import SyncRunRepository
 from portfolio.services.backup import BackupService, build_backup_service
 from portfolio.services.balance_sync import build_balance_sync_service
+from portfolio.services.price_backfill import build_price_backfill_service
 from portfolio.services.price_refresh import build_price_refresh_service
 from portfolio.services.scheduler import IntervalScheduler
 from portfolio.services.sync_coordinator import SyncCoordinator, SyncTrigger
@@ -54,8 +57,12 @@ if TYPE_CHECKING:
     from portfolio.config import Settings
     from portfolio.repositories.sync_runs import SyncRunSummary
     from portfolio.services.password_hasher import PasswordHasher
+    from portfolio.services.price_backfill import BackfillReport
     from portfolio.services.price_refresh import RefreshReport
     from portfolio.services.sync_coordinator import SyncRunner
+
+PRICE_BACKFILL_TASK_NAME: Final = "price-backfill"
+"""The price backfill timer's name in every log line the scheduler writes."""
 
 BACKUP_TASK_NAME: Final = "backup"
 """The backup timer's name in every log line the scheduler writes, and in its task's name."""
@@ -126,8 +133,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.sync_coordinator = coordinator
         app.state.balance_scheduler = balance_scheduler_for(app, settings, coordinator)
         app.state.price_scheduler = price_scheduler_for(app, settings, client)
+        app.state.price_backfill_scheduler = price_backfill_scheduler_for(app, settings, client)
         app.state.backup_scheduler = backup_scheduler_for(settings, app.state.backup_service)
-        # Three timers, three tasks, sharing nothing but a class. That is what makes "a failed
+        # Four timers, four tasks, sharing nothing but a class. That is what makes "a failed
         # price refresh does not stop the balance sync" structural rather than a promise, and
         # the same for a backup that cannot be written.
         schedulers = [
@@ -135,6 +143,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             for timer in (
                 app.state.balance_scheduler,
                 app.state.price_scheduler,
+                app.state.price_backfill_scheduler,
                 app.state.backup_scheduler,
             )
             if timer is not None
@@ -387,6 +396,60 @@ def _report_price_refresh(report: RefreshReport) -> None:
     _logger.info("price_refresh_finished", refreshed=len(report.refreshed))
 
 
+def price_backfill_scheduler_for(
+    app: FastAPI,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> IntervalScheduler | None:
+    """Build the daily price backfill timer (spec 037), or `None` when it is switched off.
+
+    Its own timer rather than a step of the hourly refresh: a daily close appears once a
+    day, and asking for 720 of them every hour would be 24 times the calls for the same rows.
+    The source is built once, here, for the reason `price_scheduler_for` builds its sources
+    here: which vendor answers is the composition root's decision.
+
+    `last_run_at` is the newest `close` row's `recorded_at`, so it counts successes, as the
+    price timer does: a fresh install, or one whose last backfill is a day old, backfills at
+    startup, and a restart within the day does not ask again.
+    """
+    if not settings.price_backfill_enabled:
+        _logger.info("scheduler_disabled", scheduler=PRICE_BACKFILL_TASK_NAME)
+        return None
+    source = KrakenDailyCloses(client)
+
+    async def run(at_startup: bool) -> None:
+        del at_startup  # A backfill is the same work whenever it happens.
+        sessionmaker = app.state.db_sessionmaker
+        async with sessionmaker() as session:
+            service = build_price_backfill_service(session, source=source)
+            report = await service.backfill()
+        _report_price_backfill(report)
+
+    return IntervalScheduler(
+        name=PRICE_BACKFILL_TASK_NAME,
+        interval_minutes=settings.price_backfill_interval_minutes,
+        last_run_at=lambda: latest_price_backfill(app),
+        run=run,
+    )
+
+
+def _report_price_backfill(report: BackfillReport) -> None:
+    """Log what one backfill did: counts and pairs, never a price, for the refresh's reason."""
+    failed = tuple(f"{entry.asset_symbol}/{entry.quote_currency}" for entry in report.failed)
+    days = sum(entry.days for entry in report.backfilled)
+    if failed:
+        _logger.warning("price_backfill_incomplete", days=days, failed=failed)
+        return
+    _logger.info("price_backfill_finished", days=days)
+
+
+async def latest_price_backfill(app: FastAPI) -> datetime | None:
+    """When the newest daily close was stored, over a session of its own."""
+    sessionmaker = app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        return await PriceHistoryRepository(session).latest_close_recorded_at()
+
+
 async def latest_price_refresh(app: FastAPI) -> datetime | None:
     """When the newest price row was written, over a session of its own.
 
@@ -539,6 +602,9 @@ def create_app() -> FastAPI:
     # a wallet route. Only the SPA mount below is order-sensitive.
     app.include_router(balances.router, prefix=API_PREFIX)
     app.include_router(portfolio.router, prefix=API_PREFIX)
+    # Full paths, like the balance router's: `/portfolio/history` beside `/portfolio/summary`,
+    # and `/wallets/{wallet_id}/value-history` beside the wallet routes, none colliding.
+    app.include_router(history.router, prefix=API_PREFIX)
 
     # Mounted last and at the root: it matches every path outside `/api`, so a route
     # registered after it there would be unreachable. It never matches one under `/api`,

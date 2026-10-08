@@ -91,6 +91,13 @@ EXPECTED_NAMES = {
         "ck_derived_addresses_used",
         "fk_derived_addresses_wallet_id_wallets",
     },
+    "price_history": {
+        "pk_price_history",
+        "uq_price_history_asset_day",
+        "ck_price_history_quote_currency",
+        "ck_price_history_basis",
+        "fk_price_history_asset_id_assets",
+    },
 }
 
 

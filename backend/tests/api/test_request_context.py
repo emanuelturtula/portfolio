@@ -674,7 +674,7 @@ async def test_every_operation_is_logged_under_its_prefixed_template(
     """Read from `scope["fastapi"]["effective_route_context"]`, measured on FastAPI 0.141.1.
 
     An upgrade that drops that entry falls back to the template without `/api`, and this
-    fails on all fifteen. A body is sent malformed and a path parameter unparsable, so the
+    fails on all seventeen. A body is sent malformed and a path parameter unparsable, so the
     route is matched and no endpoint with a side effect runs; the bodiless ones that remain
     are reads, the manual balance sync with no wallet, and `logout`, sent last.
     """
@@ -698,8 +698,8 @@ async def test_every_operation_is_logged_under_its_prefixed_template(
             assert response.status_code == seen[f"{method} {template}"][1], response.text
     entries = lines(capsys)
 
-    assert len(documented) == 15
-    assert sum(1 for _id, status in seen.values() if status == 422) == 6
+    assert len(documented) == 17
+    assert sum(1 for _id, status in seen.values() if status == 422) == 7
     for name, (request_id, _status) in seen.items():
         template = name.split(" ", 1)[1]
         assert template.startswith("/api/")

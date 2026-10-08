@@ -97,6 +97,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ADDRESS_BALANCE",
     "ADDRESS_BALANCES",
+    "ASSET_DAILY_CLOSES",
     "ASSET_PRICE",
     "ASSET_PRICES",
     "BLOCK_TIP_HEIGHT",
@@ -262,10 +263,19 @@ prices on a request path -- the failure `backend/.importlinter`'s price contract
 make impossible, observed from the other side.
 """
 
+ASSET_DAILY_CLOSES: Final = "asset_daily_closes"
+"""A read of one pair's daily candles: Kraken's OHLC at a one-day interval (spec 037).
+
+Separate from `ASSET_PRICES` because it is a different call on a different schedule: one per
+pair, once a day, for the backfill. A log showing these more often than daily is a timer
+misbehaving. The label does not carry the pair, for the reason `ASSET_PRICE` does not.
+"""
+
 ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
     {
         ADDRESS_BALANCE,
         ADDRESS_BALANCES,
+        ASSET_DAILY_CLOSES,
         ASSET_PRICE,
         ASSET_PRICES,
         BLOCK_TIP_HEIGHT,
@@ -283,7 +293,8 @@ well it is shaped.
 
 Two labels on #7; four since #8 added Kaspa's batch read and its health report; six since
 #9 added the two price reads. #13 and #104 added three exchange reads, and spec 036 took
-them out again with the exchange providers. The set changes one deliberate line at a time,
+them out again with the exchange providers; seven since spec 037 added the daily closes. The
+set changes one deliberate line at a time,
 which is the whole mechanism.
 
 Same shape as `PUBLIC_API_PATHS`: adding an endpoint protects it, and saying more about

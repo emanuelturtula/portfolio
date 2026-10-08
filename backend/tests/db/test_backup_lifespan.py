@@ -75,6 +75,7 @@ def backups(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.setenv("PORTFOLIO_DATABASE_URL", f"sqlite+aiosqlite:///{database_path.as_posix()}")
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_PRICE_BACKFILL_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_BACKUP_ENABLED", "true")
     monkeypatch.setenv("PORTFOLIO_BACKUP_DIR", str(directory))
     monkeypatch.delenv("PORTFOLIO_BACKUP_INTERVAL_MINUTES", raising=False)
