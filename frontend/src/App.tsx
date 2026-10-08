@@ -1,11 +1,10 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { NavLink, Route, Routes } from 'react-router-dom';
+import { Navigate, NavLink, Route, Routes } from 'react-router-dom';
 
 import { describeApiError } from '@/api/client';
 import { logout, sessionQueryKey, useSession } from '@/api/session';
 import { RequireSession } from '@/components/RequireSession';
 import { DashboardPage } from '@/pages/DashboardPage';
-import { DetailsPage } from '@/pages/DetailsPage';
 import { HealthPage } from '@/pages/HealthPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { NotFoundPage } from '@/pages/NotFoundPage';
@@ -17,8 +16,12 @@ import { WalletsPage } from '@/pages/WalletsPage';
  *
  * `/login` is the only public route. Everything else - including the
  * catch-all - is wrapped in `RequireSession`, per the route table in
- * docs/specs/004-login-page-and-app-shell.md, extended by #11 for `/wallets` and by #154 for
- * `/details`.
+ * docs/specs/004-login-page-and-app-shell.md, extended by #11 for `/wallets`.
+ *
+ * `/details` was a page of its own from #154 until spec 039 folded it into `/wallets`. It now
+ * redirects there, replacing the history entry, so a bookmark still lands on the same figures
+ * and the back button does not bounce through it. The redirect needs no session of its own:
+ * `/wallets` is guarded, so a signed-out visitor goes on to the login page from there.
  */
 export function App() {
   return (
@@ -39,14 +42,7 @@ export function App() {
               </RequireSession>
             }
           />
-          <Route
-            path="/details"
-            element={
-              <RequireSession>
-                <DetailsPage />
-              </RequireSession>
-            }
-          />
+          <Route path="/details" element={<Navigate to="/wallets" replace />} />
           <Route
             path="/wallets"
             element={
@@ -78,9 +74,10 @@ export function App() {
 }
 
 /**
- * Links between the dashboard and the pages beside it. Renders only when a session exists,
- * like {@link AccountControls} - a signed-out visitor never reaches either destination, so
- * showing the links to them would be navigation to nowhere.
+ * The two pages (spec 039): the dashboard, and the wallets behind its figures. Health is not
+ * here; the dashboard's backup notice links to it when there is something to see. Renders only
+ * when a session exists, like {@link AccountControls} - a signed-out visitor never reaches
+ * either destination, so showing the links to them would be navigation to nowhere.
  */
 function MainNav() {
   const session = useSession();
@@ -94,7 +91,6 @@ function MainNav() {
       <NavLink to="/" end>
         Dashboard
       </NavLink>
-      <NavLink to="/details">Details</NavLink>
       <NavLink to="/wallets">Wallets</NavLink>
     </nav>
   );

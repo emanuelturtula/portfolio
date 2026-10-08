@@ -1,6 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
+import { useNavigationType } from 'react-router-dom';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { fakePortfolio, recordRequestUrls } from '@/test/fakePortfolio';
@@ -14,6 +15,13 @@ import {
   TEST_USERNAME,
   unauthorized,
 } from '@/test/server';
+
+const NAVIGATION_TYPE_TEST_ID = 'navigation-type';
+
+/** How the router reached the current location: `PUSH`, `REPLACE` or `POP`. */
+function NavigationTypeProbe() {
+  return <span data-testid={NAVIGATION_TYPE_TEST_ID}>{useNavigationType()}</span>;
+}
 
 /** True while the login form is on screen. */
 function loginFormIsShown(): boolean {
@@ -74,7 +82,7 @@ describe('App', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
-  it('the header links to the dashboard, the details and the wallets', async () => {
+  it('the header links to the two pages, the dashboard and the wallets', async () => {
     const user = userEvent.setup();
     server.use(...fakeSession({ initialUser: TEST_USERNAME }).handlers);
 
@@ -82,20 +90,18 @@ describe('App', () => {
 
     const nav = await screen.findByRole('navigation', { name: 'Main' });
     const dashboard = within(nav).getByRole('link', { name: 'Dashboard' });
-    const details = within(nav).getByRole('link', { name: 'Details' });
     const wallets = within(nav).getByRole('link', { name: 'Wallets' });
     expect(dashboard).toHaveAttribute('href', '/');
-    expect(details).toHaveAttribute('href', '/details');
     expect(wallets).toHaveAttribute('href', '/wallets');
-    // In that order: Details sits beside the dashboard it explains (#154).
+    // Two pages and nothing else (spec 039): Details is folded into Wallets, and Health is
+    // reached from the backup notice.
     expect(
       within(nav)
         .getAllByRole('link')
         .map((link) => link.textContent),
-    ).toEqual(['Dashboard', 'Details', 'Wallets']);
+    ).toEqual(['Dashboard', 'Wallets']);
     // The current page is marked for assistive technology, not by colour alone.
     expect(dashboard).toHaveAttribute('aria-current', 'page');
-    expect(details).not.toHaveAttribute('aria-current');
     expect(wallets).not.toHaveAttribute('aria-current');
 
     await user.click(wallets);
@@ -136,7 +142,29 @@ describe('App', () => {
     await screen.findByLabelText(/username/i);
     expect(screen.queryByRole('navigation', { name: 'Main' })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'Wallets' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: 'Details' })).not.toBeInTheDocument();
+  });
+
+  it('sends /details to /wallets, replacing the entry rather than adding one', async () => {
+    server.use(...fakeSession({ initialUser: TEST_USERNAME }).handlers);
+
+    renderApp(['/details'], <NavigationTypeProbe />);
+
+    expect(await screen.findByRole('form', { name: 'Add a wallet' })).toBeInTheDocument();
+    await settle();
+    expect(currentPath()).toBe('/wallets');
+    // `replace`: the back button goes to wherever the visitor came from, not to a redirect.
+    expect(screen.getByTestId(NAVIGATION_TYPE_TEST_ID)).toHaveTextContent('REPLACE');
+  });
+
+  it('sends a signed-out /details on to the login page, by way of /wallets', async () => {
+    renderApp(['/details']);
+
+    await waitFor(() => {
+      expect(currentPath()).toBe('/login');
+    });
+    await settle();
+    expect(visitedPaths()).toEqual(['/details', '/wallets', '/login']);
+    expect(loginFormIsShown()).toBe(true);
   });
 
   it('/wallets requires a session', async () => {

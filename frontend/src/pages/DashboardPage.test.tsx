@@ -136,14 +136,14 @@ describe('DashboardPage: what the figure is missing', () => {
 
     const note = screen.getByText(/^Incomplete:/).closest('p');
     expect(note).toHaveTextContent(
-      'Incomplete: Bitcoin balance out of date; no price for KAS. See details',
+      'Incomplete: Bitcoin balance out of date; no price for KAS. See wallets',
     );
 
     // The unpriced holding is a row with a dash where a figure would be, not a zero.
     expect(cells(holdingRow('KAS'))).toEqual(['8,000', '—', '—', '—']);
 
-    await user.click(within(note as HTMLElement).getByRole('link', { name: 'See details' }));
-    expect(currentPath()).toBe('/details');
+    await user.click(within(note as HTMLElement).getByRole('link', { name: 'See wallets' }));
+    expect(currentPath()).toBe('/wallets');
   });
 
   it('names a stale price in the line', async () => {

@@ -9,7 +9,7 @@ import { Skeleton } from '@/components/Skeleton';
 import { describeMissing } from '@/lib/portfolio';
 import { BackupNotice } from '@/pages/dashboard/BackupNotice';
 import { Holdings } from '@/pages/dashboard/Holdings';
-import { SummaryCards } from '@/pages/dashboard/SummaryCards';
+import { TotalHero } from '@/pages/dashboard/TotalHero';
 import { PortfolioHistory } from '@/pages/dashboard/ValueHistory';
 
 /** See `ValueSection`: a cut-off sync request very often means the run is still going. */
@@ -22,13 +22,14 @@ function isEmpty(summary: PortfolioSummary): boolean {
 }
 
 /**
- * The dashboard (#154): the total value, its history, then what is held and how its value
- * splits.
+ * The dashboard (spec 039): the total value as the page's hero, then its history, then what is
+ * held and how its value splits.
  *
  * Every figure comes from `GET /api/portfolio/summary`, so the page has one query and one set of
  * states. What the total could not include is named in a single line under it, and the total
- * then carries a "Partial" chip; the readings and sync state behind it are on the Details page,
- * linked from that line and from the header.
+ * then carries a "Partial" chip; the readings and sync state behind it are on the Wallets page,
+ * linked from that line and from the header. The Refresh that re-reads every balance sits in
+ * the hero, beside the figure it refreshes, and says there how it went.
  *
  * The chart of the value over time (spec 037) has a query and four states of its own, inside
  * its card: a history that fails to load never takes the figures above it down with it.
@@ -43,35 +44,17 @@ export function DashboardPage() {
   return (
     <div className="page">
       <BackupNotice />
-      <div className="page-head">
-        <button
-          type="button"
-          className="button-primary"
-          onClick={() => {
-            sync.mutate();
-          }}
-          disabled={sync.isPending}
-        >
-          Refresh
-        </button>
-      </div>
-      {sync.isPending && (
-        <p className="note" role="status">
-          Reading balances… this can take a minute.
-        </p>
-      )}
-      {sync.isError && (
-        <p className="note note-error" role="alert">
-          Refresh did not complete: {describeApiError(sync.error, REFRESH_FAILURE_FALLBACK)} A sync
-          may still be running on the server; this page updates when it finishes.
-        </p>
-      )}
-      <Overview summary={summary} />
+      <Overview summary={summary} sync={sync} />
     </div>
   );
 }
 
-function Overview({ summary }: { readonly summary: ReturnType<typeof usePortfolioSummary> }) {
+interface OverviewProps {
+  readonly summary: ReturnType<typeof usePortfolioSummary>;
+  readonly sync: ReturnType<typeof useSyncBalances>;
+}
+
+function Overview({ summary, sync }: OverviewProps) {
   if (summary.isPending) {
     return <Skeleton label="Loading your portfolio…" />;
   }
@@ -118,13 +101,39 @@ function Overview({ summary }: { readonly summary: ReturnType<typeof usePortfoli
           what was last loaded.
         </p>
       )}
-      <SummaryCards summary={data} />
-      {data.missing.length > 0 && (
-        <p className="note note-warning">
-          <strong>Incomplete:</strong> {data.missing.map(describeMissing).join('; ')}.{' '}
-          <Link to="/details">See details</Link>
-        </p>
-      )}
+      <TotalHero
+        summary={data}
+        action={
+          <button
+            type="button"
+            className="button-primary"
+            onClick={() => {
+              sync.mutate();
+            }}
+            disabled={sync.isPending}
+          >
+            Refresh
+          </button>
+        }
+      >
+        {data.missing.length > 0 && (
+          <p className="note note-warning">
+            <strong>Incomplete:</strong> {data.missing.map(describeMissing).join('; ')}.{' '}
+            <Link to="/wallets">See wallets</Link>
+          </p>
+        )}
+        {sync.isPending && (
+          <p className="note" role="status">
+            Reading balances… this can take a minute.
+          </p>
+        )}
+        {sync.isError && (
+          <p className="note note-error" role="alert">
+            Refresh did not complete: {describeApiError(sync.error, REFRESH_FAILURE_FALLBACK)} A
+            sync may still be running on the server; this page updates when it finishes.
+          </p>
+        )}
+      </TotalHero>
       <PortfolioHistory />
       {data.holdings.length > 0 && <Holdings summary={data} />}
     </div>

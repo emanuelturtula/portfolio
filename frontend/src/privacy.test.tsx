@@ -114,8 +114,8 @@ describe('privacy', () => {
     });
     await settle();
 
-    // Details: every read behind the dashboard's figures, and a wallet's history by its id.
-    await user.click(within(nav).getByRole('link', { name: 'Details' }));
+    // Wallets again: every read behind the dashboard's figures, and a wallet's history by its id.
+    await user.click(within(nav).getByRole('link', { name: 'Wallets' }));
     await screen.findByRole('region', { name: 'Total value' });
     await settle();
 

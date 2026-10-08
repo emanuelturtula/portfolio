@@ -29,12 +29,12 @@ function WalletHistoryChart({ wallet, range }: WalletHistoryChartProps) {
 }
 
 /**
- * The Details page's chart (spec 037): one wallet's value on each day of the chosen range, the
+ * The Wallets page's chart (spec 037): one wallet's value on each day of the chosen range, the
  * wallet picked from the ones the tables above list - the active wallets - and named as they
  * name it. The first is shown to begin with; if the chosen one leaves the list (archived from
  * another tab), the chart goes back to the first rather than to a wallet nobody chose.
  *
- * The list is the current balances' rows, which the Details page has already read, so this
+ * The list is the current balances' rows, which the Wallets page has already read, so this
  * section adds no second way for the wallet list to fail. Nothing to choose from draws nothing.
  */
 export function WalletHistory({ wallets }: { readonly wallets: readonly WalletBalance[] }) {
