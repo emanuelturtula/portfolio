@@ -26,7 +26,8 @@ each provider's section and in the detail beneath it:
 - **unverified**: neither. The row says what would settle it, and who is placed to.
 
 A fact nobody has read or seen is unverified, however plausible. The summary tables are under
-"Vendor facts" for Bitcoin and Kaspa, and under "Price sources" for the four price sources.
+"Vendor facts" for Bitcoin and Kaspa, and under "Price sources" for the four price sources and
+for Kraken's daily candles, which the price backfill reads.
 
 ## The shape
 
@@ -340,11 +341,12 @@ of a residual #6 recorded and #7 closed: the gate used to be a *pattern*, and a 
 address is lower-case, alphanumeric and under 32 characters, so it matched the pattern and
 reached the log. Membership in a frozen set cannot be satisfied by accident.
 
-The set this release ships is exactly six: `address_balance` for a single balance read,
+The set this release ships is exactly seven: `address_balance` for a single balance read,
 `address_balances` for Kaspa's batch read, `block_tip_height` for the tip-height call
-Esplora's `health()` makes, `node_health` for the health document Kaspa's reads, and
-`asset_price` and `asset_prices` for the price reads (#9). The three exchange labels left
-with the exchange providers (spec 036).
+Esplora's `health()` makes, `node_health` for the health document Kaspa's reads,
+`asset_price` and `asset_prices` for the price reads (#9), and `asset_daily_closes` for the
+daily candles the price backfill reads (spec 037). The three exchange labels left with the
+exchange providers (spec 036).
 
 So a new endpoint is two lines, not one: the constant, and its name in `ENDPOINT_LABELS`.
 The same shape as `PUBLIC_API_PATHS` in rule 8 -- the default says nothing, and saying more
@@ -857,14 +859,20 @@ numbers:
   `prices-are-never-fetched-in-a-request` contract forbids any chain from
   `portfolio.api.routers` to `portfolio.providers.prices`, **without**
   `allow_indirect_imports` — so `router -> service -> source` is caught as a chain. The
-  mechanical consequence is that `services/prices.py` (valuation) imports no provider and
-  `services/price_refresh.py` is the only module in `services/` that does. That split is the
-  guarantee; see both module docstrings.
+  mechanical consequence is that `services/prices.py` (valuation) and
+  `services/portfolio_history.py` (the value over time) import no provider, and
+  `services/price_refresh.py` and `services/price_backfill.py` are the only modules in
+  `services/` that import from `providers.prices`. No router imports either of those two:
+  only `main.py` and `cli.py` build them. That split is the guarantee; see the module
+  docstrings.
 
 ### Each source at a glance
 
-The endpoints are read from the four modules under `providers/prices/`. No source is asked for
-history, so none has a retention window to record: each is asked for the current price only.
+The endpoints are read from the four modules under `providers/prices/`. The refresh asks each
+source for the current price only, so none of the four tables below has a retention window to
+record. **History is asked of one vendor, Kraken, and only by the price backfill** (spec 037):
+its endpoint, its window and what was confirmed about it are in the second Kraken table and in
+*Kraken's daily candles, confirmed and measured on 2026-10-08*, below.
 
 #### Kraken, the primary
 
@@ -875,6 +883,27 @@ history, so none has a retention window to record: each is asked for the current
 | the price | a string, `c[0]`; a failure arrives in `error`, on a 200 | **measured** 2026-09-23 |
 | the keys of `result` | the pair codes asked for. An entry under any other key is refused, never matched by position | **measured** 2026-09-23 for these four; the documentation does not promise it |
 | rate limit | public endpoints are limited per IP address, and calling them once a second or less stays within the limit. No monthly quota is stated | **confirmed** 2026-10-04, Kraken's support article on API rate limits |
+
+#### Kraken's daily candles, for the price backfill only
+
+Read by `KrakenDailyCloses` in `providers/prices/kraken.py`, never by the hourly refresh. The
+detail beneath each status is in *Kraken's daily candles, confirmed and measured on
+2026-10-08*, below.
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| endpoint | `GET https://api.kraken.com/0/public/OHLC?pair=<code>&interval=1440`, one pair per call, labelled `asset_daily_closes` | **confirmed** 2026-10-08, Kraken's API reference; **measured** 2026-10-08 |
+| pairs | `XXBTZUSD` and `KASUSD`, the ticker's own codes. USD only: the chart values in USDT | **measured** 2026-10-08 |
+| key | none; a public endpoint | **confirmed** 2026-10-08; **measured** 2026-10-08 |
+| `interval` | `1440` minutes, one candle a day. Documented options 1, 5, 15, 30, 60, 240, 1440, 10080 and 21600; the default is 1 | **confirmed** 2026-10-08 |
+| `since` | not sent. Documented for incremental updates, and it cannot reach further back than the window | **confirmed** 2026-10-08 |
+| a candle | `[time, open, high, low, close, vwap, volume, count]`: `time` and `count` integers, the other six strings. The close is index 4 | **confirmed** 2026-10-08; **measured** 2026-10-08, every price a JSON string |
+| a candle's day | the UTC date of `time`, the candle's open. Every `time` measured is 00:00:00 UTC; any other is refused | **measured** 2026-10-08; the refusal is spec 037, R1 |
+| the last entry | the current day, still trading, always present. Never stored | **confirmed** 2026-10-08, quoted below |
+| `result.last` | documented as the value to pass as `since` for new committed data. Read as the open time of the last committed candle, and every entry after it skipped | **confirmed** 2026-10-08 for the wording; **measured** 2026-10-08 as 2026-10-07 00:00 UTC, the day before. That it equals the last committed candle's time is the measurement, not the documentation |
+| retention window | the 720 most recent entries, and nothing older, whatever `since` says | **confirmed** 2026-10-08, quoted below; **measured** 2026-10-08 |
+| a close, once committed | assumed never to change | **unverified**: nothing documents it either way. The backfill rewrites every day it receives, every day, so a correction inside the window would be picked up |
+| rate limit | per-API-key call counters are documented; a public, unauthenticated call is not addressed | **confirmed** 2026-10-08, Kraken's Spot REST rate-limit guide. **Not measured**. Two calls a day, at the shared one-request-a-second floor |
 
 #### Coinbase, the first fallback for bitcoin
 
@@ -947,6 +976,14 @@ fourth to a third host. It never costs more than one request per pair per source
 These count calls as a source makes them. The transport may spend up to three attempts on a
 call that meets a 429, a 5xx or no answer, the failed Kraken call included.
 
+**The price backfill (spec 037) is a separate budget, to the same host.** One request per pair
+per run, two pairs, one run a day: 2 a day and 2 × 30 = 60 a month, or 2 × 365 = 730 a year.
+Together with the refresh that is 780 Kraken requests in a 30-day month. Like the refresh it
+counts successes when deciding whether to run at startup (the newest `close` row's
+`recorded_at`), so while both pairs fail a crash loop costs two calls per restart; one pair
+answering is enough to stop that. Nothing falls back from Kraken for the backfill: a pair it
+cannot read is reported and retried by the next day's run.
+
 **The issue's premise about the budget turned out not to hold, and the conclusion still
 does.** #9 was written around CoinGecko's Demo quota — roughly 10,000 calls a month, about 13
 an hour — and concluded that no request path may call a price API. Once the primary is
@@ -996,6 +1033,77 @@ be built without one, so there is no object holding a blank credential.
   therefore the time *we observed* the price, and the column, the dataclass and the docstrings
   all say so rather than implying otherwise. A vendor that starts supplying one can populate
   that field more honestly without a migration.
+
+### Kraken's daily candles, confirmed and measured on 2026-10-08
+
+The price backfill reads Kraken's OHLC endpoint at a one-day interval. Everything below was
+read on **2026-10-08** in Kraken's own API reference,
+https://docs.kraken.com/api-reference/market-data/get-ohlc-data — the older URL,
+https://docs.kraken.com/api/docs/rest-api/get-ohlc-data, redirects there, and the Markdown
+form at the same path with `.md` appended carries the OpenAPI schema — and measured against
+the live API the same day.
+
+**Confirmed against the documentation:**
+
+- `GET https://api.kraken.com/0/public/OHLC?pair=<code>&interval=1440`, a public endpoint that
+  takes no key.
+- `interval` is in minutes. The documented options are 1, 5, 15, 30, 60, 240, 1440, 10080 and
+  21600, and the default is 1, so an omitted `interval` would return one-minute candles.
+  `DAILY_INTERVAL_MINUTES` is 1440.
+- `since` is documented as "Return OHLC entries since the given timestamp (intended for
+  incremental updates)". It is **not sent**: the backfill asks for the whole window every run.
+- A tick is documented as `[int <time>, string <open>, string <high>, string <low>,
+  string <close>, string <vwap>, string <volume>, int <count>]`. `CLOSE_INDEX` is 4.
+- `result.last` is documented as "ID to be used as since when polling for new, committed OHLC
+  data".
+- Verbatim: "The last entry in the OHLC array is for the current, not-yet-committed timeframe,
+  and will always be present, regardless of the value of `since`."
+- Verbatim: "Returns up to 720 of the most recent entries (older data cannot be retrieved,
+  regardless of the value of `since`)." **That is the retention window**: a rolling 720 days
+  at this interval.
+
+**Measured against the live API:**
+
+| Pair code | Entries | First | Last entry | `result.last` | Committed closes parsed |
+|---|---|---|---|---|---|
+| `XXBTZUSD` | 721 | 2024-10-18 | 2026-10-08, the day of the measurement, uncommitted | 2026-10-07 00:00 UTC | 720 |
+| `KASUSD` | 689 | 2024-11-19, KAS's first day on Kraken | 2026-10-08, uncommitted | 2026-10-07 00:00 UTC | 688 |
+
+- Every entry's `time` is 00:00:00 UTC, the open of its day, read as Unix seconds — which the
+  dates above bear out. `parse_daily_closes` refuses a candle at any other time (spec 037, R1).
+- Every price is a JSON **string**, so no float boundary is crossed; `require_price` decides,
+  as for every source.
+- The envelope is the ticker's, `{"error": [], "result": {"<code>": [...], "last": <int>}}`,
+  and the two parsers share the envelope check (`_result_of`): an error reported in `error`
+  on a 200 is a refusal, not an empty series. A `result` carrying any key other than the pair
+  asked for and `last` is refused as a correlation bug.
+
+**How the parser tells the moving candle apart, and what it rests on.** An entry whose `time`
+is after `result.last` is skipped. The documentation says the last entry is uncommitted and
+calls `last` an ID for `since`; that `last` equals the open time of the last *committed*
+candle is the measurement, not a promise. If it ever pointed at today's candle instead, today's
+still-moving price would be stored as a `close` — for a day, until the next run rewrites it
+with the committed one, since a `close` is written over anything.
+
+**Rate limits.** Kraken's Spot REST rate-limit guide, read on 2026-10-08
+(https://docs.kraken.com/exchange/guides/rest/ratelimits), documents a call counter **per API
+key** — Starter 15, decaying by 0.33 a second; Intermediate 20, by 0.5; Pro 20, by 1 — and
+does not address public, unauthenticated calls. The support article read on 2026-10-04 (see
+the ticker table) says public endpoints are limited per IP address. **Nothing was measured.**
+The backfill makes two calls a run, once a day, and the shared transport's floor of one
+request per second per host applies to them as to the ticker.
+
+**Assumed, and written down as an assumption:** that a day's close never changes once it is
+committed. Nothing documents it either way. The backfill does not depend on it: it rewrites
+every close it receives, every day, idempotently, so a correction Kraken made inside the
+window would be picked up by the next run.
+
+**What the window means for the history.** A day more than 720 days old can only be in
+`price_history` because the backfill ran while that day was still inside the window. The
+daily timer keeps the history complete from the first deploy onward; days that had already
+left the window by then are a gap. PR 4 of the owner's plan (spec 037, *Scope*) adds Coinbase
+candles for older BTC days. **KAS before 2024-11-19 has no Kraken price at all**, so those days
+show as a gap — never as zero.
 
 ### The Kaspa price endpoint's currency is an assumption, not a fact
 
@@ -1083,6 +1191,18 @@ Kaspa suites are the control for that and were run untouched.
 `PriceSource` is a `typing.Protocol` and is **not** `@runtime_checkable`, for the reason
 `ChainProvider` is not.
 
+**A source of daily closes is a second, smaller protocol**, `DailyCloseSource` in the same
+module, and only the price backfill uses it. `KrakenDailyCloses` is the one implementation.
+
+| Member | Kind | What it must do |
+|---|---|---|
+| `name` | property | As above, written to `price_history.source`. |
+| `pairs` | property | Every pair it can backfill. `BACKFILL_PAIRS` for Kraken: BTC and KAS in USD. |
+| `daily_closes` | async method | Every **committed** daily close for one pair, oldest first, as `DailyClose(day, close)`. The day still trading is never returned; a failure is one of the three `ProviderError`s, never an empty series. |
+
+A pair the backfill cannot read is reported by name and the class of its error, and the other
+pair is still stored: each is asked, written and committed on its own.
+
 Two more rules a new source inherits rather than decides:
 
 - **Prices go through `require_price`**, which is the one boundary deciding what counts as a
@@ -1094,15 +1214,31 @@ Two more rules a new source inherits rather than decides:
 
 ### Prices in the database
 
-One table, `prices`, one row per `(asset_id, quote_currency)` — four today. `amount` is
-`NumericText(12)` and **never `sqlalchemy.Numeric`**, which round-trips through a C double on
-SQLite. Twelve decimal places serve a sub-cent asset and a five-figure one in the same column:
-KAS was quoted near `0.042` and BTC near `86,000` on the day this was measured.
+`prices` holds the price **now**: one row per `(asset_id, quote_currency)` — four today —
+overwritten by every refresh. `amount` is `NumericText(12)` and **never `sqlalchemy.Numeric`**,
+which round-trips through a C double on SQLite. Twelve decimal places serve a sub-cent asset
+and a five-figure one in the same column: KAS was quoted near `0.042` and BTC near `86,000` on
+the day this was measured.
+
+`price_history` (spec 037, migration `0013_price_history`) holds the price **of a day**: one
+row per asset, quote currency and UTC day, `UNIQUE (asset_id, quote_currency, day)`, with the
+same `NumericText(12)` amount, the `source` that supplied it and a `basis`:
+
+| `basis` | What it is | Who writes it |
+|---|---|---|
+| `close` | the day's closing price, from a committed daily candle. Final | the price backfill, over anything already there |
+| `observed` | the latest price the hourly refresh saw that day | the refresh, for every pair it stores, over an earlier `observed` of the same day and **never over a `close`** |
+
+So today's row is `observed` and moves each hour, and the next day's backfill replaces it with
+the close. A day the backfill never reached keeps its `observed` row, which is the nearest
+thing to a close there is.
 
 **Money is never aggregated in SQL.** `SUM`, `ORDER BY` and `<` on a `TEXT` money column all
 apply SQLite's numeric affinity, which is the double the column type exists to avoid — applied
-to every row at once. `repositories/prices.py` has no method that totals, sorts by price or
-compares one; the valuation service loads the rows and sums them in Python.
+to every row at once. `repositories/prices.py` and `repositories/price_history.py` have no
+method that totals, sorts by price or compares one; `price_history` is ordered by `day`, a
+`YYYY-MM-DD` text that orders as dates do, and the services load the rows and sum them in
+Python.
 
 **Staleness is computed at read time from an injected clock and is never stored.**
 `STALE_AFTER` is one hour, matching `PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES`, whose default
@@ -1181,29 +1317,41 @@ A second caller does not start a second run. It attaches to the one in flight an
 run's summary with `joined: true`, so a double-clicked refresh button costs no extra requests
 at a public index.
 
-Inside the application, one thing reaches a **price** source: the price timer, every
-`PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES` minutes -- sixty by default, matching
-`STALE_AFTER` -- plus once at startup when the newest `prices.fetched_at` is older than one
-interval. That one counts successes, because there is no record of a price attempt. So while
-every source fails, a crash loop costs one refresh per restart: one call to Kraken, up to two
-to Coinbase, one to the Kaspa server, and one to CoinGecko when it is keyed. There is no
-coordinator and no join, because there is no endpoint that can ask for one: nothing in a
-request path may reach a price vendor, which is the contract. `portfolio refresh-prices` is the
-same work on demand, in a process of its own with a client of its own.
+Inside the application, two things reach a **price** source, and both are timers:
+
+- **the price refresh**, every `PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES` minutes -- sixty by
+  default, matching `STALE_AFTER` -- plus once at startup when the newest `prices.fetched_at`
+  is older than one interval. That one counts successes, because there is no record of a price
+  attempt. So while every source fails, a crash loop costs one refresh per restart: one call
+  to Kraken, up to two to Coinbase, one to the Kaspa server, and one to CoinGecko when it is
+  keyed. Each refresh also records today's `observed` row in `price_history`;
+- **the price backfill** (spec 037), every `PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES`
+  minutes -- 1440, a day, by default -- plus once at startup when the newest `close` row's
+  `recorded_at` is older than one interval, which also counts successes. It asks Kraken's
+  OHLC endpoint for each of its two pairs and writes every committed close. While both pairs
+  fail, a crash loop costs two calls per restart.
+
+There is no coordinator and no join for either, because there is no endpoint that can ask for
+one: nothing in a request path may reach a price vendor, which is the contract.
+`portfolio refresh-prices` and `portfolio backfill-prices` are the same work on demand, each in
+a process of its own with a client of its own.
 
 **No timer sleeps a whole interval after a restart that found nothing due.** It sleeps what
 is left, rounded up to a whole second, so a deploy resumes the schedule rather than pushing
 it back -- the first version pushed it back, and every deploy left prices stale for most of
 an hour.
 
-**Two timers reach a provider, each its own task with its own switch, and they share no
-state.** A third, the backup timer (#22), reaches none. `services/scheduler.py` is generic
+**Three timers reach a provider, each its own task with its own switch, and they share no
+state.** A fourth, the backup timer (#22), reaches none. `services/scheduler.py` is generic
 over what it ticks -- it takes "when did this last happen" and "do it" -- so the timers are
 instances rather than loops, and none can stop another. They are separate because they
-answer to different vendors:
+answer to different vendors, or to the same vendor on a different schedule:
 
 - chain indexes that ban you for asking too often;
-- market-data APIs where the primary answers every configured pair in one call.
+- market-data APIs where the primary answers every configured pair in one call;
+- one market-data endpoint that answers 720 daily closes for one pair per call, and has a new
+  one to give once a day. Folding it into the hourly refresh would be 24 times the calls for
+  the same rows.
 
 **Nothing in production calls a chain provider's `health()`.** `GET /api/health/detail`
 (#23) reports what each source's last recorded attempt says and asks no vendor, because the
@@ -1287,6 +1435,14 @@ it by returning a stale number that looks exactly like a fresh one, which is the
   than edited.
 - **Kraken is a single point of failure for KAS/EUR**, the only key-free source for that
   pair. Losing it means that pair falls to CoinGecko or to a reason.
+- **Kraken is the only source of daily closes, and it keeps 720 days.** The backfill has no
+  fallback, so a Kraken outage leaves the days it lasts as `observed` rows until a later run
+  reaches them, which is fine for 720 days and a gap after that. Days that had already left the
+  window when the backfill first ran are not recoverable from Kraken at all. PR 4 of the
+  owner's plan (spec 037, *Scope*) adds Coinbase candles for older BTC days; KAS before
+  2024-11-19, its first day on Kraken, has no source yet.
+- **Whether a committed close can change is unverified.** Assumed not; the daily rewrite would
+  pick up a correction inside the window either way.
 - **`parse_rate_limit` has no production exerciser.** Measured on 2026-09-23: neither Kaspa
   endpoint sends a `ratelimit-*` header, and Esplora was never claimed to. It is tested
   against synthesised headers only, which is to say it is code that looks tested and is not

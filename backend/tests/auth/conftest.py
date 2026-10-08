@@ -15,8 +15,9 @@ Three things are arranged here and nowhere else:
   set `session_cookie_secure=False` to get around that would be testing a cookie the
   default deployment never sends. The plain-HTTP deployment has a test of its own in
   `test_login.py`, which builds the environment that mode is defined by.
-* **Both schedules off, and an HTTP client that refuses every request.** Since #10 the
-  lifespan starts two timers that reach vendors at startup and builds the shared client,
+* **Every vendor schedule off, and an HTTP client that refuses every request.** The lifespan
+  starts three timers that reach vendors at startup (since #10, and spec 037's backfill) and
+  builds the shared client,
   which costs 117 ms of SSL setup per startup. `tests/offline_http.py` has the account; the
   short of it is that no suite built here may reach a vendor, and none pays for a client it
   never uses.

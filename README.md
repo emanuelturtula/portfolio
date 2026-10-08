@@ -1,12 +1,11 @@
 # Portfolio
 
 A self-hosted crypto portfolio tracker. It reads balances from Bitcoin and Kaspa wallets
-on-chain and values them in USDT from cached prices, answering two questions:
+on-chain and values them in USDT from cached prices, answering three questions:
 
 - what is the portfolio worth right now,
-- what is each wallet worth.
-
-Charts of that value over time are coming next.
+- what is each wallet worth,
+- what were they worth on each day before.
 
 Single user, single production instance, running on a Raspberry Pi on a home network.
 
@@ -16,7 +15,9 @@ Single user, single production instance, running on a Raspberry Pi on a home net
 |---|---|
 | On-chain balances | Bitcoin addresses, and single-signature `xpub`, `ypub` and `zpub` keys whose addresses are derived locally up to a gap limit of 20. Kaspa addresses. Read from public explorers on a schedule, Bitcoin with a fallback explorer, and every run logged. |
 | Prices | Kraken, Coinbase, the Kaspa API and, with an optional key, CoinGecko, cached and refreshed on a schedule. Prices are kept in EUR and USD, each priced directly rather than converted from the other; the dashboard reads the USD price as USDT. A missing price shows as missing, never as zero. |
+| Price history | One price per asset per UTC day: the day's close from Kraken's daily candles, backfilled once a day for the 720 days Kraken keeps, and the hourly price for today. |
 | Dashboard | The total value and each holding in USDT, from the cached USD price read as USDT one for one, with each holding's share. A wallet that has not been read or whose reading is stale, and a price that is missing or stale, are named beside the figures rather than counted as zero. |
+| Value over time | An area chart of the total value per day on the dashboard, over 30 days, 90 days, a year or everything, and a chart of each wallet's value on the Details page. A day that cannot be valued, because no price or no reading exists for it, is a gap in the line, never a zero. |
 | Operations | Scheduled SQLite backups with daily and weekly retention, and a restore command. A health page that reports every source. One log line per record, a correlation id per request, and credentials and extended keys redacted from every line. |
 
 The pages are Dashboard, Details, Wallets, and Health at `/health`.

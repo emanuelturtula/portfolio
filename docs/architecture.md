@@ -1,8 +1,8 @@
 # Architecture
 
 How the backend is arranged: how money is represented, which layer may import which, how the
-application reaches the outside world, and how a request is authenticated. The first two are
-the decisions that are easiest to undo by accident.
+application reaches the outside world, how the value over time is built, and how a request is
+authenticated. The first two are the decisions that are easiest to undo by accident.
 
 ## Money
 
@@ -243,6 +243,12 @@ and what is not, how to add a provider, and the logging rules a provider follows
 - Failover is across vendors, per pair, in `fetch_prices`. A source that answers part of
   what it was asked leaves the rest to the next one, and a pair nobody answered comes back
   as unanswered rather than as a zero.
+- Daily closes, for the price backfill (spec 037), are a second protocol in the same module:
+  `DailyCloseSource`, with `name`, `pairs` and `daily_closes`, which returns every committed
+  `DailyClose(day, close)` for one pair, oldest first. `KrakenDailyCloses`, in
+  `providers/prices/kraken.py`, is the one implementation: Kraken's OHLC endpoint at a
+  one-day interval, one call per pair, for BTC and KAS in USD. It has no failover and is not
+  in `price_sources`; `portfolio.main` and `portfolio.cli` build it directly.
 
 ### What the two have in common
 
@@ -270,7 +276,8 @@ and what is not, how to add a provider, and the logging rules a provider follows
 `build_http_client()`, in `providers/http.py`, returns the `httpx.AsyncClient` every
 provider is constructed with. `portfolio.main.lifespan` builds one per application,
 publishes it as `app.state.http_client` and closes it at shutdown. `cli.run_price_refresh`
-builds one for the life of one command. No provider builds its own.
+and `cli.run_price_backfill` each build one for the life of one command. No provider builds
+its own.
 
 The rules live in a transport, `RetryingTransport`, rather than in a helper function. A
 helper has to be remembered; a transport cannot be bypassed, so every request through the
@@ -344,29 +351,34 @@ meant, not about how the bytes moved.
 
 ### Who calls a provider, and when
 
-Two timers, one endpoint and one command, and each reaches a provider through a service
+Three timers, one endpoint and two commands, and each reaches a provider through a service
 that is handed its providers rather than building them:
 
 | Caller | Service | Handed | Writes |
 |---|---|---|---|
 | the `balance-sync` timer; `POST /api/balances/sync` | `BalanceSyncService` | `provider_for`, which calls `get_chain_provider` over the shared client | `balance_snapshots`, `derived_addresses`, `sync_runs` |
-| the `price-refresh` timer; `python -m portfolio refresh-prices` | `PriceRefreshService` | the sources `price_sources` built | `prices` |
+| the `price-refresh` timer; `python -m portfolio refresh-prices` | `PriceRefreshService` | the sources `price_sources` built | `prices`, and today's `observed` row in `price_history` |
+| the `price-backfill` timer; `python -m portfolio backfill-prices` | `PriceBackfillService`, in `services/price_backfill.py` | a `KrakenDailyCloses` over the shared client | `price_history`, every committed daily close as `close` |
 
 - **The timers** are `IntervalScheduler` instances, in `services/scheduler.py`, that
-  `portfolio.main.lifespan` starts and stops. By default the balance sync runs every 15
-  minutes and the price refresh every 60. Each is its own task with its own switch,
-  so a failing vendor of one kind stops no other. Each runs at startup only when its last
-  run is older than one interval, so a container that crash-loops does not hit a public API
-  on every restart. The price timer counts only successful refreshes, so while every source
-  fails it refreshes once per restart (`docs/providers.md`). A third timer takes backups and
+  `portfolio.main.lifespan` starts and stops, four in all, served by
+  `GET /api/health/detail` in `SCHEDULER_ORDER`: `balance-sync`, `price-refresh`,
+  `price-backfill`, `backup`. By default the balance sync runs every 15 minutes, the price
+  refresh every 60 and the price backfill every 1440, once a day. Each is its own task with
+  its own switch, so a failing vendor of one kind stops no other. Each runs at startup only
+  when its last run is older than one interval, so a container that crash-loops does not hit
+  a public API on every restart. The two price timers count only successes -- the newest
+  `prices.fetched_at`, and the newest `close` row's `recorded_at` -- so while every source
+  fails each runs once per restart (`docs/providers.md`). The fourth timer takes backups and
   calls no provider.
 - **The endpoint** goes through a `SyncCoordinator`, in `services/sync_coordinator.py`, and
-  so do the balance timer's ticks. The price timer has none: no endpoint can ask for a
-  refresh, so there is nothing to join. A second caller joins the run in flight instead of
-  starting another, so a double-clicked refresh costs a public index nothing.
-- **Nothing in a request path reaches a price source.** The price refresh has no endpoint,
-  and `services/prices.py`, through which the dashboard reads prices, imports no provider.
-  A request renders from the `prices` table.
+  so do the balance timer's ticks. The price timers have none: no endpoint can ask for a
+  refresh or a backfill, so there is nothing to join. A second caller joins the run in flight
+  instead of starting another, so a double-clicked refresh costs a public index nothing.
+- **Nothing in a request path reaches a price source.** Neither price timer has an
+  endpoint, and `services/prices.py` and `services/portfolio_history.py`, through which the
+  dashboard reads prices and the value over time, import no provider. A request renders from
+  the `prices` and `price_history` tables.
 - **`GET /api/health/detail` calls no vendor.** It reports each source's last recorded
   outcome. `ChainProvider.health()` is part of the protocol, and no production code calls
   it.
@@ -394,6 +406,55 @@ that is handed its providers rather than building them:
   coordinator whose runner is a closure `main.py` built over the providers.
   `portfolio.main` is in no layer and not under `portfolio.api`, so that path crosses no
   contract.
+
+## The value over time
+
+Spec 037. The dashboard draws what the wallets were worth on each day, and the Details page
+what one wallet was worth. That needs a past price for every day, which `prices` cannot give:
+it holds one row per pair and is overwritten every hour.
+
+### The table
+
+`price_history` (migration `0013_price_history`): one row per asset, quote currency and UTC
+day, `UNIQUE (asset_id, quote_currency, day)`, with `amount` as `NumericText(12)`, `source`,
+`recorded_at` and a `basis` of `close` or `observed`.
+
+- **`close`** is the day's closing price from a committed daily candle, written by the
+  backfill over anything.
+- **`observed`** is the latest price the hourly refresh saw that day. It replaces an earlier
+  `observed` of the same day and never a `close` (R2).
+
+`day` is a `Date`, stored on SQLite as `YYYY-MM-DD` text, so ordering and range filters on it
+are date order. `amount` carries no `CHECK`: a sign check on a `TEXT` money column would be a
+numeric-affinity comparison.
+
+### The endpoints
+
+| Endpoint | Answers |
+|---|---|
+| `GET /api/portfolio/history?range=30d\|90d\|1y\|all` | `range` and `points`, one `{day, value}` per day of the range, oldest first, ending today (UTC) |
+| `GET /api/wallets/{wallet_id}/value-history?range=…` | `wallet_id`, `asset`, `range` and one `{day, quantity, value}` per day; 404 for a wallet that is not the owner's |
+
+Both are under `/api` and not in `PUBLIC_API_PATHS`, so the middleware requires a session for
+them without either route saying so. Neither asks a vendor. A day nothing can value is
+`null`, never `"0"`, and every amount is a JSON string.
+
+### The modules
+
+| Module | Layer | What it does |
+|---|---|---|
+| `api/routers/history.py` | `api` | parses `range`, calls the service, serializes. Handed a built service, never a session |
+| `services/portfolio_history.py` | `services` | `PortfolioHistoryService`: reads each wallet's closing snapshot per day and the USD rows of `price_history`, and hands them to the domain. Writes nothing; imports no provider |
+| `domain/portfolio_history.py` | `domain` | the arithmetic, pure: `days_of` (R6), `portfolio_days` and `wallet_days` (R3, R4). "Today" is an argument |
+| `services/price_backfill.py` | `services` | `PriceBackfillService`: asks a `DailyCloseSource` for each pair, writes every close, commits per pair |
+| `repositories/price_history.py` | `repositories` | `PriceHistoryRepository`: the read-then-write that keeps R2, the series a range reads, and the newest `close`'s `recorded_at` for the timer |
+| `providers/prices/kraken.py` | `providers` | `KrakenDailyCloses` and `parse_daily_closes`: the OHLC call and the parser that drops the candle still trading |
+
+Two money rules hold here as everywhere. **A day's closing snapshot is chosen in SQL by
+ordering on `observed_at` and `id`, never on a money column** (`BalanceRepository.daily_closing`,
+one window function), and every sum is `Decimal` arithmetic in `domain`, rounded once per
+holding. **A partial sum is never served as a value**: a day with a holding that has no price
+that day is `null`, because a total that quietly omits a holding would be believed.
 
 ## Authentication
 

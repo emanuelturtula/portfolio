@@ -3,9 +3,10 @@
 Day-two tasks on the running instance: creating the account, tuning the password hash to the
 hardware, changing the password, understanding when a session ends, pointing the application
 at the chain index it reads balances from, refreshing the prices that turn a balance into
-a value, backing the database up and restoring it, reading the logs, and reading how every
-source stands. Section 12 records what an operator does about the exchange sync, the
-accounting and the holdings check, which were removed.
+a value, backfilling the daily prices the value-over-time chart is drawn from, backing the
+database up and restoring it, reading the logs, and reading how every source stands. Section
+12 records what an operator does about the exchange sync, the accounting and the holdings
+check, which were removed.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -599,6 +600,86 @@ short the whole time. The pairs that did work are still stored.
 | `unsupported_pair` | this application does not price that pair | nothing was asked; check what you asked for |
 | `no_source_configured` | the pair is supported but no source was available | check the configuration |
 
+### The price history, and the daily backfill
+
+The dashboard's value-over-time chart needs a price for every past day, and `prices` keeps
+only the price now. So prices are also kept per day, in `price_history` (spec 037): one row
+per asset, quote currency and UTC day, marked with how good the number is.
+
+| Basis | What it is | Written by |
+|---|---|---|
+| `close` | the day's closing price, from Kraken's daily candle. Final | the backfill below, over anything |
+| `observed` | the latest price the hourly refresh saw that day | every refresh, for each pair it stored. Never over a `close` |
+
+**The hourly refresh writes today's `observed` row** as it already fetches, so the history
+grows from the first deploy whatever happens to the backfill. Today's point on the chart
+therefore moves during the day; the day after, the backfill replaces it with the close.
+
+**The backfill** asks Kraken's public OHLC endpoint for the daily candles of BTC/USD
+(`XXBTZUSD`) and KAS/USD (`KASUSD`) and stores every committed close as `close`. USD only: the
+chart is in USDT, read as USD one for one. It runs on a timer of its own, `price-backfill`:
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PORTFOLIO_PRICE_BACKFILL_ENABLED` | `true` | Whether the timer runs. **Switches the timer only**: `backfill-prices` below works either way, and the hourly refresh still writes `observed` rows. |
+| `PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES` | `1440` | Minutes between backfills: a day, because a new close appears once a day. Must be at least 1; the container refuses to start otherwise. Shorter rewrites the same rows more often. |
+
+- **At startup it runs only if the newest `close` row was recorded more than one interval
+  ago.** Like the price timer it counts successes, so the first start after this release
+  backfills at once, a restart within the day asks nothing, and while both pairs fail a
+  crash-looping container costs two requests per restart.
+- **It is idempotent.** A close for a day is the same number on every run and its row is
+  replaced, not added, so running it daily for a year, or twice in a row, leaves one row per
+  day.
+- **One pair failing does not stop the other.** Each pair is asked, written and committed on
+  its own. A run that stored both logs `price_backfill_finished` with `days`, the number of
+  closes it wrote; one that did not logs `price_backfill_incomplete` with `days` and `failed`,
+  the pairs it could not read. Neither line carries a price.
+- **Two requests a run, one run a day**, to the host the refresh already uses: 60 a month.
+  `docs/providers.md` has the arithmetic and what was confirmed about the endpoint.
+
+**Kraken serves the 720 most recent days and nothing older**, a rolling window. A day more
+than 720 days old is in the history only if the backfill ran while that day was still inside
+the window; the daily timer keeps it complete from the first deploy on. **KAS has no Kraken
+price before 2024-11-19**, its first day there, so those days are a gap on the chart rather
+than a value. Older BTC days are a gap too until a later release adds a second source of
+candles.
+
+### Backfilling by hand
+
+```bash
+~/portfolio-app/prod/compose.sh exec app python -m portfolio backfill-prices
+```
+
+It backfills every pair once, now, without waiting for the timer, and prints one line per
+pair: how many closes it stored and their first and last day. With what Kraken served when it
+was measured, on 2026-10-08:
+
+```
+BTC/USD 720 day(s): 2024-10-18 to 2026-10-07
+KAS/USD 688 day(s): 2024-11-19 to 2026-10-07
+```
+
+The last day is yesterday: today's candle is still trading and is never stored as a close.
+**No price is printed** — 720 lines a pair would bury the answer, and the table holds them.
+
+**Exit code 1 means a pair failed.** It is printed to stderr with the class name of the
+error, followed by a count, for example:
+
+```
+KAS/USD failed: ProviderUnavailableError
+1 of 2 pair(s) were not backfilled.
+```
+
+The pair that worked is still stored.
+
+| Error printed | What it means | What to do |
+|---|---|---|
+| `ProviderUnavailableError` | Kraken did not answer, or answered with a 5xx | check the network, then Kraken's status; run it again later |
+| `ProviderRateLimitedError` | Kraken answered 429 after the transport's retries | wait, then run it again. The backfill asks twice a day, so a 429 most likely means something else on this IP is spending the limit |
+| `ProviderResponseError` | Kraken answered, and the answer could not be trusted: an error in its envelope, a candle not at a UTC midnight, two candles for one day | report it; nothing for that pair was written |
+| `UnsupportedPair` | the pair has no row in `assets`, so nothing was asked | a defect: the migrations create both assets |
+
 ### The call budget
 
 **One request per refresh**, because Kraken returns all four pairs in a single call —
@@ -672,13 +753,14 @@ The application reads every active wallet's balance on a timer and writes what i
 | `PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES` | `15` | Minutes between runs. Must be at least 1; the container refuses to start otherwise, because zero is a loop with no sleep in it against an index that documents a ban as the consequence. |
 | `PORTFOLIO_BALANCE_SYNC_SHUTDOWN_GRACE_SECONDS` | `10` | How long shutdown waits for a run in flight before cancelling it and recording it `interrupted`. |
 
-**There are two timers and they are deliberately independent.** Balances are on the variables
-above; prices are on `PORTFOLIO_PRICE_REFRESH_ENABLED` and
-`PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES` in section 10. They are separate tasks with
-separate switches, so neither can stop the other, and an operator waiting out a chain outage
-does not also stop valuing the balances they already have. They answer to different vendors:
-chain indexes that ban you for asking too often, against market-data APIs where the primary
-answers every configured pair in a single call.
+**The timers that read from outside are deliberately independent.** Balances are on the
+variables above; prices are on `PORTFOLIO_PRICE_REFRESH_ENABLED` and
+`PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES`, and the daily price backfill on
+`PORTFOLIO_PRICE_BACKFILL_ENABLED` and `PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES`, all in
+section 10. They are separate tasks with separate switches, so none can stop another, and an
+operator waiting out a chain outage does not also stop valuing the balances they already
+have. They answer to different vendors: chain indexes that ban you for asking too often,
+against market-data APIs where the primary answers every configured pair in a single call.
 
 **At most one sync per interval, across restarts.** That is the property, stated exactly,
 and three rules produce it:
@@ -760,6 +842,36 @@ back as `cursor`, until it is `null`. One page holds at most 1000 readings, whic
 days at the default interval, so a year is a walk of several pages. `cursor` and `since`
 together is a 422, and so is a cursor the endpoint did not issue.
 
+### Reading the value over time
+
+The dashboard's chart and the Details page's per-wallet chart read two endpoints (spec 037).
+Both need a session, and **neither asks a vendor anything**: they read the stored snapshots
+and `price_history` (section 10).
+
+```bash
+curl -s -b "$COOKIE" "<origin>/api/portfolio/history?range=90d" | jq .
+curl -s -b "$COOKIE" "<origin>/api/wallets/<id>/value-history?range=30d" | jq .
+```
+
+`range` is `30d`, `90d` (the default), `1y` (365 days) or `all`, from the first day any active
+wallet was read. Every day of the range is a point, oldest first, ending today (UTC), so a gap
+shows as a gap. The portfolio answers `range` and `points`, each point a `day` and a `value`;
+the wallet answers `wallet_id`, `asset`, `range` and `points`, each a `day`, a `quantity` and a
+`value`. Amounts are JSON strings, values in USDT.
+
+- **A day's balance is its closing balance**: each wallet's last reading before the next UTC
+  midnight, carried forward over the days it was not read. A wallet with no reading yet by a
+  day adds nothing to it.
+- **A day nothing can value is `null`, never `"0"`**: no wallet had been read by its end, or a
+  wallet holding something that day has no price for that day. A partial sum would be believed
+  as the portfolio's value; a gap is not.
+- **Today** is the latest readings at today's `observed` price, so it moves during the day.
+- The portfolio counts **active wallets only**, as the summary does. A wallet's own history
+  answers for an archived one too, and is a 404 for an id that is not the owner's.
+
+The chart therefore starts where the knowledge starts: a wallet added today has no history
+before today. Balances before the first snapshot are not rebuilt yet.
+
 ### When a run is interrupted
 
 A `sync_runs` row is written at `running` **before the first request to any chain**, so a
@@ -840,7 +952,8 @@ hand (section 17, *Restoring one*, and *Bringing a copy back onto the host* for 
 What else changed for an operator:
 
 - `GET /api/health/detail` has no `exchanges` or `reconciliation` section, and its timers
-  are three: `balance-sync`, `price-refresh` and `backup` (section 19).
+  were three at that release: `balance-sync`, `price-refresh` and `backup`. Spec 037 has since
+  added `price-backfill`, so they are four (section 19).
 - `GET /api/portfolio/summary` reports wallets only: `total_value`, `holdings` and `missing`,
   where each entry of `missing` is a `wallet_unread`, a `wallet_stale`, an `unpriced` or a
   `stale_price`. There is no invested figure and no profit or loss.
@@ -1356,6 +1469,7 @@ curl -s -b "$COOKIE" <origin>/api/health/detail | jq 'del(.backup)'
   "schedulers": [
     {"name": "balance-sync", "state": "ok", "last_tick_at": "2026-10-03T09:15:02.481210Z", "last_tick_succeeded": true},
     {"name": "price-refresh", "state": "ok", "last_tick_at": "2026-10-03T09:00:01.102934Z", "last_tick_succeeded": true},
+    {"name": "price-backfill", "state": "ok", "last_tick_at": "2026-10-03T00:12:04.630918Z", "last_tick_succeeded": true},
     {"name": "backup", "state": "ok", "last_tick_at": "2026-10-03T03:00:00.912345Z", "last_tick_succeeded": true}
   ],
   "chains": {"state": "ok", "items": [
@@ -1371,7 +1485,16 @@ calls no chain index and no price source -- the page refetches every minute -- s
 healthy until its next attempt says otherwise. No setting is served: no interval, path, URL,
 key, tolerance or age limit. The timers' fields are held in memory, so a restart clears them.
 
-### `schedulers`: the three timers
+### `schedulers`: the four timers
+
+Served in this order, the order the application starts them:
+
+| Timer | What one tick does | Switch, and default interval | Section |
+|---|---|---|---|
+| `balance-sync` | reads every active wallet's balance | `PORTFOLIO_BALANCE_SYNC_ENABLED`, 15 minutes | 11 |
+| `price-refresh` | fetches the current prices, and records today's `observed` price | `PORTFOLIO_PRICE_REFRESH_ENABLED`, 60 minutes | 10 |
+| `price-backfill` | stores every daily close Kraken still serves | `PORTFOLIO_PRICE_BACKFILL_ENABLED`, 1440 minutes | 10 |
+| `backup` | copies the database, checks the copy and rotates | `PORTFOLIO_BACKUP_ENABLED`, 1440 minutes | 17 |
 
 | `state` | Meaning | What to do |
 |---|---|---|
@@ -1389,7 +1512,13 @@ measured from is in the future reads `ok` until the clock catches up.
 
 `last_tick_succeeded` is `false` when the tick raised: the log has `scheduler_tick_failed` with
 `scheduler` and the traceback. A balance sync that recorded a failed chain still finished its
-tick; that failure is the `chains` section's.
+tick; that failure is the `chains` section's. The same holds for the two price timers: a
+refresh or a backfill that could not read a pair logs `price_refresh_incomplete` or
+`price_backfill_incomplete` and still finishes its tick. Nothing in this endpoint reports a
+backfill's pairs, so read those lines (section 10).
+
+For `price-backfill` and `backup`, two intervals are two days at the default: such a timer is
+`late` when its last tick finished more than two days ago, or one has been in flight that long.
 
 ### `chains`: the balance sync per chain
 
@@ -1461,6 +1590,14 @@ A lasting one is a defect to report, with the `error_type` and the `request_id`.
 | Prices flicker to stale for a few seconds on the hour | Accepted: the interval equals the staleness threshold — section 10 |
 | `refresh-prices` exits 1 and names a pair as `every_source_failed` | Every eligible source refused or did not answer. Check connectivity, then the vendors — section 10 |
 | `refresh-prices` exits 1 with `unsupported_pair` | The pair is not one this application prices. Nothing was asked — section 10 |
+| The value chart has gaps: days with no value | No price for those days. Run `backfill-prices` — section 10. A day still missing afterwards is older than Kraken's 720 days and was never inside the window while the backfill ran, or a KAS day before 2024-11-19 |
+| KAS days before 2024-11-19 are always gaps, for KAS wallets and for the total | Kraken has no KAS price before its first day there. Working as intended: a gap, never a zero — section 10 |
+| The value chart starts later than the range asks for | No wallet had a reading before that day, so there is nothing to value. Balances before the first snapshot are not rebuilt yet — section 11 |
+| Today's point on the value chart moves during the day | Working as intended: today is valued at the latest hourly price, and becomes the day's close after the next backfill — sections 10 and 11 |
+| `backfill-prices` exits 1 naming a pair and an error class | That pair was not backfilled; the other one was stored. The class says why — section 10, *Backfilling by hand* |
+| The log has `price_backfill_incomplete` | A pair could not be read from Kraken on that run. `failed` names it; the next day's run tries again, or run `backfill-prices` now to see the error class — section 10 |
+| Container refuses to start naming `PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES` | It is zero or negative. To stop the backfill, set `PORTFOLIO_PRICE_BACKFILL_ENABLED=false` — section 10 |
+| A wallet's value history returns 404 | The id is not one of the owner's wallets. Archived wallets do answer — section 11 |
 | A portfolio total looks too small | Check the incomplete flag: a total omits any holding it could not price, on purpose — section 10 |
 | Prices are all flagged stale | The last refresh is over an hour old. The price is still shown; it is the age that is being reported — section 10 |
 | KAS/EUR is the only pair that ever fails | Kraken is the only key-free source for it. CoinGecko is the only fallback — section 10 |
