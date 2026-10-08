@@ -236,6 +236,9 @@ async def test_entering_the_lifespan_opens_no_socket(
             assert app.state.price_backfill_scheduler is None, (
                 "the price backfill timer ignored its switch"
             )
+            assert app.state.balance_rebuild_scheduler is None, (
+                "the balance rebuild timer ignored its switch"
+            )
     finally:
         get_settings.cache_clear()
 

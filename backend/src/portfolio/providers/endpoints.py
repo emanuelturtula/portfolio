@@ -282,9 +282,44 @@ class EndpointSet:
             ProviderUnavailableError: every endpoint was tried and the last did not answer
                 or failed with a 5xx -- and the same when none is configured.
         """
-        return await self._failover(
+        response, index = await self._failover(
             path, label, start, payload=None, idempotent=False, headers=headers
         )
+        return response.text, index
+
+    async def read_with_headers(
+        self, path: str, label: str, start: int = 0
+    ) -> tuple[str, httpx.Headers, int]:
+        """`read`, also handing back the answering response's headers.
+
+        For a vendor whose **paging cursor travels in a response header**: Kaspa's
+        `full-transactions-page` says where the next page starts in `X-Next-Page-Before`, and
+        its documentation tells a caller to follow that value rather than compute one (spec
+        038). The same failover, the same classification and the same stickiness as `read`,
+        because it is the same loop -- the only difference is what is returned.
+
+        A separate method rather than a flag on `read`, so that `read`'s many callers keep the
+        two-element tuple they unpack and a return type that does not depend on an argument.
+        It takes no request headers: its one caller sends none, and a parameter nothing
+        passes is a branch no test can reach.
+
+        The headers are the **response's**, from the endpoint that answered, as `httpx`
+        holds them: case-insensitive, so `X-Next-Page-Before` and `x-next-page-before` are
+        one key. They are returned and never logged; what a caller does with a value it
+        reads from them -- a cursor that goes back into a URL -- is the caller's to validate.
+
+        Returns:
+            The body, the response headers, and the index of the endpoint that produced
+            them, which the caller carries into its next read as `start`.
+
+        Raises:
+            ProviderRateLimitedError, ProviderResponseError, ProviderUnavailableError:
+                exactly as `read`.
+        """
+        response, index = await self._failover(
+            path, label, start, payload=None, idempotent=False, headers=None
+        )
+        return response.text, response.headers, index
 
     async def post(
         self,
@@ -346,9 +381,10 @@ class EndpointSet:
             ProviderUnavailableError: every endpoint was tried and the last did not answer
                 or failed with a 5xx -- and the same when none is configured.
         """
-        return await self._failover(
+        response, index = await self._failover(
             path, label, start, payload=json, idempotent=idempotent, headers=None
         )
+        return response.text, index
 
     async def _failover(
         self,
@@ -359,12 +395,15 @@ class EndpointSet:
         payload: Mapping[str, object] | None,
         idempotent: bool,
         headers: Mapping[str, str] | None,
-    ) -> tuple[str, int]:
-        """The loop both public methods are: try each endpoint in turn, classify the last.
+    ) -> tuple[httpx.Response, int]:
+        """The loop every public method is: try each endpoint in turn, classify the last.
 
-        One body rather than two, because two copies of this loop is the thing the module
-        exists to prevent -- a rule corrected once in review is a rule that must have
+        One body rather than three, because several copies of this loop is the thing the
+        module exists to prevent -- a rule corrected once in review is a rule that must have
         exactly one implementation.
+
+        It returns the answering **response** rather than its text, so that `read` and `post`
+        take the body and `read_with_headers` the headers as well, without a second loop.
 
         `idempotent` is passed through rather than decided here. `read` says `False` and
         means it: a `GET` is already retryable by `RetryPolicy.retry_methods`, so the
@@ -392,7 +431,7 @@ class EndpointSet:
                 continue
 
             if response.status_code == HTTPStatus.OK:
-                return response.text, index
+                return response, index
             failure = self._failure_for(response.status_code)
 
         raise failure.error(failure.message, status=failure.status) from failure.cause

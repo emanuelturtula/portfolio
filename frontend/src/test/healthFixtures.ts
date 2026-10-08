@@ -32,11 +32,12 @@ export function timer(overrides: Partial<SchedulerStatus> = {}): SchedulerStatus
   };
 }
 
-/** The four timers, in the order the backend serves them, all running and well. */
+/** The five timers, in the order the backend serves them, all running and well. */
 export const okTimers: readonly SchedulerStatus[] = [
   timer({ name: 'balance-sync' }),
   timer({ name: 'price-refresh' }),
   timer({ name: 'price-backfill' }),
+  timer({ name: 'balance-rebuild' }),
   timer({ name: 'backup' }),
 ];
 

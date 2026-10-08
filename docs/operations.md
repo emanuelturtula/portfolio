@@ -616,8 +616,10 @@ grows from the first deploy whatever happens to the backfill. Today's point on t
 therefore moves during the day; the day after, the backfill replaces it with the close.
 
 **The backfill** asks Kraken's public OHLC endpoint for the daily candles of BTC/USD
-(`XXBTZUSD`) and KAS/USD (`KASUSD`) and stores every committed close as `close`. USD only: the
-chart is in USDT, read as USD one for one. It runs on a timer of its own, `price-backfill`:
+(`XXBTZUSD`) and KAS/USD (`KASUSD`) and stores every committed close as `close`. Then, for
+BTC/USD only, it asks **Coinbase Exchange's** public candles for every day before the earliest
+close it has stored, back to 2015-07-20, and stores those as `close` too (spec 038). USD only:
+the chart is in USDT, read as USD one for one. It runs on a timer of its own, `price-backfill`:
 
 | Variable | Default | What it is |
 |---|---|---|
@@ -636,14 +638,16 @@ chart is in USDT, read as USD one for one. It runs on a timer of its own, `price
   closes it wrote; one that did not logs `price_backfill_incomplete` with `days` and `failed`,
   the pairs it could not read. Neither line carries a price.
 - **Two requests a run, one run a day**, to the host the refresh already uses: 60 a month.
-  `docs/providers.md` has the arithmetic and what was confirmed about the endpoint.
+  **Coinbase is asked once**: the first run fills 2015-07-20 to the day before Kraken's first
+  close in twelve requests of up to 300 days each, and from then on the earliest stored close
+  is 2015-07-20, so it is asked nothing. `docs/providers.md` has the arithmetic and what was
+  confirmed about both endpoints.
 
 **Kraken serves the 720 most recent days and nothing older**, a rolling window. A day more
 than 720 days old is in the history only if the backfill ran while that day was still inside
-the window; the daily timer keeps it complete from the first deploy on. **KAS has no Kraken
-price before 2024-11-19**, its first day there, so those days are a gap on the chart rather
-than a value. Older BTC days are a gap too until a later release adds a second source of
-candles.
+the window; the daily timer keeps it complete from the first deploy on. Older BTC days come
+from Coinbase, above. **KAS has no price before 2024-11-19**, its first day on Kraken, and
+Coinbase lists no KAS at all, so those days are a gap on the chart rather than a value.
 
 ### Backfilling by hand
 
@@ -652,33 +656,38 @@ candles.
 ```
 
 It backfills every pair once, now, without waiting for the timer, and prints one line per
-pair: how many closes it stored and their first and last day. With what Kraken served when it
-was measured, on 2026-10-08:
+pair and source: how many closes it stored and their first and last day. A first run, with
+what both vendors served when they were measured on 2026-10-08:
 
 ```
-BTC/USD 720 day(s): 2024-10-18 to 2026-10-07
-KAS/USD 688 day(s): 2024-11-19 to 2026-10-07
+BTC/USD 720 day(s) via kraken: 2024-10-18 to 2026-10-07
+BTC/USD 3378 day(s) via coinbase: 2015-07-20 to 2024-10-17
+KAS/USD 688 day(s) via kraken: 2024-11-19 to 2026-10-07
 ```
+
+Every later run prints no Coinbase line: the range before Kraken's window is already filled.
 
 The last day is yesterday: today's candle is still trading and is never stored as a close.
 **No price is printed** — 720 lines a pair would bury the answer, and the table holds them.
 
-**Exit code 1 means a pair failed.** It is printed to stderr with the class name of the
-error, followed by a count, for example:
+**Exit code 1 means a pair failed.** It is printed to stderr with its source and the class
+name of the error, followed by a count of pairs, for example:
 
 ```
-KAS/USD failed: ProviderUnavailableError
-1 of 2 pair(s) were not backfilled.
+KAS/USD via kraken failed: ProviderUnavailableError
+1 of 2 pair(s) were not fully backfilled.
 ```
 
-The pair that worked is still stored.
+The pair that worked is still stored, and so is the other source's answer for the same pair.
+A failed Coinbase read stores none of its range, so the next run asks for all of it again.
 
 | Error printed | What it means | What to do |
 |---|---|---|
-| `ProviderUnavailableError` | Kraken did not answer, or answered with a 5xx | check the network, then Kraken's status; run it again later |
-| `ProviderRateLimitedError` | Kraken answered 429 after the transport's retries | wait, then run it again. The backfill asks twice a day, so a 429 most likely means something else on this IP is spending the limit |
-| `ProviderResponseError` | Kraken answered, and the answer could not be trusted: an error in its envelope, a candle not at a UTC midnight, two candles for one day | report it; nothing for that pair was written |
+| `ProviderUnavailableError` | the source did not answer, or answered with a 5xx | check the network, then the vendor's status; run it again later |
+| `ProviderRateLimitedError` | the source answered 429 after the transport's retries | wait, then run it again. The backfill asks Kraken twice a day and Coinbase only on its first fill, so a 429 most likely means something else on this IP is spending the limit |
+| `ProviderResponseError` | the source answered, and the answer could not be trusted: an error in Kraken's envelope, a candle not at a UTC midnight, two candles for one day | report it; nothing for that pair from that source was written |
 | `UnsupportedPair` | the pair has no row in `assets`, so nothing was asked | a defect: the migrations create both assets |
+| `NoRecentClose` (`via coinbase`) | no Kraken close is stored for the pair yet, so there is no earliest day to fill back from; nothing was asked | fix Kraken's line first; the next run fills Coinbase's range |
 
 ### The call budget
 
@@ -869,8 +878,77 @@ the wallet answers `wallet_id`, `asset`, `range` and `points`, each a `day`, a `
 - The portfolio counts **active wallets only**, as the summary does. A wallet's own history
   answers for an archived one too, and is a 404 for an id that is not the owner's.
 
-The chart therefore starts where the knowledge starts: a wallet added today has no history
-before today. Balances before the first snapshot are not rebuilt yet.
+Before a wallet's first snapshot the chart uses its **rebuilt** days, below, so a wallet
+added today that has held coins for years charts those years. A wallet the rebuild could not
+prove complete starts at its first snapshot, as before.
+
+### Rebuilding past balances from the chain
+
+A snapshot exists only from the day a wallet was added here. Everything before that is rebuilt
+from the wallet's transactions (spec 038): the chain index lists every confirmed transaction of
+each address, and walking them back from today's balance gives the closing balance of every
+earlier day. The result is stored in `reconstructed_balances`, one row per wallet and UTC day
+from its first transaction to today.
+
+**A rebuild is stored only when it proves itself complete.** For each address, the
+transactions read must number exactly what the index counts, their effects must add up to the
+balance, the count and balance read before the paging must equal those read after it, and the
+walk back must end at exactly 0 before the first transaction without ever going below it.
+Anything less stores nothing and **keeps the rows the wallet had**: a partial history would
+chart a false past, and a gap is not believed. An extended-key wallet sums every address it has
+derived and used; a transfer between two of its own addresses nets to zero on its day.
+
+It runs on a timer of its own, `balance-rebuild`:
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PORTFOLIO_BALANCE_REBUILD_ENABLED` | `true` | Whether the timer runs. **Switches the timer only**: `rebuild-balances` below works either way, and the balance sync is not affected. |
+| `PORTFOLIO_BALANCE_REBUILD_INTERVAL_MINUTES` | `1440` | Minutes between rebuilds: a day. A wallet's past does not change, so more often reads the same transactions again. Must be at least 1; the container refuses to start otherwise. |
+
+- **At startup it runs only if the newest rebuilt row was written more than one interval ago.**
+  It counts successes, as the price backfill does: the first start after this release rebuilds
+  at once, and a restart within the day asks nothing. While no wallet proves complete, every
+  restart asks again.
+- **Wallets are rebuilt one at a time, each committed on its own.** One that fails or proves
+  incomplete does not stop the next. A run that rebuilt every wallet logs
+  `balance_rebuild_finished` with `wallets` and `days`; one that did not logs
+  `balance_rebuild_incomplete` with the same counts plus `incomplete`, `failed` and
+  `unsupported`, each a list of `wallet_id:reason`. Neither line carries an address or an
+  amount.
+- **It costs one request per page of history**, through the shared floor of one request per
+  second per host: an address with N transactions is about N/25 + 3 requests on Bitcoin
+  (the pages, the empty page that ends them, and its figures read before and after) and
+  about N/500 + 5 on Kaspa (the pages, and its count and balance read before and after). `docs/providers.md` has what was confirmed
+  about both endpoints.
+
+A transaction that confirms while an address is being read fails the before-and-after check;
+the next day's run tries again. A pending transaction is not a past balance and is never read.
+
+#### Rebuilding by hand
+
+```bash
+~/portfolio-app/prod/compose.sh exec app python -m portfolio rebuild-balances
+```
+
+It rebuilds every active wallet once, now, and prints one line per wallet:
+
+```
+wallet 1 (bitcoin) rebuilt: 1103 day(s) from 2023-09-28
+wallet 2 (kaspa) incomplete: moved_during_read
+```
+
+**No address and no balance is printed.** **Exit code 1 means a wallet was not rebuilt**, and
+its rows, if it had any, are kept.
+
+| Printed | What it means | What to do |
+|---|---|---|
+| `incomplete: count_mismatch` | fewer or more transactions were read than the index counts | run it again; if it persists, report it with the chain |
+| `incomplete: balance_mismatch` | the transactions read do not add up to the balance | as above |
+| `incomplete: moved_during_read` | the address received or spent while it was read | run it again later |
+| `incomplete: unresolved_input` | a Kaspa input came back without its source address or amount | run it again later |
+| `incomplete: does_not_reach_zero` / `goes_negative` | the walk back did not end at 0, or crossed it | report it: the index served a history that does not add up |
+| `failed: <ErrorClass>` | the index did not answer, or answered something that could not be trusted | the same errors as the balance sync, section 8 and 9 |
+| `unsupported` | the chain's provider cannot read a history | a defect: both chains can |
 
 ### When a run is interrupted
 
@@ -953,7 +1031,7 @@ What else changed for an operator:
 
 - `GET /api/health/detail` has no `exchanges` or `reconciliation` section, and its timers
   were three at that release: `balance-sync`, `price-refresh` and `backup`. Spec 037 has since
-  added `price-backfill`, so they are four (section 19).
+  added `price-backfill` and spec 038 `balance-rebuild`, so they are five (section 19).
 - `GET /api/portfolio/summary` reports wallets only: `total_value`, `holdings` and `missing`,
   where each entry of `missing` is a `wallet_unread`, a `wallet_stale`, an `unpriced` or a
   `stale_price`. There is no invested figure and no profit or loss.
@@ -1470,6 +1548,7 @@ curl -s -b "$COOKIE" <origin>/api/health/detail | jq 'del(.backup)'
     {"name": "balance-sync", "state": "ok", "last_tick_at": "2026-10-03T09:15:02.481210Z", "last_tick_succeeded": true},
     {"name": "price-refresh", "state": "ok", "last_tick_at": "2026-10-03T09:00:01.102934Z", "last_tick_succeeded": true},
     {"name": "price-backfill", "state": "ok", "last_tick_at": "2026-10-03T00:12:04.630918Z", "last_tick_succeeded": true},
+    {"name": "balance-rebuild", "state": "ok", "last_tick_at": "2026-10-03T00:14:41.208310Z", "last_tick_succeeded": true},
     {"name": "backup", "state": "ok", "last_tick_at": "2026-10-03T03:00:00.912345Z", "last_tick_succeeded": true}
   ],
   "chains": {"state": "ok", "items": [
@@ -1485,7 +1564,7 @@ calls no chain index and no price source -- the page refetches every minute -- s
 healthy until its next attempt says otherwise. No setting is served: no interval, path, URL,
 key, tolerance or age limit. The timers' fields are held in memory, so a restart clears them.
 
-### `schedulers`: the four timers
+### `schedulers`: the five timers
 
 Served in this order, the order the application starts them:
 
@@ -1493,7 +1572,8 @@ Served in this order, the order the application starts them:
 |---|---|---|---|
 | `balance-sync` | reads every active wallet's balance | `PORTFOLIO_BALANCE_SYNC_ENABLED`, 15 minutes | 11 |
 | `price-refresh` | fetches the current prices, and records today's `observed` price | `PORTFOLIO_PRICE_REFRESH_ENABLED`, 60 minutes | 10 |
-| `price-backfill` | stores every daily close Kraken still serves | `PORTFOLIO_PRICE_BACKFILL_ENABLED`, 1440 minutes | 10 |
+| `price-backfill` | stores every daily close Kraken still serves, and older BTC closes from Coinbase | `PORTFOLIO_PRICE_BACKFILL_ENABLED`, 1440 minutes | 10 |
+| `balance-rebuild` | rebuilds every active wallet's past daily balances from its transactions | `PORTFOLIO_BALANCE_REBUILD_ENABLED`, 1440 minutes | 11 |
 | `backup` | copies the database, checks the copy and rotates | `PORTFOLIO_BACKUP_ENABLED`, 1440 minutes | 17 |
 
 | `state` | Meaning | What to do |
@@ -1515,9 +1595,10 @@ measured from is in the future reads `ok` until the clock catches up.
 tick; that failure is the `chains` section's. The same holds for the two price timers: a
 refresh or a backfill that could not read a pair logs `price_refresh_incomplete` or
 `price_backfill_incomplete` and still finishes its tick. Nothing in this endpoint reports a
-backfill's pairs, so read those lines (section 10).
+backfill's pairs, so read those lines (section 10). Likewise a rebuild that left a wallet
+incomplete logs `balance_rebuild_incomplete` and still finishes its tick (section 11).
 
-For `price-backfill` and `backup`, two intervals are two days at the default: such a timer is
+For `price-backfill`, `balance-rebuild` and `backup`, two intervals are two days at the default: such a timer is
 `late` when its last tick finished more than two days ago, or one has been in flight that long.
 
 ### `chains`: the balance sync per chain
@@ -1590,13 +1671,17 @@ A lasting one is a defect to report, with the `error_type` and the `request_id`.
 | Prices flicker to stale for a few seconds on the hour | Accepted: the interval equals the staleness threshold — section 10 |
 | `refresh-prices` exits 1 and names a pair as `every_source_failed` | Every eligible source refused or did not answer. Check connectivity, then the vendors — section 10 |
 | `refresh-prices` exits 1 with `unsupported_pair` | The pair is not one this application prices. Nothing was asked — section 10 |
-| The value chart has gaps: days with no value | No price for those days. Run `backfill-prices` — section 10. A day still missing afterwards is older than Kraken's 720 days and was never inside the window while the backfill ran, or a KAS day before 2024-11-19 |
+| The value chart has gaps: days with no value | No price for those days. Run `backfill-prices` — section 10. A day still missing afterwards is a KAS day before 2024-11-19, a BTC day before 2015-07-20, or a KAS day older than Kraken's 720 days that was never inside the window while the backfill ran |
 | KAS days before 2024-11-19 are always gaps, for KAS wallets and for the total | Kraken has no KAS price before its first day there. Working as intended: a gap, never a zero — section 10 |
 | The value chart starts later than the range asks for | No wallet had a reading before that day, so there is nothing to value. Balances before the first snapshot are not rebuilt yet — section 11 |
 | Today's point on the value chart moves during the day | Working as intended: today is valued at the latest hourly price, and becomes the day's close after the next backfill — sections 10 and 11 |
 | `backfill-prices` exits 1 naming a pair and an error class | That pair was not backfilled; the other one was stored. The class says why — section 10, *Backfilling by hand* |
-| The log has `price_backfill_incomplete` | A pair could not be read from Kraken on that run. `failed` names it; the next day's run tries again, or run `backfill-prices` now to see the error class — section 10 |
+| The log has `price_backfill_incomplete` | A pair could not be read on that run. `failed` names it and its source, as `KAS/USD via kraken`; the next day's run tries again, or run `backfill-prices` now to see the error class — section 10 |
 | Container refuses to start naming `PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES` | It is zero or negative. To stop the backfill, set `PORTFOLIO_PRICE_BACKFILL_ENABLED=false` — section 10 |
+| The value chart starts at the day a wallet was added | Its past was not rebuilt. Run `rebuild-balances` and read the wallet's line — section 11, *Rebuilding past balances from the chain* |
+| `rebuild-balances` exits 1 naming a wallet | That wallet was not rebuilt and kept the rows it had; the others were stored. The reason says why — section 11, *Rebuilding by hand* |
+| The log has `balance_rebuild_incomplete` | A wallet's history did not prove complete, or its index failed, on that run. The lists name the wallet and the reason; the next day's run tries again — section 11 |
+| Container refuses to start naming `PORTFOLIO_BALANCE_REBUILD_INTERVAL_MINUTES` | It is zero or negative. To stop the rebuild, set `PORTFOLIO_BALANCE_REBUILD_ENABLED=false` — section 11 |
 | A wallet's value history returns 404 | The id is not one of the owner's wallets. Archived wallets do answer — section 11 |
 | A portfolio total looks too small | Check the incomplete flag: a total omits any holding it could not price, on purpose — section 10 |
 | Prices are all flagged stale | The last refresh is over an hour old. The price is still shown; it is the age that is being reported — section 10 |

@@ -42,8 +42,9 @@ that never saw it.
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
@@ -146,6 +147,126 @@ def health_body(
 
 
 # --------------------------------------------------------------------------------------
+# Accepted transactions, for `address_history` (spec 038)
+# --------------------------------------------------------------------------------------
+#
+# Shaped after the tn10 example measured on 2026-10-08: `block_time` in epoch
+# **milliseconds**, `mass` and `previous_outpoint_index` as strings, and the two resolved
+# input fields that `resolve_previous_outpoints=light` adds.
+
+#: 2026-10-08T00:00:00Z in epoch milliseconds.
+BLOCK_TIME_MS: Final = 1_791_417_600_000
+
+#: The response header that carries the next page's cursor.
+NEXT_PAGE_HEADER: Final = "X-Next-Page-Before"
+
+
+def transaction_id_of(seed: int) -> str:
+    """A transaction id built at run time -- the SHA-256 of the seed -- never a literal."""
+    return hashlib.sha256(f"kaspa-fixture-{seed}".encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class KaspaTx:
+    """One transaction as `full-transactions-page` renders it, described by what it does.
+
+    `outputs` are `(address or None, sompi)`. `inputs` are `(address, sompi)` resolved, or
+    `None` for an input whose `previous_outpoint_address` and `previous_outpoint_amount` are
+    both `null` -- the unresolved case. `coinbase` renders `inputs` as `null`, which the
+    schema allows and a coinbase transaction, spending nothing, is the natural owner of.
+    """
+
+    seed: int
+    block_time: int = BLOCK_TIME_MS
+    outputs: tuple[tuple[str | None, int], ...] = ()
+    inputs: tuple[tuple[str, int] | None, ...] = ()
+    coinbase: bool = False
+    accepted: bool = True
+
+    @property
+    def transaction_id(self) -> str:
+        return transaction_id_of(self.seed)
+
+    def funded(self, address: str) -> int:
+        return sum(amount for owner, amount in self.outputs if owner == address)
+
+    def spent(self, address: str) -> int:
+        return sum(spend[1] for spend in self.inputs if spend is not None and spend[0] == address)
+
+    def document(self) -> dict[str, Any]:
+        """The row, as a plain mutable document a test can break one field of."""
+        inputs: list[dict[str, Any]] | None = None
+        if not self.coinbase:
+            inputs = [
+                {
+                    "transaction_id": self.transaction_id,
+                    "index": index,
+                    "previous_outpoint_hash": transaction_id_of(self.seed * 1_000 + index + 1),
+                    "previous_outpoint_index": "0",
+                    "previous_outpoint_address": spend[0] if spend is not None else None,
+                    "previous_outpoint_amount": spend[1] if spend is not None else None,
+                    "signature_script": "41a1b2c3",
+                    "sig_op_count": "1",
+                }
+                for index, spend in enumerate(self.inputs)
+            ]
+        return {
+            "subnetwork_id": "0" * 40,
+            "transaction_id": self.transaction_id,
+            "hash": transaction_id_of(self.seed + 5_555_555),
+            "mass": "2036",
+            "payload": None,
+            "block_hash": [transaction_id_of(self.seed + 7_777_777)],
+            "block_time": self.block_time,
+            "version": 0,
+            "is_accepted": self.accepted,
+            "accepting_block_hash": transaction_id_of(self.seed + 9_999_999),
+            "accepting_block_blue_score": BLUE_SCORE + self.seed,
+            "accepting_block_time": self.block_time + 115,
+            "inputs": inputs,
+            "outputs": [
+                {
+                    "transaction_id": self.transaction_id,
+                    "index": index,
+                    "amount": amount,
+                    "script_public_key": "20a1b2c3ac",
+                    "script_public_key_address": owner,
+                    "script_public_key_type": "pubkey",
+                }
+                for index, (owner, amount) in enumerate(self.outputs)
+            ],
+        }
+
+
+def history_reply(address: str, transactions: Sequence[KaspaTx], **overrides: Any) -> Reply:
+    """An instance serving `transactions` (newest first) with a count and balance that agree.
+
+    The count is the distinct **accepted** ids and the balance their net, so a test that
+    changes nothing gets a history that proves itself, and each incomplete arm is one
+    override away: `tx_total=`, `balance=`, or a different reply after the paging.
+    """
+    accepted = {
+        transaction.transaction_id: transaction
+        for transaction in transactions
+        if transaction.accepted
+    }
+    reply = Reply(
+        balance=sum(
+            transaction.funded(address) - transaction.spent(address)
+            for transaction in accepted.values()
+        ),
+        tx_total=len(accepted),
+        rows=tuple(transaction.document() for transaction in transactions),
+    )
+    return replace(reply, **overrides)
+
+
+def is_history_request(request: httpx.Request) -> bool:
+    """Whether a request read a page of transactions."""
+    return request.url.path.endswith("/full-transactions-page")
+
+
+# --------------------------------------------------------------------------------------
 # The script
 # --------------------------------------------------------------------------------------
 
@@ -178,6 +299,14 @@ class Reply:
     nodes: Sequence[tuple[bool, bool]] = ((True, True),)
     """`(isSynced, isUtxoIndexed)` per backing node, for the health body."""
     database_synced: bool = True
+    tx_total: int = 0
+    """What `/transactions-count` answers as `total`."""
+    rows: Sequence[Mapping[str, Any]] = ()
+    """What `full-transactions-page` serves, newest first, as documents."""
+    page_size: int | None = None
+    """Rows per page before the boundary is completed; `None` takes the request's `limit`."""
+    ignore_cursor: bool = False
+    """Serve page one whatever `before` says: a vendor that never ends the history."""
 
     def render(self, request: httpx.Request) -> str:
         """The body this reply sends for `request`.
@@ -194,9 +323,54 @@ class Reply:
         if request.url.path.endswith("/balance"):
             address = requested_address(request)
             return balance_body(address, self._balance_of(address))
+        if request.url.path.endswith("/transactions-count"):
+            return json.dumps({"total": self.tx_total})
+        if is_history_request(request):
+            page, _cursor = self.history_page(request)
+            return json.dumps(list(page))
         if request.method == "POST":
             return batch_body(self._batch_entries(posted_addresses(request)))
         return health_body(nodes=self.nodes, database_synced=self.database_synced)
+
+    def response_headers(self, request: httpx.Request) -> dict[str, str]:
+        """The headers this reply sends: the paging cursor when there is more, then `headers`.
+
+        `headers` is applied last, so a test can replace or add a cursor the paging would
+        not have produced -- a malformed one, or one that never runs out.
+        """
+        computed: dict[str, str] = {}
+        if self.body is None and is_history_request(request):
+            _page, cursor = self.history_page(request)
+            if cursor is not None:
+                computed[NEXT_PAGE_HEADER] = str(cursor)
+        return {**computed, **self.headers}
+
+    def history_page(
+        self, request: httpx.Request
+    ) -> tuple[Sequence[Mapping[str, Any]], int | None]:
+        """One page and the cursor to the next, as the vendor was measured to page.
+
+        Rows strictly before `before` (all of them on page one), `limit` of them -- or
+        `page_size` -- and then **the boundary millisecond completed**: rows sharing the
+        last row's `block_time` join the page, which is how a page of 500 came back with
+        501. The cursor is the smallest `block_time` on the page, present only when rows
+        remain after it.
+        """
+        before = request.url.params.get("before")
+        remaining = [
+            row
+            for row in self.rows
+            if before is None or self.ignore_cursor or int(row["block_time"]) < int(before)
+        ]
+        size = self.page_size if self.page_size is not None else int(request.url.params["limit"])
+        page = remaining[:size]
+        while page and len(page) < len(remaining):
+            if remaining[len(page)]["block_time"] != page[-1]["block_time"]:
+                break
+            page.append(remaining[len(page)])
+        if len(page) < len(remaining):
+            return page, min(int(row["block_time"]) for row in page)
+        return page, None
 
     def _balance_of(self, address: str) -> int:
         return self.balances.get(address, self.balance)
@@ -254,7 +428,7 @@ class ScriptedInstance:
             raise reply.error
         return httpx.Response(
             reply.status,
-            headers=dict(reply.headers),
+            headers=reply.response_headers(request),
             content=reply.render(request),
         )
 
@@ -329,6 +503,10 @@ class KaspaFake:
             for request in self._instances[host].requests
             if request.url.path.endswith("/balance")
         ]
+
+    def history_requests(self) -> list[httpx.Request]:
+        """Every request that read a page of transactions, across both hosts, in order."""
+        return [request for request in self.requests if is_history_request(request)]
 
 
 # --------------------------------------------------------------------------------------

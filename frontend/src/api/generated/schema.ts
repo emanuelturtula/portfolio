@@ -751,10 +751,10 @@ export interface components {
         QuoteCurrency: "EUR" | "USD";
         /**
          * SchedulerName
-         * @description The four timers, by the names their log lines and task names already carry.
+         * @description The five timers, by the names their log lines and task names already carry.
          * @enum {string}
          */
-        SchedulerName: "balance-sync" | "price-refresh" | "price-backfill" | "backup";
+        SchedulerName: "balance-sync" | "price-refresh" | "price-backfill" | "balance-rebuild" | "backup";
         /**
          * SchedulerState
          * @description How one timer stands. The member is its wire form.
@@ -769,7 +769,7 @@ export interface components {
         SchedulerState: "ok" | "late" | "stopped" | "disabled";
         /**
          * SchedulerStatusResponse
-         * @description One of the four timers.
+         * @description One of the five timers.
          *
          *     `last_tick_at` is when its last tick finished and `last_tick_succeeded` whether that tick
          *     returned without raising; both `null` before a tick has finished, and always for a

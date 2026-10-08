@@ -275,10 +275,11 @@ reason `ADDRESS_BALANCE` carries no address.
 """
 
 ASSET_DAILY_CLOSES: Final = "asset_daily_closes"
-"""A read of one pair's daily candles: Kraken's OHLC at a one-day interval (spec 037).
+"""A read of one pair's daily candles: Kraken's OHLC at a one-day interval (spec 037), and
+Coinbase Exchange's candles for the days before Kraken's window (spec 038).
 
 Separate from `ASSET_PRICES` because it is a different call on a different schedule: one per
-pair, once a day, for the backfill. A log showing these more often than daily is a timer
+pair -- or per 300-day window, for Coinbase's first fill -- once a day, for the backfill. A log showing these more often than daily is a timer
 misbehaving. The label does not carry the pair, for the reason `ASSET_PRICE` does not.
 """
 

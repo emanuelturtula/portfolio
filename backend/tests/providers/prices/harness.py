@@ -34,6 +34,7 @@ CoinGecko source is driven with a `SecretStr` wrapping an obviously synthetic se
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Final
 
 import httpx
@@ -41,7 +42,7 @@ from pydantic import SecretStr
 
 from portfolio.config import Settings
 from portfolio.providers.http import HostRateLimiter, RetryPolicy, build_http_client
-from portfolio.providers.prices.coinbase import COINBASE_API_URL
+from portfolio.providers.prices.coinbase import COINBASE_API_URL, COINBASE_EXCHANGE_API_URL
 from portfolio.providers.prices.coingecko import COINGECKO_DEMO_API_URL
 from portfolio.providers.prices.kraken import KRAKEN_API_URL
 
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
 
 KRAKEN_HOST: Final = httpx.URL(KRAKEN_API_URL).host
 COINBASE_HOST: Final = httpx.URL(COINBASE_API_URL).host
+COINBASE_EXCHANGE_HOST: Final = httpx.URL(COINBASE_EXCHANGE_API_URL).host
 COINGECKO_HOST: Final = httpx.URL(COINGECKO_DEMO_API_URL).host
 
 #: The Kaspa node's two configured instances. Fictional, because this source reads them out
@@ -151,6 +153,45 @@ def coinbase_body(*, base: str, currency: str, amount: str) -> str:
     the test for the echoed-pair check a real test rather than an accident of the fixture.
     """
     return f'{{"data":{{"amount":"{amount}","base":"{base}","currency":"{currency}"}}}}'
+
+
+def coinbase_candle(opened: str, close: str) -> str:
+    """One Coinbase Exchange candle, `[time, low, high, open, close, volume]`, as JSON text.
+
+    `opened` and `close` are literal JSON tokens -- `1696118400`, `27995.46`, `"1.5"`, `true`
+    -- so a refusal is written as the token that causes it. Every other price is a JSON
+    number distinct from any close a test uses, so a parser reading the wrong index returns
+    something a literal disagrees with.
+    """
+    return f"[{opened},1.25,3.75,2.5,{close},8747.06888783]"
+
+
+def coinbase_candles_body(candles: Sequence[str]) -> str:
+    """A candles response: a JSON array of candles, in the order given."""
+    return f"[{','.join(candles)}]"
+
+
+def coinbase_candles_echo(closes: Mapping[int, str]) -> Callable[[httpx.Request], str]:
+    """A Coinbase Exchange answering the window the request asked for, newest first.
+
+    `closes` maps a candle's open time (epoch seconds) to its close as a literal JSON token.
+    Only the candles from `start` to `end` inclusive come back, as the vendor was measured
+    to answer, so a source that asked for the wrong window gets the wrong days rather than
+    every day regardless.
+    """
+
+    def render(request: httpx.Request) -> str:
+        first = _epoch_of(request.url.params["start"])
+        last = _epoch_of(request.url.params["end"])
+        chosen = sorted((opened for opened in closes if first <= opened <= last), reverse=True)
+        return coinbase_candles_body([coinbase_candle(str(t), closes[t]) for t in chosen])
+
+    return render
+
+
+def _epoch_of(iso_midnight: str) -> int:
+    """`2015-07-20T00:00:00Z` as epoch seconds, computed apart from the source under test."""
+    return int(datetime.fromisoformat(iso_midnight).timestamp())
 
 
 def coingecko_body(entries: Mapping[str, Mapping[str, str]]) -> str:
@@ -267,15 +308,20 @@ class PriceFake:
         coingecko: ScriptedVendor | None = None,
         kaspa: ScriptedVendor | None = None,
         kaspa_fallback: ScriptedVendor | None = None,
+        coinbase_exchange: ScriptedVendor | None = None,
     ) -> None:
         self.kraken = kraken if kraken is not None else ScriptedVendor()
         self.coinbase = coinbase if coinbase is not None else ScriptedVendor()
+        self.coinbase_exchange = (
+            coinbase_exchange if coinbase_exchange is not None else ScriptedVendor()
+        )
         self.coingecko = coingecko if coingecko is not None else ScriptedVendor()
         self.kaspa = kaspa if kaspa is not None else ScriptedVendor()
         self.kaspa_fallback = kaspa_fallback if kaspa_fallback is not None else ScriptedVendor()
         self._vendors: dict[str, ScriptedVendor] = {
             KRAKEN_HOST: self.kraken,
             COINBASE_HOST: self.coinbase,
+            COINBASE_EXCHANGE_HOST: self.coinbase_exchange,
             COINGECKO_HOST: self.coingecko,
             KASPA_PRIMARY_HOST: self.kaspa,
             KASPA_FALLBACK_HOST: self.kaspa_fallback,

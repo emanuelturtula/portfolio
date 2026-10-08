@@ -1,4 +1,7 @@
-"""Operator commands: `create-user`, `hash-benchmark`, `refresh-prices`, and the backups.
+"""Operator commands: `create-user`, `hash-benchmark`, the prices, the balances and the backups.
+
+The price commands are `refresh-prices` and `backfill-prices`; `rebuild-balances` rebuilds
+every active wallet's past daily balances from its transactions (spec 038).
 
 The backup commands are `backup`, `list-backups` and `restore-backup NAME` (#22, spec 029):
 take a copy of the database now, list the copies there are, and put one back.
@@ -43,11 +46,18 @@ from portfolio.domain.passwords import (
     PasswordPolicyError,
 )
 from portfolio.logging import configure_logging
+
+# Imported for its side effect, as `portfolio.main` does: each chain module registers its
+# provider class by decorator, so `get_chain_provider` can answer only once it has run.
+from portfolio.providers import chains as _registered_chain_providers  # noqa: F401
 from portfolio.providers.http import build_http_client
+from portfolio.providers.prices.coinbase import CoinbaseDailyCloses
 from portfolio.providers.prices.kraken import KrakenDailyCloses
 from portfolio.providers.prices.registry import price_sources
+from portfolio.providers.registry import get_chain_provider
 from portfolio.services.auth import AuthError, LoginThrottle, build_auth_service
 from portfolio.services.backup import BackupError, RestoreRefusedError, build_backup_service
+from portfolio.services.balance_rebuild import RebuildOutcome, build_balance_rebuild_service
 from portfolio.services.password_hasher import PasswordHasher
 from portfolio.services.price_backfill import build_price_backfill_service
 from portfolio.services.price_refresh import (
@@ -59,6 +69,8 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from portfolio.config import Settings
+    from portfolio.providers.base import ChainProvider
+    from portfolio.services.balance_rebuild import RebuildReport
     from portfolio.services.price_backfill import BackfillReport
     from portfolio.services.price_refresh import RefreshReport
 
@@ -349,17 +361,22 @@ def refresh_prices(args: argparse.Namespace) -> int:
 
 
 async def run_price_backfill(settings: Settings) -> BackfillReport:
-    """Build the client, the source and the service, run one backfill, and close it all.
+    """Build the client, the sources and the service, run one backfill, and close it all.
 
-    The same lifetimes as `run_price_refresh`, for its reasons: the client and the engine are
-    this command's, and both are closed in a `finally`.
+    Kraken is the recent source and Coinbase Exchange the older one (spec 038), as the timer
+    builds them. The same lifetimes as `run_price_refresh`, for its reasons: the client and
+    the engine are this command's, and both are closed in a `finally`.
     """
     engine = create_database_engine(settings.database_url)
     client = build_http_client()
     try:
         factory = create_session_factory(engine)
         async with factory() as session:
-            service = build_price_backfill_service(session, source=KrakenDailyCloses(client))
+            service = build_price_backfill_service(
+                session,
+                source=KrakenDailyCloses(client),
+                older=CoinbaseDailyCloses(client),
+            )
             return await service.backfill()
     finally:
         await client.aclose()
@@ -367,12 +384,14 @@ async def run_price_backfill(settings: Settings) -> BackfillReport:
 
 
 def backfill_prices(args: argparse.Namespace) -> int:
-    """`backfill-prices`: store every daily close the source still serves, now (spec 037).
+    """`backfill-prices`: store every daily close the sources serve, now (specs 037 and 038).
 
-    Prints, per pair, how many days were stored and their first and last day; a pair the
-    source could not answer is printed with the class name of why. Any failure is exit code
-    1, for the reason `refresh-prices` gives. No price is printed: 720 lines per pair would
-    bury the answer, and the table is where they are.
+    Prints, per pair and source, how many days were stored and their first and last day; a
+    pair a source could not answer is printed with the class name of why. A pair can have a
+    line from Kraken and one from Coinbase; once BTC/USD is filled back to its first day,
+    Coinbase is asked nothing and has no line. Any failure is exit code 1, for the reason
+    `refresh-prices` gives, and the closing count is of pairs, not of lines. No price is
+    printed: 720 lines per pair would bury the answer, and the table is where they are.
     """
     del args  # The command takes no options; every pair the source serves is backfilled.
     report = asyncio.run(run_price_backfill(get_settings()))
@@ -382,14 +401,19 @@ def backfill_prices(args: argparse.Namespace) -> int:
             if entry.first_day is not None and entry.last_day is not None
             else "no committed close"
         )
-        emit(f"{entry.asset_symbol}/{entry.quote_currency} {entry.days} day(s): {span}")
-    for failed in report.failed:
-        emit_error(f"{failed.asset_symbol}/{failed.quote_currency} failed: {failed.error}")
-    if report.failed:
-        emit_error(
-            f"{len(report.failed)} of {len(report.backfilled) + len(report.failed)} "
-            "pair(s) were not backfilled."
+        emit(
+            f"{entry.asset_symbol}/{entry.quote_currency} {entry.days} day(s) "
+            f"via {entry.source}: {span}"
         )
+    for failed in report.failed:
+        emit_error(
+            f"{failed.asset_symbol}/{failed.quote_currency} via {failed.source} "
+            f"failed: {failed.error}"
+        )
+    if report.failed:
+        short = {(line.asset_symbol, line.quote_currency) for line in report.failed}
+        every = short | {(line.asset_symbol, line.quote_currency) for line in report.backfilled}
+        emit_error(f"{len(short)} of {len(every)} pair(s) were not fully backfilled.")
         return 1
     return 0
 
@@ -457,6 +481,62 @@ def restore_backup(args: argparse.Namespace) -> int:
     return 0
 
 
+async def run_balance_rebuild(settings: Settings) -> RebuildReport:
+    """Build the client and the service, run one rebuild, and close it all.
+
+    The same lifetimes as `run_price_refresh`, for its reasons: the client and the engine are
+    this command's, and both are closed in a `finally`. The providers come from the registry
+    over this command's client, as the timer's come over the application's.
+    """
+    engine = create_database_engine(settings.database_url)
+    client = build_http_client()
+
+    def provider_for(chain_key: str) -> ChainProvider:
+        return get_chain_provider(chain_key, client)
+
+    try:
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            service = build_balance_rebuild_service(session, provider_for=provider_for)
+            return await service.rebuild()
+    finally:
+        await client.aclose()
+        await engine.dispose()
+
+
+def rebuild_balances(args: argparse.Namespace) -> int:
+    """`rebuild-balances`: rebuild every active wallet's past daily balances, now (spec 038).
+
+    One line per wallet, by id and chain: on stdout the days stored and the first of them;
+    on stderr a wallet that was not rebuilt, with the reason or the error's class name, then
+    a count. Any wallet not rebuilt is exit code 1, for the reason `refresh-prices` gives;
+    its rows, if it had any, are kept. **No address and no amount is printed.**
+    """
+    del args  # The command takes no options; every active wallet is rebuilt.
+    report = asyncio.run(run_balance_rebuild(get_settings()))
+    if not report.wallets:
+        emit("No active wallet to rebuild.")
+        return 0
+    short = 0
+    for entry in report.wallets:
+        name = f"wallet {entry.wallet_id} ({entry.chain_key})"
+        if entry.outcome is RebuildOutcome.REBUILT:
+            span = (
+                f"{entry.days} day(s) from {entry.first_day.isoformat()}"
+                if entry.first_day is not None
+                else "no transaction"
+            )
+            emit(f"{name} rebuilt: {span}")
+            continue
+        short += 1
+        reason = f": {entry.reason}" if entry.reason else ""
+        emit_error(f"{name} {entry.outcome.value}{reason}")
+    if short:
+        emit_error(f"{short} of {len(report.wallets)} wallet(s) were not rebuilt.")
+        return 1
+    return 0
+
+
 def utc_text(instant: datetime) -> str:
     """An instant as ISO 8601 in UTC with a `Z`, to the microsecond, as the API serves one."""
     return instant.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -512,6 +592,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="store every daily close the price source still serves, without waiting for the timer",
     )
     backfill.set_defaults(handler=backfill_prices)
+
+    rebuild = commands.add_parser(
+        "rebuild-balances",
+        help=(
+            "rebuild every active wallet's past daily balances from its transactions, "
+            "without waiting for the timer"
+        ),
+    )
+    rebuild.set_defaults(handler=rebuild_balances)
 
     backup = commands.add_parser(
         "backup",

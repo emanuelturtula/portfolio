@@ -214,11 +214,13 @@ async def test_each_timer_is_served_as_it_reports_itself_in_a_fixed_order(world:
     backup = FakeTimer(SchedulerStatus(SchedulerState.LATE, ticked - timedelta(days=3), False))
     prices = FakeTimer(SchedulerStatus(SchedulerState.STOPPED, None, None))
     backfill = FakeTimer(SchedulerStatus(SchedulerState.OK, ticked - timedelta(hours=5), True))
+    rebuild = FakeTimer(SchedulerStatus(SchedulerState.OK, ticked - timedelta(hours=7), False))
 
     served = await detail(
         world,
         timers={
             SchedulerName.BACKUP: backup,
+            SchedulerName.BALANCE_REBUILD: rebuild,
             SchedulerName.PRICE_BACKFILL: backfill,
             SchedulerName.BALANCE_SYNC: balance,
             SchedulerName.PRICE_REFRESH: prices,
@@ -229,6 +231,7 @@ async def test_each_timer_is_served_as_it_reports_itself_in_a_fixed_order(world:
         (SchedulerName.BALANCE_SYNC, SchedulerState.OK),
         (SchedulerName.PRICE_REFRESH, SchedulerState.STOPPED),
         (SchedulerName.PRICE_BACKFILL, SchedulerState.OK),
+        (SchedulerName.BALANCE_REBUILD, SchedulerState.OK),
         (SchedulerName.BACKUP, SchedulerState.LATE),
     ]
     assert served.schedulers[0].last_tick_at == ticked
@@ -236,8 +239,10 @@ async def test_each_timer_is_served_as_it_reports_itself_in_a_fixed_order(world:
     assert served.schedulers[1].last_tick_at is None
     assert served.schedulers[2].last_tick_at == ticked - timedelta(hours=5)
     assert served.schedulers[2].last_tick_succeeded is True
-    assert served.schedulers[3].last_tick_at == ticked - timedelta(days=3)
+    assert served.schedulers[3].last_tick_at == ticked - timedelta(hours=7)
     assert served.schedulers[3].last_tick_succeeded is False
+    assert served.schedulers[4].last_tick_at == ticked - timedelta(days=3)
+    assert served.schedulers[4].last_tick_succeeded is False
 
 
 async def test_a_timer_that_is_none_or_missing_from_the_mapping_is_disabled(world: World) -> None:
@@ -253,10 +258,11 @@ async def test_a_timer_that_is_none_or_missing_from_the_mapping_is_disabled(worl
         SchedulerName.BALANCE_SYNC: SchedulerState.DISABLED,
         SchedulerName.PRICE_REFRESH: SchedulerState.OK,
         SchedulerName.PRICE_BACKFILL: SchedulerState.DISABLED,
+        SchedulerName.BALANCE_REBUILD: SchedulerState.DISABLED,
         SchedulerName.BACKUP: SchedulerState.DISABLED,
     }
-    assert served.schedulers[3].last_tick_at is None
-    assert served.schedulers[3].last_tick_succeeded is None
+    assert served.schedulers[4].last_tick_at is None
+    assert served.schedulers[4].last_tick_succeeded is None
 
 
 async def test_the_clock_is_read_once_for_the_timers_and_the_prices(world: World) -> None:
@@ -511,7 +517,7 @@ async def test_every_section_failing_at_once_still_answers_the_backup_and_the_ti
     ]
     assert served.chains.state is SectionState.UNAVAILABLE
     assert served.prices.state is PriceHealthState.UNAVAILABLE
-    assert len(served.schedulers) == len(SCHEDULER_ORDER) == 4
+    assert len(served.schedulers) == len(SCHEDULER_ORDER) == 5
     assert served.backup.state.value == "pending"
 
 

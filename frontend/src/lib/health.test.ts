@@ -24,6 +24,7 @@ describe('the health words', () => {
       'balance-sync',
       'price-refresh',
       'price-backfill',
+      'balance-rebuild',
       'backup',
     ]);
     expect(Object.keys(TIMER_STATE_WORDS)).toEqual(['ok', 'late', 'stopped', 'disabled']);

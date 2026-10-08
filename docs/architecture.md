@@ -249,6 +249,11 @@ and what is not, how to add a provider, and the logging rules a provider follows
   `providers/prices/kraken.py`, is the one implementation: Kraken's OHLC endpoint at a
   one-day interval, one call per pair, for BTC and KAS in USD. It has no failover and is not
   in `price_sources`; `portfolio.main` and `portfolio.cli` build it directly.
+- Older daily closes (spec 038) are a third: `HistoricalCloseSource`, with `name`, `pairs`,
+  `earliest_day` and `daily_closes_between`, asked for a range of days rather than for
+  everything. `CoinbaseDailyCloses`, in `providers/prices/coinbase.py`, is the one
+  implementation: Coinbase Exchange's candles at a one-day granularity, BTC in USD only, from
+  2015-07-20. The backfill asks it only for the days before the earliest stored close.
 
 ### What the two have in common
 
@@ -351,34 +356,38 @@ meant, not about how the bytes moved.
 
 ### Who calls a provider, and when
 
-Three timers, one endpoint and two commands, and each reaches a provider through a service
+Four timers, one endpoint and three commands, and each reaches a provider through a service
 that is handed its providers rather than building them:
 
 | Caller | Service | Handed | Writes |
 |---|---|---|---|
 | the `balance-sync` timer; `POST /api/balances/sync` | `BalanceSyncService` | `provider_for`, which calls `get_chain_provider` over the shared client | `balance_snapshots`, `derived_addresses`, `sync_runs` |
 | the `price-refresh` timer; `python -m portfolio refresh-prices` | `PriceRefreshService` | the sources `price_sources` built | `prices`, and today's `observed` row in `price_history` |
-| the `price-backfill` timer; `python -m portfolio backfill-prices` | `PriceBackfillService`, in `services/price_backfill.py` | a `KrakenDailyCloses` over the shared client | `price_history`, every committed daily close as `close` |
+| the `price-backfill` timer; `python -m portfolio backfill-prices` | `PriceBackfillService`, in `services/price_backfill.py` | a `KrakenDailyCloses` and a `CoinbaseDailyCloses` over the shared client | `price_history`, every committed daily close as `close` |
+| the `balance-rebuild` timer; `python -m portfolio rebuild-balances` | `BalanceRebuildService`, in `services/balance_rebuild.py` | `provider_for`, as the balance sync | `reconstructed_balances`, each complete wallet's rows replaced |
 
 - **The timers** are `IntervalScheduler` instances, in `services/scheduler.py`, that
-  `portfolio.main.lifespan` starts and stops, four in all, served by
+  `portfolio.main.lifespan` starts and stops, five in all, served by
   `GET /api/health/detail` in `SCHEDULER_ORDER`: `balance-sync`, `price-refresh`,
-  `price-backfill`, `backup`. By default the balance sync runs every 15 minutes, the price
-  refresh every 60 and the price backfill every 1440, once a day. Each is its own task with
+  `price-backfill`, `balance-rebuild`, `backup`. By default the balance sync runs every 15
+  minutes, the price refresh every 60, and the price backfill and the balance rebuild every
+  1440, once a day. Each is its own task with
   its own switch, so a failing vendor of one kind stops no other. Each runs at startup only
   when its last run is older than one interval, so a container that crash-loops does not hit
   a public API on every restart. The two price timers count only successes -- the newest
   `prices.fetched_at`, and the newest `close` row's `recorded_at` -- so while every source
-  fails each runs once per restart (`docs/providers.md`). The fourth timer takes backups and
-  calls no provider.
+  fails each runs once per restart (`docs/providers.md`). The balance rebuild counts the
+  same way, by the newest `reconstructed_balances.rebuilt_at`. The backup timer takes
+  backups and calls no provider.
 - **The endpoint** goes through a `SyncCoordinator`, in `services/sync_coordinator.py`, and
-  so do the balance timer's ticks. The price timers have none: no endpoint can ask for a
-  refresh or a backfill, so there is nothing to join. A second caller joins the run in flight
+  so do the balance timer's ticks. The price timers and the rebuild have none: no endpoint
+  can ask for a refresh, a backfill or a rebuild, so there is nothing to join. A second caller joins the run in flight
   instead of starting another, so a double-clicked refresh costs a public index nothing.
-- **Nothing in a request path reaches a price source.** Neither price timer has an
-  endpoint, and `services/prices.py` and `services/portfolio_history.py`, through which the
-  dashboard reads prices and the value over time, import no provider. A request renders from
-  the `prices` and `price_history` tables.
+- **Nothing in a request path reaches a price source or a chain's history.** Neither price
+  timer nor the rebuild has an endpoint, and `services/prices.py` and
+  `services/portfolio_history.py`, through which the dashboard reads prices and the value
+  over time, import no provider. A request renders from the `prices`, `price_history` and
+  `reconstructed_balances` tables.
 - **`GET /api/health/detail` calls no vendor.** It reports each source's last recorded
   outcome. `ChainProvider.health()` is part of the protocol, and no production code calls
   it.
@@ -449,12 +458,38 @@ them without either route saying so. Neither asks a vendor. A day nothing can va
 | `services/price_backfill.py` | `services` | `PriceBackfillService`: asks a `DailyCloseSource` for each pair, writes every close, commits per pair |
 | `repositories/price_history.py` | `repositories` | `PriceHistoryRepository`: the read-then-write that keeps R2, the series a range reads, and the newest `close`'s `recorded_at` for the timer |
 | `providers/prices/kraken.py` | `providers` | `KrakenDailyCloses` and `parse_daily_closes`: the OHLC call and the parser that drops the candle still trading |
+| `providers/prices/coinbase.py` | `providers` | `CoinbaseDailyCloses`: BTC/USD candles before Kraken's window, in windows of 300 days, parsed without a float |
 
 Two money rules hold here as everywhere. **A day's closing snapshot is chosen in SQL by
 ordering on `observed_at` and `id`, never on a money column** (`BalanceRepository.daily_closing`,
 one window function), and every sum is `Decimal` arithmetic in `domain`, rounded once per
 holding. **A partial sum is never served as a value**: a day with a holding that has no price
 that day is `null`, because a total that quietly omits a holding would be believed.
+
+### Past balances, rebuilt (spec 038)
+
+A snapshot exists only from the day a wallet was added. Before that, each wallet's closing
+balance per UTC day is rebuilt from its confirmed transactions and stored in
+`reconstructed_balances` (migration `0014_reconstructed_balances`): one row per wallet and day,
+`UNIQUE (wallet_id, day)`, `confirmed` in base units with `CHECK (confirmed >= 0)`, `decimals`,
+and `rebuilt_at`. A wallet's rows are replaced whole, in one transaction, and only by a rebuild
+that proved itself complete (R1, R6).
+
+`PortfolioHistoryService` reads them beside the snapshots and uses a wallet's rebuilt days
+strictly before its first snapshot's day, then the snapshots (R7). A wallet never rebuilt
+charts from its first snapshot.
+
+| Module | Layer | What it does |
+|---|---|---|
+| `providers/base.py` | `providers` | `TransactionHistoryReader`, `AddressHistory`, `TxEffect` and `HistoryIncomplete`: one address's confirmed effects, its balance, and why it is not proven complete, if it is not |
+| `providers/chains/bitcoin.py`, `kaspa.py` | `providers` | `address_history`: pages to the oldest transaction, and checks the count and the balance before and after (R1, R2) |
+| `domain/balance_history.py` | `domain` | `rebuild_daily`, pure: walks the effects back from the balance, one closing balance per UTC day, and refuses a walk that goes below 0 or does not end at 0 (R3, R4) |
+| `services/balance_rebuild.py` | `services` | `BalanceRebuildService`: one wallet at a time, each its own commit; an extended key sums its used addresses (R5) |
+| `repositories/reconstructed_balances.py` | `repositories` | `ReconstructedBalanceRepository`: replace a wallet's rows, read them for a set of wallets, and the newest `rebuilt_at` for the timer |
+
+Balances here are integers in base units, so the walk back is integer arithmetic; the
+conversion to a `Decimal` quantity happens where the value history reads them, as it does for
+a snapshot.
 
 ## Authentication
 

@@ -33,6 +33,10 @@ DEFAULT_PRICE_INTERVAL_MINUTES: Final = 60
 #: Kraken for the same 720 candles and rewrites the same rows.
 DEFAULT_PRICE_BACKFILL_INTERVAL_MINUTES: Final = 1440
 
+#: One day (spec 038). A wallet's past does not change, so a rebuild run more often reads the
+#: same transactions again; once a day keeps a gap left by a failed read from lasting.
+DEFAULT_BALANCE_REBUILD_INTERVAL_MINUTES: Final = 1440
+
 #: Long enough for an ordinary sync to finish and short enough that a stuck one does not
 #: hold a deployment open. Being wrong in either direction costs a row marked `interrupted`
 #: rather than data, because a run writes its snapshots per chain as it goes.
@@ -56,6 +60,8 @@ def without_an_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES",
         "PORTFOLIO_PRICE_BACKFILL_ENABLED",
         "PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES",
+        "PORTFOLIO_BALANCE_REBUILD_ENABLED",
+        "PORTFOLIO_BALANCE_REBUILD_INTERVAL_MINUTES",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -223,6 +229,58 @@ def test_the_backfill_is_switched_apart_from_the_refresh() -> None:
     assert (refresh_off.price_refresh_enabled, refresh_off.price_backfill_enabled) == (
         False,
         True,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# The balance rebuild (spec 038), on a timer of its own
+# --------------------------------------------------------------------------------------
+
+
+def test_the_balance_rebuild_is_on_and_daily_by_default() -> None:
+    """On, once a day: a wallet's past fills in from the first deploy without anybody asking."""
+    settings = Settings()
+
+    assert settings.balance_rebuild_enabled is True
+    assert settings.balance_rebuild_interval_minutes == DEFAULT_BALANCE_REBUILD_INTERVAL_MINUTES
+
+
+@pytest.mark.parametrize("interval", [0, -1])
+def test_a_zero_balance_rebuild_interval_is_refused_and_names_its_switch(interval: int) -> None:
+    """The same guard as the other timers, naming the rebuild's own switch."""
+    with pytest.raises(ValidationError) as caught:
+        Settings(balance_rebuild_interval_minutes=interval)
+
+    message = str(caught.value)
+    assert "PORTFOLIO_BALANCE_REBUILD_INTERVAL_MINUTES" in message
+    assert "PORTFOLIO_BALANCE_REBUILD_ENABLED=false" in message
+    assert "PORTFOLIO_BALANCE_SYNC_ENABLED" not in message
+
+
+def test_the_rebuild_settings_are_read_from_the_variables_the_refusal_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`tests/auth/conftest.py` and the lifespan suites switch the timer off by this name.
+
+    A field renamed without this failing would turn that line into a no-op and every
+    lifespan in the suite into one that asks a chain index for a history.
+    """
+    monkeypatch.setenv("PORTFOLIO_BALANCE_REBUILD_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_BALANCE_REBUILD_INTERVAL_MINUTES", "720")
+
+    settings = Settings()
+
+    assert settings.balance_rebuild_enabled is False
+    assert settings.balance_rebuild_interval_minutes == 720
+
+
+def test_the_rebuild_is_switched_apart_from_the_sync() -> None:
+    """Stopping a misbehaving rebuild must not stop today's balances being read."""
+    rebuild_off = Settings(balance_rebuild_enabled=False)
+
+    assert (rebuild_off.balance_sync_enabled, rebuild_off.balance_rebuild_enabled) == (
+        True,
+        False,
     )
 
 

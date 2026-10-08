@@ -51,8 +51,6 @@ and will trust them equally.
 
 * **`MAX_ADDRESSES_PER_CALL`.** The document declares `addresses` as an array of strings
   with no `maxItems`, and the operation description names no ceiling. See the constant.
-* **Anything about pagination or retention.** Neither matters for a balance read; both will
-  matter for transaction history, and neither has been checked.
 
 `docs/providers.md` carries the same split, and the dates, for a reader who never opens
 this file.
@@ -121,6 +119,32 @@ If `isUtxoIndexed` means something narrower than the schema suggests, this repor
 where the vendor reports healthy -- a false alarm rather than a false balance, which is the
 right direction to be wrong in. It is a guess about a field's meaning and is recorded as one.
 
+## Transaction history (spec 038)
+
+`address_history` reads an address's whole accepted history, for the rebuild of its past
+balances. Read off the live OpenAPI document and measured on **2026-10-08**
+(`docs/providers.md`, *Transaction history, for the balance rebuild*):
+
+* **Confirmed:** `GET /addresses/{a}/full-transactions-page` takes `limit` up to **500**,
+  `before` in epoch milliseconds and `resolve_previous_outpoints=light`, and its own text
+  says to page with the value of `X-Next-Page-Before` "as long as header is present", and
+  that a page "can be != limit". `GET /addresses/{a}/transactions-count` returns
+  `{"total": integer}`. The resolved input fields are **optional** in the schema.
+* **Measured:** following the header reaches the oldest transaction with no duplicate and no
+  gap, the rows equal `total`, and outputs minus resolved inputs equal `/balance`. A page can
+  exceed `limit` because the server completes the boundary millisecond, which is why the
+  cursor is followed and never computed. **`block_time` is epoch milliseconds**. Every row
+  read was `is_accepted: true`.
+* **Assumed:** what an unaccepted row looks like, and whether `total` counts one. Only
+  accepted rows are used (R2); if `total` counted others, the history would be reported
+  `count_mismatch` rather than be wrong.
+
+The history proves itself or is reported incomplete (R1): the distinct accepted ids equal
+`total`, their effects sum to `/balance`, and the count and balance read before the paging
+equal those read after it. **The balance and the paging responses carry
+`Cache-Control: public, max-age=8`**, so two reads a few seconds apart can come from the same
+edge cache; the before-and-after comparison is only as fresh as the cache lets it be.
+
 ## Nothing here logs
 
 Not one call. The shared transport logs `"{scheme}://{host}/{label}"` and nothing else,
@@ -130,7 +154,9 @@ log line written here would bypass all of it, and this vendor puts the address i
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Final
 
@@ -146,8 +172,11 @@ from portfolio.domain.addresses import (
 from portfolio.domain.chains import ChainKey
 from portfolio.domain.chains import validate_address as validate_chain_address
 from portfolio.providers.base import (
+    AddressHistory,
     ChainCapabilities,
+    HistoryIncomplete,
     ProviderHealth,
+    TxEffect,
     align_balances,
     chunk_addresses,
     decode_json,
@@ -158,6 +187,7 @@ from portfolio.providers.errors import ProviderResponseError
 from portfolio.providers.http import (
     ADDRESS_BALANCE,
     ADDRESS_BALANCES,
+    ADDRESS_HISTORY,
     ENDPOINT_EXTENSION,
     NODE_HEALTH,
 )
@@ -177,15 +207,24 @@ __all__ = [
     "CAPABILITIES",
     "FALLBACK",
     "HEALTH_PATH",
+    "HISTORY_PAGE_LIMIT",
     "KASPA_DECIMALS",
+    "LATEST_BLOCK_TIME_MS",
     "MAX_ADDRESSES_PER_CALL",
+    "NEXT_PAGE_HEADER",
     "PRIMARY",
+    "TRANSACTIONS_COUNT_PATH",
+    "TRANSACTIONS_PAGE_PATH",
     "VENDOR",
+    "AcceptedTransaction",
     "KaspaProvider",
     "NodeHealth",
     "parse_address_balance",
     "parse_balances",
     "parse_health",
+    "parse_next_page_before",
+    "parse_transaction_count",
+    "parse_transactions_page",
 ]
 
 KASPA_DECIMALS: Final = 8
@@ -237,6 +276,40 @@ that was in flight, and simply offers no theory about why.
 ADDRESS_BALANCE_PATH: Final = "/addresses/{address}/balance"
 BALANCES_PATH: Final = "/addresses/balances"
 HEALTH_PATH: Final = "/info/health"
+TRANSACTIONS_COUNT_PATH: Final = "/addresses/{address}/transactions-count"
+
+HISTORY_PAGE_LIMIT: Final = 500
+"""The document's `maximum` for `limit` on `full-transactions-page`; `501` is answered 422.
+
+Also the page cap's divisor: `total // HISTORY_PAGE_LIMIT + 2` pages is more than a history of
+`total` rows needs, since a page holds at least `limit` rows whenever another follows it. A
+vendor that keeps sending a cursor past that is not ending the history."""
+
+TRANSACTIONS_PAGE_PATH: Final = (
+    "/addresses/{address}/full-transactions-page"
+    f"?limit={HISTORY_PAGE_LIMIT}&resolve_previous_outpoints=light"
+)
+"""The first page; every later one appends `&before=<X-Next-Page-Before>`.
+
+`light` resolves each input's source address and amount, which is all R2 needs. The endpoint
+declares `strict_query_params`, so nothing else may be added here."""
+
+NEXT_PAGE_HEADER: Final = "X-Next-Page-Before"
+"""Where the next page starts, present on every page but the last (measured 2026-10-08)."""
+
+LATEST_BLOCK_TIME_MS: Final = 253_402_300_799_999
+"""The last epoch millisecond a `datetime` can hold, 9999-12-31T23:59:59.999Z.
+
+A `block_time` past it is refused rather than left to raise out of `datetime.fromtimestamp`,
+whose exception for an out-of-range value depends on the platform's `time_t`."""
+
+_CURSOR: Final = re.compile(r"[0-9]{1,19}")
+"""An `X-Next-Page-Before` value: ASCII digits only, and no more than an `int64` has.
+
+**Checked because it goes back into the URL**, as the `before` parameter. It arrives in a
+response header the vendor -- or anything between it and us -- chooses freely, and
+`0&limit=1` is a string too. ASCII by the class, not `str.isdigit`, which accepts Unicode
+digits; bounded, so `int()` cannot meet the interpreter's digit limit."""
 
 VENDOR: Final = "Kaspa REST"
 """What this provider's upstream is called in an exhaustion message.
@@ -255,6 +328,16 @@ fallback calls its positions the same two things.
 ADDRESS_FIELD: Final = "address"
 BALANCE_FIELD: Final = "balance"
 ADDRESSES_FIELD: Final = "addresses"
+TOTAL_FIELD: Final = "total"
+TRANSACTION_ID_FIELD: Final = "transaction_id"
+IS_ACCEPTED_FIELD: Final = "is_accepted"
+BLOCK_TIME_FIELD: Final = "block_time"
+INPUTS_FIELD: Final = "inputs"
+OUTPUTS_FIELD: Final = "outputs"
+AMOUNT_FIELD: Final = "amount"
+SCRIPT_PUBLIC_KEY_ADDRESS_FIELD: Final = "script_public_key_address"
+PREVIOUS_OUTPOINT_ADDRESS_FIELD: Final = "previous_outpoint_address"
+PREVIOUS_OUTPOINT_AMOUNT_FIELD: Final = "previous_outpoint_amount"
 KASPAD_SERVERS: Final = "kaspadServers"
 DATABASE_FIELD: Final = "database"
 IS_SYNCED: Final = "isSynced"
@@ -537,6 +620,244 @@ def _require_flag(document: Mapping[str, object], owner: str, name: str) -> bool
     return value
 
 
+def parse_transaction_count(body: str | bytes) -> int:
+    """`total` out of `GET /addresses/{a}/transactions-count`, or a refusal.
+
+    A whole, non-negative number of transactions: `bool` refused with everything else, for
+    the reason `_require_sompi` gives. The message names the field and the type.
+
+    Raises:
+        ProviderResponseError: the body is not a JSON object, or `total` is not such a
+            number.
+    """
+    total = require_json_object(body).get(TOTAL_FIELD)
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        message = (
+            f"The response field {TOTAL_FIELD!r} is a {type(total).__name__} that is not a "
+            "whole, non-negative number of transactions."
+        )
+        raise ProviderResponseError(message)
+    return total
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedTransaction:
+    """One accepted transaction out of a history page: its id, its effect, and whether it
+    could be read whole.
+
+    `transaction_id` de-duplicates across pages and never leaves the provider. `resolved` is
+    false when an input's `previous_outpoint_address` or `previous_outpoint_amount` is absent
+    or `null` -- both are optional in the schema -- so whether it spent from this address is
+    unknown (R2). The effect then leaves that input out and the history is reported
+    `unresolved_input` rather than trusted.
+    """
+
+    transaction_id: str
+    effect: TxEffect
+    resolved: bool
+
+
+def parse_transactions_page(body: str | bytes, address: str) -> tuple[AcceptedTransaction, ...]:
+    """Every accepted transaction on one `full-transactions-page`, in the vendor's order.
+
+    A row with `is_accepted: false` is dropped, never counted (R2). The net effect on
+    `address` is the `outputs[].amount` paying it minus the `previous_outpoint_amount` of
+    every input whose `previous_outpoint_address` is it. `inputs` or `outputs` given as
+    `null` is read as none -- the schema requires neither, and a coinbase transaction spends
+    nothing; the balance check catches one that was not really empty.
+
+    | Refused | Why |
+    |---|---|
+    | the body is not a JSON array, or a row is not an object | the documented shape |
+    | `is_accepted` not a boolean | a missing flag is a schema we no longer understand |
+    | `transaction_id` not a string | nothing to de-duplicate by |
+    | `block_time` not an `int` in `[0, LATEST_BLOCK_TIME_MS]` | no time, no day (R3) |
+    | `inputs`/`outputs` neither an array nor `null`, or an entry not an object | the shape |
+    | an amount that is not an `int`, is a `bool`, or is negative | not sompi |
+
+    Every amount on an accepted row is checked, not only those that touch `address`, so a
+    refusal never depends on the owner's holdings. No message names the address, an id or an
+    amount; each names a field and a type.
+
+    Raises:
+        ProviderResponseError: any row of the table above.
+    """
+    rows = _require_array(body)
+    transactions: list[AcceptedTransaction] = []
+    for row in rows:
+        transaction = _accepted_transaction(row, address)
+        if transaction is not None:
+            transactions.append(transaction)
+    return tuple(transactions)
+
+
+def parse_next_page_before(value: str | None) -> int | None:
+    """The `X-Next-Page-Before` cursor, `None` when the header is absent (the last page).
+
+    Taken as the vendor gave it and never computed: a page can exceed `limit` because the
+    server completes the boundary millisecond, so a cursor worked out from the rows could
+    skip or repeat some. Checked against `_CURSOR` before it goes into a URL.
+
+    Raises:
+        ProviderResponseError: the header is present and is not a run of ASCII digits. The
+            message does not quote it.
+    """
+    if value is None:
+        return None
+    if _CURSOR.fullmatch(value) is None:
+        message = (
+            f"The response header {NEXT_PAGE_HEADER} is not a whole number of epoch "
+            "milliseconds, so it cannot be followed to the next page."
+        )
+        raise ProviderResponseError(message)
+    return int(value)
+
+
+def _accepted_transaction(row: object, address: str) -> AcceptedTransaction | None:
+    """One history row, or `None` if it was not accepted. See `parse_transactions_page`."""
+    if not isinstance(row, dict):
+        message = (
+            f"The history page carried a row that is a {type(row).__name__} rather than a "
+            "transaction object."
+        )
+        raise ProviderResponseError(message)
+    accepted = row.get(IS_ACCEPTED_FIELD)
+    if not isinstance(accepted, bool):
+        message = (
+            f"A transaction's {IS_ACCEPTED_FIELD!r} is a {type(accepted).__name__} rather "
+            "than the boolean this endpoint documents."
+        )
+        raise ProviderResponseError(message)
+    if not accepted:
+        return None
+    transaction_id = row.get(TRANSACTION_ID_FIELD)
+    if not isinstance(transaction_id, str):
+        message = (
+            f"A transaction's {TRANSACTION_ID_FIELD!r} is a {type(transaction_id).__name__} "
+            "rather than a string."
+        )
+        raise ProviderResponseError(message)
+    occurred_at = _block_time_ms(row.get(BLOCK_TIME_FIELD))
+
+    received = 0
+    for output in _optional_entries(row, OUTPUTS_FIELD):
+        amount = _require_amount(output.get(AMOUNT_FIELD), f"{OUTPUTS_FIELD}[].{AMOUNT_FIELD}")
+        if output.get(SCRIPT_PUBLIC_KEY_ADDRESS_FIELD) == address:
+            received += amount
+
+    spent = 0
+    resolved = True
+    for txin in _optional_entries(row, INPUTS_FIELD):
+        source = txin.get(PREVIOUS_OUTPOINT_ADDRESS_FIELD)
+        raw_amount = txin.get(PREVIOUS_OUTPOINT_AMOUNT_FIELD)
+        if source is None or raw_amount is None:
+            resolved = False
+            continue
+        amount = _require_amount(raw_amount, f"{INPUTS_FIELD}[].{PREVIOUS_OUTPOINT_AMOUNT_FIELD}")
+        if source == address:
+            spent += amount
+
+    return AcceptedTransaction(
+        transaction_id=transaction_id,
+        effect=TxEffect(occurred_at=occurred_at, delta=received - spent),
+        resolved=resolved,
+    )
+
+
+def _block_time_ms(value: object) -> datetime:
+    """An epoch-millisecond `block_time` as an aware UTC datetime, exactly, or a refusal.
+
+    **Integer arithmetic only**: whole seconds through `fromtimestamp`, the remainder as a
+    `timedelta` of milliseconds. Dividing by 1000 first would pass the time through binary
+    floating point -- the thing rule 2 bans in this package -- and could land a transaction a
+    millisecond before midnight on the next day.
+    """
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= LATEST_BLOCK_TIME_MS
+    ):
+        message = (
+            f"A transaction's {BLOCK_TIME_FIELD!r} is a {type(value).__name__} that is not a "
+            "time in epoch milliseconds."
+        )
+        raise ProviderResponseError(message)
+    seconds, milliseconds = divmod(value, 1000)
+    return datetime.fromtimestamp(seconds, UTC) + timedelta(milliseconds=milliseconds)
+
+
+def _optional_entries(row: Mapping[str, object], field: str) -> list[Mapping[str, object]]:
+    """A row's `inputs` or `outputs`: an array of objects, or none for an absent or `null`."""
+    items = row.get(field)
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        message = (
+            f"A transaction's {field!r} is a {type(items).__name__} rather than the array "
+            "this endpoint documents."
+        )
+        raise ProviderResponseError(message)
+    objects: list[Mapping[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            message = (
+                f"A transaction's {field}[] carried a {type(item).__name__} rather than an object."
+            )
+            raise ProviderResponseError(message)
+        objects.append(item)
+    return objects
+
+
+def _require_amount(value: object, field: str) -> int:
+    """One output or input amount: a whole, non-negative number of sompi, or a refusal.
+
+    `_require_sompi`'s rule with the field named, since a transaction has several amounts and
+    the message has to say which kind was wrong. Never the value.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        message = (
+            f"A transaction's {field} is a {type(value).__name__} that is not a whole, "
+            "non-negative number of sompi."
+        )
+        raise ProviderResponseError(message)
+    return value
+
+
+def _history_verdict(
+    *,
+    moved: bool,
+    resolved: bool,
+    ended: bool,
+    collected: int,
+    counted: int,
+    summed: int,
+    balance: int,
+) -> HistoryIncomplete | None:
+    """R1: `None` when the history proves itself complete, else the first reason it does not.
+
+    The same order as the Esplora provider's, for the same reason: each earlier reason
+    explains the later ones. A history whose cursor did not run out within the page cap is a
+    count mismatch -- the vendor served more pages than its own count allows.
+    """
+    if moved:
+        return HistoryIncomplete.MOVED_DURING_READ
+    if not resolved:
+        return HistoryIncomplete.UNRESOLVED_INPUT
+    if not ended or collected != counted:
+        return HistoryIncomplete.COUNT_MISMATCH
+    if summed != balance:
+        return HistoryIncomplete.BALANCE_MISMATCH
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class _Totals:
+    """An address's transaction count and balance, read together around the paging."""
+
+    count: int
+    balance: int
+
+
 @dataclass(frozen=True, slots=True)
 class _Probe:
     """What one health probe concluded, and the one sentence an operator is told about it.
@@ -571,7 +892,7 @@ class KaspaProvider:
     Satisfies `ChainProvider` structurally, checked by `mypy --strict` rather than by
     `isinstance`, and `ChainProviderFactory` by taking the shared client as its only
     positional argument -- which is what lets the registry build it with nothing but a
-    client.
+    client. Also satisfies `TransactionHistoryReader` (spec 038).
     """
 
     def __init__(self, client: httpx.AsyncClient, *, settings: Settings | None = None) -> None:
@@ -710,6 +1031,98 @@ class KaspaProvider:
         # answer that". Every balance therefore carries `None`, never a zero. See the module
         # docstring: zero would be a different statement, and the wrong one.
         return align_balances(canonical, found, decimals=KASPA_DECIMALS)
+
+    async def address_history(self, address: str) -> AddressHistory:
+        """Every accepted transaction's effect on `address`, oldest first, checked by R1.
+
+        Satisfies `TransactionHistoryReader` (spec 038). The order of work:
+
+        1. **The address is validated before any URL is built**, as `fetch_balances` does and
+           for its reason: it goes into a path.
+        2. **`transactions-count`, then `balance`**: what the history is checked against.
+        3. **`full-transactions-page?limit=500&resolve_previous_outpoints=light`**, then the
+           same with `&before=<X-Next-Page-Before>` while the header is present, at most
+           `total // 500 + 2` pages. The cursor is the vendor's, checked before it goes into
+           the URL, and never computed. An id seen twice is kept once.
+        4. **`transactions-count` and `balance` again.** Any difference from step 2 is a
+           transaction accepted during the read.
+
+        Complete only when it proves it (R1): the distinct accepted ids number `total`, their
+        effects sum to the balance, every input was resolved, and the two reads agree.
+        Otherwise `incomplete` says why and nothing may store the effects.
+
+        Sequential, through the host limiter, with failover sticky for the whole history:
+        a host that refused one page is not asked for the next. A history of N transactions
+        costs about N/500 + 5 requests.
+
+        **Nothing here logs**: the address, the ids and the amounts are the owner's holdings.
+
+        Raises:
+            AddressInvalidError: not a Kaspa address, or one on another network. Before any
+                request.
+            ProviderRateLimitedError: every instance answered 429, last one included.
+            ProviderUnavailableError: no instance answered.
+            ProviderResponseError: an instance refused the request, or answered with
+                something that cannot be trusted (see `parse_transactions_page`).
+        """
+        canonical = self.validate_address(address).canonical
+        # Sticky for the whole history, as within one `fetch_balances` call.
+        start = 0
+        before, start = await self._read_totals(canonical, start)
+
+        # Insertion-ordered, so newest first as the pages are; a repeat keeps the first.
+        collected: dict[str, AcceptedTransaction] = {}
+        first_page = TRANSACTIONS_PAGE_PATH.format(address=canonical)
+        path = first_page
+        ended = False
+        for _ in range(before.count // HISTORY_PAGE_LIMIT + 2):
+            body, headers, start = await self._instances.read_with_headers(
+                path, ADDRESS_HISTORY, start
+            )
+            for transaction in parse_transactions_page(body, canonical):
+                collected.setdefault(transaction.transaction_id, transaction)
+            cursor = parse_next_page_before(headers.get(NEXT_PAGE_HEADER))
+            if cursor is None:
+                ended = True
+                break
+            path = f"{first_page}&before={cursor}"
+
+        after, start = await self._read_totals(canonical, start)
+
+        oldest_first = tuple(reversed(collected.values()))
+        effects = tuple(transaction.effect for transaction in oldest_first)
+        incomplete = _history_verdict(
+            moved=before != after,
+            resolved=all(transaction.resolved for transaction in oldest_first),
+            ended=ended,
+            collected=len(collected),
+            counted=before.count,
+            summed=sum(effect.delta for effect in effects),
+            balance=before.balance,
+        )
+        return AddressHistory(
+            address=canonical,
+            balance=before.balance,
+            decimals=KASPA_DECIMALS,
+            effects=effects,
+            incomplete=incomplete,
+        )
+
+    async def _read_totals(self, address: str, start: int) -> tuple[_Totals, int]:
+        """The transaction count, then the balance, each from the first instance that answers.
+
+        The count under `ADDRESS_HISTORY`, since it is part of reading a history; the balance
+        under `ADDRESS_BALANCE` and through `parse_address_balance`, since it is exactly the
+        single-address balance read and must refuse exactly what that read refuses.
+        """
+        body, start = await self._instances.read(
+            TRANSACTIONS_COUNT_PATH.format(address=address), ADDRESS_HISTORY, start
+        )
+        count = parse_transaction_count(body)
+        body, start = await self._instances.read(
+            ADDRESS_BALANCE_PATH.format(address=address), ADDRESS_BALANCE, start
+        )
+        return _Totals(count=count, balance=parse_address_balance(body, address)), start
 
     async def health(self) -> ProviderHealth:
         """Whether either instance is answering *usefully*, without reading any address.
