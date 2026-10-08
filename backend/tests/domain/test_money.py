@@ -40,7 +40,6 @@ from portfolio.domain.money import (
     subtract,
     to_base_units,
 )
-from tests.domain.accounting.oracle import round_half_even
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -57,6 +56,21 @@ MAX_UNITS: Final = 10**30
 
 DEFAULT_DECIMAL_PRECISION: Final = 28
 """What `decimal` uses when nobody raises it -- the value criterion 4 exists to replace."""
+
+
+def round_half_even(value: Fraction, scale: int) -> Fraction:
+    """`value` rounded once, half to even, to `scale` places. Exact, context free.
+
+    The independent expectation for `divide`: it rounds an exact rational and nothing else,
+    so it cannot share a bug with the `Decimal` arithmetic under test.
+    """
+    scaled = value * 10**scale
+    floor = scaled.numerator // scaled.denominator
+    remainder = scaled - floor
+    half = Fraction(1, 2)
+    if remainder > half or (remainder == half and floor % 2 == 1):
+        floor += 1
+    return Fraction(floor, 10**scale)
 
 
 # --------------------------------------------------------------------------------------
@@ -511,13 +525,11 @@ def test_the_negative_decimals_message_no_longer_blames_the_amount() -> None:
 # `multiply` (#12): the exact product, with no rounding at all.
 # --------------------------------------------------------------------------------------
 #
-# `derive_quote_quantity` is `quantize(multiply(quantity, price), FILL_SCALE)`, and
-# `quantize` must be the only rounding in it. `Decimal.__mul__` rounds to the calling
-# thread's precision -- 28 by default, lower inside any `localcontext` a caller opened -- and
-# even a multiply under the 38-digit money context rounds a product past 38 digits, which
-# `quantize` would then round a second time. Two half-even roundings in a row can land one
-# unit away from one rounding; `tests/providers/exchanges/test_base.py` has the fill that
-# shows it.
+# A value is `quantize(multiply(quantity, price), scale)`, and `quantize` must be the only
+# rounding in it. `Decimal.__mul__` rounds to the calling thread's precision -- 28 by
+# default, lower inside any `localcontext` a caller opened -- and even a multiply under the
+# 38-digit money context rounds a product past 38 digits, which `quantize` would then round
+# a second time. Two half-even roundings in a row can land one unit away from one rounding.
 
 #: 29 significant digits, one past the `decimal` default of 28. Doubled by hand: each
 #: ten-digit group `1234567890` doubles to `2469135780`, and `12345678.9` doubles to
@@ -693,15 +705,15 @@ def test_multiply_refuses_a_product_whose_exponent_decimal_cannot_hold() -> None
 
 
 # --------------------------------------------------------------------------------------
-# `add`, `subtract` and `divide` (#17): the engine's only arithmetic.
+# `add`, `subtract` and `divide` (#17): exact sums, and a quotient rounded once.
 # --------------------------------------------------------------------------------------
 #
-# Spec 019 forbids a bare `+ - * /` on a `Decimal` anywhere in the accounting package, so
-# these three and `multiply` are the whole of its arithmetic. `add` and `subtract` must be
-# exact however many digits they carry, and `divide` must round exactly once. Every
+# A bare `+ - * /` on a `Decimal` rounds to whatever context the calling thread holds, so
+# these three and `multiply` are the arithmetic money is done in. `add` and `subtract` must
+# be exact however many digits they carry, and `divide` must round exactly once. Every
 # expectation below is either written out by hand or computed in `fractions.Fraction` by
-# the oracle's `round_half_even`, which rounds an exact rational and nothing else -- never
-# by calling the function under test a second way.
+# `round_half_even` above, which rounds an exact rational and nothing else -- never by
+# calling the function under test a second way.
 
 #: 41 significant digits: `10**40` plus one unit in the 18th decimal place. Any sum under a
 #: context of 38 digits or fewer loses the trailing `1`.
@@ -862,7 +874,7 @@ def test_divide_rounds_once_where_rounding_twice_would_differ(divisor: str) -> N
         pytest.param("2", "3", 18, "0.666666666666666667", id="2 by 3"),
         pytest.param("-2", "3", 18, "-0.666666666666666667", id="-2 by 3"),
         pytest.param("2", "-3", 18, "-0.666666666666666667", id="2 by -3"),
-        # docs/accounting.md example 6: 0.666666666666666667 / 2 is a tie on an odd digit.
+        # 0.666666666666666667 / 2 is a tie on an odd digit.
         pytest.param("0.666666666666666667", "2", 18, "0.333333333333333334", id="example 6"),
         # An exact quotient comes back padded to the scale.
         pytest.param("70000", "2", 18, "35000", id="exact"),

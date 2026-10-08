@@ -4,9 +4,9 @@
 every `state` reachable through the real router and the real service; and **no configuration
 value** -- not the directory, not the interval, not the retention -- anywhere in the body.
 
-Since #23 (spec 030) the body has five more sections beside `backup`. Every test here still
-asserts the body's top level is exactly those six, so a section dropped or added fails here as
-well as in `test_health_detail_sections.py`, which is where the other five are tested.
+Since #23 (spec 030) the body has three more sections beside `backup`. Every test here still
+asserts the body's top level is exactly those four, so a section dropped or added fails here as
+well as in `test_health_detail_sections.py`, which is where the other three are tested.
 
 The application is the real one through its real lifespan, signed in as the owner. Its
 backup service is then replaced with one built over a directory and a clock this test
@@ -36,8 +36,8 @@ DETAIL: Final = "/api/health/detail"
 IN_MEMORY: Final = "sqlite+aiosqlite:///:memory:"
 FIELDS: Final = {"state", "latest_at", "count", "last_attempt_at", "last_error_kind"}
 
-#: The body's top level since #23: the backup, and the five sections spec 030 adds beside it.
-SECTIONS: Final = {"backup", "schedulers", "chains", "exchanges", "prices", "reconciliation"}
+#: The body's top level since #23: the backup, and the three sections beside it.
+SECTIONS: Final = {"backup", "schedulers", "chains", "prices"}
 
 #: Settings no other value in the payload could coincide with, so their absence means
 #: something: an interval of 4321 minutes, 11 days, 13 weeks.

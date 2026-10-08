@@ -1,4 +1,4 @@
-"""Outbound adapters for exchanges, wallets and price feeds.
+"""Outbound adapters for wallets and price feeds.
 
 The chain side of this package is a protocol and a registry rather than a base class:
 `base.py` says what a chain provider must offer, `registry.py` says which one answers for

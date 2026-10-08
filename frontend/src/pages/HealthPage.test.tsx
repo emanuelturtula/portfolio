@@ -1,23 +1,16 @@
 import { QueryClientProvider } from '@tanstack/react-query';
 import { render, screen } from '@testing-library/react';
 import { delay, http, HttpResponse } from 'msw';
-import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 
 import { createQueryClient } from '@/lib/queryClient';
 import { HealthPage } from '@/pages/HealthPage';
 import { server } from '@/test/server';
 
-/**
- * Inside a router: the reconciliation section (spec 030) links to the dashboard's holdings
- * check, and a `Link` outside a router throws once the detail answers.
- */
 function renderHealthPage() {
   render(
     <QueryClientProvider client={createQueryClient()}>
-      <MemoryRouter>
-        <HealthPage />
-      </MemoryRouter>
+      <HealthPage />
     </QueryClientProvider>,
   );
 }

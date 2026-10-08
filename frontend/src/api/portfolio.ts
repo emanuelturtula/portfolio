@@ -17,14 +17,14 @@ export type MissingKind = components['schemas']['MissingKind'];
 export const PORTFOLIO_SUMMARY_PATH = '/api/portfolio/summary';
 
 /**
- * Polled every minute, like the positions: the endpoint reads stored balances, prices and
- * fills and reaches no vendor, so a poll costs a database read.
+ * Polled every minute, like the balances: the endpoint reads stored balances and prices and
+ * reaches no vendor, so a poll costs a database read.
  */
 const REFETCH_INTERVAL_MS = 60_000;
 
 /**
- * `['portfolio', ...]` is the prefix a balance sync, an exchange sync and a wallet change
- * invalidate, since each changes what the summary reads.
+ * `['portfolio', ...]` is the prefix a balance sync and a wallet change invalidate, since each
+ * changes what the summary reads.
  */
 export const portfolioSummaryQueryKey = ['portfolio', 'summary'] as const;
 

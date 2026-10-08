@@ -56,7 +56,6 @@ from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_
 from portfolio.logging import REQUEST_ID_KEY, ValueRedactor, configure_logging
 from portfolio.main import create_app
 from tests.address_vectors import BIP173_TESTNET_P2WPKH
-from tests.api.test_accounting import settled
 from tests.auth.conftest import BASE_URL, JSON_HEADERS, sign_in
 from tests.logging_harness import preserved_logging
 
@@ -140,7 +139,6 @@ async def served(
     app.add_api_route(PROBE, probe, methods=["GET"])
     app.add_api_route(BOOM, boom, methods=["GET"])
     async with app.router.lifespan_context(app):
-        await settled(app)
         configure_logging(production(log_level))
         if capsys is not None:
             capsys.readouterr()
@@ -676,9 +674,9 @@ async def test_every_operation_is_logged_under_its_prefixed_template(
     """Read from `scope["fastapi"]["effective_route_context"]`, measured on FastAPI 0.141.1.
 
     An upgrade that drops that entry falls back to the template without `/api`, and this
-    fails on all twenty-six. A body is sent malformed and a path parameter unparsable, so the
+    fails on all fifteen. A body is sent malformed and a path parameter unparsable, so the
     route is matched and no endpoint with a side effect runs; the bodiless ones that remain
-    are reads, the two manual syncs with nothing configured, and `logout`, sent last.
+    are reads, the manual balance sync with no wallet, and `logout`, sent last.
     """
     del api_environment, restored
     seen: dict[str, tuple[str, int]] = {}
@@ -700,8 +698,8 @@ async def test_every_operation_is_logged_under_its_prefixed_template(
             assert response.status_code == seen[f"{method} {template}"][1], response.text
     entries = lines(capsys)
 
-    assert len(documented) == 26
-    assert sum(1 for _id, status in seen.values() if status == 422) == 9
+    assert len(documented) == 15
+    assert sum(1 for _id, status in seen.values() if status == 422) == 6
     for name, (request_id, _status) in seen.items():
         template = name.split(" ", 1)[1]
         assert template.startswith("/api/")

@@ -9,10 +9,8 @@ away from whoever holds its current password and from every browser signed in to
 
 **Since #69 it replaces the credential, not the owner** (spec 013). It used to delete the
 account and insert a new one, and every row the owner has hangs off `users.id`: the wallets
-and their balance history went with it through the cascade, and the first exchange fill
-would have made the command fail outright on its `RESTRICT`. The tests below that seed a
-portfolio are the ones that fail against that implementation, and that is what they are
-for.
+and their balance history went with it through the cascade. The test below that seeds a
+portfolio is the one that fails against that implementation, and that is what it is for.
 """
 
 from __future__ import annotations
@@ -69,7 +67,6 @@ PINNED_CREATED_AT: Final = datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=UTC)
 CREDENTIAL_TABLES: Final = frozenset({"users", "sessions"})
 
 OBSERVED_AT: Final = datetime(2026, 9, 20, 12, 0, 0, 123456, tzinfo=UTC)
-EXECUTED_AT: Final = datetime(2026, 9, 3, 15, 30, 0, 123000, tzinfo=UTC)
 
 #: Two usernames no refusal message could contain by accident. "owner" would not do: it is
 #: an English word, and a message about "more than one owner account" would contain it.
@@ -168,13 +165,13 @@ def database_contents(engine: Engine) -> dict[str, list[dict[str, object]]]:
         }
 
 
-def give_the_owner_a_portfolio(engine: Engine, owner_id: int, *, with_fill: bool) -> None:
-    """One wallet with one balance snapshot, and one exchange account, optionally with a fill.
+def give_the_owner_a_portfolio(engine: Engine, owner_id: int) -> None:
+    """One wallet with one balance snapshot.
 
-    Raw SQL through a second connection, the way the balance and exchange suites seed their
-    rows: what is being protected is what is in the file, not what an ORM session believes.
-    The snapshot needs a run to point at, and a real run records its chain, so both are
-    written too. The address is a BIP-173 testnet vector; rule 3 forbids a mainnet one.
+    Raw SQL through a second connection, the way the balance suites seed their rows: what
+    is being protected is what is in the file, not what an ORM session believes. The
+    snapshot needs a run to point at, and a real run records its chain, so both are written
+    too. The address is a BIP-173 testnet vector; rule 3 forbids a mainnet one.
     """
     now = sqlite_timestamp(OBSERVED_AT)
     with engine.begin() as connection:
@@ -209,32 +206,6 @@ def give_the_owner_a_portfolio(engine: Engine, owner_id: int, *, with_fill: bool
             ),
             {"wallet_id": wallet_id, "run_id": run_id, "now": now},
         )
-        account_id: int = connection.execute(
-            text(
-                "INSERT INTO exchange_accounts (user_id, exchange_key, created_at) "
-                "VALUES (:user_id, 'bitget', :now) RETURNING id"
-            ),
-            {"user_id": owner_id, "now": now},
-        ).scalar_one()
-        if with_fill:
-            connection.execute(
-                text(
-                    "INSERT INTO exchange_fills (exchange_account_id, external_trade_id, "
-                    "external_order_id, symbol, base_asset, quote_asset, side, quantity, "
-                    "price, quote_quantity, quote_quantity_derived, fee_amount, fee_asset, "
-                    "executed_at, raw_payload, ingested_at) "
-                    "VALUES (:account_id, '1001', '5001', 'BTCUSDT', 'BTC', 'USDT', 'buy', "
-                    "'0.000424242424242424', '86000.100000000000000000', "
-                    "'36.484273484273484273', 0, '0.036484273484273484', 'USDT', "
-                    ":executed_at, :raw_payload, :now)"
-                ),
-                {
-                    "account_id": account_id,
-                    "executed_at": sqlite_timestamp(EXECUTED_AT),
-                    "raw_payload": '{"tradeId":"1001"}',
-                    "now": now,
-                },
-            )
 
 
 def test_create_user_prompts_and_never_accepts_a_password_argument(
@@ -320,22 +291,15 @@ def test_create_user_refuses_when_a_user_exists(
     assert users[0].password_hash == original
 
 
-@pytest.mark.parametrize(
-    "with_fill", [True, False], ids=["after-the-first-fill", "before-any-fill"]
-)
 def test_create_user_replace_keeps_every_row_that_belongs_to_the_owner(
     cli_database: Path,
     sync_engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
-    with_fill: bool,
 ) -> None:
     """Spec 013, criteria 1 and 2: recovering the password takes nothing else with it.
 
-    Both of the ways the old delete-then-insert lost data are here, one per parameter.
-    **After the first fill** the delete cascades to the exchange account, the fill's
-    `RESTRICT` refuses, and the command dies on an `IntegrityError` -- a forgotten password
-    becomes a lost instance again. **Before any fill**, which is every deployment today, the
-    command succeeds and quietly takes every wallet and its whole balance history with it.
+    The old delete-then-insert succeeded and quietly took every wallet and its whole balance
+    history with it through the cascade.
 
     Every table outside `users` and `sessions` is compared whole, row by row and value by
     value, rather than counted: a count survives a row that was deleted and re-created with
@@ -343,15 +307,13 @@ def test_create_user_replace_keeps_every_row_that_belongs_to_the_owner(
     """
     del cli_database
     owner_id = create_the_owner(monkeypatch, sync_engine)
-    give_the_owner_a_portfolio(sync_engine, owner_id, with_fill=with_fill)
+    give_the_owner_a_portfolio(sync_engine, owner_id)
     insert_session(sync_engine, owner_id, A_TOKEN_HASH)
     before = database_contents(sync_engine)
     seeded = {
         "wallets": 1,
         "sync_runs": 1,
         "balance_snapshots": 1,
-        "exchange_accounts": 1,
-        "exchange_fills": 1 if with_fill else 0,
     }
     # The comparison below is only worth something if there was something to compare.
     assert {table: len(before[table]) for table in seeded} == seeded
@@ -366,7 +328,6 @@ def test_create_user_replace_keeps_every_row_that_belongs_to_the_owner(
     [owner] = after["users"]
     assert owner["id"] == owner_id
     assert after["wallets"][0]["user_id"] == owner_id
-    assert after["exchange_accounts"][0]["user_id"] == owner_id
     assert FAST_HASHER.verify(str(owner["password_hash"]), REPLACEMENT_PHRASE)
     assert after["sessions"] == []
 

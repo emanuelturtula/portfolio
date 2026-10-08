@@ -5,8 +5,8 @@ import { HEADING_TAGS, type HeadingLevel } from '@/components/EmptyState';
 interface ErrorStateProps {
   readonly title?: string;
   /**
-   * A string, or inline content when the sentence needs an element in it - a `<time>`, for
-   * the invested section's "the last attempt failed on ...". Rendered inside a single `<p>`.
+   * A string, or inline content when the sentence needs an element in it, such as a `<time>`.
+   * Rendered inside a single `<p>`.
    */
   readonly description: ReactNode;
   readonly onRetry?: () => void;

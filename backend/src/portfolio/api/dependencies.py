@@ -24,13 +24,6 @@ from fastapi import Request  # noqa: TC002
 
 from portfolio.api.errors import UnauthorizedError
 from portfolio.domain.auth import SessionLifetime
-from portfolio.services.accounting import (
-    AccountingService,
-    AccountingStatus,
-    RecomputeReason,
-    build_accounting_service,
-)
-from portfolio.services.adjustments import AdjustmentService, build_adjustment_service
 from portfolio.services.auth import (
     SESSION_REQUIRED_DETAIL,
     AuthService,
@@ -40,7 +33,6 @@ from portfolio.services.auth import (
 )
 from portfolio.services.backup import BackupService
 from portfolio.services.balances import BalanceService, build_balance_service
-from portfolio.services.exchanges import ExchangeService, build_exchange_service
 from portfolio.services.health import (
     HealthService,
     SchedulerName,
@@ -49,20 +41,17 @@ from portfolio.services.health import (
 )
 from portfolio.services.password_hasher import PasswordHasher
 from portfolio.services.portfolio import PortfolioService, build_portfolio_service
-from portfolio.services.reconciliation import ReconciliationService, build_reconciliation_service
 from portfolio.services.sync_coordinator import SyncCoordinator
 from portfolio.services.wallets import WalletService, build_wallet_service
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator
 
     from fastapi import FastAPI
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from portfolio.config import Settings
-    from portfolio.domain.exchanges import ExchangeKey
     from portfolio.services.balances import SyncRunSummary
-    from portfolio.services.exchanges import ExchangeSyncRunSummary
 
 
 def install_auth_runtime(app: FastAPI, settings: Settings) -> None:
@@ -164,84 +153,10 @@ def get_sync_coordinator(request: Request) -> SyncCoordinator[SyncRunSummary]:
     return coordinator
 
 
-def get_exchange_sync_coordinator(request: Request) -> SyncCoordinator[ExchangeSyncRunSummary]:
-    """The process-wide exchange sync coordinator, which the lifespan installed.
-
-    A separate instance from the balance coordinator, on its own `app.state` attribute, for
-    the reason `get_sync_coordinator` gives about outliving the request. It is installed
-    **always**, whether or not the exchange timer is built, so a manual sync works with the
-    timer switched off.
-
-    Raises:
-        RuntimeError: the lifespan never ran. Not reachable from a served request.
-    """
-    coordinator = getattr(request.app.state, "exchange_sync_coordinator", None)
-    if not isinstance(coordinator, SyncCoordinator):
-        message = (
-            "No exchange sync coordinator is installed: the application's lifespan has not "
-            "run. Exchange sync is wired up in `portfolio.main.lifespan`."
-        )
-        raise RuntimeError(message)
-    return coordinator
-
-
-def configured_exchanges_of(app: FastAPI) -> frozenset[ExchangeKey]:
-    """The venues the lifespan found credentials for, or none if it has not run.
-
-    **The only thing a request learns about credentials**: the keys of the provider mapping,
-    published by the lifespan as `app.state.configured_exchanges`. The mapping itself, and
-    the providers holding the credentials, never reach `app.state`.
-    """
-    configured: frozenset[ExchangeKey] = getattr(app.state, "configured_exchanges", frozenset())
-    return configured
-
-
-async def get_exchange_service(request: Request) -> AsyncIterator[ExchangeService]:
-    """Open a session for this request and hand the router the read side of the exchanges.
-
-    Read-only, like `get_balance_service`. `syncing` is read from the exchange coordinator
-    now, as the request is served.
-    """
-    coordinator = get_exchange_sync_coordinator(request)
-    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
-    async with sessionmaker() as session:
-        yield build_exchange_service(
-            session,
-            configured=configured_exchanges_of(request.app),
-            syncing=coordinator.in_flight,
-        )
-
-
-async def get_accounting_service(request: Request) -> AsyncIterator[AccountingService]:
-    """Open a session for this request and hand the router the accounting service.
-
-    The endpoint only reads through it -- `positions` -- so the session is never committed here
-    and closing it discards nothing. The recompute, which does commit, is never run on a
-    request's session: the trigger in `main.py` opens its own.
-    """
-    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
-    async with sessionmaker() as session:
-        yield build_accounting_service(session)
-
-
-async def get_reconciliation_service(request: Request) -> AsyncIterator[ReconciliationService]:
-    """Open a session for this request and hand the router the reconciliation service.
-
-    Read-only, like `get_balance_service`: the service compares what the syncs and the
-    recompute stored, so the session is never committed here and closing it discards nothing.
-    **Nothing is built from the provider mapping**: the venue balances it reads are the rows
-    the exchange sync wrote, and no request path reaches a venue for them. The service's clock
-    is the default one: a reading's age is measured against the time the request is served.
-    """
-    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
-    async with sessionmaker() as session:
-        yield build_reconciliation_service(session)
-
-
 async def get_portfolio_service(request: Request) -> AsyncIterator[PortfolioService]:
     """Open a session for this request and hand the router the portfolio service.
 
-    Read-only, like `get_reconciliation_service`: the summary is built from what the syncs and
+    Read-only, like `get_balance_service`: the summary is built from what the balance sync and
     the price refresh stored, so the session is never committed here and closing it discards
     nothing. The service's clock is the default one.
     """
@@ -250,53 +165,13 @@ async def get_portfolio_service(request: Request) -> AsyncIterator[PortfolioServ
         yield build_portfolio_service(session)
 
 
-async def get_adjustment_service(request: Request) -> AsyncIterator[AdjustmentService]:
-    """Open a session for this request and hand the router the adjustment service.
-
-    The service is built with an `after_change` that awaits the recompute trigger with
-    `RecomputeReason.ADJUSTMENT`. The service commits its own write on this session first, so
-    the recompute -- which opens a session of its own and takes the recompute lock -- never
-    waits on this request's write.
-
-    **The trigger is read from `app.state.accounting_recompute`**, because
-    `run_accounting_recompute` lives in `main.py`, which nothing under `api` may import -- it
-    imports every router (spec 023, *Triggering the recompute from a request*).
-    `install_accounting_runtime` publishes it from `create_app`, so every application that
-    serves a request has one, and it is read directly, as `db_sessionmaker` is. It is read per
-    request, so a test can replace it.
-    """
-    recompute: Callable[[RecomputeReason], Awaitable[AccountingStatus]] = (
-        request.app.state.accounting_recompute
-    )
-
-    async def after_change() -> AccountingStatus:
-        return await recompute(RecomputeReason.ADJUSTMENT)
-
-    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
-    async with sessionmaker() as session:
-        yield build_adjustment_service(session, after_change=after_change)
-
-
-def get_accounting_status(request: Request) -> AccountingStatus | None:
-    """The last recompute attempt the trigger recorded, or `None` before the first one.
-
-    Read from `app.state.accounting_status`, which `create_app` installs as `None` and the
-    trigger in `main.py` replaces after every attempt. `getattr` with a default so that an
-    application whose state was never installed answers "no attempt yet" rather than raising.
-    A value of any other type is treated the same way: the route renders what the trigger
-    wrote, and nothing else.
-    """
-    status = getattr(request.app.state, "accounting_status", None)
-    return status if isinstance(status, AccountingStatus) else None
-
-
 def get_backup_service(request: Request) -> BackupService:
     """The process-wide backup service, which `create_app` installed.
 
     **Not built per request**, for the reason the coordinators are not: the service holds the
     timer's last attempt, which `GET /api/health/detail` serves, and a service built for one
     request would know nothing of it. It is installed by `create_app` rather than the lifespan,
-    as the accounting runtime is, so that it exists for a test that never starts the lifespan;
+    as the authentication runtime is, so that it exists for a test that never starts the lifespan;
     building it reads nothing from the file system.
 
     Raises:
@@ -316,14 +191,13 @@ def get_backup_service(request: Request) -> BackupService:
 SCHEDULER_ATTRIBUTES: Final[tuple[tuple[SchedulerName, str], ...]] = (
     (SchedulerName.BALANCE_SYNC, "balance_scheduler"),
     (SchedulerName.PRICE_REFRESH, "price_scheduler"),
-    (SchedulerName.EXCHANGE_SYNC, "exchange_scheduler"),
     (SchedulerName.BACKUP, "backup_scheduler"),
 )
 """Each timer's name, and the `app.state` attribute `main.lifespan` publishes it on."""
 
 
 def timers_of(app: FastAPI) -> dict[SchedulerName, TimerLike | None]:
-    """The four timers the lifespan published, `None` for each one it did not build.
+    """The three timers the lifespan published, `None` for each one it did not build.
 
     `None` when the settings switched a timer off -- the lifespan publishes `None` then -- and
     also when the lifespan has not run, which only a test does. Either way the timer is served

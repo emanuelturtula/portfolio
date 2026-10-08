@@ -561,13 +561,17 @@ async def never_ran() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# #15: the coordinator is generic, and the exchange instance speaks its own names
+# #15: the coordinator is generic, and a second instance speaks its own names
 # --------------------------------------------------------------------------------------
 
 
-def exchange_coordinator(runner: Runner) -> SyncCoordinator[SyncRunSummary]:
-    """The instance `main.py` builds for the exchange sync, over a counting stub."""
-    return SyncCoordinator(runner, task_name="exchange-sync", log_prefix="exchange_sync")
+def other_coordinator(runner: Runner) -> SyncCoordinator[SyncRunSummary]:
+    """An instance built with its own names, over a counting stub.
+
+    `main.py` builds only the balance coordinator today. The names are still parameters,
+    and these tests are what keep a second instance from logging as the balance sync.
+    """
+    return SyncCoordinator(runner, task_name="other-sync", log_prefix="other_sync")
 
 
 class NamingRunner(Runner):
@@ -595,18 +599,18 @@ async def test_the_balance_coordinator_keeps_its_names_when_built_without_them()
     assert runner.task_names == ["balance-sync"]
 
 
-async def test_the_exchange_coordinator_runs_under_its_own_task_name() -> None:
+async def test_a_second_coordinator_runs_under_its_own_task_name() -> None:
     runner = NamingRunner()
 
-    await wait_for(exchange_coordinator(runner).sync(SyncTrigger.MANUAL))
+    await wait_for(other_coordinator(runner).sync(SyncTrigger.MANUAL))
 
-    assert runner.task_names == ["exchange-sync"]
+    assert runner.task_names == ["other-sync"]
 
 
-async def test_the_exchange_coordinator_joins_rather_than_starting_a_second_run() -> None:
+async def test_a_second_coordinator_joins_rather_than_starting_a_second_run() -> None:
     """Criterion 6 of #10, for the second instance: one run, two callers, both answered."""
     runner = Runner(gated=True)
-    coordinator = exchange_coordinator(runner)
+    coordinator = other_coordinator(runner)
 
     first = asyncio.create_task(coordinator.sync(SyncTrigger.SCHEDULED))
     await wait_for(runner.started.wait())
@@ -622,25 +626,25 @@ async def test_the_exchange_coordinator_joins_rather_than_starting_a_second_run(
 
 
 async def test_two_coordinators_do_not_join_each_others_runs() -> None:
-    """The balance and exchange syncs are separate instances: neither blocks the other."""
+    """Separate instances share no run: neither blocks the other."""
     balances = Runner(gated=True)
-    exchanges = Runner()
+    others = Runner()
     balance_coordinator = SyncCoordinator(balances)
 
     held = asyncio.create_task(balance_coordinator.sync(SyncTrigger.SCHEDULED))
     await wait_for(balances.started.wait())
-    outcome = await wait_for(exchange_coordinator(exchanges).sync(SyncTrigger.MANUAL))
+    outcome = await wait_for(other_coordinator(others).sync(SyncTrigger.MANUAL))
     balances.gate.set()
     await wait_for(held)
 
     assert outcome.joined is False
-    assert exchanges.triggers == [SyncTrigger.MANUAL]
+    assert others.triggers == [SyncTrigger.MANUAL]
 
 
-async def test_an_unobserved_exchange_failure_is_logged_under_the_exchange_name() -> None:
-    """`exchange_sync_failed`, and never the balance sync's event for an exchange run."""
+async def test_an_unobserved_failure_is_logged_under_the_instances_own_name() -> None:
+    """`other_sync_failed`, and never the balance sync's event for another instance's run."""
     runner = Runner(gated=True, raises=RuntimeError("the database went away"))
-    coordinator = exchange_coordinator(runner)
+    coordinator = other_coordinator(runner)
 
     with capture_logs() as captured:
         waiter = asyncio.create_task(coordinator.sync(SyncTrigger.MANUAL))
@@ -651,13 +655,13 @@ async def test_an_unobserved_exchange_failure_is_logged_under_the_exchange_name(
         runner.gate.set()
         await settle(coordinator)
 
-    assert tracebacks(captured) == ["exchange_sync_failed"]
+    assert tracebacks(captured) == ["other_sync_failed"]
     assert not any(str(entry["event"]).startswith("balance_sync") for entry in captured)
 
 
-async def test_an_exchange_run_cancelled_at_shutdown_is_logged_under_the_exchange_name() -> None:
+async def test_a_run_cancelled_at_shutdown_is_logged_under_the_instances_own_name() -> None:
     runner = Runner(gated=True)
-    coordinator = exchange_coordinator(runner)
+    coordinator = other_coordinator(runner)
     running = asyncio.create_task(coordinator.sync(SyncTrigger.SCHEDULED))
     await wait_for(runner.started.wait())
 
@@ -666,29 +670,8 @@ async def test_an_exchange_run_cancelled_at_shutdown_is_logged_under_the_exchang
 
     assert drained is False
     events = [entry["event"] for entry in captured]
-    assert "exchange_sync_cancelled_at_shutdown" in events
+    assert "other_sync_cancelled_at_shutdown" in events
     assert "balance_sync_cancelled_at_shutdown" not in events
     runner.gate.set()
     with suppress(asyncio.CancelledError, TimeoutError, RuntimeError):
-        await wait_for(running)
-
-
-async def test_an_exchange_run_that_fails_inside_the_grace_counts_as_drained() -> None:
-    """The failure line itself is at debug, below what the suite's logger passes through."""
-    runner = Runner(gated=True, raises=RuntimeError("the database went away"))
-    coordinator = exchange_coordinator(runner)
-    running = asyncio.create_task(coordinator.sync(SyncTrigger.SCHEDULED))
-    await wait_for(runner.started.wait())
-
-    async def release() -> None:
-        await asyncio.sleep(0)
-        runner.gate.set()
-
-    releasing = asyncio.create_task(release())
-    drained = await wait_for(coordinator.drain(grace_seconds=DEADLOCK_TIMEOUT))
-    await releasing
-
-    assert drained is True
-    assert in_flight(coordinator) is False
-    with pytest.raises(RuntimeError):
         await wait_for(running)

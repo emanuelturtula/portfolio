@@ -5,9 +5,9 @@ handed an `AsyncSession` and it does not commit -- the service that opened the u
 work decides when it ends, because `create-user --replace` changes the account's
 credential and revokes its sessions, and those two have to be one transaction or none.
 
-**Nothing here deletes an account.** Every row the owner has -- wallets, balance history,
-exchange accounts and their fills -- hangs off `users.id`, some by `ON DELETE CASCADE` and
-some by `RESTRICT`. A delete would either destroy that history or fail on it, so the one
+**Nothing here deletes an account.** Every row the owner has -- wallets and their balance
+history -- hangs off `users.id` by `ON DELETE CASCADE`. A delete would destroy that history,
+so the one
 path that used to delete a user now updates it in place instead, and the query that did the
 deleting is gone rather than left for the next caller to find.
 """
@@ -85,10 +85,10 @@ class UserRepository:
     async def set_credentials(self, user: User, *, username: str, password_hash: str) -> None:
         """Replace the username and the hash in place, keeping `id` and `created_at`.
 
-        Keeping the `id` is the point: it is what every wallet, snapshot and exchange
-        account refers to, so an update leaves all of them attached -- including rows in
-        tables that do not exist yet. It revokes nothing; the service does that explicitly,
-        because an update fires no cascade.
+        Keeping the `id` is the point: it is what every wallet and snapshot refers to, so an
+        update leaves all of them attached -- including rows in tables that do not exist yet.
+        It revokes nothing; the service does that explicitly, because an update fires no
+        cascade.
         """
         user.username = username
         user.password_hash = password_hash

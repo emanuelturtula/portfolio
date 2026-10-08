@@ -108,13 +108,6 @@ def apply_auth_environment(
     # whether or not this deployment holds anything.
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
-    # #15's exchange timer is built only when a venue is configured, and nothing here
-    # configures one -- unless a developer's `.env` does, which `Settings` reads. Off
-    # regardless, so a suite that hands the lifespan a venue on purpose
-    # (`tests/api/test_exchanges.py`) owns every run it asserts on, and the manual endpoint
-    # working with the timer off is a claim that suite makes by name.
-    monkeypatch.setenv("PORTFOLIO_EXCHANGE_SYNC_ENABLED", "false")
-    monkeypatch.delenv("PORTFOLIO_EXCHANGE_HISTORY_START", raising=False)
     # #22's backup timer is on by default and takes a copy at startup on a fresh volume, and
     # its directory defaults to `./data/backups` under the working directory. Off, and the
     # directory under `tmp_path` regardless, so a suite that turns the timer back on, or calls

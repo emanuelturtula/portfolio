@@ -348,10 +348,9 @@ class AuthService:
         forgotten password would mean a lost instance.
 
         **It replaces the credential, never the account.** The row is updated in place --
-        new hash, same `id` and `created_at` -- because every wallet, balance snapshot,
-        exchange account and fill hangs off that `id`. Deleting the user instead, as this
-        once did, cascaded through the wallets and their history, and would fail outright
-        against the fills' `RESTRICT`. An update is correct for every table that references
+        new hash, same `id` and `created_at` -- because every wallet and balance snapshot
+        hangs off that `id`. Deleting the user instead, as this once did, cascaded through the
+        wallets and their history. An update is correct for every table that references
         `users.id`, including the ones not written yet.
 
         **`username` names a new account; it renames an existing one only with `rename`.**

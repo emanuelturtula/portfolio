@@ -97,11 +97,6 @@ SECRET_FIELDS: Final = frozenset(
     {
         "bootstrap_password",
         "coingecko_api_key",
-        "bitget_api_key",
-        "bitget_api_secret",
-        "bitget_api_passphrase",
-        "bingx_api_key",
-        "bingx_api_secret",
     }
 )
 

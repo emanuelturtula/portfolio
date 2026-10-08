@@ -2,13 +2,11 @@
 
 React + TypeScript + Vite frontend for the crypto portfolio tracker.
 
-Signed in, there are three pages: the dashboard at `/`, showing the total portfolio
-value, one row per held asset and one row per wallet with its freshness;
-`/wallets`, where an address is registered, archived or restored; and
-`/exchanges`, showing every imported trade with exchange and day filters (held in the URL)
-and what they add up to, each configured venue's sync status, a banner where a retention
-window has truncated its history, a manual **Sync now** trigger, and the run log.
-`/health` is still the reference page for the four-state rendering pattern below.
+Signed in, there are four pages: the dashboard at `/`, showing the total portfolio value
+in USDT, what is held and how its value splits; `/details`, with one row per held asset and
+one row per wallet with its freshness; `/wallets`, where an address is registered, archived
+or restored; and `/health`, still the reference page for the four-state rendering pattern
+below.
 
 ## Requirements
 

@@ -45,7 +45,7 @@ class HoldingResponse(BaseModel):
 
 
 class MissingResponse(BaseModel):
-    """Something a figure could not include as current, and which chain, venue or asset."""
+    """Something a figure could not include as current, and which chain or asset."""
 
     kind: MissingKind
     subject: str
@@ -59,25 +59,15 @@ class MissingResponse(BaseModel):
 class PortfolioSummaryResponse(BaseModel):
     """The dashboard's figures, in USDT.
 
-    * `total_value` -- every tracked, non-cash asset held, in the wallets and on the
-      exchanges, at its cached price.
-    * `invested` -- the net cash the exchange fills put in: spent on buys, plus fees paid in
-      cash, minus received from sells. Negative when sales brought back more than buys cost.
-    * `pnl` -- `total_value - invested`; `pnl_pct` its percentage of `invested`, `null` when
-      `invested` is not above zero.
+    * `total_value` -- every asset the wallets hold, at its cached price.
     * `holdings` -- largest value first, the unpriced ones last.
     * `missing` -- what the figures could not include, or include only as last read. Empty
       means they are whole and current.
-    * `untracked` -- assets held that nothing prices, left out of every figure.
     """
 
     total_value: MoneyStr
-    invested: MoneyStr
-    pnl: MoneyStr
-    pnl_pct: MoneyStr | None
     holdings: list[HoldingResponse]
     missing: list[MissingResponse]
-    untracked: list[str]
 
     @classmethod
     def of(cls, view: PortfolioSummaryView) -> PortfolioSummaryResponse:
@@ -85,10 +75,6 @@ class PortfolioSummaryResponse(BaseModel):
         summary = view.summary
         return cls(
             total_value=summary.total_value,
-            invested=summary.invested,
-            pnl=summary.pnl,
-            pnl_pct=summary.pnl_pct,
             holdings=[HoldingResponse.of(holding) for holding in summary.holdings],
             missing=[MissingResponse.of(entry) for entry in view.missing],
-            untracked=list(view.untracked),
         )

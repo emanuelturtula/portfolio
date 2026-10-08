@@ -25,7 +25,7 @@ services:
       # removing the data volume does not remove them. Each copy holds the owner's complete
       # financial data, as the database does. docs/operations.md, section 17.
       PORTFOLIO_BACKUP_DIR: /app/backups
-    # Application secrets (exchange API credentials, price provider keys) live in a
+    # Application secrets (the bootstrap password, price provider keys) live in a
     # host-local file, ~/portfolio-app/prod/secrets.env, that deploy.py guarantees exists at
     # mode 0600. They are written once over SSH by the operator and never pass through
     # GitHub Actions. The /dev/null default keeps compose valid before that file has any

@@ -7,8 +7,8 @@ import { money } from '@/lib/money';
 const FORMAT = { minimumFractionDigits: 2, maximumFractionDigits: 2 };
 
 const TWO_SERIES: readonly BarSeries[] = [
-  { name: 'Invested', shade: 'soft' },
-  { name: 'Market value', shade: 'solid' },
+  { name: 'Last week', shade: 'soft' },
+  { name: 'Today', shade: 'solid' },
 ];
 
 function renderChart(rows: readonly BarRow[], series: readonly BarSeries[] = []) {
@@ -94,8 +94,8 @@ describe('BarChart', () => {
       },
     ]);
 
-    const [invested, value] = tracks(plotRows(figure)[0]);
-    expect(invested?.querySelector('.bar')).not.toBeNull();
+    const [lastWeek, value] = tracks(plotRows(figure)[0]);
+    expect(lastWeek?.querySelector('.bar')).not.toBeNull();
     expect(value?.querySelector('.bar')).toBeNull();
     expect(value).toHaveTextContent('—');
     expect(value?.getAttribute('style')).toBeNull();
@@ -153,7 +153,7 @@ describe('BarChart', () => {
 
     const legend = within(figure).getByRole('list');
     const entries = within(legend).getAllByRole('listitem');
-    expect(entries.map((entry) => entry.textContent)).toEqual(['Invested', 'Market value']);
+    expect(entries.map((entry) => entry.textContent)).toEqual(['Last week', 'Today']);
     expect(entries[0]?.querySelector('.swatch')).toHaveClass('swatch-soft');
     expect(entries[1]?.querySelector('.swatch')).toHaveClass('swatch-solid');
 

@@ -1,19 +1,17 @@
-"""Spec 030 (#23), criterion 8: the five new sections of `GET /api/health/detail`, over HTTP.
+"""Spec 030 (#23), criterion 8: the sections beside the backup in `GET /api/health/detail`.
 
 The whole stack runs -- the session middleware, the router, the dependency that reads the
 timers off `app.state`, `HealthService`, the repositories and SQLite -- through the real
 lifespan, signed in as the owner. What is pinned:
 
 * **every state of every section is reachable through the endpoint**: each timer state from
-  real `IntervalScheduler`s the test starts and stops; each chain, account and price state
-  from rows planted the way the syncs write them; each holdings-check state from the real
-  reconciliation, whose counts are cross-checked against `GET /api/accounting/reconciliation`;
-  and `unavailable` for every section that can fail, while the others answer;
+  real `IntervalScheduler`s the test starts and stops; each chain and price state from rows
+  planted the way the syncs write them; and `unavailable` for every section that can fail,
+  while the others answer;
 * **the exact shape**, key for key, so nothing beyond the spec -- no interval, path, URL,
-  key, tolerance or age limit -- is served; and the chain's provider text is not;
-* **no provider is called**: a transport that records every request, a chain registry that
-  records every provider it is asked for, and a simulated venue that counts its calls all
-  stay at zero across repeated reads;
+  key or age limit -- is served; and the chain's provider text is not;
+* **no provider is called**: a transport that records every request and a chain registry
+  that records every provider it is asked for both stay at zero across repeated reads;
 * **`401` without a session**, and nothing added to the public allowlist;
 * **the OpenAPI document** declares every state as an enum of exactly its wire forms.
 
@@ -24,20 +22,20 @@ price planted "five minutes old" is five minutes older than the test's run.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
 from portfolio.api.middleware import PUBLIC_API_PATHS
 from portfolio.domain.chains import ChainKey
-from portfolio.domain.exchanges import ExchangeKey
+from portfolio.main import create_app
 from portfolio.providers.http import build_http_client
 from portfolio.providers.registry import CHAIN_PROVIDERS
-from portfolio.repositories.exchange_sync_runs import ExchangeSyncErrorKind
-from portfolio.repositories.exchanges import ExchangeAccountRepository
 from portfolio.repositories.prices import PriceRepository
 from portfolio.repositories.sync_runs import (
     ChainOutcome,
@@ -47,59 +45,46 @@ from portfolio.repositories.sync_runs import (
     SyncTrigger,
 )
 from portfolio.services.prices import STALE_AFTER
-from portfolio.services.reconciliation import ReconciliationService
 from portfolio.services.scheduler import IntervalScheduler, utc_now
-from tests.accounting_harness import plant_price
-from tests.address_vectors import BIP173_TESTNET_P2WPKH, BIP173_TESTNET_P2WSH, KASPA_TESTNET_V0
-from tests.api.test_accounting import application, plant, recompute
-from tests.api.test_reconciliation import (
-    RECONCILIATION,
-    Readings,
-    account_id,
-    add_wallet,
-    plant_synced,
-    plant_the_specs_example,
-)
-from tests.exchange_sync_harness import SimulatedVenue
-from tests.services.test_reconciliation_service import (
-    buy,
-    fail_balances,
-    plant_reading,
-    set_sync_status,
-    store_balances,
-)
+from tests.address_vectors import BIP173_TESTNET_P2WPKH, KASPA_TESTNET_V0
+from tests.auth.conftest import BASE_URL, sign_in
+from tests.balance_harness import insert_wallet
+from tests.price_harness import plant_price
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
     import pytest
     from fastapi import FastAPI
-    from httpx import AsyncClient
 
 DETAIL: Final = "/api/health/detail"
-SECTIONS: Final = {"backup", "schedulers", "chains", "exchanges", "prices", "reconciliation"}
+SECTIONS: Final = {"backup", "schedulers", "chains", "prices"}
 FAILED_DETAIL: Final = "the provider said something only the run log should keep"
 DEADLOCK_TIMEOUT: Final = 5
 
 #: Every key of every section, as the spec writes the shape. Exactly these, and no other.
 SCHEDULER_KEYS: Final = {"name", "state", "last_tick_at", "last_tick_succeeded"}
 CHAIN_KEYS: Final = {"chain_key", "state", "last_success_at", "last_error_kind"}
-EXCHANGE_KEYS: Final = {
-    "exchange_key",
-    "sync_state",
-    "last_synced_at",
-    "balances_state",
-    "balances_read_at",
-}
 PRICES_KEYS: Final = {"state", "latest_fetched_at"}
-RECONCILIATION_KEYS: Final = {
-    "state",
-    "computed_at",
-    "assets_compared",
-    "assets_mismatched",
-    "sources_not_compared",
-}
+
+
+@asynccontextmanager
+async def application() -> AsyncIterator[tuple[FastAPI, AsyncClient]]:
+    """The real application, its lifespan run, signed in as the owner."""
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url=BASE_URL) as client:
+            await sign_in(client)
+            yield app, client
+
+
+async def add_wallet(app: FastAPI, chain: ChainKey, address: str) -> int:
+    """One of the owner's wallets, inserted as the wallets endpoint would store it."""
+    async with app.state.db_sessionmaker() as session:
+        owner = await session.scalar(text("SELECT id FROM users WHERE username = 'owner'"))
+        return await insert_wallet(session, user_id=int(owner), chain_key=chain, address=address)
 
 
 async def detail(client: AsyncClient) -> dict[str, Any]:
@@ -175,34 +160,33 @@ def real_timer(
     return scheduler, sleep
 
 
-async def test_a_lifespan_with_every_timer_switched_off_serves_four_disabled_timers(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
+async def test_a_lifespan_with_every_timer_switched_off_serves_three_disabled_timers(
+    api_environment: Path,
 ) -> None:
     del api_environment
-    async with application(monkeypatch) as (_app, client):
+    async with application() as (_app, client):
         body = await detail(client)
 
     assert body["schedulers"] == [
         {"name": name, "state": "disabled", "last_tick_at": None, "last_tick_succeeded": None}
-        for name in ("balance-sync", "price-refresh", "exchange-sync", "backup")
+        for name in ("balance-sync", "price-refresh", "backup")
     ]
 
 
-async def test_every_timer_state_is_served_from_real_timers(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`ok`, `late`, `stopped` and `disabled`, each from an `IntervalScheduler` on `app.state`.
+async def test_every_timer_state_is_served_from_real_timers(api_environment: Path) -> None:
+    """`ok`, `late` and `stopped`, each from an `IntervalScheduler` on `app.state`.
 
     The late one's clock is a day behind, so its last tick is a day older than the instant the
     service judges it at. The stopped one ticked and failed before it was stopped, so its
-    `last_tick_succeeded` is `false` -- a state the page words on its own.
+    `last_tick_succeeded` is `false` -- a state the page words on its own. `disabled` is the
+    test above: a timer the lifespan never built.
     """
     del api_environment
     day_ago = datetime.now(UTC) - timedelta(days=1)
     ok, ok_sleep = real_timer("balance-sync")
     late, late_sleep = real_timer("price-refresh", clock=lambda: day_ago)
     stopped, stopped_sleep = real_timer("backup", fails=True)
-    async with application(monkeypatch) as (app, client):
+    async with application() as (app, client):
         try:
             for scheduler, sleep in ((ok, ok_sleep), (late, late_sleep), (stopped, stopped_sleep)):
                 await scheduler.start()
@@ -210,7 +194,6 @@ async def test_every_timer_state_is_served_from_real_timers(
             await stopped.stop()
             app.state.balance_scheduler = ok
             app.state.price_scheduler = late
-            app.state.exchange_scheduler = None
             app.state.backup_scheduler = stopped
 
             body = await detail(client)
@@ -222,7 +205,6 @@ async def test_every_timer_state_is_served_from_real_timers(
     assert [timer["name"] for timer in body["schedulers"]] == [
         "balance-sync",
         "price-refresh",
-        "exchange-sync",
         "backup",
     ]
     assert all(set(timer) == SCHEDULER_KEYS for timer in body["schedulers"])
@@ -231,12 +213,6 @@ async def test_every_timer_state_is_served_from_real_timers(
     assert parsed(timers["balance-sync"]["last_tick_at"]) == ok.last_tick_finished_at
     assert timers["price-refresh"]["state"] == "late"
     assert timers["price-refresh"]["last_tick_at"] == wire(day_ago)
-    assert timers["exchange-sync"] == {
-        "name": "exchange-sync",
-        "state": "disabled",
-        "last_tick_at": None,
-        "last_tick_succeeded": None,
-    }
     assert timers["backup"]["state"] == "stopped"
     assert timers["backup"]["last_tick_succeeded"] is False
 
@@ -267,13 +243,13 @@ async def finished_run(app: FastAPI, finished_at: datetime, *chains: ChainOutcom
 
 
 async def test_every_chain_state_is_served_and_the_providers_text_is_not(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
+    api_environment: Path,
 ) -> None:
     """`ok` and `failing` from a finished run, `never` for a chain only a wallet names."""
     del api_environment
     earlier = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=2)
     latest = earlier + timedelta(hours=1)
-    async with application(monkeypatch) as (app, client):
+    async with application() as (app, client):
         await add_wallet(app, ChainKey.KASPA, KASPA_TESTNET_V0)
         await finished_run(
             app,
@@ -314,12 +290,10 @@ async def test_every_chain_state_is_served_and_the_providers_text_is_not(
     }
 
 
-async def test_a_chain_that_succeeded_last_is_ok_with_no_kind(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_a_chain_that_succeeded_last_is_ok_with_no_kind(api_environment: Path) -> None:
     del api_environment
     finished = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
-    async with application(monkeypatch) as (app, client):
+    async with application() as (app, client):
         await add_wallet(app, ChainKey.BITCOIN, BIP173_TESTNET_P2WPKH)
         await finished_run(
             app,
@@ -339,100 +313,17 @@ async def test_a_chain_that_succeeded_last_is_ok_with_no_kind(
 
 
 # --------------------------------------------------------------------------------------
-# The exchanges
-# --------------------------------------------------------------------------------------
-
-
-async def test_every_exchange_state_is_served(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Bitget synced and read; BingX refused its key and its last balance read failed.
-
-    R4: `last_synced_at` is the last *successful* sync, set by `mark_synced` together with
-    `ok`, and left as it was by a later failure.
-    """
-    del api_environment
-    now = datetime.now(UTC).replace(microsecond=0)
-    synced_at = now - timedelta(minutes=30)
-    read_at = now - timedelta(minutes=29)
-    async with application(monkeypatch) as (app, client):
-        await plant(app, {ExchangeKey.BITGET: [], ExchangeKey.BINGX: []})
-        factory = app.state.db_sessionmaker
-        bitget = await account_id(app, ExchangeKey.BITGET)
-        bingx = await account_id(app, ExchangeKey.BINGX)
-        async with factory() as session:
-            accounts = ExchangeAccountRepository(session)
-            await accounts.mark_synced(bitget, synced_at=synced_at)
-            await accounts.mark_synced(bingx, synced_at=synced_at)
-            await session.commit()
-        await set_sync_status(factory, bingx, "auth_failed")
-        await store_balances(factory, bitget, (), read_at)
-        await store_balances(factory, bingx, (), read_at)
-        await fail_balances(factory, bingx, ExchangeSyncErrorKind.AUTH)
-        body = await detail(client)
-
-    assert body["exchanges"] == {
-        "state": "ok",
-        "items": [
-            {
-                "exchange_key": "bingx",
-                "sync_state": "auth_failed",
-                "last_synced_at": wire(synced_at),
-                "balances_state": "failing",
-                "balances_read_at": wire(read_at),
-            },
-            {
-                "exchange_key": "bitget",
-                "sync_state": "ok",
-                "last_synced_at": wire(synced_at),
-                "balances_state": "ok",
-                "balances_read_at": wire(read_at),
-            },
-        ],
-    }
-
-
-async def test_an_account_never_synced_and_never_read_is_served_as_such(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    del api_environment
-    async with application(monkeypatch) as (app, client):
-        await plant(app, {ExchangeKey.BITGET: []})
-        await set_sync_status(
-            app.state.db_sessionmaker, await account_id(app, ExchangeKey.BITGET), "error"
-        )
-        first = await detail(client)
-        await set_sync_status(
-            app.state.db_sessionmaker, await account_id(app, ExchangeKey.BITGET), "never_synced"
-        )
-        second = await detail(client)
-
-    assert first["exchanges"]["items"] == [
-        {
-            "exchange_key": "bitget",
-            "sync_state": "error",
-            "last_synced_at": None,
-            "balances_state": "never",
-            "balances_read_at": None,
-        }
-    ]
-    assert second["exchanges"]["items"][0]["sync_state"] == "never_synced"
-
-
-# --------------------------------------------------------------------------------------
 # The prices
 # --------------------------------------------------------------------------------------
 
 
-async def test_every_price_state_is_served(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_every_price_state_is_served(api_environment: Path) -> None:
     """`never`, then `stale` past the age limit, then `fresh`; `unavailable` is below."""
     del api_environment
     now = datetime.now(UTC).replace(microsecond=0)
     old = now - STALE_AFTER - timedelta(minutes=5)
     recent = now - timedelta(minutes=5)
-    async with application(monkeypatch) as (app, client):
+    async with application() as (app, client):
         never = (await detail(client))["prices"]
         async with app.state.db_sessionmaker() as session:
             await plant_price(session, symbol="BTC", amount=Decimal(1), as_of=old)
@@ -447,142 +338,17 @@ async def test_every_price_state_is_served(
 
 
 # --------------------------------------------------------------------------------------
-# The reconciliation, cross-checked against its own endpoint
-# --------------------------------------------------------------------------------------
-
-
-async def reconciliation_counts(client: AsyncClient) -> dict[str, Any]:
-    """What the health detail must say, worked out from the reconciliation's own document."""
-    response = await client.get(RECONCILIATION)
-    assert response.status_code == 200, response.text
-    body = response.json()
-    wallets = body["wallets"]
-    return {
-        "computed_at": body["computed_at"],
-        "assets_compared": len(body["assets"]),
-        "assets_mismatched": sum(1 for asset in body["assets"] if asset["status"] != "match"),
-        "sources_not_compared": (
-            sum(1 for venue in body["exchanges"] if venue["not_compared_reason"] is not None)
-            + wallets["stale"]
-            + wallets["unread"]
-            + wallets["chain_failed"]
-        ),
-    }
-
-
-def same_instant(left: str | None, right: str | None) -> bool:
-    if left is None or right is None:
-        return left is right
-    return parsed(left) == parsed(right)
-
-
-async def test_an_owner_with_nothing_to_compare_is_match(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """R8: the startup recompute's empty snapshot, nothing held, nothing left out."""
-    del api_environment
-    async with application(monkeypatch) as (_app, client):
-        served = (await detail(client))["reconciliation"]
-        expected = await reconciliation_counts(client)
-
-    assert served["state"] == "match"
-    assert served["computed_at"] is not None
-    assert same_instant(served["computed_at"], expected["computed_at"])
-    assert (
-        served["assets_compared"],
-        served["assets_mismatched"],
-        served["sources_not_compared"],
-    ) == (0, 0, 0)
-
-
-async def test_the_specs_example_is_a_mismatch_with_the_endpoints_counts(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ETH is `history_over` and SOL `history_short`: a mismatch, whatever else is true."""
-    del api_environment
-    async with application(monkeypatch) as (app, client):
-        await plant_the_specs_example(app, Readings())
-        served = (await detail(client))["reconciliation"]
-        expected = await reconciliation_counts(client)
-
-    assert served["state"] == "mismatch"
-    assert set(served) == RECONCILIATION_KEYS
-    assert served["assets_mismatched"] >= 2
-    assert {key: served[key] for key in expected if key != "computed_at"} == {
-        key: value for key, value in expected.items() if key != "computed_at"
-    }
-    assert same_instant(served["computed_at"], expected["computed_at"])
-
-
-async def test_a_wallet_left_unread_makes_a_matching_check_incomplete(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """BTC matches; one wallet was never read and the venue's balances never were either."""
-    del api_environment
-    readings = Readings()
-    async with application(monkeypatch) as (app, client):
-        await plant_synced(app, {ExchangeKey.BITGET: [buy(1001, 0, "BTC", "0.5", "30000")]})
-        read = await add_wallet(app, ChainKey.BITCOIN, BIP173_TESTNET_P2WPKH)
-        await add_wallet(app, ChainKey.BITCOIN, BIP173_TESTNET_P2WSH)
-        await plant_reading(
-            app.state.db_sessionmaker,
-            wallet_id=read,
-            confirmed=50_000_000,
-            observed_at=readings.newer,
-        )
-        await recompute(app)
-        served = (await detail(client))["reconciliation"]
-        expected = await reconciliation_counts(client)
-
-    assert served["state"] == "incomplete"
-    assert served["assets_mismatched"] == 0
-    assert served["sources_not_compared"] >= 1
-    assert {key: served[key] for key in expected if key != "computed_at"} == {
-        key: value for key, value in expected.items() if key != "computed_at"
-    }
-
-
-async def test_no_snapshot_is_not_computed(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    del api_environment
-    async with application(monkeypatch) as (app, client):
-        async with app.state.db_sessionmaker() as session:
-            await session.execute(text("DELETE FROM accounting_snapshots"))
-            await session.commit()
-        served = (await detail(client))["reconciliation"]
-
-    assert served == {
-        "state": "not_computed",
-        "computed_at": None,
-        "assets_compared": 0,
-        "assets_mismatched": 0,
-        "sources_not_compared": 0,
-    }
-
-
-# --------------------------------------------------------------------------------------
 # A section that fails is `unavailable`, and the others answer
 # --------------------------------------------------------------------------------------
 
 UNAVAILABLE: Final = {
     "chains": {"state": "unavailable", "items": []},
-    "exchanges": {"state": "unavailable", "items": []},
     "prices": {"state": "unavailable", "latest_fetched_at": None},
-    "reconciliation": {
-        "state": "unavailable",
-        "computed_at": None,
-        "assets_compared": None,
-        "assets_mismatched": None,
-        "sources_not_compared": None,
-    },
 }
 
 READS: Final = {
     "chains": (SyncRunRepository, "chain_histories"),
-    "exchanges": (ExchangeAccountRepository, "list_for_user"),
     "prices": (PriceRepository, "latest_fetched_at"),
-    "reconciliation": (ReconciliationService, "reconciliation"),
 }
 
 
@@ -591,9 +357,8 @@ async def test_each_failing_section_is_unavailable_while_the_rest_answer(
 ) -> None:
     """One section at a time, through the endpoint: a `200`, never a `500`."""
     del api_environment
-    async with application(monkeypatch) as (app, client):
+    async with application() as (app, client):
         await add_wallet(app, ChainKey.BITCOIN, BIP173_TESTNET_P2WPKH)
-        await plant(app, {ExchangeKey.BITGET: []})
         async with app.state.db_sessionmaker() as session:
             await plant_price(session, symbol="BTC", amount=Decimal(1), as_of=datetime.now(UTC))
         healthy = await detail(client)
@@ -608,7 +373,6 @@ async def test_each_failing_section_is_unavailable_while_the_rest_answer(
         for other in SECTIONS - {section}:
             assert body[other] == healthy[other], f"{other} changed when {section} failed"
     assert healthy["chains"]["items"][0]["chain_key"] == "bitcoin"
-    assert healthy["exchanges"]["items"][0]["exchange_key"] == "bitget"
     assert healthy["prices"]["state"] == "fresh"
 
 
@@ -617,13 +381,12 @@ async def test_each_failing_section_is_unavailable_while_the_rest_answer(
 # --------------------------------------------------------------------------------------
 
 
-async def test_every_section_has_exactly_the_specs_keys(
-    api_environment: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A populated body, walked key by key: an interval or a tolerance would be a new key."""
+async def test_every_section_has_exactly_the_specs_keys(api_environment: Path) -> None:
+    """A populated body, walked key by key: an interval or an age limit would be a new key."""
     del api_environment
-    async with application(monkeypatch) as (app, client):
-        await plant_the_specs_example(app, Readings())
+    async with application() as (app, client):
+        await add_wallet(app, ChainKey.BITCOIN, BIP173_TESTNET_P2WPKH)
+        await add_wallet(app, ChainKey.KASPA, KASPA_TESTNET_V0)
         await finished_run(
             app,
             datetime.now(UTC),
@@ -642,14 +405,9 @@ async def test_every_section_has_exactly_the_specs_keys(
     }
     assert all(set(timer) == SCHEDULER_KEYS for timer in body["schedulers"])
     assert set(body["chains"]) == {"state", "items"}
-    assert body["chains"]["items"]
+    assert len(body["chains"]["items"]) == 2
     assert all(set(chain) == CHAIN_KEYS for chain in body["chains"]["items"])
-    assert set(body["exchanges"]) == {"state", "items"}
-    assert len(body["exchanges"]["items"]) == 2
-    assert all(set(account) == EXCHANGE_KEYS for account in body["exchanges"]["items"])
     assert set(body["prices"]) == PRICES_KEYS
-    assert set(body["reconciliation"]) == RECONCILIATION_KEYS
-    assert "tolerance" not in str(body)
     assert "interval" not in str(body)
 
 
@@ -679,11 +437,10 @@ class Witness:
 async def test_reading_the_detail_calls_no_provider(
     api_environment: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Wallets on both chains, a configured venue, and five reads: nothing is asked of anyone.
+    """Wallets on both chains and five reads: nothing is asked of anyone.
 
     The HTTP client every chain index and price vendor goes through is built over a transport
-    that records and refuses; the chain registry records every provider it is asked for; and
-    the simulated venue counts its page, discovery and balance calls.
+    that records and refuses, and the chain registry records every provider it is asked for.
     """
     del api_environment
     witness = Witness()
@@ -692,19 +449,14 @@ async def test_reading_the_detail_calls_no_provider(
         lambda: build_http_client(transport=httpx.MockTransport(witness.handler)),
     )
     monkeypatch.setattr(CHAIN_PROVIDERS, "create", witness.create)
-    venue = SimulatedVenue()
-    async with application(monkeypatch, {ExchangeKey.BITGET: venue}) as (app, client):
+    async with application() as (app, client):
         await add_wallet(app, ChainKey.BITCOIN, BIP173_TESTNET_P2WPKH)
         await add_wallet(app, ChainKey.KASPA, KASPA_TESTNET_V0)
-        await plant(app, {ExchangeKey.BITGET: []})
         for _ in range(5):
             await detail(client)
 
     assert witness.requests == []
     assert witness.providers == []
-    assert venue.calls == []
-    assert venue.symbol_calls == 0
-    assert venue.balance_calls == 0
 
 
 # --------------------------------------------------------------------------------------
@@ -729,35 +481,29 @@ def test_the_schema_declares_every_state_as_its_wire_forms(app: FastAPI) -> None
     schemas = document["components"]["schemas"]
 
     assert operation["operationId"] == "getHealthDetail"
-    assert operation["summary"] == (
-        "Report how the backups, timers, syncs, prices and holdings check stand"
-    )
+    assert operation["summary"] == ("Report how the backups, timers, balance sync and prices stand")
     assert set(schemas["HealthDetailResponse"]["required"]) == SECTIONS
     assert schemas["SchedulerName"]["enum"] == [
         "balance-sync",
         "price-refresh",
-        "exchange-sync",
         "backup",
     ]
     assert schemas["SchedulerState"]["enum"] == ["ok", "late", "stopped", "disabled"]
     assert schemas["SectionState"]["enum"] == ["ok", "unavailable"]
     assert schemas["SourceState"]["enum"] == ["ok", "failing", "never"]
     assert schemas["PriceHealthState"]["enum"] == ["fresh", "stale", "never", "unavailable"]
-    assert schemas["ReconciliationHealthState"]["enum"] == [
-        "match",
-        "mismatch",
-        "incomplete",
-        "not_computed",
-        "unavailable",
-    ]
+    for removed in (
+        "ReconciliationHealthState",
+        "ReconciliationHealthResponse",
+        "ExchangeHealthResponse",
+        "ExchangesHealthResponse",
+    ):
+        assert removed not in schemas, removed
     for name, keys in (
         ("SchedulerStatusResponse", SCHEDULER_KEYS),
         ("ChainHealthResponse", CHAIN_KEYS),
-        ("ExchangeHealthResponse", EXCHANGE_KEYS),
         ("PricesHealthResponse", PRICES_KEYS),
-        ("ReconciliationHealthResponse", RECONCILIATION_KEYS),
         ("ChainsHealthResponse", {"state", "items"}),
-        ("ExchangesHealthResponse", {"state", "items"}),
     ):
         assert set(schemas[name]["properties"]) == keys, name
         assert set(schemas[name]["required"]) == keys, name

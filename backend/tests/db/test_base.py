@@ -81,28 +81,6 @@ EXPECTED_NAMES = {
         "fk_balance_snapshots_sync_run_id_sync_runs",
         "ix_balance_snapshots_wallet_observed",
     },
-    # #12. Both unique constraints are named explicitly: the convention would render
-    # `uq_exchange_accounts_user_id_exchange_key` and
-    # `uq_exchange_fills_exchange_account_id_external_trade_id`. **No index on either table**,
-    # and the absence is part of the pin: `uq_exchange_fills_account_trade` leads with
-    # `exchange_account_id`, and the reader that needs an index arrives with #15 or later.
-    "exchange_accounts": {
-        "pk_exchange_accounts",
-        "uq_exchange_accounts_user_exchange",
-        "ck_exchange_accounts_exchange_key",
-        "ck_exchange_accounts_sync_status",
-        # #104: the kind the last balance read failed with.
-        "ck_exchange_accounts_balances_error",
-        "fk_exchange_accounts_user_id_users",
-    },
-    # #104. The unique constraint is named explicitly, as every other one here is: the
-    # convention would render `uq_exchange_balances_exchange_account_id_asset`. It leads
-    # with the account, so the table needs no index beside it, and has none.
-    "exchange_balances": {
-        "pk_exchange_balances",
-        "uq_exchange_balances_account_asset",
-        "fk_exchange_balances_exchange_account_id_exchange_accounts",
-    },
     # #24. The unique key leads with the wallet, so the table needs no index beside it --
     # the one read there is, and the cascade, both go through it -- and has none.
     "derived_addresses": {
@@ -112,69 +90,6 @@ EXPECTED_NAMES = {
         "ck_derived_addresses_child_index",
         "ck_derived_addresses_used",
         "fk_derived_addresses_wallet_id_wallets",
-    },
-    "exchange_fills": {
-        "pk_exchange_fills",
-        "uq_exchange_fills_account_trade",
-        "ck_exchange_fills_external_trade_id",
-        "ck_exchange_fills_side",
-        "ck_exchange_fills_quote_quantity_derived",
-        "fk_exchange_fills_exchange_account_id_exchange_accounts",
-    },
-    # #15. The pending-window queue is read per account, so its foreign key is indexed; the
-    # run log is read newest first by id and listed by time, as `sync_runs` is. The outcome
-    # table's unique constraint leads with the run, which serves the only query on it.
-    "exchange_sync_windows": {
-        "pk_exchange_sync_windows",
-        "fk_exchange_sync_windows_exchange_account_id_exchange_accounts",
-        "ix_exchange_sync_windows_exchange_account_id",
-    },
-    "exchange_sync_runs": {
-        "pk_exchange_sync_runs",
-        "ck_exchange_sync_runs_trigger",
-        "ck_exchange_sync_runs_status",
-        "ix_exchange_sync_runs_started_at",
-    },
-    "exchange_sync_run_accounts": {
-        "pk_exchange_sync_run_accounts",
-        "uq_exchange_sync_run_accounts_run_account",
-        "ck_exchange_sync_run_accounts_status",
-        "ck_exchange_sync_run_accounts_error_kind",
-        "fk_exchange_sync_run_accounts_exchange_sync_run_id_exchange_sync_runs",
-        "fk_exchange_sync_run_accounts_exchange_account_id_exchange_accounts",
-    },
-    # #19. One current snapshot per owner and method, and its children, each keyed by the
-    # unique constraint its read and the cascade use; no index beside them (spec 021, R3).
-    "accounting_snapshots": {
-        "pk_accounting_snapshots",
-        "uq_accounting_snapshots_user_method",
-        "fk_accounting_snapshots_user_id_users",
-    },
-    "accounting_positions": {
-        "pk_accounting_positions",
-        "uq_accounting_positions_snapshot_asset",
-        "fk_accounting_positions_snapshot_id_accounting_snapshots",
-    },
-    "accounting_lots": {
-        "pk_accounting_lots",
-        "uq_accounting_lots_snapshot_seq",
-        "ck_accounting_lots_kind",
-        "fk_accounting_lots_snapshot_id_accounting_snapshots",
-    },
-    "accounting_warnings": {
-        "pk_accounting_warnings",
-        "uq_accounting_warnings_snapshot_seq",
-        "ck_accounting_warnings_kind",
-        "fk_accounting_warnings_snapshot_id_accounting_snapshots",
-    },
-    # #18. Named here, in the metadata, even though SQLite's DDL drops the primary key's
-    # name: `AUTOINCREMENT` is only legal on the inline `INTEGER PRIMARY KEY`, which carries
-    # no `CONSTRAINT` clause. `tests/db/test_migrations.py` pins what is on disk.
-    "manual_adjustments": {
-        "pk_manual_adjustments",
-        "fk_manual_adjustments_user_id_users",
-        "ck_manual_adjustments_note_not_blank",
-        "ix_manual_adjustments_user_id",
     },
 }
 

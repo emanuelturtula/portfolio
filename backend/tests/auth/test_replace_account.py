@@ -16,7 +16,6 @@ after it. So neither result can come from a service that refuses everything.
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING, Final
 
 import pytest
@@ -104,12 +103,6 @@ async def in_new_session[T](
         return await step(service)
 
 
-async def await_startup_recompute(app: FastAPI) -> None:
-    """Wait for the lifespan's startup recompute to finish, bounded like every wait here."""
-    task: asyncio.Task[object] = app.state.accounting_startup_task
-    await asyncio.wait_for(asyncio.shield(task), timeout=5)
-
-
 async def execute(factory: async_sessionmaker[AsyncSession], sql: str, **values: object) -> None:
     """One hand-written statement, committed. Raw SQL, because the app has no path for these."""
     async with factory() as session:
@@ -123,12 +116,7 @@ async def test_after_replace_the_old_session_is_refused_and_the_new_password_sig
 ) -> None:
     """The stolen token dies with the old password, and the new password is what opens it."""
     throttle = LoginThrottle()
-    # Before any session exists, so no row references the id being moved -- except the
-    # owner's cost-basis snapshot, which the lifespan's startup recompute writes (#19). It is
-    # derived data, recomputed from the fills, so the wait-and-delete below costs nothing but
-    # a race: until the task has finished, whether the row exists yet is up to the scheduler.
-    await await_startup_recompute(auth_app)
-    await execute(sessionmaker, "DELETE FROM accounting_snapshots")
+    # Before any session exists, so no row references the id being moved.
     await execute(sessionmaker, "UPDATE users SET id = :id", id=PINNED_OWNER_ID)
 
     old = await in_new_session(

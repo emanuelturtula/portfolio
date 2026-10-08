@@ -1,8 +1,8 @@
 # Working agreement
 
-A self-hosted crypto investment portfolio tracker. It reads balances from on-chain
-addresses, imports spot trade executions from exchanges, and reports total value, value per
-wallet, and how much has been invested in each asset.
+A self-hosted crypto portfolio tracker. It reads balances from Bitcoin and Kaspa wallets
+on-chain, values them in USDT from cached prices, and reports total value and value per
+wallet, with charts of that value over time to come.
 
 Python 3.12 + FastAPI, React + TypeScript + Vite, SQLite, one Docker image, one production
 instance on a Raspberry Pi 5 (arm64).
@@ -48,8 +48,8 @@ gitleaks rules are written to permit exactly those and reject their mainnet equi
 
 Credentials are read from environment variables into `SecretStr`, are never persisted to the
 database, are never returned by any endpoint (only `configured: bool` and a status), and are
-never logged. One exchange signs its requests in the query string, so the shared HTTP client
-logs URLs with the query removed.
+never logged. A query string can carry a key or a signature, so the shared HTTP client logs
+URLs with the query removed.
 
 *Enforced by:* `.gitleaks.toml` + `scripts/secret_scan.py` (fails closed), pre-commit and
 pre-push hooks, the `Secrets scan` CI job over full history, and GitHub push protection.
@@ -111,7 +111,7 @@ These have no mechanical enforcement, or only part of one, so they rest on readi
 
 - **Datetimes are timezone-aware UTC.** Ruff's `DTZ` rules catch a naive constructor, not a
   naive value that arrives from somewhere else, and a naive datetime in a time-ordered event
-  log corrupts the accounting silently. `domain` takes the clock as an argument.
+  log corrupts the history silently. `domain` takes the clock as an argument.
 - **A vendor API is verified before anything is built on it.** Check the endpoint path,
   parameters, pagination, rate limits and retention window against the vendor's own live
   documentation, never a third-party wrapper, and record what was confirmed in

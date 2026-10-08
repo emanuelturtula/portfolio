@@ -127,12 +127,9 @@ def confirm_replacement(username: str, *, rename: bool) -> None:
         "session it holds."
     )
     if rename:
-        emit(
-            f"Its username becomes '{username}'. "
-            "Its wallets, balances and exchange history are kept."
-        )
+        emit(f"Its username becomes '{username}'. Its wallets and their balance history are kept.")
     else:
-        emit("Its username, wallets, balances and exchange history are kept.")
+        emit("Its username, wallets and their balance history are kept.")
     emit(f"If no account exists, it creates '{username}'.")
     answer = input(f"Type '{username}' or 'y' to confirm: ").strip()
     if answer != username and answer.casefold() not in CONFIRMATION_WORDS:

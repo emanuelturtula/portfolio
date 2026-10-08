@@ -4,8 +4,6 @@ import { delay, http, HttpResponse } from 'msw';
 import { useNavigate } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { fakeAccounting } from '@/test/fakeAccounting';
-import { fakeExchanges } from '@/test/fakeExchanges';
 import { fakePortfolio } from '@/test/fakePortfolio';
 import { currentPath, renderApp, settle, visitedPaths } from '@/test/render';
 import {
@@ -62,12 +60,7 @@ beforeEach(() => {
   // Signing in lands on the dashboard, which reads the portfolio. An empty one
   // is the first-time owner, and it keeps those reads answered rather than
   // failing as unhandled requests that put a second alert on the page.
-  // The same goes for the invested section's positions and exchange list (spec 022).
-  server.use(
-    ...fakePortfolio().handlers,
-    ...fakeAccounting().handlers,
-    ...fakeExchanges().handlers,
-  );
+  server.use(...fakePortfolio().handlers);
 });
 
 const PROBE_LABEL = 'probe: navigate imperatively';
@@ -163,7 +156,10 @@ describe('LoginPage', () => {
     // And nothing bounced them somewhere else afterwards. This is the
     // assertion the previous version of this test was missing.
     expect(visitedPaths().at(-1)).toBe('/health');
-    expect(await screen.findByText(/backend health/i)).toBeInTheDocument();
+    // The success heading, not any text naming the page: "Loading backend
+    // health..." matches /backend health/i too, and it can be replaced by the
+    // answer between `findByText` resolving and the assertion reading it.
+    expect(await screen.findByRole('heading', { name: 'Backend health' })).toBeInTheDocument();
 
     // This test is also the positive control for the two open-redirect cases
     // below: it proves `/health` really was reachable, so "landed on `/`"

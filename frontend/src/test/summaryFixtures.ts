@@ -13,12 +13,8 @@ const ZERO_VALUE = '0.000000000000000000';
 export function portfolioSummary(overrides: Partial<PortfolioSummary> = {}): PortfolioSummary {
   return {
     total_value: ZERO_VALUE,
-    invested: ZERO_VALUE,
-    pnl: ZERO_VALUE,
-    pnl_pct: null,
     holdings: [],
     missing: [],
-    untracked: [],
     ...overrides,
   };
 }
@@ -48,23 +44,8 @@ export const KAS_HOLDING: Holding = {
   share_pct: '2.5999',
 };
 
-/**
- * The backend's own scenario (`backend/tests/api/test_portfolio_summary.py`): BTC and KAS held
- * across a wallet and a venue, 30,701.30 USDT net in, worth 30,770.00.
- */
-export const GAINING_SUMMARY: PortfolioSummary = portfolioSummary({
+/** BTC and KAS held in the wallets, worth 30,770.00 USDT. */
+export const VALUED_SUMMARY: PortfolioSummary = portfolioSummary({
   total_value: '30770.000000000000000000',
-  invested: '30701.300000000000000000',
-  pnl: '68.700000000000000000',
-  pnl_pct: '0.2238',
-  holdings: [BTC_HOLDING, KAS_HOLDING],
-});
-
-/** The same holdings, bought dearer: a loss. */
-export const LOSING_SUMMARY: PortfolioSummary = portfolioSummary({
-  total_value: '30770.000000000000000000',
-  invested: '35000.000000000000000000',
-  pnl: '-4230.000000000000000000',
-  pnl_pct: '-12.0857',
   holdings: [BTC_HOLDING, KAS_HOLDING],
 });

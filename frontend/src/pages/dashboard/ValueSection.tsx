@@ -58,13 +58,13 @@ const RUNS_UNAVAILABLE_FALLBACK = 'The run log could not be read.';
 const BALANCES_REFETCH_FALLBACK = 'The server could not be reached.';
 
 /**
- * The wallets' half of the Details page: the total, a bar per wallet, per-asset and per-wallet
+ * The Details page's content: the total, a bar per wallet, per-asset and per-wallet
  * value, a refresh button and a "last updated" indicator, every figure in USDT. See
  * docs/specs/011-wallets-page-value-dashboard.md.
  *
- * It was the whole of `DashboardPage` until the invested section joined it (spec 022), and
- * its behaviour is unchanged. Its early returns are now this section's own states rather
- * than the page's: an owner with trades and no wallets still reaches the section below.
+ * It was the whole of `DashboardPage` until #154 moved it to the Details page, and its
+ * behaviour is unchanged. Its early returns are this section's own loading, error and empty
+ * states.
  *
  * Only the current-balances query failing is a failure of the whole section - the runs
  * query and the wallets query each degrade to a notice instead, because neither one's

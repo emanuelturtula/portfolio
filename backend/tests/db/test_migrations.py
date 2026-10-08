@@ -45,12 +45,6 @@ from portfolio.db.base import NAMING_CONVENTION
 from portfolio.db.models import (
     _ASSET_KIND_CHECK,
     _BALANCE_SNAPSHOT_CONFIRMED_CHECK,
-    _EXCHANGE_ACCOUNT_BALANCES_ERROR_CHECK,
-    _EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK,
-    _EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK,
-    _EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK,
-    _EXCHANGE_FILL_QUOTE_QUANTITY_DERIVED_CHECK,
-    _EXCHANGE_FILL_SIDE_CHECK,
     _SYNC_RUN_CHAIN_ERROR_KIND_CHECK,
     _SYNC_RUN_CHAIN_STATUS_CHECK,
     _SYNC_RUN_STATUS_CHECK,
@@ -79,26 +73,6 @@ APPLICATION_TABLES = frozenset(
         "sync_runs",
         "sync_run_chains",
         "balance_snapshots",
-        # #12. The venue an owner imports from, and the immutable log of its executions.
-        "exchange_accounts",
-        "exchange_fills",
-        # #15. The pending-window queue that is the sync's checkpoint, and the exchange
-        # run log with one outcome per account per run.
-        "exchange_sync_windows",
-        "exchange_sync_runs",
-        "exchange_sync_run_accounts",
-        # #19. The current cost-basis snapshot per owner and method: its header, and the
-        # positions, lots and warnings it holds. Derived data, recomputed from the fills.
-        "accounting_snapshots",
-        "accounting_positions",
-        "accounting_lots",
-        "accounting_warnings",
-        # #18. The owner's manual adjustments: opening balances and off-exchange
-        # acquisitions. Owner data, not derived, so it is not one of #19's tables.
-        "manual_adjustments",
-        # #104. The last reading of each exchange account's spot balances, replaced whole
-        # by every successful read. Derived data: the venue is the source.
-        "exchange_balances",
         # #24. The addresses an extended-key wallet has derived, with whether each one has
         # ever been used. Derived from the key; kept so a rescan does not derive them again.
         "derived_addresses",
@@ -113,6 +87,10 @@ updates this set or fails, which is what the set was presumably always meant to 
 
 `alembic_version` is Alembic's own bookkeeping and is added where a live schema is
 compared, rather than being listed here as though the application owned it.
+
+The exchange, accounting and adjustment tables of #12 to #104 are not here: `0012` drops them
+(spec 036). They exist only between `0006_exchanges` and `0011_extended_keys`, and
+`DROPPED_TABLES` names them for the tests that reach that part of the history.
 """
 
 STAMP_TABLE = "alembic_version"
@@ -159,6 +137,17 @@ EXCHANGE_BALANCE_TABLES = frozenset({"exchange_balances"})
 #: #24's one. Its revision sits on top of #104's, so every single-step reversal below
 #: `0011_extended_keys` takes it down as well, and each test subtracts it.
 DERIVED_ADDRESS_TABLES = frozenset({"derived_addresses"})
+
+#: Spec 036's revision, and the one below it: the last schema that has the tables it drops.
+DROP_REVISION = "0012_drop_exchanges_accounting"
+REVISION_BEFORE_DROP = "0011_extended_keys"
+DROPPED_TABLES = (
+    EXCHANGE_TABLES
+    | EXCHANGE_SYNC_TABLES
+    | ACCOUNTING_TABLES
+    | ADJUSTMENT_TABLES
+    | EXCHANGE_BALANCE_TABLES
+)
 
 EXPECTED_SEED_ROWS = [
     ("BTC", "Bitcoin", 8, "crypto"),
@@ -218,9 +207,25 @@ EXPECTED_CONSTRAINT_NAMES = {
         "fk_balance_snapshots_wallet_id_wallets",
         "fk_balance_snapshots_sync_run_id_sync_runs",
     },
-    # #12. Three CHECKs, each compared with its model constant by
-    # `test_the_exchange_check_constraints_match_the_models`, and exercised with a real insert
-    # in `tests/db/test_exchange_fills.py`.
+    # #24. Three CHECKs, compared with their model constants and exercised with real inserts
+    # in `tests/db/test_extended_keys_migration.py`. The unique key is what makes a rescan
+    # an upsert rather than a second copy of the same index.
+    "derived_addresses": {
+        "pk_derived_addresses",
+        "uq_derived_addresses_wallet_branch_index",
+        "ck_derived_addresses_branch",
+        "ck_derived_addresses_child_index",
+        "ck_derived_addresses_used",
+        "fk_derived_addresses_wallet_id_wallets",
+    },
+}
+
+#: The names the dropped tables carried at `0011_extended_keys`, the last revision that has
+#: them. `0012`'s downgrade rebuilds them by running `0006` to `0010` again, so these are also
+#: what a rollback past it recreates.
+PRE_DROP_CONSTRAINT_NAMES = {
+    # #12. Three CHECKs, compared with their texts by
+    # `test_the_exchange_check_constraints_are_the_specs`.
     "exchange_accounts": {
         "pk_exchange_accounts",
         "uq_exchange_accounts_user_exchange",
@@ -240,8 +245,7 @@ EXPECTED_CONSTRAINT_NAMES = {
         "ck_exchange_fills_quote_quantity_derived",
         "fk_exchange_fills_exchange_account_id_exchange_accounts",
     },
-    # #15. The CHECKs are compared with their constants in
-    # `tests/db/test_exchange_sync_migration.py`; this pins that they exist and are named.
+    # #15.
     "exchange_sync_windows": {
         "pk_exchange_sync_windows",
         "fk_exchange_sync_windows_exchange_account_id_exchange_accounts",
@@ -259,9 +263,8 @@ EXPECTED_CONSTRAINT_NAMES = {
         "fk_exchange_sync_run_accounts_exchange_sync_run_id_exchange_sync_runs",
         "fk_exchange_sync_run_accounts_exchange_account_id_exchange_accounts",
     },
-    # #19. Two CHECKs, compared with their model constants in
-    # `tests/db/test_accounting_migration.py`; every child cascades from the header and the
-    # header from `users`, and each natural key is a named unique constraint (spec 021, R3).
+    # #19. Every child cascades from the header and the header from `users`, and each natural
+    # key is a named unique constraint (spec 021, R3).
     "accounting_snapshots": {
         "pk_accounting_snapshots",
         "uq_accounting_snapshots_user_method",
@@ -284,8 +287,7 @@ EXPECTED_CONSTRAINT_NAMES = {
         "ck_accounting_warnings_kind",
         "fk_accounting_warnings_snapshot_id_accounting_snapshots",
     },
-    # #18. One CHECK, the note's, compared with its model constant and exercised with real
-    # inserts in `tests/db/test_adjustments_migration.py`. No CHECK on a money column.
+    # #18. One CHECK, the note's. No CHECK on a money column.
     #
     # **The primary key is the one anonymous constraint in the schema, and it has to be.**
     # `AUTOINCREMENT` is only legal on SQLite's inline `INTEGER PRIMARY KEY`, and SQLAlchemy
@@ -293,30 +295,18 @@ EXPECTED_CONSTRAINT_NAMES = {
     # with no `CONSTRAINT` clause, so the `pk_manual_adjustments` the migration passes is
     # dropped. The rebuild hazard this map guards against is therefore a different one here:
     # a batch migration must pass `sqlite_autoincrement` again, or it silently loses
-    # `AUTOINCREMENT`, which `test_adjustments_migration.py` pins by behaviour.
+    # `AUTOINCREMENT`.
     "manual_adjustments": {
         None,
         "ck_manual_adjustments_note_not_blank",
         "fk_manual_adjustments_user_id_users",
     },
     # #104. No CHECK, and the absence is part of the pin: `quantity` is a `TEXT` money
-    # column, and a sign check on one is a numeric-affinity comparison. Compared in full in
-    # `tests/db/test_exchange_balances_migration.py`.
+    # column, and a sign check on one is a numeric-affinity comparison.
     "exchange_balances": {
         "pk_exchange_balances",
         "uq_exchange_balances_account_asset",
         "fk_exchange_balances_exchange_account_id_exchange_accounts",
-    },
-    # #24. Three CHECKs, compared with their model constants and exercised with real inserts
-    # in `tests/db/test_extended_keys_migration.py`. The unique key is what makes a rescan
-    # an upsert rather than a second copy of the same index.
-    "derived_addresses": {
-        "pk_derived_addresses",
-        "uq_derived_addresses_wallet_branch_index",
-        "ck_derived_addresses_branch",
-        "ck_derived_addresses_child_index",
-        "ck_derived_addresses_used",
-        "fk_derived_addresses_wallet_id_wallets",
     },
 }
 
@@ -492,19 +482,11 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
     command.downgrade(build_alembic_config(database_url), REVISION_BEFORE_PRICES)
 
     # Everything above `0003_wallets` comes down, which since #10 is `prices` *and* the
-    # three balance tables, and since #12 the two exchange tables too. Subtracting them all
+    # three balance tables, and since #24 `derived_addresses` too. Subtracting them all
     # is what keeps this test about the prices migration rather than about how many
     # revisions happen to sit on top of it.
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES
-        - {"prices"}
-        - BALANCE_TABLES
-        - EXCHANGE_TABLES
-        - EXCHANGE_SYNC_TABLES
-        - ACCOUNTING_TABLES
-        - ADJUSTMENT_TABLES
-        - EXCHANGE_BALANCE_TABLES
-        - DERIVED_ADDRESS_TABLES
+        APPLICATION_TABLES - {"prices"} - BALANCE_TABLES - DERIVED_ADDRESS_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -533,16 +515,10 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
 
     command.downgrade(build_alembic_config(database_url), PRICES_REVISION)
 
-    # Since #12 the exchange revision sits on top of this one and comes down with it.
+    # `0012`'s downgrade recreates the exchange tables on the way down, and `0010` to `0006`
+    # drop them again, so none of them is left over.
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES
-        - BALANCE_TABLES
-        - EXCHANGE_TABLES
-        - EXCHANGE_SYNC_TABLES
-        - ACCOUNTING_TABLES
-        - ADJUSTMENT_TABLES
-        - EXCHANGE_BALANCE_TABLES
-        - DERIVED_ADDRESS_TABLES
+        APPLICATION_TABLES - BALANCE_TABLES - DERIVED_ADDRESS_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -576,8 +552,12 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
     the `downgrade()` drops them in matters, and it only matters with rows present -- which
     is why one of each is written first. The owner row is asserted afterwards because a
     `downgrade()` with a stray `op.execute` would be invisible to a comparison of names.
+
+    Since spec 036 the tables exist only below `0012`, so the rows are written at the last
+    revision that has them.
     """
-    upgrade_to_head(database_url)
+    config = build_alembic_config(database_url)
+    command.upgrade(config, REVISION_BEFORE_DROP)
     with sync_engine.begin() as connection:
         user_id: int = connection.execute(
             text(
@@ -605,17 +585,9 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
         )
     assert table_names(sync_engine) >= EXCHANGE_TABLES
 
-    command.downgrade(build_alembic_config(database_url), BALANCES_REVISION)
+    command.downgrade(config, BALANCES_REVISION)
 
-    assert table_names(sync_engine) == (
-        APPLICATION_TABLES
-        - EXCHANGE_TABLES
-        - EXCHANGE_SYNC_TABLES
-        - ACCOUNTING_TABLES
-        - ADJUSTMENT_TABLES
-        - EXCHANGE_BALANCE_TABLES
-        - DERIVED_ADDRESS_TABLES
-    ) | {STAMP_TABLE}
+    assert table_names(sync_engine) == (APPLICATION_TABLES - DERIVED_ADDRESS_TABLES) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM users")) == 1
@@ -844,31 +816,53 @@ def test_the_new_check_constraints_match_the_models(
             assert reflected[name] == normalise_sql(sql), f"{table}.{name}"
 
 
-def test_the_exchange_check_constraints_match_the_models(
+def test_the_dropped_tables_carry_the_convention_names_below_the_drop(
     database_url: str,
     sync_engine: Engine,
 ) -> None:
-    """Every `CHECK` #12 adds, reflected off a migrated file and compared with its constant.
+    """At `0011_extended_keys` the eleven tables exist, with every constraint named."""
+    command.upgrade(build_alembic_config(database_url), REVISION_BEFORE_DROP)
+    inspector = inspect(sync_engine)
 
-    The same hazard as the two tests above: autogenerate has no check-constraint comparator,
-    so editing one of these constants without editing `v0006_exchanges.py` passes every
-    other gate. **The absence of a money `CHECK` is part of the pin**: exactly these three
-    exist on `exchange_fills`, because `quantity > 0` on a `TEXT` column is a numeric-affinity
-    comparison -- the float path rule 2 bans.
+    assert set(PRE_DROP_CONSTRAINT_NAMES) == DROPPED_TABLES
+    assert table_names(sync_engine) == APPLICATION_TABLES | DROPPED_TABLES | {STAMP_TABLE}
+    for table, expected in PRE_DROP_CONSTRAINT_NAMES.items():
+        found = {inspector.get_pk_constraint(table)["name"]}
+        found |= {unique["name"] for unique in inspector.get_unique_constraints(table)}
+        found |= {check["name"] for check in inspector.get_check_constraints(table)}
+        found |= {foreign["name"] for foreign in inspector.get_foreign_keys(table)}
+        assert found == expected, table
+
+
+def test_the_exchange_check_constraints_are_the_specs(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Every `CHECK` #12 adds, reflected at the last revision that has it, against the spec.
+
+    The model constants went with the models in spec 036, so the texts are pinned by hand from
+    the spec's data model. **The absence of a money `CHECK` is part of the pin**: exactly these
+    three exist on `exchange_fills`, because `quantity > 0` on a `TEXT` column is a
+    numeric-affinity comparison -- the float path rule 2 bans.
     """
-    upgrade_to_head(database_url)
+    command.upgrade(build_alembic_config(database_url), REVISION_BEFORE_DROP)
     inspector = inspect(sync_engine)
     expected = {
         "exchange_accounts": {
-            "ck_exchange_accounts_exchange_key": _EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK,
-            "ck_exchange_accounts_sync_status": _EXCHANGE_ACCOUNT_SYNC_STATUS_CHECK,
-            # #104, added by a second rebuild of the table.
-            "ck_exchange_accounts_balances_error": _EXCHANGE_ACCOUNT_BALANCES_ERROR_CHECK,
+            "ck_exchange_accounts_exchange_key": "exchange_key IN ('bingx', 'bitget')",
+            "ck_exchange_accounts_sync_status": (
+                "sync_status IN ('auth_failed', 'error', 'never_synced', 'ok')"
+            ),
+            "ck_exchange_accounts_balances_error": (
+                "balances_error IS NULL OR "
+                "balances_error IN ('auth', 'conflict', 'insufficient_scope', 'internal', "
+                "'invalid_request', 'rate_limited', 'retention_window', 'schema', 'unavailable')"
+            ),
         },
         "exchange_fills": {
-            "ck_exchange_fills_external_trade_id": _EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK,
-            "ck_exchange_fills_side": _EXCHANGE_FILL_SIDE_CHECK,
-            "ck_exchange_fills_quote_quantity_derived": _EXCHANGE_FILL_QUOTE_QUANTITY_DERIVED_CHECK,
+            "ck_exchange_fills_external_trade_id": "external_trade_id <> ''",
+            "ck_exchange_fills_side": "side IN ('buy', 'sell')",
+            "ck_exchange_fills_quote_quantity_derived": "quote_quantity_derived IN (0, 1)",
         },
     }
 
@@ -882,29 +876,16 @@ def test_the_exchange_check_constraints_match_the_models(
             assert reflected[name] == normalise_sql(sql), f"{table}.{name}"
 
 
-def test_the_exchange_check_texts_are_the_specs() -> None:
-    """The four texts, pinned by hand from the spec's data model.
-
-    The reflection test above compares the migration with the model; this compares the
-    model with the spec, so a constant edited in both places at once is still noticed.
-    """
-    assert _EXCHANGE_ACCOUNT_EXCHANGE_KEY_CHECK == "exchange_key IN ('bingx', 'bitget')"
-    assert _EXCHANGE_FILL_EXTERNAL_TRADE_ID_CHECK == "external_trade_id <> ''"
-    assert _EXCHANGE_FILL_SIDE_CHECK == "side IN ('buy', 'sell')"
-    assert _EXCHANGE_FILL_QUOTE_QUANTITY_DERIVED_CHECK == "quote_quantity_derived IN (0, 1)"
-
-
 def test_the_exchange_foreign_keys_carry_their_delete_rules(
     database_url: str,
     sync_engine: Engine,
 ) -> None:
     """Cascade from the owner to the account; restrict from the account to its fills.
 
-    Reflected off the migrated file rather than trusted to the drift check, because a
-    `RESTRICT` that became a `CASCADE` would delete an owner's trade history along with the
-    account, without a word. No index on either table, and the absence is part of the pin.
+    Reflected at the last revision that has the tables. No index on either table, and the
+    absence is part of the pin.
     """
-    upgrade_to_head(database_url)
+    command.upgrade(build_alembic_config(database_url), REVISION_BEFORE_DROP)
     inspector = inspect(sync_engine)
 
     accounts = inspector.get_foreign_keys("exchange_accounts")
@@ -1015,3 +996,12 @@ def test_every_model_table_is_created_by_a_migration(
 
     assert table in table_names(sync_engine)
     assert table in metadata.tables
+
+
+def test_the_drop_revision_sits_directly_on_top_of_the_extended_keys_one() -> None:
+    """Adjacency, for the tests above that stop one revision below the drop."""
+    revisions = [
+        script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+    ]
+
+    assert revisions.index(DROP_REVISION) == revisions.index(REVISION_BEFORE_DROP) - 1

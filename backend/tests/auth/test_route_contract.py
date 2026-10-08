@@ -105,32 +105,9 @@ def test_the_walk_actually_finds_the_routes(auth_app: FastAPI) -> None:
     assert ("GET", "/api/balances/current") in routes
     assert ("GET", "/api/balances/runs") in routes
     assert ("GET", "/api/wallets/{wallet_id}/balances") in routes
-    # #15's three. Nothing was added to `PUBLIC_API_PATHS`, so registering them protected
-    # them; named so the sweep visibly covers the endpoint that signs requests with the
-    # owner's exchange key.
-    assert ("GET", "/api/exchanges") in routes
-    assert ("POST", "/api/exchanges/sync") in routes
-    assert ("GET", "/api/exchanges/runs") in routes
-    # #93's one. Not in `PUBLIC_API_PATHS`, so registering it protected it; named so the
-    # sweep visibly covers the endpoint that serves the owner's trades and what they total.
-    assert ("GET", "/api/exchanges/fills") in routes
-    # #19's one. Not in `PUBLIC_API_PATHS`, so registering it protected it; named so the
-    # sweep visibly covers the endpoint that serves the owner's holdings and returns.
-    assert ("GET", "/api/accounting/positions") in routes
-    # #18's four. Nothing was added to `PUBLIC_API_PATHS`, so registering them protected
-    # them; named so the sweep visibly covers the endpoints that write the owner's opening
-    # balances and the notes that explain them.
-    assert ("GET", "/api/accounting/adjustments") in routes
-    assert ("POST", "/api/accounting/adjustments") in routes
-    assert ("PUT", "/api/accounting/adjustments/{adjustment_id}") in routes
-    assert ("DELETE", "/api/accounting/adjustments/{adjustment_id}") in routes
-    # #104's one. Not in `PUBLIC_API_PATHS`, so registering it protected it; named so the
-    # sweep visibly covers the one endpoint that serves what the owner's venues hold.
-    assert ("GET", "/api/accounting/reconciliation") in routes
-    # #111's one. Not in `PUBLIC_API_PATHS`, so registering it protected it; named so the
-    # sweep visibly covers the endpoint that says which assets the owner has traded, and
-    # since when.
-    assert ("GET", "/api/accounting/first-trades") in routes
+    # #154's one. Not in `PUBLIC_API_PATHS`, so registering it protected it; named so the
+    # sweep visibly covers the endpoint that serves what the owner's wallets are worth.
+    assert ("GET", "/api/portfolio/summary") in routes
     # #22's one. Not in `PUBLIC_API_PATHS`, unlike `/api/health` beside it, so registering
     # it protected it; named so the sweep visibly covers the endpoint that says whether the
     # owner's data has a recent copy.

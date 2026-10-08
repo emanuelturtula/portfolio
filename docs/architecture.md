@@ -119,8 +119,8 @@ no `<` or `>` on a money column. Sorting by value is done in Python too, on the 
 values, after loading.
 
 The cost of that is the reason it is affordable here: one user, thousands of rows. A
-portfolio with a decade of daily fills is a table of tens of thousands of rows on a
-machine with gigabytes of memory, and reading all of them costs milliseconds. Trading
+portfolio with a decade of daily balance readings is a table of tens of thousands of rows on
+a machine with gigabytes of memory, and reading all of them costs milliseconds. Trading
 correctness for a performance gain nobody would notice is a bad trade, and a product whose
 core output is a set of numbers cannot afford numbers that are almost right.
 
@@ -166,8 +166,8 @@ braces are siblings that may not import each other.
   testable without one.
 - **`repositories` and `providers`** are siblings: the database side and the outside-world
   side never import each other. Both may use the layers below them. A provider reads its
-  base URLs and keys from `config`, and the price and fill parsers read `PRICE_SCALE` and
-  `FILL_SCALE` from `db.models`, so that a parser refuses a value its column would round.
+  base URLs and keys from `config`, and the price parsers read `PRICE_SCALE` from
+  `db.models`, so that a parser refuses a value its column would round.
 - **`db`** sits above `config` and `domain`. This is the one place a persistence concern is
   allowed to depend on the domain vocabulary, and it exists so that `NumericText` rounds
   by `domain.money.quantize` rather than carrying a second copy of the rounding rule.
@@ -194,15 +194,14 @@ matters.
 | `thin-routers` | `api.routers` importing `sqlalchemy`, `httpx`, `repositories` or `providers` directly |
 | `framework-free-services` | `services` importing `fastapi` |
 | `prices-are-never-fetched-in-a-request` | `api.routers` reaching `providers.prices`, directly or through anything else |
-| `api-never-reaches-an-exchange-provider` | anything under `api` reaching `providers.exchanges`, directly or through anything else |
 | `domain-is-pure` | `domain` importing a framework, an HTTP client, or a standard-library module that does I/O or introduces nondeterminism |
 
 The clock is a call rather than an import, so `domain-is-pure` cannot see it.
 `backend/tests/security/test_domain_has_no_clock.py` forbids it by walking the syntax tree
 of every module under `domain/`.
 
-`backend/tests/test_import_contracts.py` pins the file to exactly these six contracts. For
-the prices, exchange and domain contracts it also plants a violation and asserts that the
+`backend/tests/test_import_contracts.py` pins the file to exactly these five contracts. For
+the prices and domain contracts it also plants a violation and asserts that the
 contract reports it, because a forbidden module that nothing imports yet makes a contract
 pass without checking anything.
 
@@ -213,7 +212,7 @@ Everything the application learns from outside the process, it learns through
 the detail: each vendor's endpoints, rate limits and retention windows, what is confirmed
 and what is not, how to add a provider, and the logging rules a provider follows.
 
-### Three families
+### Two families
 
 **Chain balance providers**, in `providers/chains/`, read what an address holds.
 
@@ -245,45 +244,25 @@ and what is not, how to add a provider, and the logging rules a provider follows
   what it was asked leaves the rest to the next one, and a pair nobody answered comes back
   as unanswered rather than as a zero.
 
-**Exchange providers**, in `providers/exchanges/`, read an account's spot fills and its spot
-balances.
+### What the two have in common
 
-- Protocol: `ExchangeProvider`, in `providers/exchanges/base.py`, with `capabilities`,
-  `fetch_fill_page`, `candidate_symbols` and `fetch_balances`. Fills come one page at a
-  time, because the sync commits a checkpoint between pages.
-- Capabilities: `ExchangeCapabilities` declares `retention`, `max_query_window`,
-  `page_size`, `cursor_kind`, `rate_limit` and `requires_symbol`. The exchange sync plans
-  its windows and pages from them without knowing which venue it is talking to.
-  `rate_limit` is the one nothing reads: the shared limiter below is stricter than either
-  venue's documented limit.
-- Implementations: `BitgetProvider` and `BingXProvider`, built by
-  `exchange_providers(client)`, in `providers/exchanges/registry.py`, only for the venues
-  whose credentials are configured. A venue without credentials has no provider object at
-  all, so no code path can sign a request without a key.
-- Requests are signed with HMAC-SHA256 by `providers/exchanges/signing.py`, over a
-  `Credentials` value that cannot render its secret.
-
-### What the three have in common
-
-- **Structural protocols, checked by `mypy --strict`.** None of the three is
+- **Structural protocols, checked by `mypy --strict`.** Neither is
   `@runtime_checkable`: `isinstance` against a protocol compares attribute names and
   nothing about their signatures. A provider satisfies its protocol by its shape, and the
   type checker decides whether it does.
 - **Contracts enforced by construction.** A provider hands what it parsed to a shared
   helper rather than promising to be careful. `align_balances` returns one result per
   requested address, in order, with an address the vendor did not mention as a zero.
-  `assemble_fill_page` and `assemble_balances` do the same for fills and balances.
   `fetch_prices` discards a response that answers a pair nobody asked about.
 - **One error vocabulary.** `providers/errors.py` defines `ProviderUnavailableError` (the
   vendor did not answer: retry later, keep the last reading), its subclass
   `ProviderRateLimitedError`, `ProviderResponseError` (it answered, and the answer cannot be
-  trusted) and `UnknownChainError`. The seven exchange errors in
-  `providers/exchanges/errors.py` subclass them. No message carries an address, a URL or a
-  response body.
+  trusted) and `UnknownChainError`. No message carries an address, a URL or a response
+  body.
 - **Money crosses the boundary exactly.** `decode_json`, in `providers/base.py`, is the one
   JSON decoder. It parses a JSON number with `parse_float=Decimal`, so a price arrives with
   the digits the vendor sent, and it refuses `NaN` and `Infinity`. Chain balances stay
-  integer base units, prices and fills are `Decimal`, and every duration is an integer
+  integer base units, prices are `Decimal`, and every duration is an integer
   number of milliseconds.
 
 ### The shared HTTP client and the host rate limiter
@@ -305,7 +284,8 @@ client follows the rules whether or not its author knew them. Every request gets
   30-second ceiling, on a transport error, a 429 or a 5xx, honouring `Retry-After`;
 - retry for `GET` and `HEAD` only, unless one request declares itself safe to repeat with
   `IDEMPOTENT_EXTENSION`. Kaspa's batch balance read is a `POST` and opts in that way;
-  widening the policy instead would also make every future exchange `POST` retryable.
+  widening the policy instead would also make every future `POST` retryable, including one
+  that changes something at the vendor.
 
 The client adds two settings of its own: explicit connect, read, write and pool timeouts
 (`DEFAULT_TIMEOUT`), and no redirects followed. They are client settings rather than
@@ -324,8 +304,8 @@ meant, not about how the bytes moved.
 
 - The transport logs each request's outcome, at error for a failure and at debug otherwise,
   and a warning for each retry. Its target is `request_target`: `{scheme}://{host}/{label}`.
-  **The path and the query are never logged.** Both chain APIs put the address in the path, and BingX signs its
-  requests in the query string.
+  **The path and the query are never logged.** Both chain APIs put the address in the path,
+  and a query string can carry a key or a signature.
 - The label is a constant the provider sets in the request's `endpoint` extension, such as
   `ADDRESS_BALANCE`. A label that is not in `ENDPOINT_LABELS` is logged as `<unlabelled>`,
   so saying more about a request is an edit to a named constant.
@@ -342,7 +322,7 @@ meant, not about how the bytes moved.
 - `ExtendedKeyScanner`, in `providers/base.py`, is the one optional capability a chain
   provider may have: `scan_extended_key(key, known)` returns an `ExtendedKeyScan`. Only
   `EsploraProvider` implements it.
-- It is `@runtime_checkable`, unlike the three protocols above, and on purpose. The balance
+- It is `@runtime_checkable`, unlike the two protocols above, and on purpose. The balance
   sync holds a `ChainProvider` and has to ask at run time whether it can also scan. A chain
   with an extended-key wallet and a provider that cannot scan fails as `internal`, rather
   than skipping the wallet and reading it as a zero. `mypy` still checks the signature.
@@ -364,27 +344,26 @@ meant, not about how the bytes moved.
 
 ### Who calls a provider, and when
 
-Three timers, two endpoints and one command, and each reaches a provider through a service
+Two timers, one endpoint and one command, and each reaches a provider through a service
 that is handed its providers rather than building them:
 
 | Caller | Service | Handed | Writes |
 |---|---|---|---|
 | the `balance-sync` timer; `POST /api/balances/sync` | `BalanceSyncService` | `provider_for`, which calls `get_chain_provider` over the shared client | `balance_snapshots`, `derived_addresses`, `sync_runs` |
 | the `price-refresh` timer; `python -m portfolio refresh-prices` | `PriceRefreshService` | the sources `price_sources` built | `prices` |
-| the `exchange-sync` timer; `POST /api/exchanges/sync` | `ExchangeSyncService` | the mapping `exchange_providers` built | `exchange_fills`, `exchange_sync_windows`, `exchange_balances`, `exchange_sync_runs` |
 
 - **The timers** are `IntervalScheduler` instances, in `services/scheduler.py`, that
-  `portfolio.main.lifespan` starts and stops. By default the balance and exchange syncs run
-  every 15 minutes and the price refresh every 60. Each is its own task with its own switch,
+  `portfolio.main.lifespan` starts and stops. By default the balance sync runs every 15
+  minutes and the price refresh every 60. Each is its own task with its own switch,
   so a failing vendor of one kind stops no other. Each runs at startup only when its last
   run is older than one interval, so a container that crash-loops does not hit a public API
   on every restart. The price timer counts only successful refreshes, so while every source
-  fails it refreshes once per restart (`docs/providers.md`). The exchange timer exists only when at least one venue is configured. A
-  fourth timer takes backups and calls no provider.
-- **The two endpoints** go through a `SyncCoordinator`, in `services/sync_coordinator.py`,
-  one per kind, and so do the balance and exchange timers' ticks. The price timer has none:
-  no endpoint can ask for a refresh, so there is nothing to join. A second caller joins the run in flight
-  instead of starting another, so a double-clicked refresh costs a public index nothing.
+  fails it refreshes once per restart (`docs/providers.md`). A third timer takes backups and
+  calls no provider.
+- **The endpoint** goes through a `SyncCoordinator`, in `services/sync_coordinator.py`, and
+  so do the balance timer's ticks. The price timer has none: no endpoint can ask for a
+  refresh, so there is nothing to join. A second caller joins the run in flight instead of
+  starting another, so a double-clicked refresh costs a public index nothing.
 - **Nothing in a request path reaches a price source.** The price refresh has no endpoint,
   and `services/prices.py`, through which the dashboard reads prices, imports no provider.
   A request renders from the `prices` table.
@@ -407,18 +386,14 @@ that is handed its providers rather than building them:
 - **A router imports no provider.** `thin-routers` forbids the direct import. A provider
   call inherits the vendor's latency, its outages and its rate limit, so a request path that
   reaches one by accident turns a page load into a vendor call.
-- **For prices and exchanges, the indirect path is forbidden too.**
-  `prices-are-never-fetched-in-a-request` and `api-never-reaches-an-exchange-provider` are
-  written without `allow_indirect_imports`, so `router -> service -> provider` fails as
-  surely as a direct import. That is the change a well-meaning edit introduces: "just
-  refresh it if it is stale" in a read-side service. The exchange contract covers all of
-  `portfolio.api`, schemas and dependencies included, because `providers.exchanges` is the
-  package that holds the owner's credentials.
-- **The sanctioned paths go through `portfolio.main`.** `POST /api/balances/sync` and
-  `POST /api/exchanges/sync` call a coordinator whose runner is a closure `main.py` built
-  over the providers. `portfolio.main` is in no layer and not under `portfolio.api`, so
-  that path crosses no contract. `app.state` publishes only `configured_exchanges`, the set
-  of venue keys, and never the providers.
+- **For prices, the indirect path is forbidden too.**
+  `prices-are-never-fetched-in-a-request` is written without `allow_indirect_imports`, so
+  `router -> service -> provider` fails as surely as a direct import. That is the change a
+  well-meaning edit introduces: "just refresh it if it is stale" in a read-side service.
+- **The sanctioned path goes through `portfolio.main`.** `POST /api/balances/sync` calls a
+  coordinator whose runner is a closure `main.py` built over the providers.
+  `portfolio.main` is in no layer and not under `portfolio.api`, so that path crosses no
+  contract.
 
 ## Authentication
 
@@ -468,8 +443,4 @@ See `docs/specs/003-single-user-password-login.md` for the decisions and what th
   add one.
 - `docs/operations.md` — running the instance: the account, the password hash, sessions.
 - `docs/deployment.md` — how a merge becomes a running container.
-- `docs/accounting.md` — how fills become cost basis, average cost and realized P&L, with
-  worked examples.
-- `docs/adr/` — architecture decision records, starting with weighted-average cost basis and
-  why it is not a tax figure.
 - `docs/specs/` — the per-issue implementation specs.

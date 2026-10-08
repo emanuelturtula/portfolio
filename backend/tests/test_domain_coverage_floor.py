@@ -81,7 +81,7 @@ def run_floor(tmp_path: Path, document: object, *, raw: str | None = None) -> tu
     return result.returncode, result.stdout + result.stderr
 
 
-DOMAIN_FILE: Final = "src/portfolio/domain/accounting/replay.py"
+DOMAIN_FILE: Final = "src/portfolio/domain/portfolio.py"
 
 
 # --------------------------------------------------------------------------------------
@@ -127,7 +127,7 @@ def test_the_domain_is_summed_across_its_files(tmp_path: Path) -> None:
     document = report(
         {
             "src/portfolio/domain/money.py": summary(100, 100, 50, 50),
-            "src/portfolio/domain/accounting/replay.py": summary(80, 100, 50, 50),
+            "src/portfolio/domain/portfolio.py": summary(80, 100, 50, 50),
         }
     )
 
@@ -141,7 +141,7 @@ def test_files_outside_the_domain_do_not_count(tmp_path: Path) -> None:
     document = report(
         {
             DOMAIN_FILE: summary(100, 100, 100, 100),
-            "src/portfolio/services/accounting.py": summary(0, 500, 0, 500),
+            "src/portfolio/services/prices.py": summary(0, 500, 0, 500),
             "src/portfolio/domain_extras/helpers.py": summary(0, 500, 0, 500),
         }
     )
@@ -154,7 +154,7 @@ def test_files_outside_the_domain_do_not_count(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "path",
     [
-        pytest.param("src\\portfolio\\domain\\accounting\\replay.py", id="windows separators"),
+        pytest.param("src\\portfolio\\domain\\portfolio.py", id="windows separators"),
         pytest.param("/home/runner/work/backend/src/portfolio/domain/money.py", id="absolute"),
     ],
 )

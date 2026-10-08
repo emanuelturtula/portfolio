@@ -1,110 +1,63 @@
-"""What the portfolio is worth against what went into it: the dashboard's three figures.
+"""What the portfolio is worth: the dashboard's total and every holding's share of it.
 
-`net_invested(lines, cash_assets)` and `summarize(holdings, invested)` are the arithmetic
-behind `GET /api/portfolio/summary` (#154). **Pure**: no I/O, no clock, no ORM. The service
-reads the fills, the balances and the prices, and hands this module plain values.
-
-## Invested is the cash that went into the fills, net
-
-The owner's definition (#154): what the exchange fills spent buying, minus what they received
-selling, in the cash assets -- USDT and USDC, each taken at one unit of account. Fill by fill:
-
-* **Quoted in a cash asset**: a buy adds its `quote_quantity`, a sell subtracts it.
-* **A fee paid in a cash asset** adds its amount on either side: on a buy it is cash spent on
-  top of the quote, on a sell it is cash withheld from the proceeds. A rebate is negative and
-  subtracts.
-* **Base asset in cash** -- USDC bought with USDT -- is a conversion between two kinds of cash:
-  nothing went into anything else, so its quote is not counted. Its fee still is: that cash is
-  gone.
-* **Quoted in anything else** -- KAS bought with BTC -- moved no cash, and has no cash value on
-  its day without a price this module will not invent. It is not counted, and its quote asset
-  is named in `unvalued_quotes`, so the figure can say it is partial instead of being quietly
-  short.
-
-Manual adjustments are not fills and are not counted: the owner's definition is the fills.
-
-**This is not the accounting engine's cost basis.** The cost basis is the cost of what is
-still held, and every sale reduces it. Invested here is the net cash flow, so it carries the
-realized result inside it: `value - invested` is the portfolio's whole P/L, realized and
-unrealized together, provided the cash a sale brought back is not counted in `value` -- and it
-is not, because cash is not a holding.
+`summarize(holdings)` is the arithmetic behind `GET /api/portfolio/summary`. **Pure**: no I/O,
+no clock, no ORM. The service reads the balances and the prices, and hands this module plain
+values.
 
 ## Every figure is exact or rounded once
 
-Sums are `money.add` and `money.subtract`, which never round. A value is `price x quantity`
-rounded once to `VALUE_SCALE`, as the positions are (`domain.accounting.valuation`), and a
-percentage is one `money.divide` to `RETURN_PCT_SCALE`. Nothing here is a `float`.
+Sums are `money.add`, which never rounds. A value is `price x quantity` rounded once to
+`VALUE_SCALE` by `value_of`, and a percentage is one `money.divide` to `RETURN_PCT_SCALE`.
+Nothing here is a `float`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Final, assert_never
+from typing import TYPE_CHECKING, Final
 
-from portfolio.domain.accounting import RETURN_PCT_SCALE, VALUE_SCALE
-from portfolio.domain.exchanges import FillSide
-from portfolio.domain.money import add, divide, multiply, quantize, subtract
+from portfolio.domain.money import add, divide, multiply, quantize
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from portfolio.domain.fill_totals import FillLine
-
 __all__ = [
+    "MAX_READING_AGE",
+    "RETURN_PCT_SCALE",
+    "VALUE_SCALE",
     "HoldingSummary",
-    "NetInvested",
     "PortfolioSummary",
     "PricedQuantity",
-    "net_invested",
     "summarize",
+    "value_of",
 ]
+
+VALUE_SCALE: Final = 18
+"""The places a market value is rounded to.
+
+A price is stored at twelve places (`db.models.PRICE_SCALE`) and a quantity at up to eighteen,
+so their product can carry thirty; this is the one rounding it gets. Eighteen leaves
+`MONEY_PRECISION - 18` = 20 digits in front of the point.
+"""
+
+RETURN_PCT_SCALE: Final = 4
+"""The places a percentage is rounded to: `71.4286`, a hundredth of a basis point."""
+
+MAX_READING_AGE: Final = timedelta(hours=24)
+"""How old a wallet's reading may be and still be current.
+
+The balance sync runs on a timer of minutes, so a reading a day old means a wallet that has
+stopped being read with nothing recorded against it -- a timer switched off, a balance run that
+never finishes -- and its coins may have moved since. A day is far above any healthy interval,
+so a reading is never called stale for being a few runs late.
+"""
 
 _ZERO: Final = Decimal((0, (0,), -VALUE_SCALE))
 """Zero at `VALUE_SCALE` places, so an empty total reads `0E-18` like every value beside it."""
 
 _HUNDRED: Final = Decimal(100)
-
-
-@dataclass(frozen=True, slots=True)
-class NetInvested:
-    """The net cash the fills put in, and the quote assets of the fills it could not count.
-
-    `unvalued_quotes` is sorted and holds each quote asset once. Empty means every fill that
-    bought or sold something other than cash was counted.
-    """
-
-    amount: Decimal
-    unvalued_quotes: tuple[str, ...]
-
-
-def net_invested(lines: Iterable[FillLine], cash_assets: frozenset[str]) -> NetInvested:
-    """What the fills spent buying minus what they received selling, in cash, net of fees.
-
-    See the module docstring for the rule, fill by fill. A sum over no fills is zero at
-    `VALUE_SCALE` places, the scale the fills are stored at.
-
-    Matched on both sides rather than `BUY` and "anything else", so a value that is not a
-    side is an `AssertionError` rather than a sale.
-    """
-    amount = _ZERO
-    unvalued: set[str] = set()
-    for line in lines:
-        if line.fee_asset is not None and line.fee_asset in cash_assets:
-            amount = add(amount, line.fee_amount)
-        if line.base_asset in cash_assets:
-            continue
-        if line.quote_asset not in cash_assets:
-            unvalued.add(line.quote_asset)
-            continue
-        match line.side:
-            case FillSide.BUY:
-                amount = add(amount, line.quote_quantity)
-            case FillSide.SELL:
-                amount = subtract(amount, line.quote_quantity)
-            case _:
-                assert_never(line.side)
-    return NetInvested(amount=amount, unvalued_quotes=tuple(sorted(unvalued)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,36 +91,32 @@ class PortfolioSummary:
 
     * `total_value` -- the sum of every holding that has a value. An unpriced holding adds
       nothing, and the caller says so: this module only knows it had no price.
-    * `invested` -- passed in, as `net_invested` computed it. It can be negative: more came
-      back from sales than went into buys.
-    * `pnl` -- `total_value - invested`.
-    * `pnl_pct` -- `pnl / invested x 100` at `RETURN_PCT_SCALE`; `None` when `invested` is
-      not above zero, since a return on nothing, or on a withdrawal, is not a percentage.
     * `holdings` -- by value, largest first, then the unpriced ones; ties by asset.
     """
 
     total_value: Decimal
-    invested: Decimal
-    pnl: Decimal
-    pnl_pct: Decimal | None
     holdings: tuple[HoldingSummary, ...]
 
 
-def summarize(holdings: Iterable[PricedQuantity], invested: Decimal) -> PortfolioSummary:
-    """Value each holding, total them, and set the total against what was invested.
+def value_of(quantity: Decimal, price: Decimal) -> Decimal:
+    """`quantity x price`, rounded once to `VALUE_SCALE`.
 
     Raises:
-        decimal.InvalidOperation: a value has more integer digits than `MONEY_PRECISION`
+        decimal.InvalidOperation: the value has more integer digits than `MONEY_PRECISION`
             leaves room for at `VALUE_SCALE` places -- `quantize`'s refusal, for a holding
             worth 10**20 units or more, which no portfolio is.
     """
+    return quantize(multiply(quantity, price), VALUE_SCALE)
+
+
+def summarize(holdings: Iterable[PricedQuantity]) -> PortfolioSummary:
+    """Value each holding, total them, and give each its share of the total.
+
+    Raises:
+        decimal.InvalidOperation: as `value_of` does.
+    """
     valued = [
-        (
-            holding,
-            None
-            if holding.price is None
-            else quantize(multiply(holding.quantity, holding.price), VALUE_SCALE),
-        )
+        (holding, None if holding.price is None else value_of(holding.quantity, holding.price))
         for holding in holdings
     ]
     total = _ZERO
@@ -186,14 +135,7 @@ def summarize(holdings: Iterable[PricedQuantity], invested: Decimal) -> Portfoli
         for holding, value in valued
     ]
     summaries.sort(key=_largest_first)
-    pnl = subtract(total, invested)
-    return PortfolioSummary(
-        total_value=total,
-        invested=invested,
-        pnl=pnl,
-        pnl_pct=_percent(pnl, invested),
-        holdings=tuple(summaries),
-    )
+    return PortfolioSummary(total_value=total, holdings=tuple(summaries))
 
 
 def _percent(part: Decimal, whole: Decimal) -> Decimal | None:

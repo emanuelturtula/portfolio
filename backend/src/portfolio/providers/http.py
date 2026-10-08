@@ -20,9 +20,9 @@ because that decision is about what the vendor meant, not about how the bytes mo
 Two functions, because two different questions are being answered.
 
 `strip_query` removes the query string, the fragment and any userinfo. That is the rule
-`CLAUDE.md` states, and it exists because one exchange signs its requests *in the query
-string*: the signature and the key that produced it would otherwise ride along in any URL
-that reached a log. It was written for that exchange; no provider calls it.
+`CLAUDE.md` states: a vendor that authenticates *in the query string* would otherwise have
+its signature and key ride along in any URL that reached a log. It was written for the
+exchange providers this application once had; no provider calls it today.
 
 **For a chain provider that is necessary and not sufficient, and it is worth being precise
 about why.** Both target APIs put the address in the *path*:
@@ -106,9 +106,6 @@ __all__ = [
     "ENDPOINT_EXTENSION",
     "ENDPOINT_LABEL",
     "ENDPOINT_LABELS",
-    "EXCHANGE_BALANCES",
-    "EXCHANGE_FILLS",
-    "EXCHANGE_SYMBOL",
     "HTTP_ERROR_FLOOR",
     "IDEMPOTENT_EXTENSION",
     "MAX_HEADER_DIGITS",
@@ -265,50 +262,6 @@ prices on a request path -- the failure `backend/.importlinter`'s price contract
 make impossible, observed from the other side.
 """
 
-EXCHANGE_FILLS: Final = "exchange_fills"
-"""A signed read of one page of an account's fills, at either venue.
-
-Bitget's `GET /api/v2/spot/trade/fills` and BingX's `GET /openApi/spot/v1/trade/myTrades` both
-use it. One label for both, because the host already says which venue it was.
-
-**This is the label that stands between a signature and a log line.** A Bitget request
-carries the key, the passphrase and a signature in its headers, and the account's time window
-and paging cursor in its query string. **A BingX request carries the signature itself in its
-query string**, after the window, the cursor and the timestamp, with the key in a header. The
-log carries the scheme, the host and these two words, and never the path or the query, so
-neither signature is ever logged. The label says which kind of call failed -- the one an
-operator needs to tell a sync failure from a market-data failure -- and nothing about whose
-account it was or which page.
-"""
-
-EXCHANGE_BALANCES: Final = "exchange_balances"
-"""A signed read of what an account's spot account holds, at either venue.
-
-Bitget's `GET /api/v2/spot/account/assets` and BingX's `GET /openApi/spot/v1/account/balance`
-both use it, for the reason `EXCHANGE_FILLS` is one label for both: the host already says
-which venue it was.
-
-Separate from `EXCHANGE_FILLS` because the two fail separately and mean different things
-when they do. A failed fills read stops an account's sync. A failed balance read stops
-nothing: the sync's outcome stands, and the holdings check goes without that venue (#104).
-An operator reading `https://<host>/exchange_balances` beside a failure knows which of the
-two it was.
-
-It is signed exactly as a fills request is, so everything `EXCHANGE_FILLS` says about what
-must not reach a log holds here: BingX's signature is in the query string, and the label is
-all that is logged of either request. It says nothing of which assets were answered, or how
-many.
-"""
-
-EXCHANGE_SYMBOL: Final = "exchange_symbol"
-"""An unsigned read of what one pair is made of: Bitget's `GET /api/v2/spot/public/symbols`.
-
-Separate from `EXCHANGE_FILLS` because it is a different kind of call: public market data,
-no credential on it, asked once per new symbol. A log that shows these without fills
-lines, or many of them, is a symbol cache not doing its job. The label does not carry the
-symbol, for the reason `ASSET_PRICE` does not carry the pair.
-"""
-
 ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
     {
         ADDRESS_BALANCE,
@@ -316,9 +269,6 @@ ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
         ASSET_PRICE,
         ASSET_PRICES,
         BLOCK_TIP_HEIGHT,
-        EXCHANGE_BALANCES,
-        EXCHANGE_FILLS,
-        EXCHANGE_SYMBOL,
         NODE_HEALTH,
     }
 )
@@ -332,9 +282,9 @@ closes that, because a string that is not a member renders as `UNLABELLED` no ma
 well it is shaped.
 
 Two labels on #7; four since #8 added Kaspa's batch read and its health report; six since
-#9 added the two price reads; eight since #13 added the exchange fills read and the symbol
-lookup beside it; nine since #104 added the exchange balances read. The set grows one
-deliberate line at a time, which is the whole mechanism.
+#9 added the two price reads. #13 and #104 added three exchange reads, and spec 036 took
+them out again with the exchange providers. The set changes one deliberate line at a time,
+which is the whole mechanism.
 
 Same shape as `PUBLIC_API_PATHS`: adding an endpoint protects it, and saying more about
 one is a visible edit to a named constant rather than a value computed at a call site.
@@ -463,14 +413,14 @@ type Sleeper = Callable[[int], Awaitable[None]]
 def strip_query(url: httpx.URL | str) -> httpx.URL:
     """The URL with its query string, fragment and userinfo removed.
 
-    The query string because one exchange signs its requests there, so a logged URL would
-    otherwise carry a valid signature and betray the key that produced it. The fragment
+    The query string because a vendor that signs its requests there would otherwise have a
+    logged URL carry a valid signature and betray the key that produced it. The fragment
     because it is never sent to the server and has no business in a log either. The
     userinfo because `https://key:secret@host/...` is a credential written in a URL, and
     `httpx` will happily carry one.
 
-    This is the rule `CLAUDE.md` states, written for the exchange that signs in the query
-    string; no provider calls it. It is **not** what this module's transport logs -- for a
+    This is the rule `CLAUDE.md` states, written for an exchange that signed in the query
+    string; no provider calls it today. It is **not** what this module's transport logs -- for a
     chain provider the address is in the path, so `request_target` is stricter. Reaching for
     this one to log a chain request would meet the letter of the rule and leak the address
     anyway.

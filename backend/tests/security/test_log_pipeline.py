@@ -70,7 +70,7 @@ if TYPE_CHECKING:
 
 #: Synthetic, distinctive, and none of them an address: what a secret looks like to the rule.
 KEY_SENTINEL: Final = "sentinel-coingecko-0f3a9c"
-OTHER_SENTINEL: Final = "sentinel-bitget-secret-77e1"
+OTHER_SENTINEL: Final = "sentinel-owner-phrase-77e1"
 SIGNATURE: Final = "sentinel-signature-5d2b"
 SIGNED_URL: Final = f"https://api.example.test/v2/spot/fills?apiKey=k&signature={SIGNATURE}"
 REQUEST_ID: Final = "0b6f3a52-7c1e-4d2a-9f8e-2a4c6e8b0d1f"
@@ -336,13 +336,7 @@ def test_a_second_configuration_redacts_its_own_secrets(
     """The set is built on every call: a redactor built once would miss the second's."""
     del restored_logging
     install(with_secrets(coingecko_api_key=KEY_SENTINEL))
-    install(
-        with_secrets(
-            bitget_api_secret=OTHER_SENTINEL,
-            bitget_api_key="k" * 12,
-            bitget_api_passphrase="p" * 12,
-        )
-    )
+    install(with_secrets(bootstrap_password=OTHER_SENTINEL))
 
     structlog.get_logger("t").warning("second", value=OTHER_SENTINEL)
     logging.getLogger("some.library").warning("%s", OTHER_SENTINEL)

@@ -112,9 +112,8 @@ function BackupsSection() {
  * The backups section under the details is a second query with the same three states of
  * its own, mounted only once the health check has answered: a backend that is not up has
  * already been reported above, and a second loading line and a second alert for the same
- * outage would only repeat it. The sections after it (timers, balance sync, exchanges,
- * prices, reconciliation) read the same entry and are mounted the same way; see
- * {@link DetailSections}.
+ * outage would only repeat it. The sections after it (timers, balance sync, prices) read
+ * the same entry and are mounted the same way; see {@link DetailSections}.
  */
 export function HealthPage() {
   const { data, error, isPending, isError } = useQuery({

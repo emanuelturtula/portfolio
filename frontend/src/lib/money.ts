@@ -58,7 +58,7 @@ export interface FormatMoneyOptions {
    *
    * - `'auto'`, the default: only a negative amount carries a sign.
    * - `'exceptZero'`: a positive amount is prefixed with `+`, a negative one keeps its `-`,
-   *   and zero stays unsigned. For profit and loss, where the sign is the only thing that
+   *   and zero stays unsigned. For a signed change, where the sign is the only thing that
    *   tells a gain from a loss once colour is not relied on.
    *
    * The sign follows the exact value, never the rounded one, so a gain too small to show
@@ -208,11 +208,6 @@ export function fromBaseUnits(units: string, decimals: number): Money {
   return money(negative ? `-${unsigned}` : unsigned);
 }
 
-/** `money(value)`, or `null` for a figure the backend sent as `null`. */
-export function moneyOrNull(value: string | null): Money | null {
-  return value === null ? null : money(value);
-}
-
 /** Adds two {@link Money} values with no precision loss and returns another. */
 export function addMoney(a: Money, b: Money): Money {
   // `toString` (and `toJSON`/`valueOf`) switch to exponential notation once the
@@ -230,26 +225,6 @@ export function addMoney(a: Money, b: Money): Money {
 }
 
 /**
- * The exact plain spelling of `value`: no grouping, no exponent, no rounding, and no trailing
- * zeros. For a value an input can hold, such as an amount the owner is about to edit, where
- * the wire's `"1.500000000000000000"` would show eighteen places nobody typed and
- * {@link formatMoney}'s `"1,234.5"` is not a number a field accepts.
- *
- * The result is the same amount: nothing is rounded, so a value of 18 places keeps all 18.
- * The edges:
- *
- * - every zero is `"0"`, whatever its spelling: `"0.000000000000000000"` and `"-0.00"` too, so
- *   a negative zero never reaches a field;
- * - a very small or very large value stays in positional notation (`"0.000000000000000001"`,
- *   not `"1e-18"`), because `toFixed()` with no argument is the one `decimal.js` output that
- *   never uses an exponent - the reason {@link addMoney} uses it as well;
- * - the integer part is kept whole: `"100.000"` is `"100"`, never `"1"`.
- */
-export function plainMoney(value: Money): Money {
-  return money(new Decimal(value).toFixed());
-}
-
-/**
  * Whether `value` is exactly zero, however the wire spells it: `"0"`, `"0.00"`, `"-0"` and
  * `"0.000000000000000000"` are all zero. Comparing the strings would call the last one
  * non-zero, which is how a fully sold position ends up listed as held.
@@ -258,37 +233,9 @@ export function isZeroMoney(value: Money): boolean {
   return new Decimal(value).isZero();
 }
 
-/**
- * Whether `a` and `b` are the same amount, however each is spelled: `"5"` equals
- * `"5.000000000000000000"`, which a comparison of the strings would call different.
- */
-export function equalsMoney(a: Money, b: Money): boolean {
-  return new Decimal(a).equals(new Decimal(b));
-}
-
-/** Whether `value` is below zero. A negative zero is not. */
-export function isNegativeMoney(value: Money): boolean {
-  const decimal = new Decimal(value);
-  return decimal.isNegative() && !decimal.isZero();
-}
-
 /** Orders two amounts for `Array.prototype.sort`: negative when `a` is the smaller. */
 export function compareMoney(a: Money, b: Money): number {
   return new Decimal(a).comparedTo(new Decimal(b));
-}
-
-/** Which way a signed amount points. */
-export type Tone = 'gain' | 'loss' | 'flat';
-
-/**
- * The direction of a profit, a loss or a return, for the colour drawn under its sign. Never the
- * only channel: the figure it colours always carries its `+` or `-`.
- */
-export function toneOf(value: Money): Tone {
-  if (isZeroMoney(value)) {
-    return 'flat';
-  }
-  return isNegativeMoney(value) ? 'loss' : 'gain';
 }
 
 /** The largest of `values`, or zero when there are none. Exact, like every comparison here. */

@@ -3,10 +3,9 @@
 Day-two tasks on the running instance: creating the account, tuning the password hash to the
 hardware, changing the password, understanding when a session ends, pointing the application
 at the chain index it reads balances from, refreshing the prices that turn a balance into
-a value, connecting the Bitget and BingX accounts whose trades say what each asset cost,
-keeping the import of those trades running, reading the cost-basis snapshot built from
-them, checking that history against the balances actually held, backing the database up and
-restoring it, reading the logs, and reading how every source stands.
+a value, backing the database up and restoring it, reading the logs, and reading how every
+source stands. Section 12 records what an operator does about the exchange sync, the
+accounting and the holdings check, which were removed.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -29,8 +28,8 @@ deployment fail.** The application now refuses to start in `prod` when
 `PORTFOLIO_ALLOWED_ORIGIN` is still the development default, so the container never becomes
 healthy and `deploy.py` rolls back.
 
-Add both variables to the host-local secrets file — the same file exchange credentials go
-in, at mode 0600, never through GitHub:
+Add both variables to the host-local secrets file — the same file every credential goes in,
+at mode 0600, never through GitHub:
 
 ```bash
 $EDITOR ~/portfolio-app/prod/secrets.env
@@ -192,8 +191,8 @@ the host:
 
 The command asks for confirmation, then for the new password twice. It changes the password
 on the existing account in place and **keeps its username**, so the command above is safe to
-copy as it is. The account keeps its identity, so **wallets, balance history, exchange
-accounts and imported fills are all kept**. Every session is signed out in the same
+copy as it is. The account keeps its identity, so **its wallets and their balance history
+are kept**. Every session is signed out in the same
 transaction, exactly as a password change through the application does, so a cookie stolen
 before the recovery stops working the moment it completes. The last line of output names
 the account that was changed.
@@ -778,796 +777,75 @@ a future command that did would sweep the server's live run.
 Snapshots are committed per chain as the run goes, so an interrupted run keeps whatever it had
 already read.
 
-## 12. Connecting the Bitget account
+## 12. Exchanges, accounting, adjustments and the holdings check: removed
 
-The application reads your Bitget **spot fills** -- every buy and sell execution -- with a
-read-only API key, to know what you paid for each asset. The provider that reads them landed
-with #13, and the sync that runs it and stores the fills with #15: once the three variables
-below are set and the container recreated, the exchange timer imports fills every fifteen
-minutes. Section 13 covers the sync -- its settings, what an account's status means, and how
-to recover when Bitget refuses the key.
+Up to spec 036 this guide had five more sections here: connecting the Bitget account,
+syncing exchange fills, connecting the BingX account, the cost-basis snapshot and manual
+adjustments, and the holdings check. That functionality is gone. The application now tracks
+wallets, read on-chain, and values them in USDT from the cached prices. Sections 13 to 16 are
+left unused, so that the numbers of sections 17 to 19, which other files cite, stay right.
 
-### Keep the account Classic: do not accept the Unified Trading Account upgrade
+**Do these once, when the release carrying migration `0012_drop_exchanges_accounting` is
+deployed.**
 
-Bitget has two account systems, **Classic** and the **Unified Trading Account (UTA)**, and
-the app offers the upgrade with a banner. **Do not accept it.** This application reads fills
-through the Classic (v2) API. A UTA account reads them through a different API, with a
-different cursor, window and field names, and Bitget's notice to broker partners states that
-a UTA key cannot call Classic endpoints at all.
+1. **Revoke the API keys at the venues.** Delete the read-only keys in Bitget's and BingX's
+   own API-management pages. Nothing reads them any more, and a key that is no longer used
+   is only a liability.
+2. **Delete the variables from the host's secrets file**:
 
-**What a Classic call made with a UTA account's key returns is not documented.** A refusal is
-expected -- an auth or invalid-request error on every sync until the account is switched
-back, which is loud and costs nothing but time. But it is expected, not documented. If the
-venue answered with an empty success instead, it would be indistinguishable from a period in
-which you made no trades: nothing would fail, the sync would move on, and once those weeks
-aged past Bitget's 90-day retention the trades would be gone for good. That is one more
-reason not to accept the upgrade. The application refuses the one undocumented empty shape it
-can recognise, a `null` in place of the list of fills, but it cannot tell a documented empty
-list from a real one. Support for UTA is #76.
+   ```bash
+   $EDITOR ~/portfolio-app/prod/secrets.env
+   ```
 
-Two facts from Bitget's documentation, read on 2026-09-25:
-
-- **Since 2026-09-15 Bitget has been moving eligible Classic accounts to UTA automatically.
-  An account with an API key linked is not eligible**, so the read-only key below also keeps
-  the account where it is.
-- **A main account can switch back** to Classic after an upgrade; a sub-account cannot.
-
-To check which one you have: a Classic account shows separate Spot, Futures and Margin tabs,
-and a banner offering the upgrade. The owner's account was Classic on 2026-09-25.
-
-### Creating a read-only key
-
-In Bitget's API management page, create a new API key:
-
-1. If Bitget offers a choice of key type, choose the **system-generated (HMAC)** one. This
-   application signs with HMAC-SHA256; it does not use RSA keys.
-2. Set a **passphrase**. Bitget asks you to choose one when the key is created, and it is the
-   third of the three values below, so keep it with the other two. Use printable ASCII with no
-   space at either end -- the application refuses anything else at startup.
-3. Grant **read-only** permission and nothing else. The application only ever reads fills,
-   symbol information and, since #104, the spot account's balances (section 16); it never
-   places, cancels or transfers anything, and a key that cannot is a key that cannot be
-   misused. **Never grant trade, transfer or withdrawal.**
-4. An IP allowlist is optional. If you set one, it must include the address the host's
-   requests reach the internet from, or every sync is refused as an auth error (venue code
-   `40018` or `40038`). Do not write that address into this repository.
-5. Copy the **API key** and the **secret key** straight into `secrets.env`. Assume the
-   secret is shown only once.
-
-### The three variables, in `secrets.env` and nowhere else
-
-| Variable | What it is |
-|---|---|
-| `PORTFOLIO_BITGET_API_KEY` | the API key |
-| `PORTFOLIO_BITGET_API_SECRET` | the secret key |
-| `PORTFOLIO_BITGET_API_PASSPHRASE` | the passphrase you chose for the key |
-
-They go in the host-local secrets file -- the same file as section 1, at mode 0600, never
-through GitHub, never in this repository, never in any other file:
-
-```bash
-$EDITOR ~/portfolio-app/prod/secrets.env
-```
-
-```
-PORTFOLIO_BITGET_API_KEY=<the API key>
-PORTFOLIO_BITGET_API_SECRET=<the secret key>
-PORTFOLIO_BITGET_API_PASSPHRASE=<the passphrase you chose>
-```
-
-Then recreate the container, because `env_file` is read at creation:
-
-```bash
-~/portfolio-app/prod/compose.sh up -d --force-recreate app
-```
-
-**All three, or none.** With none set, Bitget is not configured and the provider is not built
-at all -- nothing in the process holds a credential and nothing can reach the venue. The
-container **refuses to start** if:
-
-- only some of the three are set -- the log names the ones that are missing;
-- any of them is set but blank;
-- any of them holds text that cannot be encoded as UTF-8 -- usually a value copied from a
-  file or a terminal in another encoding;
-- the key or the passphrase holds a character an HTTP header cannot carry: a space or tab at
-  either end, a line break or another control character, or anything outside printable
-  ASCII. **A trailing space pasted along with the value is the usual cause.** The secret is
-  not checked this way; it is never sent, only used to sign.
-
-No refusal ever prints a value, only the variable's name. The credentials are never written
-to the database, never returned by any endpoint and never logged: they travel in request
-headers on the one call that needs them, and the log names that call
-`https://api.bitget.com/exchange_fills` and nothing more.
-
-### What a Bitget error means
-
-An exchange error carries Bitget's own code, as `venue code NNNNN`, and never the text of
-Bitget's message. The ones worth knowing:
-
-| Venue code | Reported as | Means | What to do |
-|---|---|---|---|
-| `40008`, `40005` | unavailable | **the host clock**: Bitget refuses a request whose timestamp is more than 30 seconds from its own clock | check the clock is synchronised -- `timedatectl` should say `System clock synchronized: yes`. One `40008` right after a throttle is harmless: the transport resent a signed request late, and the next run signs a fresh one |
-| `40006`, `40037`, `40041`, `40012`, `40036`, `40009` | auth | the key, the secret or the passphrase is wrong, or the key was deleted | check the three variables; create a new key if in doubt |
-| `40018`, `40038` | auth | the request came from an address the key's IP allowlist does not include | update the allowlist, or remove it |
-| `40014`, `40025`, `40040` | insufficient scope | the key lacks read permission | edit the key's permissions |
-| `429` | rate limited | too many requests. Bitget's overall per-address limit takes five minutes to recover | nothing; the next run asks again |
-| `40704` | retention window | a window older than Bitget keeps: "the last three months" | nothing; the sync starts later |
-| `45001`, `40725`, `40808`, `40015` | unavailable | Bitget is deploying (Tuesdays and Thursdays) | nothing; the next run asks again |
-
-Two refusals come from this application rather than from Bitget, and both name a field:
-
-- **`feeDetail.deduction`**: the fill's fee was paid in **BGB**. What Bitget's fee fields hold
-  then is not documented, so such a fill is refused rather than recorded with a guessed fee.
-  If Bitget is set to pay fees with BGB, turn that off; fills from before that stay refused
-  until support for BGB fees is written from a real example.
-- **`feeDetail.totalFee`** "is positive": Bitget reported a fee with the opposite sign from
-  its documentation. Refused rather than recorded as income. Report it; it needs a rule
-  written from the real fill.
-
-A sync that starts failing with an auth or invalid-request error right after you accepted
-something in the Bitget app is most likely the UTA upgrade. Switch the main account back to
-Classic. The same goes for a schema error saying `data must be an array of fills` -- and, since
-the documentation does not say what a UTA account's key gets back, for syncs that suddenly
-find no trades at all after an upgrade.
-
-## 13. Syncing exchange fills
-
-Every configured venue's spot fills are imported into `exchange_fills` on a timer of their
-own. Each attempt is one row in `exchange_sync_runs` plus one row per account in
-`exchange_sync_run_accounts`. The fills table is **append-only**: the database itself refuses
-an update or a delete of a fill, and re-reading history the sync already holds inserts
-nothing.
-
-The signed-in `/exchanges` page shows all of this without a terminal: the imported fills with
-their totals, the account list, a banner for any venue whose retention window truncated its
-history, and the run log. The
-`curl` commands below still work, and are what a script needs, but a human recovering an
-`auth_failed` key can do the last step from the page - see step 4 below.
-
-### The four settings
-
-| Variable | Default | What it is |
-|---|---|---|
-| `PORTFOLIO_EXCHANGE_HISTORY_START` | unset | The earliest date to import fills from, `YYYY-MM-DD`, at 00:00 UTC. Unset means everything the venue still keeps. A date after today's (UTC) date is refused at startup. Moving it **earlier** later is supported: the next run imports the older range, as far as the venue's retention allows. |
-| `PORTFOLIO_EXCHANGE_SYNC_ENABLED` | `true` | Whether the timer runs. **Does not disable `POST /api/exchanges/sync`**, as with the balance switch. |
-| `PORTFOLIO_EXCHANGE_SYNC_INTERVAL_MINUTES` | `15` | Minutes between runs. Must be at least 1; the container refuses to start otherwise. |
-| `PORTFOLIO_EXCHANGE_SYNC_SHUTDOWN_GRACE_SECONDS` | `10` | How long shutdown waits for a run in flight before cancelling it and recording it `interrupted`. The balance sync's grace runs at the same time, not after it. |
-
-**The timer only exists when a venue is configured.** With no exchange credentials in
-`secrets.env` nothing is scheduled and no empty run is written every fifteen minutes; the
-manual trigger still works and records a run with nothing in it. The same at-most-once-per-
-interval rule as the balance timer applies (section 11): the startup run happens only if the
-newest exchange run, of any status, started more than one interval ago.
-
-**The first sync is a backfill.** It reads everything from the history start -- clamped to
-what the venue keeps, 90 days at Bitget and at BingX -- newest first, in windows the
-venue accepts, one page at a time. Each page is committed with its checkpoint, so a restart
-in the middle loses at most the page in flight and the next run resumes where the last one
-stopped. Later runs read from where the previous plan ended, reaching five minutes back to
-catch a fill the venue recorded late.
-
-### The host clock must be synchronised
-
-The sync plans by the host's clock, and a signed venue checks it: Bitget refuses any request
-whose timestamp is more than 30 seconds from its own (venue code `40008`), and **BingX any
-more than 5 seconds from its own** (venue code `100421`), both reported as `unavailable`.
-Keep NTP on -- `timedatectl` should say `System clock synchronized: yes`.
-
-If the clock is wrong anyway:
-
-- **Ahead**: every request is refused while it is, so nothing is read. The run plans up to
-  the wrong time; once the clock is corrected, the next run notices the plan is ahead of the
-  clock (log event `exchange_sync_clock_behind_plan`), pulls it back, and the run after that
-  reads everything from there. No fill is lost, but nothing is imported until the clock is
-  right.
-- **Behind**: the venue refuses requests as well, beyond its window. Once corrected, the
-  sync re-reads from where the slow clock left the plan. That costs requests and inserts
-  nothing twice. Only a clock behind by more than the venue's retention (90 days at each
-  venue) loses history, and `history_truncated` then says so.
-
-### Reading the account list
-
-```bash
-curl -s -b "$COOKIE" https://<host>/api/exchanges | jq .
-```
-
-One entry per configured venue, plus any venue that has an account row but no credentials
-any more (`configured: false`). **Nothing here is a credential**: `configured` says whether
-the process has one, never what it is.
-
-| Field | Means |
-|---|---|
-| `status` | where the account stands; see below |
-| `syncing` | a sync is running now and covers this venue |
-| `requested_since` | what you asked for: `PORTFOLIO_EXCHANGE_HISTORY_START`, or 2009-01-03 when it is unset |
-| `effective_since` | the instant from which the history held is complete |
-| `history_truncated` | `effective_since` is later than `requested_since`: the venue did not keep everything you asked for, and **the history is complete from `effective_since`**. Some older fills may still be stored -- from before a long outage, or before the venue refused a window as too old -- but there is no promise about anything before it |
-| `last_synced_at` | when a run last finished the account with nothing left to read |
-| `fills_stored` | how many fills are stored for it |
-| `pending_windows` | how many windows of history are planned and not yet read. Non-zero after a failure or an interruption; the next run continues from them |
-| `last_error` | the kind and detail of the latest attempt, when that attempt failed. A run that skipped the account does not replace it |
-
-`history_truncated: true` with the history start unset is the normal state at both venues:
-you asked for everything, and Bitget keeps 90 days. At BingX this application reads **90
-days**, measured on 2026-10-05: a window older than that is not refused, it is answered with
-the account's newest fills and both time bounds ignored, and the sync refuses such a page
-(`N fill(s) have an executed_at outside the requested window`). BingX's API documentation
-says 7 days, which it does not enforce, and its support centre says a year, about exporting
-trade history from the website, which the API does not follow. The same article says some
-regions and risk-controlled accounts get 30 days. Trades older than 90 days have to come
-from somewhere else, such as a one-time import.
-
-### What an account's status means
-
-| `status` | Means | What to do |
-|---|---|---|
-| `never_synced` | no run has finished with this account yet | nothing, or trigger one |
-| `ok` | the last run read everything planned | nothing |
-| `error` | the last attempt failed; `last_error` says why. **The next scheduled run tries again** | see `error_kind` below |
-| `auth_failed` | the venue refused the key, or the key lacks read permission. **Scheduled runs skip the account** (their outcome says `skipped`) until you act | recover as below |
-
-`auth_failed` is not retried on the timer on purpose: asking a venue to refuse the same key
-every fifteen minutes is how an address gets banned. **To recover:**
-
-1. Fix the key at the venue, or create a new read-only one (section 12).
-2. Put the corrected values in the host-local `secrets.env`, and nowhere else.
-3. Recreate the container -- `env_file` is read at creation, so a restart is not enough:
+   Remove every line naming `PORTFOLIO_BITGET_API_KEY`, `PORTFOLIO_BITGET_API_SECRET`,
+   `PORTFOLIO_BITGET_API_PASSPHRASE`, `PORTFOLIO_BINGX_API_KEY` or
+   `PORTFOLIO_BINGX_API_SECRET`, and any of `PORTFOLIO_EXCHANGE_HISTORY_START`,
+   `PORTFOLIO_EXCHANGE_SYNC_ENABLED`, `PORTFOLIO_EXCHANGE_SYNC_INTERVAL_MINUTES` and
+   `PORTFOLIO_EXCHANGE_SYNC_SHUTDOWN_GRACE_SECONDS` if you set them. The application ignores
+   them now, so a line left behind does not stop it starting; it is a credential sitting on
+   the host for no reason. Then recreate the container so it no longer carries them in its
+   environment:
 
    ```bash
    ~/portfolio-app/prod/compose.sh up -d --force-recreate app
    ```
 
-4. Trigger a sync by hand. **A manual sync is the one that retries an `auth_failed`
-   account**. On the `/exchanges` page, press **Sync now**; the same page shows the result
-   once it lands. Scripting the same thing:
-
-   ```bash
-   curl -X POST -H 'Content-Type: application/json' -H "Origin: https://<host>" \
-        -b "$COOKIE" https://<host>/api/exchanges/sync
-   ```
-
-   The response carries the run and one entry per account. `status: "success"` on the
-   account means it is `ok` again, and the timer picks it up from there.
-
-   **If the response says `"joined": true`**, your request attached to a scheduled or
-   startup run that was already in flight -- the one right after the container came up,
-   most likely -- and that run skipped the `auth_failed` account: its entry says `skipped`.
-   Wait for it to finish (`GET /api/exchanges` shows `syncing: false`), then send the POST
-   again. A run you start yourself is the one that retries the account.
-
-### `error_kind`
-
-| Kind | Whose problem | What happens next |
-|---|---|---|
-| `auth`, `insufficient_scope` | the key | the account becomes `auth_failed`; recover as above. `insufficient_scope` means the key was accepted but lacks read permission |
-| `rate_limited` | the venue throttled us | each request is retried three times, waiting what the venue asks or 2, 4, then 8 seconds. A wait over 60 seconds is not waited: the account fails for this run, and the next one asks again |
-| `unavailable` | the venue | the shared HTTP client already retried; the next run asks again |
-| `retention_window` | the venue keeps less than it declares | first, once per window, the sync moves the refused window up to the retention edge as it stands now -- a long first backfill reaches its oldest window after that edge has moved on. If that does not help, it moves the window a day later and asks again, up to three times per window per run. When those run out the account fails, **keeping the moved start**, so the next run continues from there; `effective_since` rises with it |
-| `invalid_request`, `schema` | the venue changed what it accepts or answers, or our request is wrong | read `detail`; it names a field and a rule. A cursor that returned to one already visited is a `schema` error too |
-| `conflict` | see below | the account stops at that page until someone looks |
-| `internal` | ours | a bug. The container log has the traceback; `detail` is only the exception's type name |
-
-`detail` never holds a trade id, a symbol, an amount or anything the venue wrote in its
-message -- only a fixed summary, the HTTP status and the venue's numeric code.
-
-### `conflict`: a fill that changed under the same id
-
-Re-reading a fill that is already stored is normal and inserts nothing. A re-read fill whose
-trade id is stored but whose **contents differ** -- side, symbol, assets, quantity, price,
-quote amount, fee, fee asset, order id or execution time -- is a conflict, and it is refused
-rather than silently keeping either version. The page is rolled back, the checkpoint does not
-move, and the account fails with `conflict` on every run until someone looks.
-
-It means one of two things: the venue revised a settled fill, or its trade ids are not unique
-per account the way this application assumes. Neither is fixed from here, and neither
-recovers on its own; open an issue with the run's `detail` (a count, never an id). Recording a
-correction as an adjustment is the cost-basis milestone's decision. A venue adding a new
-field to its response is **not** a conflict: the stored payload is not compared.
-
-### Reading the run log, and interrupted runs
-
-```bash
-curl -s -b "$COOKIE" "https://<host>/api/exchanges/runs?limit=20" | jq .
-```
-
-Newest first; `limit` is 1 to 100. Each run has the same five statuses as a balance run
-(section 11), computed over the accounts it **attempted**: a run that only skipped an
-`auth_failed` account is a `success` that did nothing. `fills_seen` counts every fill read,
-overlap included; `fills_inserted` only the new ones, so a quiet interval shows a few seen and
-none inserted.
-
-A run row is written before the first request to any venue, and a surviving `running` row is
-swept to `interrupted` at startup, at shutdown and at the start of every exchange run. An
-interrupted run loses nothing already committed: every page is its own transaction, and the
-next run resumes each window from its last committed cursor -- at Bitget, whose cursor is a
-trade id, even when the retention edge has moved past the window's start in the meantime.
-(BingX's cursor is a time, so there such a window is re-read from its first page, which
-costs requests and inserts nothing twice.) **Do not run an exchange sync from a second
-process while the server is up**, for the reason section 11 gives.
-
-### Reading the imported fills
-
-The Transactions section of the `/exchanges` page shows them, with filters and totals. The
-same read from a terminal:
-
-```bash
-curl -s -b "$COOKIE" -G https://<host>/api/exchanges/fills \
-  --data-urlencode exchange=bitget --data-urlencode exchange=bingx \
-  --data-urlencode from=2026-03-01T00:00:00Z --data-urlencode to=2026-04-01T00:00:00Z \
-  --data-urlencode limit=50 --data-urlencode offset=0 | jq .
-```
-
-Every parameter is optional:
-
-- `exchange` is repeatable, and leaving it out means every venue.
-- `from` is inclusive and `to` exclusive, each an ISO 8601 datetime **with an offset**. A
-  naive one is refused rather than read as UTC. Use `--data-urlencode`, because a literal
-  `+01:00` in a URL arrives as a space.
-- `limit` is 1 to 200 (default 50). `offset` counts from 0.
-
-The response has three parts:
-
-- `fills` is newest first. Each fill carries its **order id**, which is what finds the trade
-  at the venue, but never the venue's trade id.
-- `total_count` is how many fills matched.
-- `totals` covers **every** matching fill, whatever the page. It has per-asset quantities
-  bought and sold, USDT spent and received, and fees per asset with their sign. A fill quoted
-  in anything but USDT is summed in its own quote asset under `not_valued_in_usdt` and never
-  converted.
-
-Every amount is a string. The totals cover only what has been imported, so read them together
-with `history_truncated`, `pending_windows` and `status` from the account list above.
-
-## 14. Connecting the BingX account
-
-The application reads your BingX **spot fills** -- every buy and sell execution -- with a
-read-only API key, exactly as it reads Bitget's (section 12). The provider landed with #14.
-Once the two variables below are set and the container recreated, the exchange timer imports
-BingX fills alongside Bitget's; section 13 covers the sync, what an account's status means,
-and how to recover when BingX refuses the key. Either venue can be configured without the
-other.
-
-### Creating a read-only key
-
-On the BingX website, under **User Center → API Management**, create a new API key:
-
-1. **Leave it read-only.** BingX creates new keys with read-only permission by default, and
-   that is exactly what this application needs: it only ever reads fills and, since #104, the
-   spot account's balances (section 16), and never places, cancels or transfers anything.
-   **Never enable trading, transfer or withdrawal.**
-2. BingX keys have no passphrase. There are two values, not three.
-3. An IP whitelist is optional, and BingX recommends one. If you set one, it must include the
-   address the host's requests reach the internet from, or every sync is refused with venue
-   code `100419`, reported as an auth error. Do not write that address into this
-   repository.
-4. Copy the **API key** and the **secret key** straight into `secrets.env`. Assume the secret
-   is shown only once.
-
-### The two variables, in `secrets.env` and nowhere else
-
-| Variable | What it is |
-|---|---|
-| `PORTFOLIO_BINGX_API_KEY` | the API key |
-| `PORTFOLIO_BINGX_API_SECRET` | the secret key |
-
-They go in the host-local secrets file -- the same file as section 1, at mode 0600, never
-through GitHub, never in this repository, never in any other file:
-
-```bash
-$EDITOR ~/portfolio-app/prod/secrets.env
-```
-
-```
-PORTFOLIO_BINGX_API_KEY=<the API key>
-PORTFOLIO_BINGX_API_SECRET=<the secret key>
-```
-
-Then recreate the container, because `env_file` is read at creation:
-
-```bash
-~/portfolio-app/prod/compose.sh up -d --force-recreate app
-```
-
-**Both, or neither.** With neither set, BingX is not configured and the provider is not built
-at all -- nothing in the process holds a credential and nothing can reach the venue. The
-container **refuses to start** if:
-
-- only one of the two is set -- the log names the one that is missing;
-- either is set but blank;
-- either holds text that cannot be encoded as UTF-8 -- usually a value copied from a file or
-  a terminal in another encoding;
-- the key holds a character an HTTP header cannot carry: a space or tab at either end, a line
-  break or another control character, or anything outside printable ASCII. **A trailing space
-  pasted along with the value is the usual cause.** The secret is not checked this way; it is
-  never sent, only used to sign.
-
-No refusal ever prints a value, only the variable's name. The credentials are never written to
-the database, never returned by any endpoint and never logged. The key travels in a request
-header and the signature in the query string of the one call that needs them, and the log
-names that call `https://open-api.bingx.com/exchange_fills` and nothing more.
-
-### What a BingX error means
-
-A BingX error carries its code, as `venue code NNNNNN`, and never the text of BingX's
-message. Every error BingX sent during testing came with HTTP status 200 and the code in the
-body, so the code is what to read. The ones worth knowing:
-
-| Venue code | Reported as | Means | What to do |
-|---|---|---|---|
-| `100421` | unavailable | **the host clock**: BingX refuses a request whose timestamp is more than **5 seconds** from its own | check the clock is synchronised -- `timedatectl` should say `System clock synchronized: yes`. Five seconds is tight: a clock NTP keeps is well inside it, and one that drifts is not. One `100421` right after a throttle or a server error is harmless: the transport resent a signed request late, and the next run signs a fresh one |
-| `100419` | auth | the request came from an address the key's IP whitelist does not include | update the whitelist, or remove it |
-| `100001`, `100412`, `100413` | auth | the secret or the key is wrong, or the key was deleted | check the two variables; create a new key if in doubt |
-| `100414`, `100441`, `100401` | auth | BingX considers the account abnormal, or wants identity verification completed | sort it out with BingX in the app or with support, then recover as in section 13 |
-| `100004` | insufficient scope | the key lacks read permission | edit the key's permissions |
-| `100410`, `109429`, HTTP `418` | rate limited | too many requests; BingX restores a throttled account after five minutes, and a `418` means requests continued after a `429` | nothing; the next run asks again |
-| `100500`, `100503` | unavailable | BingX is busy | nothing; the next run asks again |
-| `100400`, `100204`, `100404`, `100490` | invalid request | BingX refused a request this application built | read `detail` and open an issue; it will not fix itself |
-
-Three refusals come from this application rather than from BingX, and each names a field:
-
-- **`commission` "is positive"**: BingX reported a fee with the opposite sign from its
-  documentation. Refused rather than recorded as income. Report it; it needs a rule written
-  from the real fill.
-- **`symbol` "must be BASE-QUOTE"**: a fill arrived for a pair spelled in a way no BingX
-  spot pair has been. The rule is wide -- anything before the last hyphen, up to 40
-  characters, so `STRK-OLD-USDT`, `$U-USDT` and `MØTH-USDT` all pass -- and refuses only
-  whitespace, control characters and a quote that is not upper-case letters and digits.
-  Report it.
-- **"a full page of 500 fills all executed in the millisecond it was asked from"**: more than
-  500 fills share one millisecond, and the time cursor BingX pages with cannot get past them.
-  Report it. It is not expected from one person's trading.
-
-### Checking the first sync after trading a second symbol
-
-The application asks BingX for every symbol at once, without naming one. BingX documents that,
-and it held when this was tested -- but that account had traded a single symbol, so no answer
-carrying two symbols has been seen yet. If BingX ever answered for one symbol only, the other
-symbol's fills would be missing, and nothing would fail.
-
-So the first time you have traded **two different pairs** on BingX, check once:
-
-1. Trigger a sync (section 13, step 4) and wait for it to finish.
-2. Count the fills stored for BingX -- on the `/exchanges` page, or as `fills_stored` in
-   `GET /api/exchanges` -- and count the spot trades in BingX's own trade history for the
-   same period. Both count executions, not
-   orders: one order filled in several parts is several fills.
-3. If this application holds fewer, open an issue saying so -- the counts, never the trades.
-
-The same check is worth making once the account has more than 500 fills in any 30 days, the
-first time BingX pages past a single answer.
-
-## 15. The cost-basis snapshot: recomputing it, and reading it
-
-The stored fills, and the manual adjustments the owner has entered, are replayed into one
-position per asset -- quantity, cost basis, average cost, realized P&L -- by the engine
-`docs/accounting.md` describes, and the result is kept as a **snapshot** in four tables
-(`accounting_snapshots` and its positions, lots and warnings). `GET /api/accounting/positions`
-serves that snapshot, valued at the cached USD prices. The contracts are specs
-`docs/specs/021-position-snapshots.md` and `docs/specs/023-manual-adjustments.md`.
-
-### When it is recomputed
-
-- **Once at startup**, in the background. The health check does not wait for it, so a deploy
-  never fails over a slow replay. This is the run that covers the first deploy over fills
-  already stored, and an engine upgrade.
-- **After every exchange sync run that stored at least one new fill**, inside that run. A
-  manual `POST /api/exchanges/sync` therefore returns only once the snapshot is current.
-- **After an exchange sync run that stored nothing, only if the last recompute failed**, so
-  that a transient failure is retried at the next sync (every fifteen minutes by default)
-  rather than at the next stored fill or restart. Otherwise a run that stored nothing leaves
-  the snapshot alone.
-- **After every change to a manual adjustment**, inside the request that made it: a `POST`,
-  `PUT` or `DELETE` under `/api/accounting/adjustments` answers only once the snapshot is
-  current. The change is committed first, so a recompute that fails does not undo it.
-- **Never on a read.** `GET /api/accounting/positions` reads what is stored.
-
-Two recomputes never overlap: a second one waits for the first. A recompute whose input has
-not changed -- the same fills and adjustments, the same engine version -- writes nothing, and
-the snapshot's `computed_at` stays where it was.
-
-### The two log lines
-
-```bash
-~/portfolio-app/prod/compose.sh logs app | grep accounting_recompute
-```
-
-| Event | Fields | Meaning |
-|---|---|---|
-| `accounting_recompute_finished` | `reason`, `duration_ms`, `event_count`, `outcome` | `reason` is `startup`, `exchange_sync` or `adjustment`. `outcome` is `written` (the snapshot was replaced) or `unchanged` (the input was the same, nothing was written). `event_count` is the number of fills and adjustments replayed. |
-| `accounting_recompute_failed` | `reason`, `duration_ms`, `error`, and `adjustment_id` when `error` is `UnconvertibleAdjustmentError` | The recompute raised. `error` is the exception's **class name only** -- never its message and never a traceback. The database engine already hides the values a failed statement was binding, but a message is free text that nothing promises to keep clear of a trade id or an amount, and the class name is enough to act on. `adjustment_id` names the manual adjustment to correct; an adjustment id is logged on every change to one anyway. A fill's identity is never logged. |
-
-**The startup run's `duration_ms` on the Pi is the measurement for spec 021's criterion 8**
-(under two seconds). It is the replay of the whole history on the real hardware.
-
-### What a failed recompute means
-
-**The previous snapshot stays exactly as it was, and is still served.** A recompute replaces
-the snapshot in one transaction, and a failure rolls it back. Whatever triggered it is not
-affected: a sync's run and fills are recorded as usual, and a manual adjustment stays saved and
-the request that changed it still succeeds.
-
-The endpoint says so. `last_recompute` carries the last attempt since the process started:
-
-```bash
-curl -s -b "$COOKIE" https://<host>/api/accounting/positions | jq '.computed_at, .last_recompute'
-```
-
-`computed_at` is when the snapshot served was written, `null` before the first one.
-`last_recompute` is `{"at", "outcome", "error"}`, with `outcome` `unchanged`, `written` or
-`failed`. It lives in memory, so it is `null` after a restart until the startup run finishes.
-
-| `error` | What it means | What to do |
-|---|---|---|
-| `UnconvertibleFillError` | A stored fill has a shape the engine cannot account for: a pair whose base and quote are the same asset, a fee that consumes everything received, or a rebate larger than everything given. Ingestion has refused these since #99, so this is a row written before that, or by hand. | Do not edit the database: `exchange_fills` is append-only, and the recompute will keep failing until the row is dealt with. Report it with the venue and the date. The error names neither the account nor the trade on purpose, so that trade ids stay out of the log. |
-| `UnconvertibleAdjustmentError` | A stored manual adjustment breaks a rule the engine enforces: a quantity not above zero, a negative cost, more than 18 decimal places, a cost times a quantity too large to represent, a blank asset, or a date that cannot be expressed in UTC. The API refuses all of these when an adjustment is entered, so this is a row written some other way, such as by hand on the Pi. | The `accounting_recompute_failed` log line names it: its `adjustment_id` field. The Adjustments page does not show ids. `GET /api/accounting/adjustments` in `/api/docs`, while signed in, lists each adjustment with its `id`: find the one the log names there, and note its asset and date. Then correct that adjustment, or delete it, on the Adjustments page, where its asset and date identify the row; either recomputes at once. "Recording an opening balance" below describes the page, and the API under `/api/accounting/adjustments` as the alternative to it. |
-| `OperationalError` | SQLite refused the statement, most likely "database is locked": another write held the lock past the five-second busy timeout. Transient. | Nothing. It is retried at the next exchange sync, even one that stores nothing, and at the next restart. If it persists across several syncs, report it. |
-| `StatementError` | The write was refused. The likeliest cause is a figure of 10²⁰ or more, which no column can hold and no real history reaches. | Report it. |
-| `InvalidOperation` | Replay left the engine's range (spec 019, *Risks*). | Report it. |
-| anything else | A defect of ours. | Report it with the class name and the time. |
-
-**Every failed recompute is retried**: at the next exchange sync, whether or not that sync
-stored a fill, at the next change to a manual adjustment, and at the next restart. A transient
-failure such as `OperationalError` clears itself that way. A failure caused by the data --
-`UnconvertibleFillError`, `UnconvertibleAdjustmentError`, `StatementError`,
-`InvalidOperation` -- does not, because the same rows fail the same way every time; the retry
-costs one replay per sync and changes nothing until the cause is dealt with.
-
-### Recording an opening balance, or any acquisition the history does not show
-
-A `negative_inventory` warning, and the `history_incomplete` flag on an asset, mean a sale
-larger than everything the imported history holds -- usually coins bought before the venue's
-retention window. The fix is a **manual adjustment**: an inflow of the asset, at its cost or at
-an unknown cost, dated **before the first sale it has to cover**. `docs/accounting.md`,
-"Recording what the history does not show", explains the rules and works an example.
-
-**Enter it on the Adjustments page**, at `/adjustments` in the signed-in application. The page
-lists the adjustments recorded, and one form records a new one or edits an existing one. A
-delete asks for confirmation first. When the asset entered is one the imported history trades,
-the form says when its earliest imported trade is and offers a date before it; the date is
-offered, never filled in. The form's hint says which coins that date is for: coins already
-held by then are dated before that trade, and **coins acquired later carry the date they were
-acquired**. An inflow dated too early changes the cost applied to every sale in between, and
-nothing warns about it (`docs/accounting.md`, "Dating an opening balance"). Under "Held exceeds
-history", the dashboard's holdings check offers to record the missing coins and links each
-asset it lists there to the page, with the asset filled in and nothing else.
-
-The page calls these endpoints, which need a session, like every other:
-
-| Method | Path | Does |
-|---|---|---|
-| `GET` | `/api/accounting/adjustments` | Lists them, in the order they replay. |
-| `POST` | `/api/accounting/adjustments` | Records one. `201`. |
-| `PUT` | `/api/accounting/adjustments/{id}` | Replaces all five fields, `unit_cost` included: `null` is an unknown cost. |
-| `DELETE` | `/api/accounting/adjustments/{id}` | Deletes one. `204`. |
-| `GET` | `/api/accounting/first-trades` | Per asset, the instant of the earliest imported fill it takes part in, as base asset, as quote asset, or as the asset of a fee that is not zero. Sorted by asset. USDC and USDT are left out and adjustments are not counted. It is where the page's suggested date comes from, and it reads the stored fills, so it does not wait for a recompute. |
-
-**The alternative to the page is `/api/docs`, which works for all of these while signed in**
-(section 6) **except the delete.** Every write must carry `Content-Type: application/json`,
-and Swagger UI sends no content type for a request without a body, so a delete from there is
-refused with a 403 before it reaches the endpoint. To delete without the page, use the browser
-console, on a page of the signed-in application, with the adjustment's id in place of `<id>`:
-
-```js
-await fetch('/api/accounting/adjustments/<id>', {method: 'DELETE', headers: {'Content-Type': 'application/json'}})
-```
-
-The browser adds the `Origin` header and the session cookie itself; the promise resolves to a
-response whose `status` is `204` when the adjustment is gone, and `404` when no adjustment of
-yours has that id.
-
-Every amount is a JSON string: a JSON number is refused. Each change answers after the
-snapshot is recomputed, so `GET /api/accounting/positions` shows it straight away; if that
-recompute fails, the change is still saved and `last_recompute` says `failed`. The log records
-`adjustment_created`, `adjustment_updated` and `adjustment_deleted` with the adjustment's id
-**and nothing else**: never the asset, an amount, a date or the note.
-
-### Reading the positions
-
-Every amount is a JSON string. Quantities, costs, values and P&L are at eighteen decimal
-places; `price.amount` is the price as stored, at twelve; and the percentage is at four.
-Valuation is in **USD**, because the unit of account is USDT/USDC pinned at 1. EUR is not
-offered: it would need an exchange rate at every purchase, which the application does not
-have.
-
-**Only a chain's native asset is priced** -- BTC and KAS today -- because those are the only
-pairs the price refresh fetches. Any other asset a venue traded shows `market_value: null` with
-`market_value_unavailable_reason: "unsupported_pair"`, and is listed in `totals.excluded` as
-`unpriced`. A chain asset with no price yet shows `never_fetched` instead (section 10). A
-price that makes the value too large to represent -- 10²⁰ dollars or more, which no real price
-reaches -- shows `value_out_of_range` and is left out of the totals the same way. An
-asset holding units of unknown cost is listed there as `unknown_basis`. The totals cover only
-what is left, so their percentage is the return on exactly the money in the total beside it.
-
-Two totals are the exception and cover **every** position, held or closed, comparable or
-excluded: `totals.realized_pnl` and `totals.unmatched_proceeds`. The second is what sales
-brought in for units with no known cost -- units that arrived without a cost, or units sold
-beyond what the imported history held -- kept out of realized P&L because there is no cost to
-compare it with. It is signed: proceeds are net of fees, and a fee paid in a third asset can
-cost more than the sale brought in. The dashboard shows it beside realized P&L whenever a
-position carries any, with the assets it comes from.
-
-## 16. The holdings check: which balances are compared, and what a failed read means
-
-The cost-basis snapshot says what the imported history adds up to. The **holdings check**
-compares that, per asset, with the balances read: each wallet's latest balance and each
-venue's, for as long as those readings are current. More held than the history accounts for
-usually means buys are missing from it, which no warning in the snapshot can show.
-`docs/accounting.md`, "Checking the history against the balances held", explains the
-comparison and what each result means; the contract is spec
-`docs/specs/025-holdings-reconciliation.md`. The signed-in dashboard shows it as the
-**Holdings check** block of the Invested section.
-
-### What is read, and when
-
-- **Only the spot account of each venue is read.** Earn, futures, margin and funding accounts
-  are not. Coins held there are simply missing from the held side, which can make the history
-  look larger than the balances (`history_over`, shown and never an error) and can never make
-  it look smaller.
-- **After every successful fill sync of a venue**, inside the same run, the venue is asked
-  what its spot account holds, and the answer **replaces** the stored reading whole. One
-  reading per account is kept; there is no history of balances. The one exception is a venue
-  that refused the key on its last balance read: scheduled and startup runs do not ask it
-  again, and a manual sync does (see "What to do about a `balances_error`").
-- **Not after a failed or skipped fill sync.** Fresh balances beside a stale history would
-  show differences that mean nothing.
-- **Never on a read.** `GET /api/accounting/reconciliation` compares what is stored.
-
-### Which readings are compared: the 24-hour rule
-
-A reading that is out of date is worse than a missing one. Coins withdrawn from a venue to a
-wallet after the venue was last read would be counted in both, and the check would report
-units that do not exist as missing from the history. So a reading is compared only while it
-is **current**, and one that is not adds nothing:
-
-- **A venue** is compared when its last balance read succeeded, its fill sync is `ok`, and
-  the reading is at most **24 hours** old.
-- **A wallet** is compared when its chain did not fail in the last balance run that finished,
-  and its latest reading is at most 24 hours old. When the chain did fail in that run, the
-  wallet is compared only if a later run has already read it, and that reading is at most
-  24 hours old.
-
-The limit is served as `max_reading_age_hours` and is not configurable. Both syncs run every
-fifteen minutes by default, so a reading only reaches it when a source has stopped being
-read. The age is measured when the request is served.
-
-**A wallet whose chain failed is left out at once**, without waiting for the limit (spec
-`docs/specs/028-wallet-chain-failed.md`). The run that decides is the newest one in
-`GET /api/balances/runs` whose `status` is `success`, `partial` or `failed` (section 11). When
-that run has the wallet's chain as `failed`, the wallet's last reading is not compared,
-however recent it is, unless a later run has already stored it. A `running` or `interrupted`
-run records no chain, so it decides nothing and the run before it still stands. A reading stored by a run later than the one that
-decides, which is a run still in progress or one interrupted after it read the chain, is kept
-and compared. A chain with no entry in that run did not fail, and neither has any chain
-before the first run finishes.
-
-```bash
-curl -s -b "$COOKIE" https://<host>/api/accounting/reconciliation \
-  | jq '.max_reading_age_hours, .last_recompute, .exchanges, .wallets'
-```
-
-Each entry of `exchanges` has:
-
-| Field | Means |
-|---|---|
-| `balances_read_at` | when that venue's balances were last read **successfully**; `null` when they never have been |
-| `balances_error` | the kind the last attempt failed with, in the `error_kind` vocabulary of section 13; `null` when it succeeded or none was made |
-| `not_compared_reason` | `null` when the venue's balances are in the comparison; otherwise why they are not |
-
-`not_compared_reason` is the first of these that applies:
-
-| Reason | Means | What to do |
-|---|---|---|
-| `read_failed` | The last balance read failed. The rows of the reading before it stay in the database and are **not** compared. | Read `balances_error`; see below. |
-| `never_read` | No balance read has succeeded yet. | Nothing if the venue was just configured: the next successful fill sync reads it. If the venue shows `configured: false` on `GET /api/exchanges`, its credentials were removed and no sync will come. |
-| `sync_failed` | The venue's fill sync is not `ok` (`error`, `auth_failed` or `never_synced`). Balances are read only after a successful fill sync, so nothing is refreshing the reading. | Fix the fill sync: section 13, "What an account's status means". |
-| `out_of_date` | The reading is more than 24 hours old, although the last read succeeded and the account is `ok`. No balance read has succeeded for that venue since, which normally means no sync has run for it. | Check `PORTFOLIO_EXCHANGE_SYNC_ENABLED`, and whether the venue still shows `configured: true`. A manual sync of a configured venue refreshes it. |
-
-`wallets` has four counts that add up to the active wallets. `compared` wallets are in the
-comparison. A wallet that is left out is counted under the first of these that applies:
-
-| Count | Means | What to do |
-|---|---|---|
-| `chain_failed` | The last balance run that finished could not read the wallet's chain, and no later run has read the wallet. Its last reading is **not** compared. A wallet on that chain with no reading at all is counted here, and not under `unread`. | `failed_chains` names the chain. Read that chain's `error_kind` in `GET /api/balances/runs`: section 11. The wallet is compared again once a run reads the chain. If no run follows, check the balance timer (`PORTFOLIO_BALANCE_SYNC_ENABLED`): with it off no run comes, and the wallet stays left out. |
-| `unread` | No balance run has read the wallet yet (section 11). | Nothing if the wallet was just added: the next run reads it. |
-| `stale` | The reading is more than 24 hours old, and the last run that finished does not have the chain as `failed`. No run has read the wallet for a day. | Check `PORTFOLIO_BALANCE_SYNC_ENABLED`, and whether the runs are all `interrupted` (section 11). |
-
-`failed_chains` lists the chains behind `chain_failed`, sorted by `chain_key`. Each entry has
-the `chain_key` and `wallets`, the number of wallets on that chain that were left out. Only a
-chain with at least one wallet left out is listed, so `wallets` is never zero, the entries add
-up to `chain_failed`, and the list is empty when no wallet is left out this way. An entry does
-not say why the chain failed: the run log does. The dashboard shows one notice per chain.
-`oldest_observed_at` is the oldest reading among the compared wallets.
-
-A source that is left out adds nothing to the held side. That can hide a difference, and
-cannot produce one. What can still produce a false one is coins moved between two current
-readings, taken at different times by two different syncs: they are counted twice, or not at
-all, until both sources have been read again. Those readings are **minutes** apart while both
-syncs are running, and **up to 24 hours** apart when a source has stopped being read without
-a recorded failure. Its last reading then stays in the comparison until it reaches the limit,
-and nothing names the source until then. These are the residuals:
-
-- a wallet, when the balance timer is switched off (`PORTFOLIO_BALANCE_SYNC_ENABLED=false`),
-  or when no balance run finishes: the last run that finished is then an old one, and says
-  nothing about what happened since;
-- a venue whose credentials were removed after a read;
-- a venue, when the exchange timer is switched off (`PORTFOLIO_EXCHANGE_SYNC_ENABLED=false`);
-- the double failure logged as `exchange_balances_failure_not_recorded` (below).
-
-The chain rule leaves two windows of its own, each bounded by one balance interval
-(`PORTFOLIO_BALANCE_SYNC_INTERVAL_MINUTES`, fifteen minutes by default) while the balance
-timer runs:
-
-- A chain that starts failing **between** two balance runs is not known to have failed until
-  the next run finishes, so a wallet on it stays in the comparison for up to one balance
-  interval.
-- A run does not attempt a chain with no active wallet, so it has no entry for that chain, and
-  a chain with no entry did not fail. When a chain's only wallets were archived while the
-  last run ran and were restored afterwards, their previous readings are compared, while
-  they are under 24 hours old, even if the run before has the chain as `failed`. That lasts
-  until the next run finishes.
-
-The dashboard shows each reading's age. Treat a `history_short` as a prompt to look.
-
-`last_recompute` is the one `GET /api/accounting/positions` serves (section 15). It is `null`
-after a restart until the startup recompute ends, and the stored snapshot is compared
-meanwhile. When its outcome is `failed`, the snapshot compared is older than the balances,
-every asset bought since shows as missing from the history, and the dashboard shows no
-comparison until a recompute succeeds. A shorter window of the same kind opens on every run
-that stores a fill: between a sync's commits and its recompute, an asset bought in that sync
-can show as `history_short`, and with two venues that window spans the second venue's sync.
-
-### The read-only key should need no new permission (not verified with a real key)
-
-The balances are read with the key the fills are read with (sections 12 and 14). Nothing
-should have to be granted, and **nothing more should be**: trade, transfer and withdrawal
-stay off.
-
-What that rests on, read on 2026-10-01: BingX documents its spot balance endpoint as needing
-the **Read** permission, which the key already has. Bitget's page for its spot assets endpoint
-does not state a permission; the read-only permission is what its fills are read with.
-`docs/providers.md` records both. **Neither endpoint had been called with a real key when
-this was written.** If a venue does refuse the key for it, the fills keep syncing and the
-refusal shows as described below.
-
-### Where a failed balance read shows up
-
-**Not in the account's status, and not in the run log.** `status`, `last_error` and
-`GET /api/exchanges/runs` describe the fills, and a failed balance read changes none of them:
-the account stays `ok` and the run stays a `success`. It shows in two places.
-
-**In the holdings check itself**: the venue's entry has `balances_error` set and
-`not_compared_reason: "read_failed"`, and the dashboard names the venue and the reason. The
-rows of the last good reading are kept in the database, with their `balances_read_at`, and
-are not used: that venue's coins are missing from the comparison until a read succeeds.
-
-**In the container log**, one line per venue whose fills were synced, per run, and two when a
-failed read could not be recorded either:
-
-```bash
-~/portfolio-app/prod/compose.sh logs app | grep exchange_balances
-```
-
-| Event | Fields | Meaning |
-|---|---|---|
-| `exchange_balances_read` | `exchange_key`, `assets` | The balances were read and stored. `assets` is how many assets the spot account holds a balance of. |
-| `exchange_balances_read_failed` | `exchange_key`, `error_kind`, `error_type` | The read failed. `error_type` is the exception's class name. An `internal` kind is a defect of ours and the line carries the traceback. |
-| `exchange_balances_read_skipped` | `exchange_key`, `reason` | A scheduled or startup run did not ask, because the last read was refused for the key. `reason` is `auth` or `insufficient_scope`. |
-| `exchange_balances_failure_not_recorded` | `exchange_key`, `error_type` | The read failed **and** writing its kind to the account failed too, most likely "database is locked". It follows the `exchange_balances_read_failed` line of the same venue and carries the traceback. The run carries on and closes normally, and the fills are unaffected, but `balances_error` still shows what the attempt before left, so the endpoint does not show this failure: the two log lines are the only record. **The venue's previous reading then stays in the comparison** until a read succeeds or that reading is 24 hours old. Nothing to do unless it repeats; the next successful fill sync reads the balances again. |
-
-A venue whose fill sync failed or was skipped has no line here: its balances were not asked
-for. None of these fields carries an asset or an amount, and the reconciliation endpoint is
-the only place a venue's balances are served.
-
-### What to do about a `balances_error`
-
-| Kind | What happens next |
-|---|---|
-| `unavailable`, `rate_limited` | Nothing to do. The next successful fill sync of that venue asks again, and the venue is left out of the comparison until a read succeeds. |
-| `auth`, `insufficient_scope` | The venue refused the key for this read. **Scheduled and startup runs stop asking**, for the reason an `auth_failed` account is skipped (section 13), so the venue stays out of the comparison until you act. Fix the key at the venue, put the corrected values in `secrets.env`, recreate the container, and trigger a sync by hand: **a manual sync is the one that asks again**. If the response says `"joined": true`, wait and send it again, as in section 13. |
-| `schema`, `invalid_request` | The venue answered something the parser does not recognise, or refused the request. The parsers refuse whatever they do not recognise rather than store a guess, so this is a missing reading and never a wrong number. Every run asks again. Report it with the venue and the kind. |
-| `internal` | A defect of ours. The container log has the traceback. Every run asks again. Report it. |
-
-The fills are untouched by any of these, and so are the positions.
+**The deployment deletes the data, and the pre-deployment backup is where it survives.**
+Migration `0012_drop_exchanges_accounting` drops eleven tables -- `exchange_accounts`,
+`exchange_fills`, `exchange_sync_windows`, `exchange_sync_runs`,
+`exchange_sync_run_accounts`, `exchange_balances`, `accounting_snapshots`,
+`accounting_positions`, `accounting_lots`, `accounting_warnings` and `manual_adjustments` --
+and the two triggers that kept `exchange_fills` append-only. Every imported fill, every sync
+run, every cost-basis snapshot and every manual adjustment goes with them.
+
+Before the new container starts, `deploy.py` snapshots the live database, as it does on every
+deployment (`docs/deployment.md`, *What happens on the host*, step 6). Once the deployment
+succeeds, that snapshot is `prod/backup/database.sqlite3`, and it is the copy holding the deleted
+rows. **The next successful deployment replaces it**, because the host keeps one
+(`docs/deployment.md`, *One backup, and why*). The scheduled copies in `/app/backups` taken
+before the deployment hold the rows too, until the rotation removes them (section 17). If the
+history may ever be wanted, copy one of them off the host before the next deployment, as
+section 17, *Copying one off the host*, shows.
+
+**Rolling back past 0012 means restoring that backup, not running the old image.** If the
+deployment itself fails, the automatic rollback restores its own snapshot, so nothing is lost
+(`docs/deployment.md`, *Rolling back*). After it has succeeded, an older image refuses to
+start on a database at 0012, since it does not know the revision, and a revert fails to
+deploy for the same reason. The migration's downgrade recreates the eleven tables and the two
+triggers by running the upgrades of migrations 0006 to 0010, but **empty**: it cannot bring
+back a row. Going back with the data means restoring a copy taken before the deployment, by
+hand (section 17, *Restoring one*, and *Bringing a copy back onto the host* for the file in
+`prod/backup/database.sqlite3`), which loses everything written since.
+
+What else changed for an operator:
+
+- `GET /api/health/detail` has no `exchanges` or `reconciliation` section, and its timers
+  are three: `balance-sync`, `price-refresh` and `backup` (section 19).
+- `GET /api/portfolio/summary` reports wallets only: `total_value`, `holdings` and `missing`,
+  where each entry of `missing` is a `wallet_unread`, a `wallet_stale`, an `unpriced` or a
+  `stale_price`. There is no invested figure and no profit or loss.
+- `/api/exchanges/*` and `/api/accounting/*` are gone, and so are the Exchanges and
+  Adjustments pages.
 
 ## 17. Backups: where they are, how they stand, and restoring one
 
@@ -1577,8 +855,11 @@ is in `docs/deployment.md`, *Scheduled backups*. The contract is spec
 `docs/specs/029-sqlite-backups.md`.
 
 **Every copy holds the owner's complete financial data, as the live database does**: every
-imported trade, every wallet address, every manual adjustment, and the owner's account with
-its password hash. Treat a copy you take off the host as you would the database.
+wallet address and extended public key, the balance history read from them, and the owner's
+account with its password hash. A copy taken before migration
+`0012_drop_exchanges_accounting` also holds the imported trades and manual adjustments that
+migration deleted (section 12). Treat a copy you take off the host as you would the
+database.
 
 **The copies do not protect against losing the storage device**: they are on the same device
 as the database. Copy one off the host from time to time, as *Copying one off the host* below
@@ -1758,7 +1039,7 @@ steps, the check included, before merging anything.
    Restored portfolio-20261001T030000123456Z.sqlite3.
    The database as it was before is in the safety copy portfolio-20261002T093012345678Z.sqlite3.
    Rows per table after the restore:
-     accounting_lots: 12
+     assets: 2
      ...
      wallets: 3
    ```
@@ -1776,7 +1057,7 @@ steps, the check included, before merging anything.
    database at startup.
 
 5. **Check**: `~/portfolio-app/prod/compose.sh ps` until the container is healthy, then sign in
-   and look at the wallets, the adjustments and the positions. The Health page should show the
+   and look at the wallets and the dashboard. The Health page should show the
    backups as `ok`.
 
 **A restore brings the account back as it was too.** The password is the one the account had
@@ -2013,9 +1294,8 @@ however deeply nested.
 value, and every key at any depth, so a field keyed by address is caught too. The rules repeat
 over a string until nothing more changes, so two values written back to back are both caught:
 
-- **every credential the application holds**: the bootstrap password, the CoinGecko key, the
-  three Bitget variables and the two BingX ones -- every `SecretStr` setting, found by type, so
-  one added later is covered too. Wherever it appears when it is 8 characters or longer, and
+- **every credential the application holds**: the bootstrap password and the CoinGecko key
+  -- every `SecretStr` setting, found by type, so one added later is covered too. Wherever it appears when it is 8 characters or longer, and
   only as a whole value when shorter, so that a short value does not redact ordinary words;
 - **extended keys, public and private**: the public `xpub`, `ypub`, `zpub`, `tpub`, `upub`,
   `vpub`, `Ypub`, `Zpub`, `Upub` and `Vpub`, and the private `xprv`, `yprv`, `zprv`, `tprv`,
@@ -2027,7 +1307,7 @@ over a string until nothing more changes, so two values written back to back are
   `kaspa:`, `kaspatest:`, `kaspasim:` or `kaspadev:` prefix. No checksum is checked, so a word
   that merely looks like one is redacted too;
 - **the query string of any URL**: `https://host/path?query` is logged as
-  `https://host/path?[REDACTED]`. One exchange signs its requests in the query string.
+  `https://host/path?[REDACTED]`. A query string can carry a key or a signature.
 
 Nothing is exempt, `request_id` included. A request id never matches a rule: its longest run
 of characters without a hyphen is 12, and the shortest address a rule recognises is 14.
@@ -2076,34 +1356,29 @@ curl -s -b "$COOKIE" <origin>/api/health/detail | jq 'del(.backup)'
   "schedulers": [
     {"name": "balance-sync", "state": "ok", "last_tick_at": "2026-10-03T09:15:02.481210Z", "last_tick_succeeded": true},
     {"name": "price-refresh", "state": "ok", "last_tick_at": "2026-10-03T09:00:01.102934Z", "last_tick_succeeded": true},
-    {"name": "exchange-sync", "state": "disabled", "last_tick_at": null, "last_tick_succeeded": null},
     {"name": "backup", "state": "ok", "last_tick_at": "2026-10-03T03:00:00.912345Z", "last_tick_succeeded": true}
   ],
   "chains": {"state": "ok", "items": [
     {"chain_key": "bitcoin", "state": "ok", "last_success_at": "2026-10-03T09:15:31.004812Z", "last_error_kind": null},
     {"chain_key": "kaspa", "state": "failing", "last_success_at": "2026-10-03T08:45:12.774102Z", "last_error_kind": "rate_limited"}
   ]},
-  "exchanges": {"state": "ok", "items": [
-    {"exchange_key": "bitget", "sync_state": "ok", "last_synced_at": "2026-10-03T09:00:44.310275Z", "balances_state": "ok", "balances_read_at": "2026-10-03T09:00:45.120934Z"}
-  ]},
-  "prices": {"state": "fresh", "latest_fetched_at": "2026-10-03T09:00:01.003712Z"},
-  "reconciliation": {"state": "match", "computed_at": "2026-10-03T09:00:46.551203Z", "assets_compared": 2, "assets_mismatched": 0, "sources_not_compared": 0}
+  "prices": {"state": "fresh", "latest_fetched_at": "2026-10-03T09:00:01.003712Z"}
 }
 ```
 
 `backup` is section 17. **Each source is what its last recorded attempt says**: the endpoint
-calls no chain index and no exchange -- the page refetches every minute -- so a source looks
+calls no chain index and no price source -- the page refetches every minute -- so a source looks
 healthy until its next attempt says otherwise. No setting is served: no interval, path, URL,
 key, tolerance or age limit. The timers' fields are held in memory, so a restart clears them.
 
-### `schedulers`: the four timers
+### `schedulers`: the three timers
 
 | `state` | Meaning | What to do |
 |---|---|---|
 | `ok` | Running and not late. | Nothing. |
 | `late` | Running, and one of two things. A tick is in flight, and it started more than two intervals ago. Or no tick is in flight, and the last one finished more than two intervals ago -- or, before the first tick, the timer started more than two intervals ago. | Look for the timer's lines in the log; a sync stuck on a vendor that never answers shows as a tick in flight. Restarting the container starts the timer again. |
 | `stopped` | The timer was built and its task is not running. | It should not happen while the application runs. Look for a traceback in the log and restart the container. |
-| `disabled` | Its `PORTFOLIO_*_ENABLED` setting is false. The exchange timer is also `disabled` when no exchange has credentials. | Nothing, unless it should be on: sections 10, 11, 13 and 17 name the setting. |
+| `disabled` | Its `PORTFOLIO_*_ENABLED` setting is false. | Nothing, unless it should be on: sections 10, 11 and 17 name the setting. |
 
 "In flight" is read from the wall clock: the timer records when each tick starts and
 finishes, and a tick is in flight when its start is later than the last finish. If the Pi's
@@ -2126,18 +1401,6 @@ One entry per chain that a wallet uses or that the latest finished balance run r
 | `failing` | It failed. `last_error_kind` says how, in the vocabulary of the run log. | Section 11, *Reading the run log*: `GET /api/balances/runs` has the provider's message. `last_success_at` says how long it has been failing. |
 | `never` | No finished run has read it: the wallet was registered after the last run, or no run has finished yet. | Wait for the next run, or trigger one (section 11). |
 
-### `exchanges`: one entry per account
-
-`sync_state` is the fill sync's status -- `ok`, `error`, `auth_failed` or `never_synced`, as
-section 13 describes -- and `last_synced_at` when a run last left the account with nothing
-pending.
-
-| `balances_state` | Meaning | What to do |
-|---|---|---|
-| `ok` | The last balance read succeeded, at `balances_read_at`. | Nothing. |
-| `failing` | The last balance read failed. | Section 16, *What to do about a `balances_error`*. |
-| `never` | No balance read has been made: balances are read only after a successful fill sync. | Look at `sync_state` first. |
-
 ### `prices`
 
 | `state` | Meaning | What to do |
@@ -2146,22 +1409,9 @@ pending.
 | `stale` | It is older: the refresh has stopped writing prices. | Check the price timer above and the `price_refresh_incomplete` lines; section 10. |
 | `never` | No price has ever been stored. | Check that the price timer is not `disabled`; section 10. |
 
-### `reconciliation`: the holdings check, in short
-
-A state and three counts: `assets_compared`, `assets_mismatched` and `sources_not_compared`
-(exchange accounts and wallets left out of the comparison). No quantity is served; the
-holdings check on the dashboard, and `GET /api/accounting/reconciliation`, have the detail.
-
-| `state` | Meaning | What to do |
-|---|---|---|
-| `match` | Every asset matches and every source was compared. | Nothing. |
-| `mismatch` | At least one asset's history and balances disagree beyond the tolerance. | Section 16: a `history_short` asset usually means a buy the history does not hold. |
-| `incomplete` | Every compared asset matches, but at least one source was left out: an account whose reading is not current, or a wallet that is stale, unread or on a chain that failed. | Section 16, *Which readings are compared*. |
-| `not_computed` | No cost-basis snapshot has been computed yet. | Wait for the startup recompute, or look at section 15. |
-
 ### `unavailable`: a section that could not be read
 
-`chains`, `exchanges`, `prices` and `reconciliation` can each be `unavailable`, with its items
+`chains` and `prices` can each be `unavailable`, with its items
 empty and every other field `null`, while the other sections still answer. The Health page
 says "Could not be read. The log says why." The log has `health_section_failed` with `section`
 and `error_type`, the exception's class name:
@@ -2187,16 +1437,6 @@ A lasting one is a defect to report, with the `error_type` and the `request_id`.
 | Logged out roughly monthly despite daily use | Working as intended: the 30-day absolute ceiling, which activity does not extend |
 | Edited `secrets.env`, nothing changed | `env_file` is read at container creation — recreate, do not restart |
 | Container never becomes healthy after setting the Esplora URLs | One of them has no scheme, no host, or a scheme other than `http`/`https` — the startup log names which — section 8 |
-| Container refuses to start, log names `PORTFOLIO_EXCHANGE_HISTORY_START` | The date is after today's date in UTC — section 13 |
-| An exchange account stays `auth_failed` after fixing the key | Scheduled runs skip it: recreate the container, then trigger a sync by hand, and again if the first POST says `"joined": true` — section 13 |
-| Exchange syncs fail `unavailable` with venue code `40008` | The host clock is off by more than 30 seconds — section 13, "The host clock must be synchronised" |
-| An exchange account fails with `conflict` on every run | A stored fill changed under the same id; it needs a person — section 13 |
-| The holdings check says a venue's balances could not be read, while the account is `ok` | A failed balance read never changes the account's status. Read `balances_error` — section 16 |
-| A venue's `balances_error` stays `auth` or `insufficient_scope` after fixing the key | Scheduled runs do not ask again: recreate the container, then trigger a sync by hand — section 16 |
-| The holdings check shows the history above the balances for an asset | Not a finding: only the spot account is read, so coins in Earn, futures or an unregistered wallet are not counted. A sale the import did not see looks the same, and the check cannot tell them apart — section 16 |
-| The holdings check leaves a venue or a wallet out although nothing failed today | Its reading is more than 24 hours old, or the venue's fill sync is not `ok`. Read `not_compared_reason` and `wallets.stale` — section 16 |
-| The holdings check says the last balance sync that finished could not read a chain, and leaves its wallets out | The last balance run that finished has that chain as `failed`. Read `wallets.failed_chains`, then that chain's `error_kind` in `/api/balances/runs`. The wallets are compared again once a run reads the chain; if none follows, check `PORTFOLIO_BALANCE_SYNC_ENABLED` — sections 11 and 16 |
-| The dashboard shows no holdings comparison at all | The last recompute failed, so the history is older than the balances. Read `last_recompute` — sections 15 and 16 |
 | A Bitcoin wallet reports "the address is on a different network" | `PORTFOLIO_BITCOIN_NETWORK` does not match the address — section 8 |
 | Bitcoin balances stop updating and the log shows 429 | The public index is throttling us. Lengthen nothing by hand; run your own Esplora — section 8 |
 | Reading many Bitcoin addresses takes a minute | Working as intended: one request per second per host — section 8 |
@@ -2225,23 +1465,6 @@ A lasting one is a defect to report, with the `error_type` and the `request_id`.
 | Prices are all flagged stale | The last refresh is over an hour old. The price is still shown; it is the age that is being reported — section 10 |
 | KAS/EUR is the only pair that ever fails | Kraken is the only key-free source for it. CoinGecko is the only fallback — section 10 |
 | A pair reports `every_source_failed` while the vendor is plainly up | A vendor can be refused for what it *sent*: a price of zero or below, a non-finite number, or one too large or too small for the column. Failover treats that like any other refusal — section 10 |
-| Container refuses to start naming a `PORTFOLIO_BITGET_*` variable | Only some of the three are set, one is blank, one is not valid UTF-8, or the key or passphrase has a character a header cannot carry — usually a trailing space from pasting — section 12 |
-| A Bitget error says venue code `40008` or `40005` | The host clock is more than 30 seconds off. Check `timedatectl`. A single one right after a throttle is harmless — section 12 |
-| A Bitget error names `feeDetail.deduction` | Fees paid in BGB are not supported yet. Turn off paying fees with BGB in Bitget — section 12 |
-| Bitget errors start, or Bitget syncs stop finding trades, right after accepting something in the Bitget app | Most likely the Unified Trading Account upgrade. What a Classic call returns then is not documented. Switch the main account back to Classic — section 12 |
-| Container refuses to start naming a `PORTFOLIO_BINGX_*` variable | Only one of the two is set, one is blank, one is not valid UTF-8, or the key has a character a header cannot carry — usually a trailing space from pasting — section 14 |
-| A BingX error says venue code `100421` | The host clock is more than 5 seconds off. Check `timedatectl`. A single one right after a throttle is harmless — section 14 |
-| A BingX error says venue code `100419` | The key has an IP whitelist that does not include the host's address — section 14 |
-| BingX holds fewer fills than BingX's own trade history shows | The case the application cannot detect by itself: report it with the two counts — section 14 |
-| BingX holds more fills than its own trade history, around the time BingX renamed a pair (to a name like `XYZ-OLD-USDT`) | A fill read under both names is stored twice, because its id includes the pair's name. Report it with the two counts and the date; do not edit the database — section 14 |
-| `/api/accounting/positions` has `computed_at: null` | No snapshot has been written yet. The startup recompute has not finished, or it failed: read `last_recompute` — section 15 |
-| `last_recompute.outcome` is `failed` | The previous snapshot is still the one served. Read `error` — section 15 |
-| New trades are imported but the positions do not change | Check `last_recompute`: a failed recompute keeps the old snapshot. If it says `unchanged`, the fills replayed were exactly the ones the snapshot was already computed from — section 15 |
-| An asset shows `market_value: null` with `unsupported_pair` | Only chain assets (BTC, KAS) are priced. It is left out of the totals and named in `totals.excluded` — section 15 |
-| A `negative_inventory` warning, and `history_incomplete` on an asset | A sale larger than the imported history holds. Record the missing coins as a manual adjustment dated before that sale, on the Adjustments page — section 15 |
-| An opening balance was entered and the warning is still there | The adjustment is dated at or after the sale. At the same instant, a fill replays first. Edit it on the Adjustments page and date it earlier — section 15 |
-| Deleting an adjustment from `/api/docs` returns 403 | Delete it on the Adjustments page (`/adjustments`). Swagger UI sends no content type for a request without a body, and every write needs `application/json`, so it cannot send the delete. Without the page, delete it from the browser console — section 15 |
-| Creating an adjustment returns 422 naming `asset` | The symbol must be the venue's own spelling, upper case, such as `BTC`, and not USDC or USDT — section 15 |
 | The dashboard says the last scheduled backup failed, `last_error_kind` is `database_error` | SQLite could not open or read the live database. Check that the container is healthy and the data volume is mounted; report it with the `error_type` from the `backup_failed` line — section 17 |
 | `last_error_kind` is `integrity_failed` | A copy did not pass `PRAGMA integrity_check` and was not kept. It is read from the live database, so take one by hand to see the message. If the database is damaged, restore the newest good copy: the restore moves the damaged file aside first — section 17 |
 | `last_error_kind` is `storage_error` | Writing to `/app/backups` failed: usually a full disk. Check `df -h` on the host. If the `backup_failed` line has `kept`, the copy was kept and the rotation after it failed — section 17 |
