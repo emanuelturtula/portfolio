@@ -175,7 +175,7 @@ describe('App', () => {
 
     renderApp(['/health']);
 
-    expect(await screen.findByText(/backend health/i)).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Backend health' })).toBeInTheDocument();
     expect(currentPath()).toBe('/health');
   });
 

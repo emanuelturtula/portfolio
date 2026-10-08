@@ -156,7 +156,10 @@ describe('LoginPage', () => {
     // And nothing bounced them somewhere else afterwards. This is the
     // assertion the previous version of this test was missing.
     expect(visitedPaths().at(-1)).toBe('/health');
-    expect(await screen.findByText(/backend health/i)).toBeInTheDocument();
+    // The success heading, not any text naming the page: "Loading backend
+    // health..." matches /backend health/i too, and it can be replaced by the
+    // answer between `findByText` resolving and the assertion reading it.
+    expect(await screen.findByRole('heading', { name: 'Backend health' })).toBeInTheDocument();
 
     // This test is also the positive control for the two open-redirect cases
     // below: it proves `/health` really was reachable, so "landed on `/`"
