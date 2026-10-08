@@ -52,8 +52,7 @@ never logged. One exchange signs its requests in the query string, so the shared
 logs URLs with the query removed.
 
 *Enforced by:* `.gitleaks.toml` + `scripts/secret_scan.py` (fails closed), pre-commit and
-pre-push hooks, the `Secrets scan` CI job over full history, GitHub push protection, and a
-`PreToolUse` hook that stops an agent writing one in the first place.
+pre-push hooks, the `Secrets scan` CI job over full history, and GitHub push protection.
 
 ### 4. Business logic is never in a router
 
@@ -127,13 +126,13 @@ These have no mechanical enforcement, or only part of one, so they rest on readi
   green. Errors get `role="alert"`, and a loading state is announced, not a bare spinner.
 - **Every diff is reviewed as an adversary before its pull request**: secrets first, then
   money as a float, then a correctness bug with a concrete failing input, then layering, then
-  criteria no test proves, then error paths that swallow. `/work-issue` spells it out.
+  criteria no test proves, then error paths that swallow.
 
 ## Running things
 
 ```bash
 python scripts/check.py              # the full gate: lint, types, layering, tests, secrets
-python scripts/check.py --fast       # quick version, used by the agent stop hook
+python scripts/check.py --fast       # quick version: no coverage, formatting or history scan
 python scripts/check.py --backend    # one side only
 ```
 
@@ -156,10 +155,6 @@ merge, which is why the rollback path exists and why it is tested rather than as
 
 ## Working on an issue
 
-`/work-issue <N>` takes an issue to an open pull request in one session: a branch, a short
-spec in `docs/specs/` for a feature, a test-first implementation, the full gate, a review of
-the diff, and the pull request. The steps are in `.claude/skills/work-issue/`.
-
-There is no agent team. One context that has already read the code costs a fraction of five
-that each read it again, and a single writer needs no file ownership split between writers.
-`/code-review` gives a large change a second pass with a fresh context.
+An issue becomes a pull request in this order: a branch, a short spec in `docs/specs/` for
+a feature, a test-first implementation, the full gate, an adversarial review of the diff in
+the order listed above, and the pull request.

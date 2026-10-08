@@ -43,5 +43,5 @@ Thumbs.db
 openapi.json
 .import_linter_cache/
 
-# Claude Code local state (agent definitions and skills ARE committed)
-.claude/settings.local.json
+# Claude Code local state: nothing under .claude/ is part of the repository
+.claude/
