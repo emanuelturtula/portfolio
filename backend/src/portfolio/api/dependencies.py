@@ -208,13 +208,14 @@ SCHEDULER_ATTRIBUTES: Final[tuple[tuple[SchedulerName, str], ...]] = (
     (SchedulerName.BALANCE_SYNC, "balance_scheduler"),
     (SchedulerName.PRICE_REFRESH, "price_scheduler"),
     (SchedulerName.PRICE_BACKFILL, "price_backfill_scheduler"),
+    (SchedulerName.BALANCE_REBUILD, "balance_rebuild_scheduler"),
     (SchedulerName.BACKUP, "backup_scheduler"),
 )
 """Each timer's name, and the `app.state` attribute `main.lifespan` publishes it on."""
 
 
 def timers_of(app: FastAPI) -> dict[SchedulerName, TimerLike | None]:
-    """The four timers the lifespan published, `None` for each one it did not build.
+    """The five timers the lifespan published, `None` for each one it did not build.
 
     `None` when the settings switched a timer off -- the lifespan publishes `None` then -- and
     also when the lifespan has not run, which only a test does. Either way the timer is served

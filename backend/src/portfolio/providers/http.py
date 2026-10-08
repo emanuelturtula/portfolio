@@ -97,6 +97,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ADDRESS_BALANCE",
     "ADDRESS_BALANCES",
+    "ADDRESS_HISTORY",
     "ASSET_DAILY_CLOSES",
     "ASSET_PRICE",
     "ASSET_PRICES",
@@ -263,6 +264,16 @@ prices on a request path -- the failure `backend/.importlinter`'s price contract
 make impossible, observed from the other side.
 """
 
+ADDRESS_HISTORY: Final = "address_history"
+"""A read of one page of an address's confirmed transactions, or of how many it has (spec 038).
+
+Esplora's `/address/:a/txs/chain[/:txid]` and Kaspa's `/addresses/{a}/full-transactions-page`
+and `/transactions-count`. Separate from `ADDRESS_BALANCE` because it is the call that comes in
+dozens for one wallet: a log full of these is a rebuild running, and one full of them every
+hour is a timer misbehaving. The label carries neither the address nor the cursor, for the
+reason `ADDRESS_BALANCE` carries no address.
+"""
+
 ASSET_DAILY_CLOSES: Final = "asset_daily_closes"
 """A read of one pair's daily candles: Kraken's OHLC at a one-day interval (spec 037).
 
@@ -275,6 +286,7 @@ ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
     {
         ADDRESS_BALANCE,
         ADDRESS_BALANCES,
+        ADDRESS_HISTORY,
         ASSET_DAILY_CLOSES,
         ASSET_PRICE,
         ASSET_PRICES,
@@ -293,7 +305,8 @@ well it is shaped.
 
 Two labels on #7; four since #8 added Kaspa's batch read and its health report; six since
 #9 added the two price reads. #13 and #104 added three exchange reads, and spec 036 took
-them out again with the exchange providers; seven since spec 037 added the daily closes. The
+them out again with the exchange providers; seven since spec 037 added the daily closes;
+eight since spec 038 added the address history. The
 set changes one deliberate line at a time,
 which is the whole mechanism.
 

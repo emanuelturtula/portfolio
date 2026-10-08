@@ -91,6 +91,12 @@ EXPECTED_NAMES = {
         "ck_derived_addresses_used",
         "fk_derived_addresses_wallet_id_wallets",
     },
+    "reconstructed_balances": {
+        "pk_reconstructed_balances",
+        "uq_reconstructed_balances_wallet_day",
+        "ck_reconstructed_balances_confirmed",
+        "fk_reconstructed_balances_wallet_id_wallets",
+    },
     "price_history": {
         "pk_price_history",
         "uq_price_history_asset_day",

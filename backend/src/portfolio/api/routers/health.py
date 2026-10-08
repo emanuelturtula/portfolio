@@ -5,7 +5,7 @@ dependency is up, so a slow dependency cannot make the container look dead. It i
 because the container's health check calls it before anyone signs in, and it stays that cheap.
 
 `GET /api/health/detail` is the other half: how the scheduled backups stand (#22, spec 029),
-and the other sources beside them (#23, spec 030) -- the four timers, the balance sync per
+and the other sources beside them (#23, spec 030) -- the five timers, the balance sync per
 chain and the prices, each as its last recorded attempt left it. **No vendor is called**: the
 page refetches every minute, and a check that asked a chain index or a price source would
 spend the rate limits the syncs are budgeted against. It is **not** in `PUBLIC_API_PATHS`, so

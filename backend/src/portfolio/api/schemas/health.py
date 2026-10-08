@@ -77,7 +77,7 @@ class BackupStatusResponse(BaseModel):
 
 
 class SchedulerStatusResponse(BaseModel):
-    """One of the four timers.
+    """One of the five timers.
 
     `last_tick_at` is when its last tick finished and `last_tick_succeeded` whether that tick
     returned without raising; both `null` before a tick has finished, and always for a

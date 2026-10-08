@@ -110,6 +110,7 @@ def apply_auth_environment(
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_BACKFILL_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_BALANCE_REBUILD_ENABLED", "false")
     # #22's backup timer is on by default and takes a copy at startup on a fresh volume, and
     # its directory defaults to `./data/backups` under the working directory. Off, and the
     # directory under `tmp_path` regardless, so a suite that turns the timer back on, or calls

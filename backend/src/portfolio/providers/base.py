@@ -55,6 +55,7 @@ from dataclasses import dataclass
 # A real import, not a `TYPE_CHECKING` one: `decode_json` hands this class to `json.loads`
 # as `parse_float`, so it is needed at run time and not only in an annotation.
 from decimal import Decimal
+from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from portfolio.domain.money import from_base_units
@@ -62,18 +63,23 @@ from portfolio.providers.errors import ProviderResponseError
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+    from datetime import datetime
 
     from portfolio.domain.chains import ChainKey, ValidatedAddress
 
 __all__ = [
     "AddressBalance",
+    "AddressHistory",
     "ChainCapabilities",
     "ChainProvider",
     "ExtendedKeyScan",
     "ExtendedKeyScanner",
+    "HistoryIncomplete",
     "KnownDerivedAddress",
     "ProviderHealth",
     "ScannedAddress",
+    "TransactionHistoryReader",
+    "TxEffect",
     "align_balances",
     "chunk_addresses",
     "decode_json",
@@ -323,6 +329,78 @@ class ExtendedKeyScanner(Protocol):
             ProviderUnavailableError: the chain could not be reached, or did not answer.
             ProviderResponseError: it answered with something that cannot be trusted, or a
                 branch would pass `MAX_ADDRESSES_PER_BRANCH`.
+        """
+
+
+@dataclass(frozen=True, slots=True)
+class TxEffect:
+    """What one confirmed transaction did to one address (spec 038, R2).
+
+    `delta` is the sum of the transaction's outputs to the address minus the sum of its
+    resolved inputs from it, in the chain's base units: positive when the address received,
+    negative when it spent, and zero for a transaction that touched it both ways evenly.
+    `occurred_at` is the block's time, aware and in UTC (R3 takes its date).
+    """
+
+    occurred_at: datetime
+    delta: int
+
+
+class HistoryIncomplete(StrEnum):
+    """Why an address's history does not prove itself complete (spec 038, R1). Its wire form.
+
+    * `count_mismatch` -- the transactions collected are not as many as the vendor counts.
+    * `balance_mismatch` -- their effects do not sum to the confirmed balance.
+    * `moved_during_read` -- the count or the balance read after the paging differs from the
+      one read before it: a transaction confirmed while the history was being read.
+    * `unresolved_input` -- an input's source address or amount could not be read, so its
+      effect is unknown.
+    """
+
+    COUNT_MISMATCH = "count_mismatch"
+    BALANCE_MISMATCH = "balance_mismatch"
+    MOVED_DURING_READ = "moved_during_read"
+    UNRESOLVED_INPUT = "unresolved_input"
+
+
+@dataclass(frozen=True, slots=True)
+class AddressHistory:
+    """Every confirmed transaction's effect on one address, oldest first, and its balance.
+
+    `balance` is the confirmed balance the history was checked against, in base units.
+    `incomplete` is `None` exactly when the history proved itself complete by R1: then the
+    effects sum to `balance`. Otherwise it says why, and `effects` is whatever was collected,
+    which nothing may store.
+    """
+
+    address: str
+    balance: int
+    decimals: int
+    effects: tuple[TxEffect, ...]
+    incomplete: HistoryIncomplete | None
+
+
+@runtime_checkable
+class TransactionHistoryReader(Protocol):
+    """A chain provider that can read an address's whole confirmed history (spec 038).
+
+    `runtime_checkable` for the reason `ExtendedKeyScanner` is: the rebuild holds a
+    `ChainProvider` and asks at run time whether it can also do this. The signature is
+    checked by `mypy` assigning each provider to a variable of this type in the tests.
+    """
+
+    async def address_history(self, address: str) -> AddressHistory:
+        """Every confirmed transaction's effect on `address`, oldest first, checked by R1.
+
+        An incomplete history is a result, not an exception: the caller decides what to do
+        with it, and a rebuild keeps the rows it had.
+
+        Raises:
+            AddressInvalidError: the address is not one this provider's network reads.
+                Checked before any request.
+            ProviderUnavailableError: the chain could not be reached, or did not answer.
+            ProviderRateLimitedError: it refused because we asked too often.
+            ProviderResponseError: it answered with something that cannot be trusted.
         """
 
 
