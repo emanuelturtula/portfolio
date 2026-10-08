@@ -25,16 +25,17 @@ this one is about the report, that one is about the row.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
 import pytest
 from sqlalchemy import select, text
 
-from portfolio.db.models import Asset, AssetPrice
+from portfolio.db.models import Asset, AssetPrice, PriceHistory
 from portfolio.providers.errors import ProviderUnavailableError
 from portfolio.providers.prices.base import BTC, EUR, KAS, SUPPORTED_PAIRS, USD, PriceQuote
+from portfolio.repositories.price_history import CLOSE, OBSERVED, PriceHistoryRepository
 from portfolio.services.price_refresh import (
     PriceRefreshService,
     RefreshedPair,
@@ -440,6 +441,135 @@ async def test_an_hour_old_refresh_is_what_makes_a_price_stale(
 
 
 # --------------------------------------------------------------------------------------
+# Spec 037: every refresh also records today's `observed` price in `price_history`
+# --------------------------------------------------------------------------------------
+
+#: The UTC day of `REFRESHED_AT`, written out rather than derived from it.
+REFRESHED_DAY: Final = date(2026, 9, 23)
+
+
+async def history_rows(session: AsyncSession) -> dict[tuple[str, str, date], PriceHistory]:
+    """Every `price_history` row by `(symbol, currency, day)`, read afresh from the table.
+
+    `expunge_all` first, so what comes back is the table and not the objects the refresh's
+    own identity map still holds.
+    """
+    session.expunge_all()
+    result = await session.execute(
+        select(PriceHistory, Asset.symbol).join(Asset, Asset.id == PriceHistory.asset_id)
+    )
+    return {(symbol, row.quote_currency, row.day): row for row, symbol in result.all()}
+
+
+async def test_a_refresh_records_todays_observed_price_for_every_pair_it_stored(
+    service_session: AsyncSession,
+) -> None:
+    """R2's other writer: one `observed` row per stored pair, for the UTC day of the refresh.
+
+    The same amount, source and instant as the `prices` row, from the same clock read, so
+    the history and the current price cannot disagree about when or what.
+    """
+    await service(service_session, FakeSource()).refresh_prices()
+
+    rows = await history_rows(service_session)
+
+    assert set(rows) == {(symbol, currency, REFRESHED_DAY) for symbol, currency in SUPPORTED_PAIRS}
+    assert {
+        (symbol, currency): row.amount for (symbol, currency, _day), row in rows.items()
+    } == ALL_FOUR_PRICES
+    assert {row.basis for row in rows.values()} == {OBSERVED}
+    assert {row.source for row in rows.values()} == {VENDOR}
+    assert {row.recorded_at for row in rows.values()} == {REFRESHED_AT}
+
+
+async def test_a_later_refresh_the_same_day_replaces_the_observed_price(
+    service_session: AsyncSession,
+) -> None:
+    """Hourly: the day keeps one row, holding the latest price seen, not the first."""
+    later = REFRESHED_AT + timedelta(hours=5)
+    await service(service_session, FakeSource()).refresh_prices([BTC_USD])
+    moved = FakeSource(name="another-vendor", answers={BTC_USD: Decimal("86500.5")})
+
+    await build_price_refresh_service(
+        service_session, sources=(moved,), clock=lambda: later
+    ).refresh_prices([BTC_USD])
+
+    rows = await history_rows(service_session)
+    assert list(rows) == [(BTC, USD, REFRESHED_DAY)]
+    row = rows[(BTC, USD, REFRESHED_DAY)]
+    assert (row.amount, row.basis, row.source) == (Decimal("86500.5"), OBSERVED, "another-vendor")
+    assert row.recorded_at == later
+
+
+async def test_a_refresh_never_overwrites_a_close_for_the_same_day(
+    service_session: AsyncSession,
+) -> None:
+    """Criterion 2: the backfill's close stands, while the current price still refreshes.
+
+    The two halves together: `prices` takes the new number -- the dashboard's now -- and
+    `price_history` keeps the close, because an hourly price must never undo a final one.
+    The other pairs, with no close that day, get their `observed` row as usual.
+    """
+    btc = (await service_session.scalars(select(Asset.id).where(Asset.symbol == BTC))).one()
+    await PriceHistoryRepository(service_session).record(
+        asset_id=btc,
+        quote_currency=USD,
+        day=REFRESHED_DAY,
+        amount=Decimal("85000.25"),
+        basis=CLOSE,
+        source="kraken",
+        recorded_at=REFRESHED_AT - timedelta(hours=1),
+    )
+    await service_session.commit()
+
+    report = await service(service_session, FakeSource()).refresh_prices([BTC_USD, KAS_USD])
+
+    rows = await history_rows(service_session)
+    close = rows[(BTC, USD, REFRESHED_DAY)]
+    assert (close.amount, close.basis, close.source) == (Decimal("85000.25"), CLOSE, "kraken")
+    assert close.recorded_at == REFRESHED_AT - timedelta(hours=1)
+    assert rows[(KAS, USD, REFRESHED_DAY)].basis == OBSERVED
+    assert [line.amount for line in report.refreshed if line.asset_symbol == BTC] == [BTC_PRICE]
+    current = await service_session.scalar(
+        text(
+            "SELECT p.amount FROM prices p JOIN assets a ON a.id = p.asset_id "
+            "WHERE a.symbol = 'BTC' AND p.quote_currency = 'USD'"
+        )
+    )
+    assert current == "86000.100000000000", "the current price refreshed regardless"
+
+
+async def test_the_history_day_is_the_utc_date_of_the_clock_read(
+    service_session: AsyncSession,
+) -> None:
+    """A clock reading 22:30 at UTC-5 is 03:30 the next day in UTC, and that is the day.
+
+    The day a price belongs to is a UTC day (spec 037), so a clock handed in another zone --
+    a test's, or a future caller's -- must not file the price under its local date.
+    """
+    eastern = timezone(timedelta(hours=-5))
+    local_evening = datetime(2026, 9, 23, 22, 30, tzinfo=eastern)
+
+    await build_price_refresh_service(
+        service_session, sources=(FakeSource(),), clock=lambda: local_evening
+    ).refresh_prices([BTC_USD])
+
+    rows = await history_rows(service_session)
+    assert list(rows) == [(BTC, USD, date(2026, 9, 24))]
+
+
+async def test_a_pair_that_fails_records_no_history_either(
+    service_session: AsyncSession,
+) -> None:
+    """A failed pair is an absence in `price_history` too, never a zero for the day."""
+    down = FakeSource(raises=ProviderUnavailableError("down"))
+
+    await service(service_session, down).refresh_prices([BTC_USD])
+
+    assert await history_rows(service_session) == {}
+
+
+# --------------------------------------------------------------------------------------
 # The loud failure, and the shape of the report
 # --------------------------------------------------------------------------------------
 
@@ -477,6 +607,9 @@ async def test_a_quote_for_an_asset_with_no_row_is_loud_and_writes_nothing(
     await service_session.rollback()
     assert (await service_session.scalars(select(AssetPrice))).all() == [], (
         "a refresh that raised must commit nothing, not even the pairs it did resolve"
+    )
+    assert (await service_session.scalars(select(PriceHistory))).all() == [], (
+        "nor the history row it recorded for them"
     )
 
 

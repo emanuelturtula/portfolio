@@ -160,7 +160,7 @@ def real_timer(
     return scheduler, sleep
 
 
-async def test_a_lifespan_with_every_timer_switched_off_serves_three_disabled_timers(
+async def test_a_lifespan_with_every_timer_switched_off_serves_four_disabled_timers(
     api_environment: Path,
 ) -> None:
     del api_environment
@@ -169,7 +169,7 @@ async def test_a_lifespan_with_every_timer_switched_off_serves_three_disabled_ti
 
     assert body["schedulers"] == [
         {"name": name, "state": "disabled", "last_tick_at": None, "last_tick_succeeded": None}
-        for name in ("balance-sync", "price-refresh", "backup")
+        for name in ("balance-sync", "price-refresh", "price-backfill", "backup")
     ]
 
 
@@ -180,31 +180,43 @@ async def test_every_timer_state_is_served_from_real_timers(api_environment: Pat
     service judges it at. The stopped one ticked and failed before it was stopped, so its
     `last_tick_succeeded` is `false` -- a state the page words on its own. `disabled` is the
     test above: a timer the lifespan never built.
+
+    The price backfill (spec 037) is the fourth, read off `app.state.price_backfill_scheduler`,
+    and served in `SCHEDULER_ORDER`'s place for it: after the refresh, before the backup.
     """
     del api_environment
     day_ago = datetime.now(UTC) - timedelta(days=1)
     ok, ok_sleep = real_timer("balance-sync")
     late, late_sleep = real_timer("price-refresh", clock=lambda: day_ago)
+    backfill, backfill_sleep = real_timer("price-backfill")
     stopped, stopped_sleep = real_timer("backup", fails=True)
     async with application() as (app, client):
         try:
-            for scheduler, sleep in ((ok, ok_sleep), (late, late_sleep), (stopped, stopped_sleep)):
+            for scheduler, sleep in (
+                (ok, ok_sleep),
+                (late, late_sleep),
+                (backfill, backfill_sleep),
+                (stopped, stopped_sleep),
+            ):
                 await scheduler.start()
                 await sleep.parked()
             await stopped.stop()
             app.state.balance_scheduler = ok
             app.state.price_scheduler = late
+            app.state.price_backfill_scheduler = backfill
             app.state.backup_scheduler = stopped
 
             body = await detail(client)
         finally:
             await ok.stop()
             await late.stop()
+            await backfill.stop()
 
     timers = {timer["name"]: timer for timer in body["schedulers"]}
     assert [timer["name"] for timer in body["schedulers"]] == [
         "balance-sync",
         "price-refresh",
+        "price-backfill",
         "backup",
     ]
     assert all(set(timer) == SCHEDULER_KEYS for timer in body["schedulers"])
@@ -213,6 +225,9 @@ async def test_every_timer_state_is_served_from_real_timers(api_environment: Pat
     assert parsed(timers["balance-sync"]["last_tick_at"]) == ok.last_tick_finished_at
     assert timers["price-refresh"]["state"] == "late"
     assert timers["price-refresh"]["last_tick_at"] == wire(day_ago)
+    assert timers["price-backfill"]["state"] == "ok"
+    assert timers["price-backfill"]["last_tick_succeeded"] is True
+    assert parsed(timers["price-backfill"]["last_tick_at"]) == backfill.last_tick_finished_at
     assert timers["backup"]["state"] == "stopped"
     assert timers["backup"]["last_tick_succeeded"] is False
 
@@ -486,6 +501,7 @@ def test_the_schema_declares_every_state_as_its_wire_forms(app: FastAPI) -> None
     assert schemas["SchedulerName"]["enum"] == [
         "balance-sync",
         "price-refresh",
+        "price-backfill",
         "backup",
     ]
     assert schemas["SchedulerState"]["enum"] == ["ok", "late", "stopped", "disabled"]

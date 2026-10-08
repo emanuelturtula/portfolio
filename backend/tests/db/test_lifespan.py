@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
 
@@ -33,9 +33,15 @@ from portfolio.db.engine import (
 )
 from portfolio.db.models import Asset
 from portfolio.domain.chains import ChainKey
-from portfolio.main import create_app, drain_coordinators
+from portfolio.main import create_app, drain_coordinators, latest_price_backfill
 from portfolio.providers.errors import ProviderUnavailableError
-from portfolio.providers.prices.base import SUPPORTED_PAIRS, PriceQuote, PriceSource
+from portfolio.providers.prices.base import (
+    SUPPORTED_PAIRS,
+    DailyClose,
+    DailyCloseSource,
+    PriceQuote,
+    PriceSource,
+)
 from portfolio.services.scheduler import IntervalScheduler
 from portfolio.services.sync_coordinator import SyncCoordinator
 from tests.balance_harness import (
@@ -57,7 +63,7 @@ from tests.offline_http import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterator, MutableMapping, Sequence
     from pathlib import Path
 
     from sqlalchemy.engine.interfaces import DBAPIConnection
@@ -84,6 +90,7 @@ def lifespan_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
     )
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_PRICE_BACKFILL_ENABLED", "false")
     # #22's backup timer too. It is the first timer to reach its sleep when a copy is recent,
     # which is what `PacedSleep.reached()` waits for, so left on it answered for the timer a
     # test is about. Its directory is under `tmp_path` in case a test turns it back on.
@@ -1076,3 +1083,274 @@ async def test_a_sweep_that_fails_does_not_stop_startup_or_shutdown(
 
     events = [entry["event"] for entry in captured]
     assert events.count("balance_sync_orphan_sweep_failed") == 2, "at startup and at shutdown"
+
+
+# --------------------------------------------------------------------------------------
+# Spec 037: the price backfill, a fourth timer of its own
+# --------------------------------------------------------------------------------------
+
+BACKFILL_PAIRS_UNDER_TEST: Final[frozenset[PricePair]] = frozenset({("BTC", "USD"), ("KAS", "USD")})
+
+#: The close every fake candle carries: distinctive, so its absence from a log line means
+#: something.
+FAKE_CLOSE: Final = Decimal("4321.98765")
+
+FAKE_DAYS: Final = (date(2026, 10, 6), date(2026, 10, 7))
+
+
+class FakeDailyCloses:
+    """A `DailyCloseSource` answering two days per pair, or refusing the pairs it is told to.
+
+    The lifespan builds the real one as `KrakenDailyCloses(client)`; `stub_daily_closes`
+    replaces that name in `main`, so no candle is ever asked of Kraken here.
+    """
+
+    name = "a-candle-vendor"
+    pairs = BACKFILL_PAIRS_UNDER_TEST
+
+    def __init__(self, *, fails: frozenset[PricePair] = frozenset()) -> None:
+        self.fails = fails
+        self.asked: list[PricePair] = []
+
+    async def daily_closes(self, pair: PricePair) -> Sequence[DailyClose]:
+        self.asked.append(pair)
+        if pair in self.fails:
+            message = "the candle vendor did not answer"
+            raise ProviderUnavailableError(message)
+        return tuple(DailyClose(day=day, close=FAKE_CLOSE) for day in FAKE_DAYS)
+
+
+_CONFORMS_AS_A_DAILY_CLOSE_SOURCE: DailyCloseSource = FakeDailyCloses()
+
+
+def stub_daily_closes(monkeypatch: pytest.MonkeyPatch, source: FakeDailyCloses) -> list[object]:
+    """Replace `KrakenDailyCloses` where `main` imported it; return the clients it was given."""
+    clients: list[object] = []
+
+    def build(client: object) -> FakeDailyCloses:
+        clients.append(client)
+        return source
+
+    monkeypatch.setattr("portfolio.main.KrakenDailyCloses", build)
+    return clients
+
+
+@pytest.fixture
+def backfilled_lifespan(
+    lifespan_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Path]:
+    """The shared environment with only the **backfill** timer on."""
+    monkeypatch.setenv("PORTFOLIO_PRICE_BACKFILL_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        yield lifespan_database
+    finally:
+        get_settings.cache_clear()
+
+
+HISTORY_SQL: Final = (
+    "SELECT asset_id, quote_currency, day, amount, basis, source FROM price_history "
+    "ORDER BY asset_id, day"
+)
+
+
+async def history_in(database: Path) -> list[dict[str, object]]:
+    """Every `price_history` row, read through a connection of this test's own."""
+    async with own_session(database) as session:
+        return await rows_of(session, HISTORY_SQL)
+
+
+async def seed_history(database: Path, rows: Sequence[tuple[str, datetime, str]]) -> None:
+    """`price_history` rows for BTC/USD as `(basis, recorded_at, day)`, as if written so."""
+    async with own_session(database) as session:
+        for basis, recorded_at, day in rows:
+            await session.execute(
+                text(
+                    "INSERT INTO price_history (asset_id, quote_currency, day, amount, basis, "
+                    "source, recorded_at) VALUES ((SELECT id FROM assets WHERE symbol = 'BTC'), "
+                    "'USD', :day, '1000.000000000000', :basis, 'a-vendor', :at)"
+                ),
+                {"day": day, "basis": basis, "at": sqlite_timestamp(recorded_at)},
+            )
+        await session.commit()
+
+
+def events_named(
+    captured: Sequence[MutableMapping[str, Any]], name: str
+) -> list[MutableMapping[str, Any]]:
+    """The captured log entries of one event, in order."""
+    return [entry for entry in captured if entry["event"] == name]
+
+
+async def test_the_price_backfill_is_scheduled_and_stores_closes_at_startup(
+    backfilled_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh install backfills at startup: a running timer, and `close` rows on disk.
+
+    Asserted as rows and as the log line, not as an object: a timer whose first tick is a
+    day away would satisfy `is not None` and fill nothing. The source is built once, over
+    the process-wide client the lifespan owns, and the timer stops with the application.
+    """
+    await bring_the_schema_up(backfilled_lifespan)
+    source = FakeDailyCloses()
+    clients = stub_daily_closes(monkeypatch, source)
+    app = create_app()
+
+    with capture_logs() as captured:
+        async with app.router.lifespan_context(app):
+            scheduler = app.state.price_backfill_scheduler
+            assert isinstance(scheduler, IntervalScheduler)
+            assert scheduler.name == "price-backfill"
+            assert scheduler.interval_seconds == 1440 * 60, "daily by default"
+            assert is_running(scheduler) is True
+            assert clients == [app.state.http_client], "one source, over the shared client"
+            await asyncio.wait_for(
+                until(lambda: bool(events_named(captured, "price_backfill_finished"))),
+                timeout=5,
+            )
+
+    assert is_running(scheduler) is False
+    rows = await history_in(backfilled_lifespan)
+    assert len(rows) == len(BACKFILL_PAIRS_UNDER_TEST) * len(FAKE_DAYS)
+    assert {row["basis"] for row in rows} == {"close"}
+    assert {row["source"] for row in rows} == {source.name}
+    assert sorted(source.asked) == sorted(BACKFILL_PAIRS_UNDER_TEST), "each pair asked once"
+
+
+async def test_a_finished_backfill_logs_its_day_count_and_never_a_price(
+    backfilled_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`price_backfill_finished` at info, with the days stored across every pair."""
+    await bring_the_schema_up(backfilled_lifespan)
+    stub_daily_closes(monkeypatch, FakeDailyCloses())
+    app = create_app()
+
+    with capture_logs() as captured:
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(
+                until(lambda: bool(events_named(captured, "price_backfill_finished"))),
+                timeout=5,
+            )
+
+    (finished,) = events_named(captured, "price_backfill_finished")
+    assert finished["log_level"] == "info"
+    assert finished["days"] == len(BACKFILL_PAIRS_UNDER_TEST) * len(FAKE_DAYS)
+    assert str(FAKE_CLOSE) not in repr(finished), "a price must never reach a log line"
+    assert events_named(captured, "price_backfill_incomplete") == []
+
+
+async def test_an_incomplete_backfill_is_a_warning_naming_pairs_and_never_amounts(
+    backfilled_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One pair refused: a warning naming it, the other pair's days counted, no price.
+
+    The failed pair's name is public; the vendor's message is not repeated, and no close is
+    -- for the reason `_report_price_refresh` gives.
+    """
+    await bring_the_schema_up(backfilled_lifespan)
+    stub_daily_closes(monkeypatch, FakeDailyCloses(fails=frozenset({("KAS", "USD")})))
+    app = create_app()
+
+    with capture_logs() as captured:
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(
+                until(lambda: bool(events_named(captured, "price_backfill_incomplete"))),
+                timeout=5,
+            )
+
+    (incomplete,) = events_named(captured, "price_backfill_incomplete")
+    assert incomplete["log_level"] == "warning"
+    assert incomplete["failed"] == ("KAS/USD",)
+    assert incomplete["days"] == len(FAKE_DAYS)
+    assert str(FAKE_CLOSE) not in repr(incomplete), "a price must never reach a log line"
+    assert "did not answer" not in repr(incomplete), "nor the vendor's message"
+    assert events_named(captured, "price_backfill_finished") == []
+    rows = await history_in(backfilled_lifespan)
+    assert len(rows) == len(FAKE_DAYS), "the pair that answered was stored regardless"
+
+
+async def test_the_price_backfill_is_not_built_when_disabled(
+    lifespan_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Switched off: `None` on `app.state`, one `scheduler_disabled` line, no source built."""
+    source = FakeDailyCloses()
+    clients = stub_daily_closes(monkeypatch, source)
+    app = create_app()
+
+    with capture_logs() as captured:
+        async with app.router.lifespan_context(app):
+            assert app.state.price_backfill_scheduler is None
+
+    disabled = [entry["scheduler"] for entry in events_named(captured, "scheduler_disabled")]
+    assert disabled.count("price-backfill") == 1
+    assert clients == [], "a disabled timer builds no source"
+    assert source.asked == []
+    assert await history_in(lifespan_database) == []
+
+
+async def test_the_backfills_last_run_is_the_newest_close_and_never_an_observed_price(
+    lifespan_database: Path,
+) -> None:
+    """`latest_price_backfill`, the timer's `last_run_at`, over the lifespan's own sessions.
+
+    `None` before anything is stored, which is what makes a fresh install backfill at once.
+    Then the newest `close` row's instant -- and an `observed` row written after it, which
+    the hourly refresh writes every hour, does not count: otherwise the refresh would keep
+    the backfill from ever looking due.
+    """
+    await bring_the_schema_up(lifespan_database)
+    app = create_app()
+    newest_close = datetime(2026, 10, 7, 0, 30, tzinfo=UTC)
+
+    async with app.router.lifespan_context(app):
+        empty = await latest_price_backfill(app)
+        await seed_history(
+            lifespan_database,
+            [
+                ("close", newest_close - timedelta(days=1), "2026-10-05"),
+                ("close", newest_close, "2026-10-06"),
+                ("observed", newest_close + timedelta(hours=10), "2026-10-07"),
+            ],
+        )
+        latest = await latest_price_backfill(app)
+
+    assert empty is None
+    assert latest == newest_close
+    assert latest is not None
+    assert latest.tzinfo is not None
+
+
+@pytest.mark.parametrize(
+    ("age", "backfilled_at_startup"),
+    [(timedelta(hours=2), False), (timedelta(days=2), True)],
+    ids=["a close two hours old", "a close two days old"],
+)
+async def test_a_recent_close_suppresses_the_startup_backfill(
+    backfilled_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    age: timedelta,
+    backfilled_at_startup: bool,
+) -> None:
+    """A restart within the day asks Kraken nothing; one after a day's gap backfills at once.
+
+    The crash-loop argument again, for the daily timer: a container restarting every thirty
+    seconds must not ask for 720 candles per pair every thirty seconds. Both ages are
+    asserted, because a timer that never ran at startup would pass the recent case alone.
+    """
+    await bring_the_schema_up(backfilled_lifespan)
+    await seed_history(backfilled_lifespan, [("close", datetime.now(UTC) - age, "2026-10-05")])
+    source = FakeDailyCloses()
+    stub_daily_closes(monkeypatch, source)
+    sleep = PacedSleep()
+    with_a_paced_sleep(monkeypatch, sleep)
+    app = create_app()
+
+    async with app.router.lifespan_context(app):
+        await sleep.reached()
+
+    assert bool(source.asked) is backfilled_at_startup
