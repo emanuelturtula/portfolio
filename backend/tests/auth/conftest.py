@@ -15,8 +15,9 @@ Three things are arranged here and nowhere else:
   set `session_cookie_secure=False` to get around that would be testing a cookie the
   default deployment never sends. The plain-HTTP deployment has a test of its own in
   `test_login.py`, which builds the environment that mode is defined by.
-* **Both schedules off, and an HTTP client that refuses every request.** Since #10 the
-  lifespan starts two timers that reach vendors at startup and builds the shared client,
+* **Every vendor schedule off, and an HTTP client that refuses every request.** The lifespan
+  starts three timers that reach vendors at startup (since #10, and spec 037's backfill) and
+  builds the shared client,
   which costs 117 ms of SSL setup per startup. `tests/offline_http.py` has the account; the
   short of it is that no suite built here may reach a vendor, and none pays for a client it
   never uses.
@@ -108,6 +109,7 @@ def apply_auth_environment(
     # whether or not this deployment holds anything.
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_PRICE_BACKFILL_ENABLED", "false")
     # #22's backup timer is on by default and takes a copy at startup on a fresh volume, and
     # its directory defaults to `./data/backups` under the working directory. Off, and the
     # directory under `tmp_path` regardless, so a suite that turns the timer back on, or calls

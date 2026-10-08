@@ -70,10 +70,12 @@ None of this makes `as_of` a vendor's quote time. No vendor supplies one; see
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC
 from typing import TYPE_CHECKING
 
 from portfolio.providers.prices.base import SUPPORTED_PAIRS, fetch_prices, sources_for
 from portfolio.repositories.assets import AssetRepository
+from portfolio.repositories.price_history import OBSERVED, PriceHistoryRepository
 from portfolio.repositories.prices import PriceRepository
 from portfolio.services.prices import PriceUnavailable, utc_now
 
@@ -199,12 +201,14 @@ class PriceRefreshService:
         *,
         session: AsyncSession,
         prices: PriceRepository,
+        history: PriceHistoryRepository,
         assets: AssetRepository,
         sources: Sequence[PriceSource],
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._session = session
         self._prices = prices
+        self._history = history
         self._assets = assets
         self._sources = tuple(sources)
         self._clock = clock
@@ -299,6 +303,18 @@ class PriceRefreshService:
                 as_of=as_of,
                 fetched_at=as_of,
             )
+            # Today's row in the history too, as `observed` (spec 037, R2): it gives way to
+            # the day's close when the backfill brings one, and never replaces it. The day is
+            # the UTC date of the refresh's clock read, the instant the price is stored at.
+            await self._history.record(
+                asset_id=asset.id,
+                quote_currency=quote.quote_currency,
+                day=as_of.astimezone(UTC).date(),
+                amount=quote.amount,
+                basis=OBSERVED,
+                source=quote.source,
+                recorded_at=as_of,
+            )
             written.append((asset.id, quote))
         await self._session.commit()
 
@@ -357,6 +373,7 @@ def build_price_refresh_service(
     return PriceRefreshService(
         session=session,
         prices=PriceRepository(session),
+        history=PriceHistoryRepository(session),
         assets=AssetRepository(session),
         sources=sources,
         clock=clock,

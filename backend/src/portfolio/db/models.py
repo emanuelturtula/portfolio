@@ -16,13 +16,14 @@ from __future__ import annotations
 # `Mapped[Decimal]` at class-creation time to build the mapper.
 # `tool.ruff.lint.flake8-type-checking` is configured with this Base so TC003 leaves them
 # alone.
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
+    Date,
     ForeignKey,
     Index,
     Integer,
@@ -84,6 +85,12 @@ _DERIVED_ADDRESS_USED_CHECK: Final = "used IN (0, 1)"
 # together. Adding a currency is therefore a migration -- which is the honest cost, since
 # an existing row would have no price in the new one.
 _PRICE_QUOTE_CURRENCY_CHECK: Final = "quote_currency IN ('EUR', 'USD')"
+
+# Where a day's price came from (spec 037, R2): `close`, a daily candle's closing price, or
+# `observed`, the latest price the hourly refresh saw that day. The same duplication hazard
+# as the constants above -- the text is repeated verbatim in `0013_price_history` -- and the
+# same reflection test.
+_PRICE_HISTORY_BASIS_CHECK: Final = "basis IN ('close', 'observed')"
 
 # How a balance sync run was started, and how it ended. Both carry the same duplication
 # hazard as the constants above -- the text is repeated verbatim in `0005_balances` and
@@ -386,6 +393,38 @@ class AssetPrice(Base):
     source: Mapped[str] = mapped_column(Text, nullable=False)
     as_of: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
+class PriceHistory(Base):
+    """One asset's price on one UTC day, in one quote currency (spec 037).
+
+    `prices` holds the price now and is overwritten every hour; this table keeps one row per
+    day, so a past day can be valued. `basis` says how good the number is: a `close` is the
+    day's closing price and is final, an `observed` price is the latest the refresh saw that
+    day and gives way to a `close` when the backfill brings one (R2).
+
+    `day` is a calendar date with no time and no zone: the UTC day the price belongs to. A
+    `Date` on SQLite is stored as `YYYY-MM-DD` text, which orders and compares as dates do.
+    `amount` is `NumericText(PRICE_SCALE)`, as `prices.amount` is, and carries no `CHECK`:
+    a sign check on a `TEXT` money column is a numeric-affinity comparison (rule 2).
+    """
+
+    __tablename__ = "price_history"
+    __table_args__ = (
+        UniqueConstraint("asset_id", "quote_currency", "day", name="uq_price_history_asset_day"),
+        CheckConstraint(_PRICE_QUOTE_CURRENCY_CHECK, name="quote_currency"),
+        CheckConstraint(_PRICE_HISTORY_BASIS_CHECK, name="basis"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No `ondelete`, for the reason `prices.asset_id` has none.
+    asset_id: Mapped[int] = mapped_column(Integer, ForeignKey("assets.id"), nullable=False)
+    quote_currency: Mapped[str] = mapped_column(Text, nullable=False)
+    day: Mapped[date] = mapped_column(Date, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(NumericText(PRICE_SCALE), nullable=False)
+    basis: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 class SyncRun(Base):

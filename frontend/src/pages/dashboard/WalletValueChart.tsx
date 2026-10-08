@@ -12,7 +12,7 @@ function hasValue<T extends WalletBalance>(wallet: T): wallet is T & { value: st
 }
 
 /** The name the wallets table gives a row: its label, or its chain and id. */
-function walletName(wallet: WalletBalance): string {
+export function walletName(wallet: WalletBalance): string {
   return (
     wallet.label ?? `${chainDisplayName(wallet.chain_key)} wallet #${String(wallet.wallet_id)}`
   );

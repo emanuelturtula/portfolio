@@ -41,6 +41,10 @@ from portfolio.services.health import (
 )
 from portfolio.services.password_hasher import PasswordHasher
 from portfolio.services.portfolio import PortfolioService, build_portfolio_service
+from portfolio.services.portfolio_history import (
+    PortfolioHistoryService,
+    build_portfolio_history_service,
+)
 from portfolio.services.sync_coordinator import SyncCoordinator
 from portfolio.services.wallets import WalletService, build_wallet_service
 
@@ -165,6 +169,18 @@ async def get_portfolio_service(request: Request) -> AsyncIterator[PortfolioServ
         yield build_portfolio_service(session)
 
 
+async def get_portfolio_history_service(
+    request: Request,
+) -> AsyncIterator[PortfolioHistoryService]:
+    """Open a session for this request and hand the router the value-history service.
+
+    Read-only, like `get_portfolio_service`. The service's clock is the default one.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_portfolio_history_service(session)
+
+
 def get_backup_service(request: Request) -> BackupService:
     """The process-wide backup service, which `create_app` installed.
 
@@ -191,13 +207,14 @@ def get_backup_service(request: Request) -> BackupService:
 SCHEDULER_ATTRIBUTES: Final[tuple[tuple[SchedulerName, str], ...]] = (
     (SchedulerName.BALANCE_SYNC, "balance_scheduler"),
     (SchedulerName.PRICE_REFRESH, "price_scheduler"),
+    (SchedulerName.PRICE_BACKFILL, "price_backfill_scheduler"),
     (SchedulerName.BACKUP, "backup_scheduler"),
 )
 """Each timer's name, and the `app.state` attribute `main.lifespan` publishes it on."""
 
 
 def timers_of(app: FastAPI) -> dict[SchedulerName, TimerLike | None]:
-    """The three timers the lifespan published, `None` for each one it did not build.
+    """The four timers the lifespan published, `None` for each one it did not build.
 
     `None` when the settings switched a timer off -- the lifespan publishes `None` then -- and
     also when the lifespan has not run, which only a test does. Either way the timer is served

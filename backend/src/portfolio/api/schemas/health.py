@@ -1,6 +1,6 @@
 """Response models for `GET /api/health/detail`: how the application's own sources stand.
 
-`backup` came first (#22, spec 029). #23 (spec 030) adds the others beside it: the three
+`backup` came first (#22, spec 029). #23 (spec 030) adds the others beside it: the four
 timers, the balance sync per chain and the prices. That is why the payload is an object keyed
 by source rather than the backup's fields at the top.
 
@@ -77,7 +77,7 @@ class BackupStatusResponse(BaseModel):
 
 
 class SchedulerStatusResponse(BaseModel):
-    """One of the three timers.
+    """One of the four timers.
 
     `last_tick_at` is when its last tick finished and `last_tick_succeeded` whether that tick
     returned without raising; both `null` before a tick has finished, and always for a

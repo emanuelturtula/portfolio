@@ -10,6 +10,7 @@ import { describeMissing } from '@/lib/portfolio';
 import { BackupNotice } from '@/pages/dashboard/BackupNotice';
 import { Holdings } from '@/pages/dashboard/Holdings';
 import { SummaryCards } from '@/pages/dashboard/SummaryCards';
+import { PortfolioHistory } from '@/pages/dashboard/ValueHistory';
 
 /** See `ValueSection`: a cut-off sync request very often means the run is still going. */
 const REFRESH_FAILURE_FALLBACK = 'The server could not be reached.';
@@ -21,12 +22,16 @@ function isEmpty(summary: PortfolioSummary): boolean {
 }
 
 /**
- * The dashboard (#154): the total value, then what is held and how its value splits.
+ * The dashboard (#154): the total value, its history, then what is held and how its value
+ * splits.
  *
  * Every figure comes from `GET /api/portfolio/summary`, so the page has one query and one set of
  * states. What the total could not include is named in a single line under it, and the total
  * then carries a "Partial" chip; the readings and sync state behind it are on the Details page,
  * linked from that line and from the header.
+ *
+ * The chart of the value over time (spec 037) has a query and four states of its own, inside
+ * its card: a history that fails to load never takes the figures above it down with it.
  *
  * Above everything, a warning when the scheduled backups failed or stopped (spec 029): it is
  * about the data underneath, not about any one figure.
@@ -120,6 +125,7 @@ function Overview({ summary }: { readonly summary: ReturnType<typeof usePortfoli
           <Link to="/details">See details</Link>
         </p>
       )}
+      <PortfolioHistory />
       {data.holdings.length > 0 && <Holdings summary={data} />}
     </div>
   );

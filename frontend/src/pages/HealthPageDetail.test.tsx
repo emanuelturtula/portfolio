@@ -154,7 +154,7 @@ describe('HealthPage: the detail sections, as a whole', () => {
 
     expect(within(chains).getByRole('alert')).toHaveTextContent(UNAVAILABLE);
     expect(screen.getAllByRole('alert')).toHaveLength(1);
-    expect(items(await section('Timers'))).toHaveLength(3);
+    expect(items(await section('Timers'))).toHaveLength(4);
   });
 
   it('shows every readable section beside two that could not be read', async () => {
@@ -170,19 +170,19 @@ describe('HealthPage: the detail sections, as a whole', () => {
       expect(within(found).getByRole('alert')).toHaveTextContent(UNAVAILABLE);
       expect(within(found).queryByRole('term')).not.toBeInTheDocument();
     }
-    expect(items(await section('Timers'))).toHaveLength(3);
+    expect(items(await section('Timers'))).toHaveLength(4);
   });
 });
 
 describe('HealthPage: the timers', () => {
-  it('names the three timers in the order served, each with its state, tick and result', async () => {
+  it('names the four timers in the order served, each with its state, tick and result', async () => {
     inTimeZone('UTC');
     renderDetail();
 
     const timers = await answered('Timers');
 
     expect(items(timers)).toEqual(
-      ['Balance sync', 'Price refresh', 'Backup'].map((name) => [
+      ['Balance sync', 'Price refresh', 'Price backfill', 'Backup'].map((name) => [
         name,
         [
           ['State', 'OK. The timer is running on schedule.'],

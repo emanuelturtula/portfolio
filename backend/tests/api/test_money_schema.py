@@ -400,6 +400,10 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         # The dashboard's summary (#154): total value and each holding's share. Every amount
         # a string.
         "/api/portfolio/summary",
+        # The value history (spec 037): one point per day, every amount a string and a day
+        # nothing can value a `null`.
+        "/api/portfolio/history",
+        "/api/wallets/{wallet_id}/value-history",
     }
 
 

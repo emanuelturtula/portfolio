@@ -55,12 +55,15 @@ if TYPE_CHECKING:
 
     from fastapi import FastAPI
 
-#: The settings that decide whether a lifespan reaches a vendor. Both default to `true`,
+#: The settings that decide whether a lifespan reaches a vendor. All three default to `true`,
 #: which is right in production and is exactly why a test environment has to say otherwise.
-#: The backup timer is the third timer and reaches no vendor, so it is not one of these.
+#: The price backfill (spec 037) is one of them: its first tick is at startup on a database
+#: with no daily close, and it asks Kraken for two pairs whatever this deployment holds. The
+#: backup timer is the fourth timer and reaches no vendor, so it is not one of these.
 SCHEDULE_SWITCHES: Final = (
     "balance_sync_enabled",
     "price_refresh_enabled",
+    "price_backfill_enabled",
 )
 
 
@@ -159,7 +162,7 @@ def test_the_shared_environment_leaves_no_schedule_running(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every suite built on `apply_auth_environment` has both schedules switched off.
+    """Every suite built on `apply_auth_environment` has every vendor timer switched off.
 
     Asserted on a `Settings` built from the environment that helper arranges, rather than on
     the text of the helper, because what matters is the value the application reads. The
@@ -179,7 +182,7 @@ def test_the_shared_environment_leaves_no_schedule_running(
 def test_the_production_default_is_the_opposite_and_that_is_why_this_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The control. If both schedules were off by default the test above would prove nothing.
+    """The control. If these timers were off by default the test above would prove nothing.
 
     A deployment that configures nothing has to sync, or the product does not work; the test
     environment is the exception and it has to be a written one.
@@ -230,6 +233,9 @@ async def test_entering_the_lifespan_opens_no_socket(
             assert app.state.http_client.is_closed is False
             assert app.state.balance_scheduler is None, "the balance timer ignored its switch"
             assert app.state.price_scheduler is None, "the price timer ignored its switch"
+            assert app.state.price_backfill_scheduler is None, (
+                "the price backfill timer ignored its switch"
+            )
     finally:
         get_settings.cache_clear()
 

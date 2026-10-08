@@ -20,7 +20,12 @@ import {
  */
 describe('the health words', () => {
   it('has words for exactly the states each table is keyed by', () => {
-    expect(Object.keys(TIMER_NAMES)).toEqual(['balance-sync', 'price-refresh', 'backup']);
+    expect(Object.keys(TIMER_NAMES)).toEqual([
+      'balance-sync',
+      'price-refresh',
+      'price-backfill',
+      'backup',
+    ]);
     expect(Object.keys(TIMER_STATE_WORDS)).toEqual(['ok', 'late', 'stopped', 'disabled']);
     expect(Object.keys(CHAIN_STATE_WORDS)).toEqual(['ok', 'failing', 'never']);
     expect(Object.keys(PRICES_STATE_WORDS)).toEqual(['fresh', 'stale', 'never']);

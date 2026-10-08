@@ -45,6 +45,8 @@ from portfolio.db.base import NAMING_CONVENTION
 from portfolio.db.models import (
     _ASSET_KIND_CHECK,
     _BALANCE_SNAPSHOT_CONFIRMED_CHECK,
+    _PRICE_HISTORY_BASIS_CHECK,
+    _PRICE_QUOTE_CURRENCY_CHECK,
     _SYNC_RUN_CHAIN_ERROR_KIND_CHECK,
     _SYNC_RUN_CHAIN_STATUS_CHECK,
     _SYNC_RUN_STATUS_CHECK,
@@ -76,6 +78,9 @@ APPLICATION_TABLES = frozenset(
         # #24. The addresses an extended-key wallet has derived, with whether each one has
         # ever been used. Derived from the key; kept so a rescan does not derive them again.
         "derived_addresses",
+        # Spec 037. One price per asset, quote currency and UTC day, so a past day can be
+        # valued; the hourly refresh and the daily backfill write it.
+        "price_history",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -137,6 +142,10 @@ EXCHANGE_BALANCE_TABLES = frozenset({"exchange_balances"})
 #: #24's one. Its revision sits on top of #104's, so every single-step reversal below
 #: `0011_extended_keys` takes it down as well, and each test subtracts it.
 DERIVED_ADDRESS_TABLES = frozenset({"derived_addresses"})
+
+#: Spec 037's one. Its revision sits on top of `0012`, so every single-step reversal below
+#: `0013_price_history` takes it down as well, and each test subtracts it.
+PRICE_HISTORY_TABLES = frozenset({"price_history"})
 
 #: Spec 036's revision, and the one below it: the last schema that has the tables it drops.
 DROP_REVISION = "0012_drop_exchanges_accounting"
@@ -210,6 +219,16 @@ EXPECTED_CONSTRAINT_NAMES = {
     # #24. Three CHECKs, compared with their model constants and exercised with real inserts
     # in `tests/db/test_extended_keys_migration.py`. The unique key is what makes a rescan
     # an upsert rather than a second copy of the same index.
+    # Spec 037. Two CHECKs, compared with their model constants by
+    # `test_the_price_history_check_constraints_match_the_model`. The unique key leads with
+    # `asset_id`, so it is also the index every read uses.
+    "price_history": {
+        "pk_price_history",
+        "uq_price_history_asset_day",
+        "ck_price_history_quote_currency",
+        "ck_price_history_basis",
+        "fk_price_history_asset_id_assets",
+    },
     "derived_addresses": {
         "pk_derived_addresses",
         "uq_derived_addresses_wallet_branch_index",
@@ -486,7 +505,11 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
     # is what keeps this test about the prices migration rather than about how many
     # revisions happen to sit on top of it.
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - {"prices"} - BALANCE_TABLES - DERIVED_ADDRESS_TABLES
+        APPLICATION_TABLES
+        - {"prices"}
+        - BALANCE_TABLES
+        - DERIVED_ADDRESS_TABLES
+        - PRICE_HISTORY_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -518,7 +541,7 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
     # `0012`'s downgrade recreates the exchange tables on the way down, and `0010` to `0006`
     # drop them again, so none of them is left over.
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - BALANCE_TABLES - DERIVED_ADDRESS_TABLES
+        APPLICATION_TABLES - BALANCE_TABLES - DERIVED_ADDRESS_TABLES - PRICE_HISTORY_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -587,7 +610,9 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
 
     command.downgrade(config, BALANCES_REVISION)
 
-    assert table_names(sync_engine) == (APPLICATION_TABLES - DERIVED_ADDRESS_TABLES) | {STAMP_TABLE}
+    assert table_names(sync_engine) == (
+        APPLICATION_TABLES - DERIVED_ADDRESS_TABLES - PRICE_HISTORY_TABLES
+    ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM users")) == 1
@@ -825,7 +850,9 @@ def test_the_dropped_tables_carry_the_convention_names_below_the_drop(
     inspector = inspect(sync_engine)
 
     assert set(PRE_DROP_CONSTRAINT_NAMES) == DROPPED_TABLES
-    assert table_names(sync_engine) == APPLICATION_TABLES | DROPPED_TABLES | {STAMP_TABLE}
+    assert table_names(sync_engine) == (
+        (APPLICATION_TABLES - PRICE_HISTORY_TABLES) | DROPPED_TABLES | {STAMP_TABLE}
+    )
     for table, expected in PRE_DROP_CONSTRAINT_NAMES.items():
         found = {inspector.get_pk_constraint(table)["name"]}
         found |= {unique["name"] for unique in inspector.get_unique_constraints(table)}
@@ -1005,3 +1032,52 @@ def test_the_drop_revision_sits_directly_on_top_of_the_extended_keys_one() -> No
     ]
 
     assert revisions.index(DROP_REVISION) == revisions.index(REVISION_BEFORE_DROP) - 1
+
+
+def test_the_price_history_check_constraints_match_the_model(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Spec 037's two `CHECK`s, reflected off a migrated file and compared with their constants.
+
+    The quote currency reuses `_PRICE_QUOTE_CURRENCY_CHECK`, one constant for one fact, so the
+    history cannot come to admit a currency the current prices do not.
+    """
+    upgrade_to_head(database_url)
+
+    reflected = {
+        str(found["name"]): normalise_sql(str(found["sqltext"]))
+        for found in inspect(sync_engine).get_check_constraints("price_history")
+    }
+
+    assert reflected == {
+        "ck_price_history_quote_currency": normalise_sql(_PRICE_QUOTE_CURRENCY_CHECK),
+        "ck_price_history_basis": normalise_sql(_PRICE_HISTORY_BASIS_CHECK),
+    }
+    assert _PRICE_HISTORY_BASIS_CHECK == "basis IN ('close', 'observed')"
+
+
+def test_the_price_history_revision_sits_directly_on_top_of_the_drop() -> None:
+    """Adjacency, for the single-step reversals above that subtract its table."""
+    revisions = [
+        script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+    ]
+
+    assert revisions.index("0013_price_history") == revisions.index(DROP_REVISION) - 1
+
+
+def test_the_price_history_migration_reverses_on_its_own(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """One step down drops `price_history` and nothing else; the upgrade brings it back."""
+    upgrade_to_head(database_url)
+
+    command.downgrade(build_alembic_config(database_url), DROP_REVISION)
+
+    assert table_names(sync_engine) == (APPLICATION_TABLES - PRICE_HISTORY_TABLES) | {STAMP_TABLE}
+    assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}

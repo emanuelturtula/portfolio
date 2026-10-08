@@ -54,6 +54,7 @@ import {
   type PriceUnavailable,
   type SyncErrorKind,
 } from '@/test/fixtures';
+import { historySettled } from '@/test/historyFixtures';
 import { currentPath, renderApp, settle } from '@/test/render';
 import {
   fakeSession,
@@ -227,6 +228,9 @@ async function lastUpdated(): Promise<HTMLElement> {
 async function loaded(): Promise<void> {
   await totalRegion();
   await walletsRegion();
+  // The wallet chart's query starts once the rows are in: its loading status would otherwise
+  // still be on screen for a test that asserts there is none.
+  await historySettled('Wallet value over time');
 }
 
 /** The healthy portfolio, with one wallet row replaced. */

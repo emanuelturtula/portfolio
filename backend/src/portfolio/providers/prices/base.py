@@ -55,6 +55,7 @@ from portfolio.providers.errors import ProviderError, ProviderResponseError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from datetime import date
 
 __all__ = [
     "BTC",
@@ -62,6 +63,8 @@ __all__ = [
     "KAS",
     "SUPPORTED_PAIRS",
     "USD",
+    "DailyClose",
+    "DailyCloseSource",
     "PriceFetch",
     "PricePair",
     "PriceQuote",
@@ -203,6 +206,43 @@ class PriceSource(Protocol):
             ProviderRateLimitedError: it refused because we asked too often.
             ProviderResponseError: it answered with something that cannot be trusted, or it
                 refused the request.
+        """
+
+
+@dataclass(frozen=True, slots=True)
+class DailyClose:
+    """One UTC day's closing price for one pair, as a daily candle reports it (spec 037).
+
+    `day` is the UTC date the candle opened on, and `close` its closing price: what the asset
+    cost at the end of that day. Only a committed candle becomes one of these; the day still
+    trading is never reported.
+    """
+
+    day: date
+    close: Decimal
+
+
+class DailyCloseSource(Protocol):
+    """What the price backfill needs of a vendor: the daily closes it still keeps, per pair.
+
+    Structural and checked by `mypy`, for the reason `PriceSource` is.
+    """
+
+    @property
+    def name(self) -> str:
+        """What this source is called in `price_history.source` and in a log."""
+
+    @property
+    def pairs(self) -> frozenset[PricePair]:
+        """Every pair this source can backfill."""
+
+    async def daily_closes(self, pair: PricePair) -> Sequence[DailyClose]:
+        """Every committed daily close the vendor serves for `pair`, oldest first.
+
+        Raises:
+            ProviderUnavailableError: the vendor could not be reached, or did not answer.
+            ProviderRateLimitedError: it refused because we asked too often.
+            ProviderResponseError: it answered with something that cannot be trusted.
         """
 
 

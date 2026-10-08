@@ -55,10 +55,11 @@ tick that never returns is a timer that has stopped working while its task still
 
 
 class SchedulerName(StrEnum):
-    """The three timers, by the names their log lines and task names already carry."""
+    """The four timers, by the names their log lines and task names already carry."""
 
     BALANCE_SYNC = "balance-sync"
     PRICE_REFRESH = "price-refresh"
+    PRICE_BACKFILL = "price-backfill"
     BACKUP = "backup"
 
 

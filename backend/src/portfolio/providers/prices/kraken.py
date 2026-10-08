@@ -34,17 +34,19 @@ failover on to the next source.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
 from portfolio.providers.base import require_json_object
 from portfolio.providers.endpoints import PRIMARY, EndpointSet
 from portfolio.providers.errors import ProviderResponseError
-from portfolio.providers.http import ASSET_PRICES
+from portfolio.providers.http import ASSET_DAILY_CLOSES, ASSET_PRICES
 from portfolio.providers.prices.base import (
     BTC,
     EUR,
     KAS,
     USD,
+    DailyClose,
     PriceQuote,
     require_price,
 )
@@ -59,11 +61,16 @@ if TYPE_CHECKING:
     from portfolio.providers.prices.base import PricePair
 
 __all__ = [
+    "BACKFILL_PAIRS",
+    "DAILY_INTERVAL_MINUTES",
     "KRAKEN",
     "KRAKEN_API_URL",
+    "OHLC_PATH",
     "PAIR_CODES",
     "TICKER_PATH",
+    "KrakenDailyCloses",
     "KrakenPriceSource",
+    "parse_daily_closes",
     "parse_ticker",
 ]
 
@@ -146,29 +153,7 @@ def parse_ticker(body: str | bytes, requested: Mapping[str, PricePair]) -> tuple
         ProviderResponseError: the body is not JSON, is not the documented envelope, or
             carries an entry that cannot be trusted.
     """
-    document = require_json_object(body)
-
-    reported = document.get(ERROR_FIELD)
-    if not isinstance(reported, list):
-        message = (
-            f"The {VENDOR} response has no {ERROR_FIELD!r} list, so it is not the envelope "
-            "this endpoint documents."
-        )
-        raise ProviderResponseError(message)
-    if reported:
-        # Kraken answers 200 and reports the failure in this list, so a status check alone
-        # would read an error document as an empty result and silently report no prices.
-        # The count and nothing else: the entries are vendor prose and go in no message.
-        message = f"The {VENDOR} response carries {len(reported)} error(s) in its envelope."
-        raise ProviderResponseError(message)
-
-    result = document.get(RESULT_FIELD)
-    if not isinstance(result, dict):
-        message = (
-            f"The {VENDOR} response has no {RESULT_FIELD!r} object, so it is not the "
-            "envelope this endpoint documents."
-        )
-        raise ProviderResponseError(message)
+    result = _result_of(body)
 
     unexpected = len(set(result) - set(requested))
     if unexpected:
@@ -193,6 +178,40 @@ def parse_ticker(body: str | bytes, requested: Mapping[str, PricePair]) -> tuple
             )
         )
     return tuple(quotes)
+
+
+def _result_of(body: str | bytes) -> Mapping[str, object]:
+    """The `result` object out of Kraken's envelope, refusing every envelope that is not one.
+
+    Every public endpoint answers `{"error": [...], "result": {...}}`, and answers 200 with
+    its own failures in `error`, so a status check alone would read an error document as an
+    empty result. The ticker and the OHLC parsers share this so the rule is written once.
+
+    Raises:
+        ProviderResponseError: the body is not JSON, is not the envelope, or reports errors.
+    """
+    document = require_json_object(body)
+
+    reported = document.get(ERROR_FIELD)
+    if not isinstance(reported, list):
+        message = (
+            f"The {VENDOR} response has no {ERROR_FIELD!r} list, so it is not the envelope "
+            "this endpoint documents."
+        )
+        raise ProviderResponseError(message)
+    if reported:
+        # The count and nothing else: the entries are vendor prose and go in no message.
+        message = f"The {VENDOR} response carries {len(reported)} error(s) in its envelope."
+        raise ProviderResponseError(message)
+
+    result = document.get(RESULT_FIELD)
+    if not isinstance(result, dict):
+        message = (
+            f"The {VENDOR} response has no {RESULT_FIELD!r} object, so it is not the "
+            "envelope this endpoint documents."
+        )
+        raise ProviderResponseError(message)
+    return result
 
 
 def _last_trade_price(entry: object, code: str) -> Decimal:
@@ -285,3 +304,146 @@ class KrakenPriceSource:
         query = ",".join(requested)
         body, _index = await self._endpoint.read(f"{TICKER_PATH}?pair={query}", ASSET_PRICES)
         return parse_ticker(body, requested)
+
+
+# --------------------------------------------------------------------------------------
+# Daily closes, for the price backfill (spec 037)
+# --------------------------------------------------------------------------------------
+
+OHLC_PATH: Final = "/0/public/OHLC"
+"""Confirmed against Kraken's documentation and the live service on 2026-10-08."""
+
+DAILY_INTERVAL_MINUTES: Final = 1440
+"""One candle per day. One of the nine documented intervals: 1, 5, 15, 30, 60, 240, 1440,
+10080 and 21600 minutes."""
+
+SECONDS_PER_DAY: Final = 86_400
+
+LAST_COMMITTED_FIELD: Final = "last"
+"""`result.last`: the time of the last committed candle, documented as the value to pass as
+`since` when polling. Measured on 2026-10-08: yesterday's 00:00 UTC, with today's candle,
+still trading, after it."""
+
+CLOSE_INDEX: Final = 4
+"""Where the close is in a candle. Documented as `[int <time>, string <open>, string <high>,
+string <low>, string <close>, string <vwap>, string <volume>, int <count>]`."""
+
+BACKFILL_PAIRS: Final[frozenset[PricePair]] = frozenset({(BTC, USD), (KAS, USD)})
+"""The pairs the backfill reads. USD only: the dashboard values in USDT, read as USD one for
+one, and an EUR history nobody draws would double the calls for nothing (spec 037)."""
+
+
+def parse_daily_closes(body: str | bytes, code: str) -> tuple[DailyClose, ...]:
+    """Every committed daily close in one OHLC response, oldest first, or a refusal.
+
+    Kraken documents three things this parser leans on, and each was measured on 2026-10-08:
+    at most 720 entries come back, the last entry is the candle still trading, and
+    `result.last` is the time of the last committed one. So an entry whose time is after
+    `last` is skipped, never stored: it is a price still moving (spec 037, R1).
+
+    The refusals, and why each is one:
+
+    | Body | Why it is a refusal |
+    |---|---|
+    | the envelope is not Kraken's, or reports errors | `_result_of`, shared with the ticker |
+    | `result` carries a pair other than `code` | a correlation bug, as in `parse_ticker` |
+    | `code` absent, or not a list | the one thing asked for is not there |
+    | `last` absent or not an integer | without it the moving candle cannot be told apart |
+    | an entry that is not a list of at least five | not the documented candle |
+    | a time that is not an integer, or not a UTC midnight | not a daily candle's open |
+    | a close that is not a positive, finite price | `require_price` decides |
+    | two entries for one day, or out of order | the series cannot be trusted as a whole |
+
+    Raises:
+        ProviderResponseError: any of the above.
+    """
+    result = _result_of(body)
+    unexpected = len(set(result) - {code, LAST_COMMITTED_FIELD})
+    if unexpected:
+        message = (
+            f"The {VENDOR} OHLC response carries {unexpected} pair(s) that were not requested, "
+            "so it cannot be matched to the request."
+        )
+        raise ProviderResponseError(message)
+    entries = result.get(code)
+    if not isinstance(entries, list):
+        message = f"The {VENDOR} OHLC response has no list of candles for {code}."
+        raise ProviderResponseError(message)
+    last = result.get(LAST_COMMITTED_FIELD)
+    if not isinstance(last, int) or isinstance(last, bool):
+        message = (
+            f"The {VENDOR} OHLC response has no integer {LAST_COMMITTED_FIELD!r}, so the "
+            "candle still trading cannot be told from the committed ones."
+        )
+        raise ProviderResponseError(message)
+
+    closes: list[DailyClose] = []
+    for entry in entries:
+        opened = _candle_time(entry, code)
+        if opened > last:
+            continue
+        day = datetime.fromtimestamp(opened, UTC).date()
+        if closes and day <= closes[-1].day:
+            message = f"The {VENDOR} OHLC candles for {code} are not one per day, oldest first."
+            raise ProviderResponseError(message)
+        closes.append(DailyClose(day=day, close=require_price(entry[CLOSE_INDEX], source=VENDOR)))
+    return tuple(closes)
+
+
+def _candle_time(entry: object, code: str) -> int:
+    """A candle's open time, refusing every candle that is not a daily one.
+
+    Raises:
+        ProviderResponseError: not a list of at least five, or its time is not an integer
+            at a UTC midnight.
+    """
+    if not isinstance(entry, list) or len(entry) <= CLOSE_INDEX:
+        message = f"A {VENDOR} OHLC candle for {code} is not the documented array."
+        raise ProviderResponseError(message)
+    opened = entry[0]
+    if not isinstance(opened, int) or isinstance(opened, bool) or opened % SECONDS_PER_DAY:
+        message = f"A {VENDOR} OHLC candle for {code} does not open at a UTC midnight."
+        raise ProviderResponseError(message)
+    return opened
+
+
+class KrakenDailyCloses:
+    """Reads one pair's daily closes from Kraken's public OHLC endpoint, one call per pair.
+
+    Satisfies `DailyCloseSource` structurally. The same single endpoint as the ticker, for
+    the reason `KrakenPriceSource` gives.
+    """
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        """Bind to the shared client. No key and no configuration."""
+        self._endpoint = EndpointSet.configured(client, ((PRIMARY, KRAKEN_API_URL),), vendor=VENDOR)
+
+    @property
+    def name(self) -> str:
+        """`kraken`, the string written to `price_history.source`."""
+        return KRAKEN
+
+    @property
+    def pairs(self) -> frozenset[PricePair]:
+        """`BACKFILL_PAIRS`: BTC and KAS in USD."""
+        return BACKFILL_PAIRS
+
+    async def daily_closes(self, pair: PricePair) -> tuple[DailyClose, ...]:
+        """The committed daily closes Kraken still serves for `pair`, oldest first.
+
+        The query carries a public pair code and an interval, nothing about the owner, and
+        the transport logs only the label.
+
+        Raises:
+            ProviderRateLimitedError: a 429 that survived the transport's retries.
+            ProviderUnavailableError: the vendor did not answer, or failed with a 5xx.
+            ProviderResponseError: the pair is not one this source backfills, or the answer
+                cannot be trusted.
+        """
+        if pair not in BACKFILL_PAIRS:
+            message = f"{pair[0]}/{pair[1]} is not a pair the {VENDOR} backfill reads."
+            raise ProviderResponseError(message)
+        code = PAIR_CODES[pair]
+        path = f"{OHLC_PATH}?pair={code}&interval={DAILY_INTERVAL_MINUTES}"
+        body, _index = await self._endpoint.read(path, ASSET_DAILY_CLOSES)
+        return parse_daily_closes(body, code)

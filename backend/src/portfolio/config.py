@@ -296,6 +296,13 @@ class Settings(BaseSettings):
     price_refresh_enabled: bool = True
     price_refresh_interval_minutes: int = 60
 
+    # The price backfill (spec 037), on its own timer: Kraken's daily closes into
+    # `price_history`. A day, because a daily close appears once a day; running it more
+    # often rewrites the same rows. `enabled` stops the timer only: `python -m portfolio
+    # backfill-prices` works either way.
+    price_backfill_enabled: bool = True
+    price_backfill_interval_minutes: int = 1440
+
     # Scheduled copies of the database (#22, spec 029): the wallets, their balance history and
     # the price cache exist nowhere else.
     #
@@ -469,6 +476,11 @@ class Settings(BaseSettings):
                 "PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES",
                 self.price_refresh_interval_minutes,
                 "PORTFOLIO_PRICE_REFRESH_ENABLED",
+            ),
+            (
+                "PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES",
+                self.price_backfill_interval_minutes,
+                "PORTFOLIO_PRICE_BACKFILL_ENABLED",
             ),
         ):
             if minutes < 1:

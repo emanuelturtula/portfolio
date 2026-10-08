@@ -22,6 +22,7 @@ import pytest
 from portfolio.providers.http import (
     ADDRESS_BALANCE,
     ADDRESS_BALANCES,
+    ASSET_DAILY_CLOSES,
     ASSET_PRICE,
     ASSET_PRICES,
     BLOCK_TIP_HEIGHT,
@@ -382,10 +383,16 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     them with it: a label nothing sends is a line of the allowlist nobody can read a reason
     for, and it is one more name that would be logged without question if a new caller
     reused it for something else.
+
+    Seven at spec 037: `asset_daily_closes` is the backfill's read of one pair's daily
+    candles, Kraken's OHLC. Its own label rather than `asset_prices`, because it is a
+    different call on a different schedule -- one per pair, once a day -- and a log that
+    showed it hourly would be a timer misbehaving, which only a distinct label can show.
     """
     assert sorted(ENDPOINT_LABELS) == [
         "address_balance",
         "address_balances",
+        "asset_daily_closes",
         "asset_price",
         "asset_prices",
         "block_tip_height",
@@ -393,6 +400,7 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     ]
     assert ADDRESS_BALANCE == "address_balance"
     assert ADDRESS_BALANCES == "address_balances"
+    assert ASSET_DAILY_CLOSES == "asset_daily_closes"
     assert ASSET_PRICE == "asset_price"
     assert ASSET_PRICES == "asset_prices"
     assert BLOCK_TIP_HEIGHT == "block_tip_height"

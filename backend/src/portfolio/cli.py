@@ -44,10 +44,12 @@ from portfolio.domain.passwords import (
 )
 from portfolio.logging import configure_logging
 from portfolio.providers.http import build_http_client
+from portfolio.providers.prices.kraken import KrakenDailyCloses
 from portfolio.providers.prices.registry import price_sources
 from portfolio.services.auth import AuthError, LoginThrottle, build_auth_service
 from portfolio.services.backup import BackupError, RestoreRefusedError, build_backup_service
 from portfolio.services.password_hasher import PasswordHasher
+from portfolio.services.price_backfill import build_price_backfill_service
 from portfolio.services.price_refresh import (
     UnknownAssetError,
     build_price_refresh_service,
@@ -57,6 +59,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from portfolio.config import Settings
+    from portfolio.services.price_backfill import BackfillReport
     from portfolio.services.price_refresh import RefreshReport
 
 # What the issue asks the Raspberry Pi to be tuned to. Reported as guidance rather than
@@ -345,6 +348,52 @@ def refresh_prices(args: argparse.Namespace) -> int:
     return 0
 
 
+async def run_price_backfill(settings: Settings) -> BackfillReport:
+    """Build the client, the source and the service, run one backfill, and close it all.
+
+    The same lifetimes as `run_price_refresh`, for its reasons: the client and the engine are
+    this command's, and both are closed in a `finally`.
+    """
+    engine = create_database_engine(settings.database_url)
+    client = build_http_client()
+    try:
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            service = build_price_backfill_service(session, source=KrakenDailyCloses(client))
+            return await service.backfill()
+    finally:
+        await client.aclose()
+        await engine.dispose()
+
+
+def backfill_prices(args: argparse.Namespace) -> int:
+    """`backfill-prices`: store every daily close the source still serves, now (spec 037).
+
+    Prints, per pair, how many days were stored and their first and last day; a pair the
+    source could not answer is printed with the class name of why. Any failure is exit code
+    1, for the reason `refresh-prices` gives. No price is printed: 720 lines per pair would
+    bury the answer, and the table is where they are.
+    """
+    del args  # The command takes no options; every pair the source serves is backfilled.
+    report = asyncio.run(run_price_backfill(get_settings()))
+    for entry in report.backfilled:
+        span = (
+            f"{entry.first_day.isoformat()} to {entry.last_day.isoformat()}"
+            if entry.first_day is not None and entry.last_day is not None
+            else "no committed close"
+        )
+        emit(f"{entry.asset_symbol}/{entry.quote_currency} {entry.days} day(s): {span}")
+    for failed in report.failed:
+        emit_error(f"{failed.asset_symbol}/{failed.quote_currency} failed: {failed.error}")
+    if report.failed:
+        emit_error(
+            f"{len(report.failed)} of {len(report.backfilled) + len(report.failed)} "
+            "pair(s) were not backfilled."
+        )
+        return 1
+    return 0
+
+
 def take_backup(args: argparse.Namespace) -> int:
     """`backup`: take a copy of the database now, then rotate, and print its name and size.
 
@@ -457,6 +506,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="fetch every supported pair once and store it now, without waiting for the timer",
     )
     refresh.set_defaults(handler=refresh_prices)
+
+    backfill = commands.add_parser(
+        "backfill-prices",
+        help="store every daily close the price source still serves, without waiting for the timer",
+    )
+    backfill.set_defaults(handler=backfill_prices)
 
     backup = commands.add_parser(
         "backup",

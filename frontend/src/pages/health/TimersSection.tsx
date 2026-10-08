@@ -46,7 +46,7 @@ function TimerItem({ timer }: { readonly timer: SchedulerStatus }) {
 }
 
 /**
- * The three timers: the balance sync, the price refresh and the backup.
+ * The four timers: the balance sync, the price refresh, the price backfill and the backup.
  * Each shows its state in words, when it last finished a tick and how that tick ended. A timer
  * that never ticked says so ("none since the server started": the record is in memory). A timer
  * that is `disabled` is told apart from one that is `stopped` and shows its state only, since a

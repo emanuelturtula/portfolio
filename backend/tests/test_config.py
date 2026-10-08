@@ -29,6 +29,10 @@ DEFAULT_BALANCE_INTERVAL_MINUTES: Final = 15
 #: interval longer than the staleness window would mark every price stale between ticks.
 DEFAULT_PRICE_INTERVAL_MINUTES: Final = 60
 
+#: One day (spec 037). A daily close appears once a day, so a backfill run more often asks
+#: Kraken for the same 720 candles and rewrites the same rows.
+DEFAULT_PRICE_BACKFILL_INTERVAL_MINUTES: Final = 1440
+
 #: Long enough for an ordinary sync to finish and short enough that a stuck one does not
 #: hold a deployment open. Being wrong in either direction costs a row marked `interrupted`
 #: rather than data, because a run writes its snapshots per chain as it goes.
@@ -50,6 +54,8 @@ def without_an_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "PORTFOLIO_BALANCE_SYNC_SHUTDOWN_GRACE_SECONDS",
         "PORTFOLIO_PRICE_REFRESH_ENABLED",
         "PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES",
+        "PORTFOLIO_PRICE_BACKFILL_ENABLED",
+        "PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -142,6 +148,82 @@ def test_a_zero_price_refresh_interval_is_refused_too(interval: int) -> None:
         Settings(price_refresh_interval_minutes=interval)
 
     assert "PORTFOLIO_PRICE_REFRESH_INTERVAL_MINUTES" in str(caught.value)
+
+
+# --------------------------------------------------------------------------------------
+# The price backfill (spec 037), on a timer of its own
+# --------------------------------------------------------------------------------------
+
+
+def test_the_price_backfill_is_on_and_daily_by_default() -> None:
+    """On, once a day: the history fills in from the first deploy without anybody asking.
+
+    Written out rather than read from the class. Off by default would mean a fresh install
+    draws a chart that starts today until somebody finds the command.
+    """
+    settings = Settings()
+
+    assert settings.price_backfill_enabled is True
+    assert settings.price_backfill_interval_minutes == DEFAULT_PRICE_BACKFILL_INTERVAL_MINUTES
+
+
+@pytest.mark.parametrize("interval", [0, -1])
+def test_a_zero_price_backfill_interval_is_refused_and_names_its_switch(interval: int) -> None:
+    """The same guard as the other two timers: a loop with no sleep against Kraken's OHLC.
+
+    The message names the backfill's own switch, not the refresh's: an operator who typed
+    `0` meaning "off" has to be told which variable actually stops this timer, and the
+    refresh's switch would stop the wrong one.
+    """
+    with pytest.raises(ValidationError) as caught:
+        Settings(price_backfill_interval_minutes=interval)
+
+    message = str(caught.value)
+    assert "PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES" in message
+    assert "PORTFOLIO_PRICE_BACKFILL_ENABLED=false" in message
+    assert "PORTFOLIO_PRICE_REFRESH_ENABLED" not in message
+
+
+def test_the_backfill_settings_are_read_from_the_variables_the_refusal_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two names the test environments and the operations guide set, read as such.
+
+    `tests/auth/conftest.py` and the lifespan suites switch the timer off with
+    `PORTFOLIO_PRICE_BACKFILL_ENABLED=false`; a field renamed without this failing would turn
+    that line into a no-op and every lifespan in the suite into one that asks Kraken.
+    """
+    monkeypatch.setenv("PORTFOLIO_PRICE_BACKFILL_ENABLED", "false")
+    monkeypatch.setenv("PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES", "720")
+
+    settings = Settings()
+
+    assert settings.price_backfill_enabled is False
+    assert settings.price_backfill_interval_minutes == 720
+
+
+def test_a_price_backfill_interval_of_one_minute_is_accepted() -> None:
+    """The floor from the other side: the rule is about zero, not about speed."""
+    assert Settings(price_backfill_interval_minutes=1).price_backfill_interval_minutes == 1
+
+
+def test_the_backfill_is_switched_apart_from_the_refresh() -> None:
+    """Turning the backfill off leaves the hourly refresh running, and the reverse.
+
+    The refresh records today's `observed` price whatever the backfill does, so an operator
+    stopping a misbehaving backfill must not stop the price cache filling with it.
+    """
+    backfill_off = Settings(price_backfill_enabled=False)
+    refresh_off = Settings(price_refresh_enabled=False)
+
+    assert (backfill_off.price_refresh_enabled, backfill_off.price_backfill_enabled) == (
+        True,
+        False,
+    )
+    assert (refresh_off.price_refresh_enabled, refresh_off.price_backfill_enabled) == (
+        False,
+        True,
+    )
 
 
 def test_the_two_schedules_are_configured_apart() -> None:

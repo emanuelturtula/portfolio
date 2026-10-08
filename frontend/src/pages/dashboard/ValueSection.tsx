@@ -11,6 +11,7 @@ import { NEVER_SYNCED_MESSAGE, selectSettledRun, type SyncRunSummary } from '@/l
 import { AssetTable } from '@/pages/dashboard/AssetTable';
 import { TotalSummary } from '@/pages/dashboard/TotalSummary';
 import { WalletBalanceTable } from '@/pages/dashboard/WalletBalanceTable';
+import { WalletHistory } from '@/pages/dashboard/WalletHistory';
 import { WalletValueChart } from '@/pages/dashboard/WalletValueChart';
 
 // `settled.status` is typed over every `SyncRunStatus`, `'running'` included, even though
@@ -60,7 +61,8 @@ const BALANCES_REFETCH_FALLBACK = 'The server could not be reached.';
 /**
  * The Details page's content: the total, a bar per wallet, per-asset and per-wallet
  * value, a refresh button and a "last updated" indicator, every figure in USDT. See
- * docs/specs/011-wallets-page-value-dashboard.md.
+ * docs/specs/011-wallets-page-value-dashboard.md. Under the tables, one wallet's value over
+ * time (spec 037), chosen from the same rows.
  *
  * It was the whole of `DashboardPage` until #154 moved it to the Details page, and its
  * behaviour is unchanged. Its early returns are this section's own loading, error and empty
@@ -205,6 +207,7 @@ export function ValueSection() {
         settledRun={settled}
         freshnessKnown={freshnessKnown}
       />
+      <WalletHistory wallets={data.wallets} />
     </div>
   );
 }

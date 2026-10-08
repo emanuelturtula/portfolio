@@ -201,6 +201,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/portfolio/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The wallets' value in USDT at the end of each day of a range
+         * @description One point per day, oldest first, ending today (UTC).
+         *
+         *     A day's value is each active wallet's closing balance times that day's price. **A day
+         *     nothing can value is `null`, never `"0"`**: no wallet read yet, or a holding with no
+         *     price that day. Every amount is a JSON string.
+         */
+        get: operations["readPortfolioHistory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/portfolio/summary": {
         parameters: {
             query?: never;
@@ -324,6 +348,29 @@ export interface paths {
          *     wallet that does not exist gets, because any other status would confirm the id.
          */
         get: operations["readWalletBalanceHistory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/wallets/{wallet_id}/value-history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One wallet's quantity and value in USDT at the end of each day of a range
+         * @description One point per day for one wallet, archived ones included.
+         *
+         *     A wallet that is not the caller's is a `404`, the answer a wallet that does not exist
+         *     gets, because any other status would confirm the id.
+         */
+        get: operations["readWalletValueHistory"];
         put?: never;
         post?: never;
         delete?: never;
@@ -502,6 +549,14 @@ export interface components {
             version: string;
         };
         /**
+         * HistoryRange
+         * @description How far back a history reaches (R6). The member is its wire form.
+         *
+         *     `all` starts on the first day any wallet in the history has a reading.
+         * @enum {string}
+         */
+        HistoryRange: "30d" | "90d" | "1y" | "all";
+        /**
          * HoldingResponse
          * @description One asset held: how much, its price, its value and its share of the total.
          *
@@ -565,6 +620,28 @@ export interface components {
             current_password: string;
             /** New Password */
             new_password: string;
+        };
+        /**
+         * PortfolioHistoryResponse
+         * @description Every active wallet together, one point per day of `range`, oldest first.
+         */
+        PortfolioHistoryResponse: {
+            /** Points */
+            points: components["schemas"]["PortfolioPointResponse"][];
+            range: components["schemas"]["HistoryRange"];
+        };
+        /**
+         * PortfolioPointResponse
+         * @description The wallets' value at the end of `day`, in USDT. `null` when it cannot be known.
+         */
+        PortfolioPointResponse: {
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Value */
+            value: string | null;
         };
         /**
          * PortfolioSummaryResponse
@@ -674,10 +751,10 @@ export interface components {
         QuoteCurrency: "EUR" | "USD";
         /**
          * SchedulerName
-         * @description The three timers, by the names their log lines and task names already carry.
+         * @description The four timers, by the names their log lines and task names already carry.
          * @enum {string}
          */
-        SchedulerName: "balance-sync" | "price-refresh" | "backup";
+        SchedulerName: "balance-sync" | "price-refresh" | "price-backfill" | "backup";
         /**
          * SchedulerState
          * @description How one timer stands. The member is its wire form.
@@ -692,7 +769,7 @@ export interface components {
         SchedulerState: "ok" | "late" | "stopped" | "disabled";
         /**
          * SchedulerStatusResponse
-         * @description One of the three timers.
+         * @description One of the four timers.
          *
          *     `last_tick_at` is when its last tick finished and `last_tick_succeeded` whether that tick
          *     returned without raising; both `null` before a tick has finished, and always for a
@@ -1025,6 +1102,24 @@ export interface components {
             wallets: components["schemas"]["WalletResponse"][];
         };
         /**
+         * WalletPointResponse
+         * @description One wallet at the end of `day`.
+         *
+         *     `quantity` is `null` before the wallet's first reading; `value` is `null` then too, and
+         *     when what it held has no price that day.
+         */
+        WalletPointResponse: {
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Quantity */
+            quantity: string | null;
+            /** Value */
+            value: string | null;
+        };
+        /**
          * WalletResponse
          * @description One wallet, as the API publishes it.
          */
@@ -1071,6 +1166,19 @@ export interface components {
             archived?: boolean | null;
             /** Label */
             label?: string | null;
+        };
+        /**
+         * WalletValueHistoryResponse
+         * @description One wallet, one point per day of `range`, oldest first.
+         */
+        WalletValueHistoryResponse: {
+            /** Asset */
+            asset: string;
+            /** Points */
+            points: components["schemas"]["WalletPointResponse"][];
+            range: components["schemas"]["HistoryRange"];
+            /** Wallet Id */
+            wallet_id: number;
         };
     };
     responses: never;
@@ -1305,6 +1413,38 @@ export interface operations {
             };
         };
     };
+    readPortfolioHistory: {
+        parameters: {
+            query?: {
+                /** @description How far back: 30d, 90d, 1y, or all since the first reading. */
+                range?: components["schemas"]["HistoryRange"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortfolioHistoryResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     readPortfolioSummary: {
         parameters: {
             query?: never;
@@ -1479,6 +1619,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WalletHistoryResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    readWalletValueHistory: {
+        parameters: {
+            query?: {
+                /** @description How far back: 30d, 90d, 1y, or all since the first reading. */
+                range?: components["schemas"]["HistoryRange"];
+            };
+            header?: never;
+            path: {
+                wallet_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WalletValueHistoryResponse"];
                 };
             };
             /** @description Validation Error */
