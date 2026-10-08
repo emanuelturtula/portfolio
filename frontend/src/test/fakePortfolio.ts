@@ -1,20 +1,30 @@
 import { onTestFinished } from 'vitest';
 import { http, HttpResponse, type HttpHandler } from 'msw';
 
+import {
+  HISTORY_RANGES,
+  PORTFOLIO_HISTORY_PATH,
+  type HistoryRange,
+  type PortfolioHistory,
+  type WalletValueHistory,
+} from '@/api/history';
 import { PORTFOLIO_SUMMARY_PATH, type PortfolioSummary } from '@/api/portfolio';
 
 import {
+  assetOf,
   currentBalances,
   NOW,
   syncRun,
   triggered,
   unreadBalance,
   unreadEntry,
+  type ChainKey,
   type CurrentBalancesResponse,
   type SyncRunResponse,
   type SyncTriggeredResponse,
   type WalletResponse,
 } from './fixtures';
+import { unreadWalletHistory, unvaluedPortfolioHistory } from './historyFixtures';
 import { problem, refuseNonJsonWrite, server, unauthorized } from './server';
 import { missing, portfolioSummary } from './summaryFixtures';
 
@@ -23,6 +33,7 @@ export const WALLET_PATH = '/api/wallets/:walletId';
 export const BALANCES_CURRENT_PATH = '/api/balances/current';
 export const BALANCES_RUNS_PATH = '/api/balances/runs';
 export const BALANCES_SYNC_PATH = '/api/balances/sync';
+export const WALLET_VALUE_HISTORY_PATH = '/api/wallets/:walletId/value-history';
 
 /**
  * The exact sentences the backend answers with, copied from
@@ -120,6 +131,28 @@ export type HoldableRoute = 'create' | 'archive' | 'restore' | 'sync';
  */
 export type CurrentView = (activeWallets: readonly WalletResponse[]) => CurrentBalancesResponse;
 
+/** A portfolio history computed from the range asked for. */
+export type PortfolioHistoryView = (range: HistoryRange) => PortfolioHistory;
+
+/** A wallet's history computed from the wallet and the range asked for. */
+export type WalletHistoryView = (
+  wallet: WalletResponse,
+  range: HistoryRange,
+) => WalletValueHistory | undefined;
+
+/** The `range` query parameter as the backend reads it: absent means `90d`. */
+function rangeOf(request: Request): HistoryRange | undefined {
+  const raw = new URL(request.url).searchParams.get('range') ?? '90d';
+  return HISTORY_RANGES.find((range) => range === raw);
+}
+
+/** What the backend answers for a `range` it does not accept. */
+function invalidRange(): Response {
+  return validationProblem([
+    { loc: ['query', 'range'], msg: "Input should be '30d', '90d', '1y' or 'all'", type: 'enum' },
+  ]);
+}
+
 export interface FakePortfolioOptions {
   readonly wallets?: readonly WalletResponse[];
   /**
@@ -143,6 +176,18 @@ export interface FakePortfolioOptions {
    */
   readonly summary?: PortfolioSummary;
   /**
+   * What `GET /api/portfolio/history` answers, for every range or by range. When omitted, every
+   * day of the requested range is `null`: what the backend answers before anything could be
+   * valued, and the only answer a fake that knows no prices can give honestly.
+   */
+  readonly history?: PortfolioHistory | PortfolioHistoryView;
+  /**
+   * What `GET /api/wallets/{id}/value-history` answers for a registered wallet, archived ones
+   * included. When omitted, or when this returns `undefined`, every day of the range is `null`
+   * for the wallet's asset. A wallet that is not registered is a `404`, as on the backend.
+   */
+  readonly walletHistory?: WalletHistoryView;
+  /**
    * The session these endpoints belong to. When given, every request made
    * while it is signed out is answered `401`, as the backend's deny-by-default
    * middleware answers it. Without this, a query rebuilt in the instant
@@ -163,6 +208,8 @@ export interface FakePortfolio {
   runs(): readonly SyncRunResponse[];
   summary(): PortfolioSummary;
   setSummary(summary: PortfolioSummary | undefined): void;
+  history(range: HistoryRange): PortfolioHistory;
+  setHistory(history: PortfolioHistory | PortfolioHistoryView | undefined): void;
   setCurrent(current: CurrentBalancesResponse | CurrentView | undefined): void;
   setRuns(runs: readonly SyncRunResponse[]): void;
   /** The next create of this address answers a 422 on `["body", "address"]`. */
@@ -200,6 +247,7 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
   let current: CurrentBalancesResponse | CurrentView | undefined = options.current;
   let runs: SyncRunResponse[] = [...(options.runs ?? [])];
   let summary: PortfolioSummary | undefined = options.summary;
+  let history: PortfolioHistory | PortfolioHistoryView | undefined = options.history;
   const rejections = new Map<string, AddressRejectionType>();
   /** What each wallet created here was registered with, for the duplicate check. */
   const canonicalOf = new Map<number, string>();
@@ -255,6 +303,15 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     setSummary: (next) => {
       summary = next;
     },
+    history: (range) => {
+      if (history === undefined) {
+        return unvaluedPortfolioHistory(range);
+      }
+      return typeof history === 'function' ? history(range) : history;
+    },
+    setHistory: (next) => {
+      history = next;
+    },
     current: () => {
       if (current === undefined) {
         return derivedCurrent();
@@ -308,6 +365,8 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     http.all(WALLET_PATH, requireSession),
     http.all('/api/balances/*', requireSession),
     http.all(PORTFOLIO_SUMMARY_PATH, requireSession),
+    http.all(PORTFOLIO_HISTORY_PATH, requireSession),
+    http.all(WALLET_VALUE_HISTORY_PATH, requireSession),
     http.get(WALLETS_PATH, async ({ request }) => {
       await record(request);
       const includeArchived = new URL(request.url).searchParams.get('include_archived') === 'true';
@@ -455,6 +514,31 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     http.get(PORTFOLIO_SUMMARY_PATH, async ({ request }) => {
       await record(request);
       return HttpResponse.json(fake.summary());
+    }),
+
+    http.get(PORTFOLIO_HISTORY_PATH, async ({ request }) => {
+      await record(request);
+      const range = rangeOf(request);
+      if (range === undefined) {
+        return invalidRange();
+      }
+      return HttpResponse.json(fake.history(range));
+    }),
+
+    http.get(WALLET_VALUE_HISTORY_PATH, async ({ request, params }) => {
+      await record(request);
+      const range = rangeOf(request);
+      if (range === undefined) {
+        return invalidRange();
+      }
+      const target = findWallet(params.walletId);
+      if (target === undefined) {
+        return problem(404, 'Not Found', WALLET_NOT_FOUND_DETAIL);
+      }
+      return HttpResponse.json(
+        options.walletHistory?.(target, range) ??
+          unreadWalletHistory(target.id, assetOf(target.chain_key as ChainKey), range),
+      );
     }),
 
     http.post(BALANCES_SYNC_PATH, async ({ request }) => {

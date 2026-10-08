@@ -34,6 +34,7 @@ export const NO_TICK_WORDS = 'none since the server started';
 export const TIMER_NAMES: Record<SchedulerName, string> = {
   'balance-sync': 'Balance sync',
   'price-refresh': 'Price refresh',
+  'price-backfill': 'Price backfill',
   backup: 'Backup',
 };
 

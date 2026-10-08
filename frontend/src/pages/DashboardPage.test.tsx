@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { PORTFOLIO_SUMMARY_PATH, type PortfolioSummary } from '@/api/portfolio';
 import { fakePortfolio, type FakePortfolio, type FakePortfolioOptions } from '@/test/fakePortfolio';
 import { healthyPortfolio, syncRun, triggered } from '@/test/fixtures';
+import { historySettled } from '@/test/historyFixtures';
 import { currentPath, renderApp, settle, type ProvidedRender } from '@/test/render';
 import { fakeSession, problem, server, TEST_USERNAME } from '@/test/server';
 import {
@@ -51,8 +52,10 @@ function figure(name: Figure): HTMLElement {
   return screen.getByRole('region', { name });
 }
 
+/** The figures are on screen, and the chart beside them has stopped loading. */
 async function loaded(): Promise<void> {
   await screen.findByRole('region', { name: 'Total value' });
+  await historySettled('Value over time');
 }
 
 /** The figure as read: its parts - amount, unit - one space apart, or its dash. */

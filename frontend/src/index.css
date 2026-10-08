@@ -952,6 +952,66 @@ tbody th {
   color: var(--color-muted);
 }
 
+/* Value over time (spec 037). One area from zero, a 2px line over a 10% wash of its colour,
+   hairline gridlines and muted ticks. A day nothing could value is a gap in the line, never a
+   fall to zero. The range buttons are toggles: the pressed one is inked, like the primary
+   button, so the choice reads without colour and `aria-pressed` says it to a screen reader. */
+
+.history-title {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.card-head .history-title h2 {
+  margin: 0;
+}
+
+.range-selector {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.range-selector button {
+  padding: 0.2rem 0.65rem;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-selector button[aria-pressed='true'] {
+  border-color: var(--color-text);
+  background-color: var(--color-text);
+  color: var(--color-surface);
+  font-weight: 600;
+}
+
+.history-wallet {
+  max-width: 22rem;
+  margin-bottom: 0.75rem;
+}
+
+.history {
+  margin: 0;
+}
+
+.history-chart {
+  width: 100%;
+  height: 240px;
+}
+
+.history + .note {
+  margin-top: 0.5rem;
+}
+
+.history-empty {
+  margin: 0;
+  padding: 1.5rem 0;
+  color: var(--color-muted);
+  font-size: 0.875rem;
+  text-align: center;
+}
+
 /* Bar charts. Horizontal bars on one scale from zero, the figure at each tip in ink. A row's
    colour is its asset's; two series are two shades of it, told apart by the legend. Bars are
    14px with a 4px rounded end and a square baseline. The track keeps room on its right for the

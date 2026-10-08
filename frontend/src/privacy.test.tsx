@@ -104,7 +104,7 @@ describe('privacy', () => {
     // Copying an address is a clipboard write, not a request.
     await user.click(within(archivedRow).getByRole('button', { name: COPY_ADDRESS }));
 
-    // Dashboard: its summary, and a refresh.
+    // Dashboard: its summary, its history, and a refresh.
     const nav = screen.getByRole('navigation', { name: 'Main' });
     await user.click(within(nav).getByRole('link', { name: 'Dashboard' }));
     await screen.findByRole('region', { name: 'Total value' });
@@ -114,7 +114,7 @@ describe('privacy', () => {
     });
     await settle();
 
-    // Details: every read behind the dashboard's figures.
+    // Details: every read behind the dashboard's figures, and a wallet's history by its id.
     await user.click(within(nav).getByRole('link', { name: 'Details' }));
     await screen.findByRole('region', { name: 'Total value' });
     await settle();
@@ -127,6 +127,8 @@ describe('privacy', () => {
     expect(paths).toContain('/api/wallets/4');
     expect(paths).toContain('/api/wallets/1');
     expect(paths).toContain('/api/portfolio/summary');
+    expect(paths).toContain('/api/portfolio/history?range=90d');
+    expect(paths).toContain('/api/wallets/1/value-history?range=90d');
     expect(paths).toContain('/api/balances/current?quote_currency=USD');
     expect(paths).toContain('/api/balances/runs?limit=2');
     expect(paths).toContain('/api/balances/sync');
