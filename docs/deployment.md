@@ -364,12 +364,18 @@ The registry login needs nothing set: each job uses its own short-lived `GITHUB_
 
 The host needs:
 
-- Docker with the Compose plugin;
+- Docker with the Compose plugin, Engine 28.0.0 or later. Before 28.0.0, a machine on the same
+  network segment could reach a port published on `127.0.0.1`, which is the only place the
+  application's port is published (spec 038);
 - Python 3.11 or later, for `deploy.py`, which uses the standard library only;
 - a user that can run `docker` without `sudo`, which in practice means the `docker` group.
   That group is root-equivalent on the host, one more reason the key below is used by
   nothing else;
-- Tailscale, and host port 8083 free.
+- Tailscale, and host port 8083 free on the loopback interface. The application is
+  published on `127.0.0.1` only (spec 038), so nothing else on the network can reach it there;
+- for opening the application from anywhere but the host, `cloudflared` running as a
+  service, with Cloudflare Access in front. That is set up once, by hand, as
+  `docs/operations.md` section 20 describes, and no deployment touches it.
 
 ### 1. A dedicated SSH key
 

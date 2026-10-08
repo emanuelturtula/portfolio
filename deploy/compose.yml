@@ -16,8 +16,14 @@ services:
   app:
     image: ${PORTFOLIO_IMAGE:?An immutable image digest is required}
     restart: unless-stopped
+    # Published on the host's loopback interface only (spec 038). The application is reached
+    # from anywhere else through the Cloudflare tunnel, whose connector runs on the host and
+    # forwards to 127.0.0.1 (docs/operations.md, section 20). Without the address, Docker
+    # publishes on every interface, which served plain HTTP -- the password and the session
+    # cookie in the clear -- to the whole local network, through forwarding rules Docker
+    # applies before a host firewall sees the packet.
     ports:
-      - "${PORTFOLIO_PORT:?A host port is required}:8000"
+      - "127.0.0.1:${PORTFOLIO_PORT:?A host port is required}:8000"
     environment:
       PORTFOLIO_ENVIRONMENT: ${PORTFOLIO_ENVIRONMENT:?An environment name is required}
       PORTFOLIO_DATABASE_URL: sqlite+aiosqlite:////app/data/portfolio.db
