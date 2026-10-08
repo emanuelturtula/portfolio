@@ -65,6 +65,7 @@ __all__ = [
     "USD",
     "DailyClose",
     "DailyCloseSource",
+    "HistoricalCloseSource",
     "PriceFetch",
     "PricePair",
     "PriceQuote",
@@ -243,6 +244,50 @@ class DailyCloseSource(Protocol):
             ProviderUnavailableError: the vendor could not be reached, or did not answer.
             ProviderRateLimitedError: it refused because we asked too often.
             ProviderResponseError: it answered with something that cannot be trusted.
+        """
+
+
+class HistoricalCloseSource(Protocol):
+    """A vendor whose daily closes reach further back than a `DailyCloseSource`'s (spec 038).
+
+    Kraken serves the last 720 days and nothing older, so the backfill asks this second kind
+    of source for the days before the earliest close it has stored (R8). It is asked for a
+    range rather than for everything, because "everything" here is a decade of candles and
+    the backfill already knows the only days it is missing.
+
+    Structural and checked by `mypy`, for the reason `PriceSource` is.
+    """
+
+    @property
+    def name(self) -> str:
+        """What this source is called in `price_history.source` and in a log."""
+
+    @property
+    def pairs(self) -> frozenset[PricePair]:
+        """Every pair this source can answer about the past."""
+
+    @property
+    def earliest_day(self) -> date:
+        """The first UTC day the vendor has a close for. Nothing before it is ever asked."""
+
+    async def daily_closes_between(
+        self,
+        pair: PricePair,
+        first_day: date,
+        last_day: date,
+    ) -> Sequence[DailyClose]:
+        """The committed daily closes from `first_day` to `last_day` inclusive, oldest first.
+
+        **Only days inside that range, and only committed ones**: a candle the vendor sends
+        for a day outside the range, or for today (UTC) or later, is never returned. A day
+        the vendor has no candle for is absent, never a zero. An empty range, or one wholly
+        before `earliest_day`, is `()` without a request.
+
+        Raises:
+            ProviderUnavailableError: the vendor could not be reached, or did not answer.
+            ProviderRateLimitedError: it refused because we asked too often.
+            ProviderResponseError: the pair is not one this source answers, or the answer
+                cannot be trusted.
         """
 
 

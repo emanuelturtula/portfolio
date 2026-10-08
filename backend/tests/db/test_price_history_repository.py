@@ -21,7 +21,8 @@ session -- not on the object the writing session still holds, which would be the
 sharing state with its subject.
 
 **Nothing here sums, orders or compares money in SQL.** `series` orders by `asset_id` and
-`day`, and `latest_close_recorded_at` takes a `MAX()` over an instant.
+`day`, `latest_close_recorded_at` takes a `MAX()` over an instant, and `earliest_close_day`
+a `MIN()` over a date.
 """
 
 from __future__ import annotations
@@ -504,3 +505,68 @@ async def test_only_observed_rows_mean_no_backfill_has_run(
     await session.commit()
 
     assert await repository.latest_close_recorded_at() is None
+
+
+# --------------------------------------------------------------------------------------
+# `earliest_close_day` (spec 038)
+# --------------------------------------------------------------------------------------
+
+
+async def test_the_earliest_close_day_is_none_on_an_empty_table(
+    repository: PriceHistoryRepository,
+    session: AsyncSession,
+) -> None:
+    """Nothing stored: nothing to extend the history back from."""
+    assert await repository.earliest_close_day(await asset_id(session, BTC), USD) is None
+
+
+async def test_the_earliest_close_day_is_the_first_close_of_that_asset_and_currency(
+    repository: PriceHistoryRepository,
+    session: AsyncSession,
+) -> None:
+    """The oldest `close` of the pair, as a `date`, whatever order the rows were written in.
+
+    Written newest first, so an answer that took the first row inserted is wrong. An older
+    row for another asset or another currency is not the pair's, and an older `observed` row
+    is not a close: it is the refresh's price, and a close for its day is still owed.
+    """
+    btc = await asset_id(session, BTC)
+    kas = await asset_id(session, KAS)
+    for day in (date(2026, 10, 7), date(2024, 10, 18), date(2025, 3, 1)):
+        await record(repository, btc, amount="1", basis=CLOSE, day=day)
+    await record(repository, btc, amount="1", basis=CLOSE, day=date(2015, 7, 20), currency=EUR)
+    await record(repository, kas, amount="0.04", basis=CLOSE, day=date(2024, 1, 1))
+    await record(repository, btc, amount="2", basis=OBSERVED, day=date(2024, 9, 30))
+    await session.commit()
+
+    earliest = await repository.earliest_close_day(btc, USD)
+
+    assert earliest == date(2024, 10, 18)
+    assert type(earliest) is date
+    assert await repository.earliest_close_day(btc, EUR) == date(2015, 7, 20)
+    assert await repository.earliest_close_day(kas, USD) == date(2024, 1, 1)
+
+
+async def test_only_observed_rows_have_no_earliest_close_day(
+    repository: PriceHistoryRepository,
+    session: AsyncSession,
+) -> None:
+    btc = await asset_id(session, BTC)
+    await record(repository, btc, amount="1", basis=OBSERVED)
+    await session.commit()
+
+    assert await repository.earliest_close_day(btc, USD) is None
+
+
+async def test_the_earliest_close_day_orders_dates_across_a_year_and_a_month_boundary(
+    repository: PriceHistoryRepository,
+    session: AsyncSession,
+) -> None:
+    """`MIN()` over `YYYY-MM-DD` text is chronological: 2015-12-31 before 2016-01-01, and
+    2016-01-09 before 2016-01-10 -- the pair a format without zero padding would get wrong."""
+    btc = await asset_id(session, BTC)
+    for day in (date(2016, 1, 10), date(2016, 1, 9), date(2016, 1, 1), date(2015, 12, 31)):
+        await record(repository, btc, amount="1", basis=CLOSE, day=day)
+    await session.commit()
+
+    assert await repository.earliest_close_day(btc, USD) == date(2015, 12, 31)

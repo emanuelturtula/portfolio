@@ -31,8 +31,6 @@ documentation:
   and why a wrong-network address is refused here, offline, rather than by asking.
 * That `mempool_stats` is always present in practice. Its absence is read as "this
   instance cannot tell you", not as a zero.
-* Anything about pagination or retention. Neither matters for a balance read; both will
-  matter for transaction history, and neither has been checked.
 
 `docs/providers.md` carries the same split, and the date, for a reader who never opens
 this file.
@@ -83,6 +81,29 @@ which both vendors document in both stats objects (re-read on **2026-10-03**; se
 `docs/providers.md`, *Extended public keys*). The gap limit, the cap and the order of work
 are in the method's docstring.
 
+## Transaction history (spec 038)
+
+`address_history` reads an address's whole confirmed history, for the rebuild of its past
+balances. Confirmed against both vendors' documentation and measured on both hosts on
+**2026-10-08** (`docs/providers.md`, *Transaction history, for the balance rebuild*):
+
+* `GET /address/:a/txs/chain[/:last_seen_txid]` "Returns 25 transactions per page", newest
+  first. Paging by the last txid of the previous page reaches the oldest transaction on both
+  hosts. **The path form is the only one both honour**: `?after_txid=` is ignored on
+  `/txs/chain` by both, so a pager relying on it would read page one forever.
+* **An unknown or reorged-out cursor answers `200 []`**, exactly like the end of the history.
+  An empty page therefore proves nothing on its own, and the history proves itself instead
+  (R1): the distinct txids collected equal `chain_stats.tx_count`, their effects sum to
+  `funded_txo_sum - spent_txo_sum`, and the stats read before the paging equal those read
+  after it. Anything else is returned as incomplete, with the reason, and never as a zero.
+* Amounts are integer satoshis; `status.block_time` is Unix seconds and is absent, not
+  `null`, on an unconfirmed transaction; a coinbase input carries no `prevout`.
+
+**Assumed**: the order of transactions within one block (undocumented; nothing here depends
+on it), and that a page shorter than 25 is the last -- not relied on: the pager reads on to
+the empty page. Block header times are not monotonic in height, so `occurred_at` can step
+backwards by a little between two effects in chain order.
+
 ## Nothing here logs
 
 Not one call. The shared transport logs `"{scheme}://{host}/{label}"` and nothing else,
@@ -92,7 +113,9 @@ log line written here would bypass all of it, and both vendors put the address i
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Final
 
@@ -120,17 +143,25 @@ from portfolio.domain.extended_keys import (
     parse_extended_public_key,
 )
 from portfolio.providers.base import (
+    AddressHistory,
     ChainCapabilities,
     ExtendedKeyScan,
+    HistoryIncomplete,
     ProviderHealth,
     ScannedAddress,
+    TxEffect,
     align_balances,
     decode_json,
     require_json_object,
 )
 from portfolio.providers.endpoints import FALLBACK, PRIMARY, EndpointSet
 from portfolio.providers.errors import ProviderResponseError
-from portfolio.providers.http import ADDRESS_BALANCE, BLOCK_TIP_HEIGHT, ENDPOINT_EXTENSION
+from portfolio.providers.http import (
+    ADDRESS_BALANCE,
+    ADDRESS_HISTORY,
+    BLOCK_TIP_HEIGHT,
+    ENDPOINT_EXTENSION,
+)
 from portfolio.providers.registry import register_chain_provider
 
 if TYPE_CHECKING:
@@ -148,12 +179,20 @@ __all__ = [
     "BRANCH_CAP_MESSAGE",
     "CAPABILITIES",
     "FALLBACK",
+    "HISTORY_PAGE_PATH",
+    "HISTORY_PAGE_SIZE",
+    "HISTORY_PATH",
+    "LATEST_BLOCK_TIME",
     "PRIMARY",
     "TIP_HEIGHT_PATH",
     "VENDOR",
     "AddressStats",
+    "ChainStats",
+    "ChainTransaction",
     "EsploraProvider",
     "parse_address_response",
+    "parse_chain_stats",
+    "parse_history_page",
     "parse_tip_height",
 ]
 
@@ -166,6 +205,27 @@ MAX_ADDRESSES_PER_CALL: Final = 1
 
 ADDRESS_PATH: Final = "/address/{address}"
 TIP_HEIGHT_PATH: Final = "/blocks/tip/height"
+HISTORY_PATH: Final = "/address/{address}/txs/chain"
+HISTORY_PAGE_PATH: Final = "/address/{address}/txs/chain/{txid}"
+"""The first page of an address's confirmed history, and every later one by the path form.
+
+The path form is the only paging both hosts honour (2026-10-08): `?after_txid=` is ignored on
+`/txs/chain` by both, and a pager that relied on it would be served page one forever."""
+
+HISTORY_PAGE_SIZE: Final = 25
+""""Returns 25 transactions per page" -- both vendors' documentation, and measured on both.
+
+Used for one thing: the page cap, `tx_count // HISTORY_PAGE_SIZE + 2`, which is one more page
+than a history of `tx_count` transactions needs (every full page, a remainder, and the empty
+page that ends it). A vendor that keeps answering past it is not ending the history, and the
+read stops there rather than following it without end."""
+
+LATEST_BLOCK_TIME: Final = 253_402_300_799
+"""The last Unix second a `datetime` can hold, 9999-12-31T23:59:59Z.
+
+A `block_time` past it is refused as a response error rather than left to raise an
+`OverflowError` or a `ValueError` out of `datetime.fromtimestamp` -- which one depends on the
+platform's `time_t`, and neither is in this package's vocabulary."""
 
 VENDOR: Final = "Esplora"
 """What this provider's upstream is called in an exhaustion message.
@@ -186,6 +246,23 @@ MEMPOOL_STATS: Final = "mempool_stats"
 FUNDED_SUM: Final = "funded_txo_sum"
 SPENT_SUM: Final = "spent_txo_sum"
 TX_COUNT: Final = "tx_count"
+TXID_FIELD: Final = "txid"
+STATUS_FIELD: Final = "status"
+CONFIRMED_FIELD: Final = "confirmed"
+BLOCK_TIME_FIELD: Final = "block_time"
+VIN_FIELD: Final = "vin"
+VOUT_FIELD: Final = "vout"
+PREVOUT_FIELD: Final = "prevout"
+IS_COINBASE_FIELD: Final = "is_coinbase"
+SCRIPTPUBKEY_ADDRESS_FIELD: Final = "scriptpubkey_address"
+VALUE_FIELD: Final = "value"
+
+_TXID: Final = re.compile(r"[0-9a-f]{64}")
+"""A txid as Esplora renders one: 64 lower-case hexadecimal characters.
+
+**Checked because a txid goes back into a URL path**, as the next page's cursor. It comes
+out of a response body, which the vendor chooses freely, and `../../blocks/tip/height` is a
+string too. `fullmatch` rather than `match` with `$`, which would accept a trailing newline."""
 
 CAPABILITIES: Final = ChainCapabilities(
     chain_key=ChainKey.BITCOIN,
@@ -230,6 +307,40 @@ class AddressStats:
     confirmed: int
     pending: int | None
     used: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ChainStats:
+    """An address's confirmed figures: how many transactions, and the two satoshi sums.
+
+    What `address_history` checks a history against (R1), and compares before and after the
+    paging: two reads that differ in any of the three mean a transaction confirmed while the
+    history was being read. Equality is the dataclass's, over all three fields.
+    """
+
+    tx_count: int
+    funded: int
+    spent: int
+
+    @property
+    def balance(self) -> int:
+        """`funded - spent`, the confirmed balance. Never negative: the parser refuses it."""
+        return self.funded - self.spent
+
+
+def parse_chain_stats(body: str | bytes, expected_address: str) -> ChainStats:
+    """An address response's `chain_stats`, for the history's completeness check.
+
+    The same parser `parse_address_response` uses for its confirmed half -- one reading of
+    one object, so the two cannot drift -- with every refusal it makes for that half: the
+    body, the echoed address, the stats object, either sum, a negative balance and the
+    count. `mempool_stats` is not read: a pending transaction is not part of a history.
+
+    Raises:
+        ProviderResponseError: the rows of `parse_address_response`'s table about the body,
+            the address and `chain_stats`.
+    """
+    return _chain_stats(require_json_object(body), expected_address)
 
 
 def parse_address_response(body: str | bytes, expected_address: str) -> AddressStats:
@@ -281,22 +392,8 @@ def parse_address_response(body: str | bytes, expected_address: str) -> AddressS
         ProviderResponseError: any row of the table above.
     """
     document = require_json_object(body)
-    if document.get(ADDRESS_FIELD) != expected_address:
-        message = (
-            "The response does not carry the 'address' it was asked about, "
-            "so it cannot be matched to the request."
-        )
-        raise ProviderResponseError(message)
-
-    chain_stats = _require_stats(document, CHAIN_STATS)
-    confirmed = _require_delta(chain_stats, CHAIN_STATS)
-    if confirmed < 0:
-        message = (
-            f"The response reports a larger {CHAIN_STATS}.{SPENT_SUM} than "
-            f"{CHAIN_STATS}.{FUNDED_SUM}, which would make the confirmed balance negative."
-        )
-        raise ProviderResponseError(message)
-    used = _require_count(chain_stats, CHAIN_STATS, TX_COUNT) > 0
+    chain = _chain_stats(document, expected_address)
+    used = chain.tx_count > 0
 
     # `in` rather than `.get(...) is None`, so that an explicit null is a mistyped field
     # and reaches the refusal below rather than being read as "no mempool figures".
@@ -308,7 +405,234 @@ def parse_address_response(body: str | bytes, expected_address: str) -> AddressS
         # every address that already has a confirmed transaction.
         mempool_used = _require_count(mempool_stats, MEMPOOL_STATS, TX_COUNT) > 0
         used = used or mempool_used
-    return AddressStats(confirmed=confirmed, pending=pending, used=used)
+    return AddressStats(confirmed=chain.balance, pending=pending, used=used)
+
+
+def _chain_stats(document: Mapping[str, object], expected_address: str) -> ChainStats:
+    """The echoed address and the confirmed half of an address response, or a refusal.
+
+    The refusals, in the order a body meets them: an echo that is not the address asked
+    about, a `chain_stats` that is not an object, either sum, a spent sum over the funded
+    one, and the count. Both public parsers go through here, so they refuse identically.
+    """
+    if document.get(ADDRESS_FIELD) != expected_address:
+        message = (
+            "The response does not carry the 'address' it was asked about, "
+            "so it cannot be matched to the request."
+        )
+        raise ProviderResponseError(message)
+
+    chain_stats = _require_stats(document, CHAIN_STATS)
+    funded = _require_sum(chain_stats, CHAIN_STATS, FUNDED_SUM)
+    spent = _require_sum(chain_stats, CHAIN_STATS, SPENT_SUM)
+    if spent > funded:
+        message = (
+            f"The response reports a larger {CHAIN_STATS}.{SPENT_SUM} than "
+            f"{CHAIN_STATS}.{FUNDED_SUM}, which would make the confirmed balance negative."
+        )
+        raise ProviderResponseError(message)
+    tx_count = _require_count(chain_stats, CHAIN_STATS, TX_COUNT)
+    return ChainStats(tx_count=tx_count, funded=funded, spent=spent)
+
+
+@dataclass(frozen=True, slots=True)
+class ChainTransaction:
+    """One confirmed transaction out of a history page: its id, its effect, and whether it
+    could be read whole.
+
+    `txid` is kept for two jobs and never leaves the provider: it de-duplicates across pages,
+    and the last one on a page is the next page's cursor. `resolved` is false when a
+    non-coinbase input carried no `prevout`, so its source -- and whether it spent from this
+    address -- is unknown (R2); the effect then leaves that input out, and the history is
+    reported `unresolved_input` rather than trusted.
+    """
+
+    txid: str
+    effect: TxEffect
+    resolved: bool
+
+
+def parse_history_page(body: str | bytes, address: str) -> tuple[ChainTransaction, ...]:
+    """Every transaction on one `/txs/chain` page, in the vendor's order, or a refusal.
+
+    The net effect on `address` is R2: the outputs paying `address` minus the `prevout` of
+    every input spending from it. A coinbase input has no `prevout` and is skipped -- it
+    spends nothing. A non-coinbase input with no `prevout` is not a refusal but an unknown,
+    carried as `resolved=False`.
+
+    | Refused | Why |
+    |---|---|
+    | the body is not a JSON array, or an entry is not an object | the documented shape |
+    | `txid` not 64 lower-case hex characters | it goes back into a URL as the cursor |
+    | `status` not an object, or `status.confirmed` not `true` | a chain page is confirmed |
+    | `status.block_time` not an `int` in `[0, LATEST_BLOCK_TIME]` | no time, no day (R3) |
+    | `vin`/`vout` not arrays, or an entry of either not an object | the documented shape |
+    | a `value` that is not an `int`, is a `bool`, or is negative | `1.0e8` is not satoshis |
+    | a `prevout` present but not an object | mistyped is not "absent" |
+
+    **Every amount is checked, not only those that touch `address`**: a vendor rendering one
+    output as a float renders them all that way, and refusing only when it happened to be
+    ours would make the refusal depend on the owner's holdings.
+
+    No message names the address, a txid or an amount; each names a field and a type.
+
+    Raises:
+        ProviderResponseError: any row of the table above.
+    """
+    entries = decode_json(body)
+    if not isinstance(entries, list):
+        message = (
+            f"The history page is a {type(entries).__name__} rather than the JSON array "
+            "this endpoint documents."
+        )
+        raise ProviderResponseError(message)
+    return tuple(_chain_transaction(entry, address) for entry in entries)
+
+
+def _chain_transaction(entry: object, address: str) -> ChainTransaction:
+    """One history entry, read and checked. See `parse_history_page` for the refusals."""
+    if not isinstance(entry, dict):
+        message = (
+            f"The history page carried an entry that is a {type(entry).__name__} rather "
+            "than a transaction object."
+        )
+        raise ProviderResponseError(message)
+    txid = entry.get(TXID_FIELD)
+    if not isinstance(txid, str) or _TXID.fullmatch(txid) is None:
+        message = (
+            f"A transaction's {TXID_FIELD!r} is not 64 lower-case hexadecimal characters, so "
+            "it cannot be followed as the next page's cursor."
+        )
+        raise ProviderResponseError(message)
+
+    status = entry.get(STATUS_FIELD)
+    if not isinstance(status, dict):
+        message = (
+            f"A transaction's {STATUS_FIELD!r} is a {type(status).__name__} rather than the "
+            "object this endpoint documents."
+        )
+        raise ProviderResponseError(message)
+    if status.get(CONFIRMED_FIELD) is not True:
+        message = (
+            "The confirmed-history page carried a transaction that is not confirmed, which "
+            "this endpoint does not serve."
+        )
+        raise ProviderResponseError(message)
+    occurred_at = _block_time(status.get(BLOCK_TIME_FIELD))
+
+    received = 0
+    for output in _require_entries(entry, VOUT_FIELD):
+        value = _require_amount(output.get(VALUE_FIELD), f"{VOUT_FIELD}[].{VALUE_FIELD}")
+        if output.get(SCRIPTPUBKEY_ADDRESS_FIELD) == address:
+            received += value
+
+    spent = 0
+    resolved = True
+    for txin in _require_entries(entry, VIN_FIELD):
+        if txin.get(IS_COINBASE_FIELD) is True:
+            continue
+        prevout = txin.get(PREVOUT_FIELD)
+        if prevout is None:
+            resolved = False
+            continue
+        if not isinstance(prevout, dict):
+            message = (
+                f"A transaction's {VIN_FIELD}[].{PREVOUT_FIELD} is a {type(prevout).__name__} "
+                "rather than the object this endpoint documents."
+            )
+            raise ProviderResponseError(message)
+        value = _require_amount(
+            prevout.get(VALUE_FIELD), f"{VIN_FIELD}[].{PREVOUT_FIELD}.{VALUE_FIELD}"
+        )
+        if prevout.get(SCRIPTPUBKEY_ADDRESS_FIELD) == address:
+            spent += value
+
+    return ChainTransaction(
+        txid=txid,
+        effect=TxEffect(occurred_at=occurred_at, delta=received - spent),
+        resolved=resolved,
+    )
+
+
+def _block_time(value: object) -> datetime:
+    """A block's Unix-seconds time as an aware UTC datetime, or a refusal.
+
+    `int` only, `bool` refused, and bounded to what a `datetime` can hold (see
+    `LATEST_BLOCK_TIME`), so the conversion below cannot raise. `fromtimestamp` of an `int`
+    is exact. Absent and mistyped are one refusal: neither has a day to put the effect on.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= LATEST_BLOCK_TIME:
+        message = (
+            f"A confirmed transaction's {STATUS_FIELD}.{BLOCK_TIME_FIELD} is a "
+            f"{type(value).__name__} that is not a Unix time in seconds."
+        )
+        raise ProviderResponseError(message)
+    return datetime.fromtimestamp(value, UTC)
+
+
+def _require_entries(entry: Mapping[str, object], field: str) -> list[Mapping[str, object]]:
+    """A transaction's `vin` or `vout`: an array of objects, or a refusal naming the type."""
+    items = entry.get(field)
+    if not isinstance(items, list):
+        message = (
+            f"A transaction's {field!r} is a {type(items).__name__} rather than the array "
+            "this endpoint documents."
+        )
+        raise ProviderResponseError(message)
+    objects: list[Mapping[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            message = (
+                f"A transaction's {field}[] carried a {type(item).__name__} rather than an object."
+            )
+            raise ProviderResponseError(message)
+        objects.append(item)
+    return objects
+
+
+def _require_amount(value: object, field: str) -> int:
+    """One output's or prevout's `value`: a whole, non-negative number of satoshis.
+
+    The same refusal `_require_sum` makes, for the same reasons -- `json.loads` hands back
+    whatever the vendor sent, and `True` is an `int` -- plus a negative value, which no
+    output can carry. The message names the field and the type, never the value.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        message = (
+            f"A transaction's {field} is a {type(value).__name__} that is not a whole, "
+            "non-negative number of satoshis."
+        )
+        raise ProviderResponseError(message)
+    return value
+
+
+def _history_verdict(
+    *,
+    moved: bool,
+    resolved: bool,
+    ended: bool,
+    collected: int,
+    counted: int,
+    summed: int,
+    balance: int,
+) -> HistoryIncomplete | None:
+    """R1: `None` when the history proves itself complete, else the first reason it does not.
+
+    In this order, because each earlier reason explains the later ones: a transaction that
+    confirmed mid-read moves the count and the balance both; an input of unknown source
+    makes the sum unknowable; and a history that did not end, or ended short, cannot be
+    expected to sum to the balance. A history that did not end within the page cap is a
+    count mismatch: the vendor served more pages than its own count allows.
+    """
+    if moved:
+        return HistoryIncomplete.MOVED_DURING_READ
+    if not resolved:
+        return HistoryIncomplete.UNRESOLVED_INPUT
+    if not ended or collected != counted:
+        return HistoryIncomplete.COUNT_MISMATCH
+    if summed != balance:
+        return HistoryIncomplete.BALANCE_MISMATCH
+    return None
 
 
 def parse_tip_height(body: str | bytes) -> int:
@@ -476,7 +800,8 @@ class EsploraProvider:
     Satisfies `ChainProvider` structurally, checked by `mypy --strict` rather than by
     `isinstance`, and `ChainProviderFactory` by taking the shared client as its only
     positional argument -- which is what lets the registry build it with nothing but a
-    client. Also satisfies `ExtendedKeyScanner`, the one chain provider that does (spec 031).
+    client. Also satisfies `ExtendedKeyScanner`, the one chain provider that does (spec 031),
+    and `TransactionHistoryReader` (spec 038).
     """
 
     def __init__(self, client: httpx.AsyncClient, *, settings: Settings | None = None) -> None:
@@ -686,6 +1011,93 @@ class EsploraProvider:
             scanned.extend(on_branch)
 
         return ExtendedKeyScan(addresses=tuple(scanned), decimals=BITCOIN_DECIMALS)
+
+    async def address_history(self, address: str) -> AddressHistory:
+        """Every confirmed transaction's effect on `address`, oldest first, checked by R1.
+
+        Satisfies `TransactionHistoryReader` (spec 038). The order of work:
+
+        1. **The address is validated before any URL is built**, as `fetch_balances` does and
+           for its reason: it goes into a path.
+        2. **`GET /address/:a`**, for `chain_stats`: the count and the balance the history
+           will be checked against.
+        3. **`GET /address/:a/txs/chain`, then `/txs/chain/{last txid}`** until a page comes
+           back empty, at most `tx_count // 25 + 2` pages. Each txid is checked before it is
+           put back into a path. A txid seen twice is kept once.
+        4. **`GET /address/:a` again.** Any difference from step 2 is a transaction that
+           confirmed during the read.
+
+        **An empty page is not proof of the end**: an unknown or reorged-out cursor also
+        answers `200 []`. So the history is complete only when it proves it (R1) -- the
+        distinct txids number `tx_count`, the effects sum to `funded - spent`, and the two
+        stats reads agree. Otherwise `incomplete` says why (see `_history_verdict` for the
+        order), `effects` is what was collected, and nothing may store it.
+
+        Every read is sequential and goes through the host limiter, with failover sticky for
+        the whole history, stats reads included: a host that refused page three is not asked
+        for page four. A history of N transactions costs about N/25 + 3 requests.
+
+        **Nothing here logs**, as everywhere in this module: the address, the txids and the
+        amounts are the owner's holdings. The caller logs the reason and a count.
+
+        Raises:
+            AddressInvalidError: not a Bitcoin address, or one on another network. Before
+                any request.
+            ProviderRateLimitedError: every instance answered 429, last one included.
+            ProviderUnavailableError: no instance answered.
+            ProviderResponseError: an instance refused the request, or answered with
+                something that cannot be trusted (see `parse_history_page`).
+        """
+        canonical = self.validate_address(address).canonical
+        # Sticky for the whole history, as within one `fetch_balances` call.
+        start = 0
+        before, start = await self._read_chain_stats(canonical, start)
+
+        # Insertion-ordered, so newest first as the pages are; a repeat keeps the first.
+        collected: dict[str, ChainTransaction] = {}
+        path = HISTORY_PATH.format(address=canonical)
+        ended = False
+        for _ in range(before.tx_count // HISTORY_PAGE_SIZE + 2):
+            body, start = await self._instances.read(path, ADDRESS_HISTORY, start)
+            page = parse_history_page(body, canonical)
+            if not page:
+                ended = True
+                break
+            for transaction in page:
+                collected.setdefault(transaction.txid, transaction)
+            path = HISTORY_PAGE_PATH.format(address=canonical, txid=page[-1].txid)
+
+        after, start = await self._read_chain_stats(canonical, start)
+
+        oldest_first = tuple(reversed(collected.values()))
+        effects = tuple(transaction.effect for transaction in oldest_first)
+        incomplete = _history_verdict(
+            moved=before != after,
+            resolved=all(transaction.resolved for transaction in oldest_first),
+            ended=ended,
+            collected=len(collected),
+            counted=before.tx_count,
+            summed=sum(effect.delta for effect in effects),
+            balance=before.balance,
+        )
+        return AddressHistory(
+            address=canonical,
+            balance=before.balance,
+            decimals=BITCOIN_DECIMALS,
+            effects=effects,
+            incomplete=incomplete,
+        )
+
+    async def _read_chain_stats(self, address: str, start: int) -> tuple[ChainStats, int]:
+        """`GET /address/:address` for its `chain_stats`, from the first instance that answers.
+
+        The same request `_read_address` makes, under the same label -- it is the same read
+        of the same endpoint -- parsed for the three figures a history is checked against.
+        """
+        body, start = await self._instances.read(
+            ADDRESS_PATH.format(address=address), ADDRESS_BALANCE, start
+        )
+        return parse_chain_stats(body, address), start
 
     async def _read_address(self, address: str, start: int) -> tuple[AddressStats, int]:
         """One address read: `GET /address/:address` from the first instance that answers.

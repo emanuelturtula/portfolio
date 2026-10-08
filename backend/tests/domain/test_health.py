@@ -51,6 +51,7 @@ def test_every_state_is_its_wire_form() -> None:
         "balance-sync",
         "price-refresh",
         "price-backfill",
+        "balance-rebuild",
         "backup",
     ]
     assert [member.value for member in SchedulerState] == ["ok", "late", "stopped", "disabled"]

@@ -29,9 +29,10 @@ is the module-level annotated assignment at the bottom of `test_bitcoin.py`, whi
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Final
 
 import httpx
 
@@ -40,7 +41,7 @@ from portfolio.providers.chains.bitcoin import EsploraProvider
 from portfolio.providers.http import HostRateLimiter, RetryPolicy, build_http_client
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 # --------------------------------------------------------------------------------------
 # The two fictional instances
@@ -74,12 +75,17 @@ def balance_body(
     spent: int = 0,
     mempool_funded: int | None = 0,
     mempool_spent: int | None = 0,
+    tx_count: int = 2,
 ) -> str:
     """The Esplora address body, exactly the shape Blockstream's `API.md` documents.
 
     `mempool_funded=None` omits `mempool_stats` altogether, which is the case criterion 10
     turns on: an instance that does not report a mempool is one that *cannot answer*, not
     one answering zero.
+
+    `tx_count` is `chain_stats.tx_count`. Two by default, as before spec 038; a history test
+    sets it to the number of transactions it serves, which is what the history is checked
+    against.
     """
     body: dict[str, object] = {
         "address": address,
@@ -88,7 +94,7 @@ def balance_body(
             "funded_txo_sum": funded,
             "spent_txo_count": 1,
             "spent_txo_sum": spent,
-            "tx_count": 2,
+            "tx_count": tx_count,
         },
     }
     if mempool_funded is not None:
@@ -100,6 +106,160 @@ def balance_body(
             "tx_count": 1,
         }
     return json.dumps(body)
+
+
+# --------------------------------------------------------------------------------------
+# Confirmed transactions, for `address_history` (spec 038)
+# --------------------------------------------------------------------------------------
+
+#: A plausible block time, in Unix seconds: 2026-10-08T00:00:00Z. Not a round number in any
+#: unit a parser might confuse it with, and inside a UTC day so offsets from it stay there.
+BLOCK_TIME: Final = 1_791_417_600
+
+#: The txid a coinbase input names: 64 zeros. Never a cursor, never a history entry.
+COINBASE_TXID: Final = "0" * 64
+
+
+def txid_of(seed: int) -> str:
+    """A txid, built at run time from a number so no hex literal sits in the source.
+
+    Lower-case, 64 characters, as Esplora renders one: the SHA-256 of the seed, so it has
+    letters as well as digits -- an upper-cased copy is a different string, which the txid
+    check has to notice. Built rather than written because a 64-character hex literal is the
+    shape a secret scanner's entropy rule looks at twice.
+    """
+    return hashlib.sha256(f"esplora-fixture-{seed}".encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class EsploraTx:
+    """One confirmed transaction, described by what it does rather than by its bytes.
+
+    `outputs` are `(address or None, value)`: `None` is an output with no address -- an
+    `OP_RETURN` -- which can never pay the address being read. `inputs` are
+    `(address, value)` spent from, or `None` for a non-coinbase input whose `prevout` is
+    missing, which is the unresolved case. `coinbase` adds the coinbase input, which has no
+    `prevout` at all.
+    """
+
+    seed: int
+    block_time: int = BLOCK_TIME
+    outputs: tuple[tuple[str | None, int], ...] = ()
+    inputs: tuple[tuple[str, int] | None, ...] = ()
+    coinbase: bool = False
+
+    @property
+    def txid(self) -> str:
+        return txid_of(self.seed)
+
+    def funded(self, address: str) -> int:
+        """What this transaction paid `address`: its part of `funded_txo_sum`."""
+        return sum(value for owner, value in self.outputs if owner == address)
+
+    def spent(self, address: str) -> int:
+        """What this transaction spent from `address`: its part of `spent_txo_sum`."""
+        return sum(spend[1] for spend in self.inputs if spend is not None and spend[0] == address)
+
+    def document(self) -> dict[str, Any]:
+        """The transaction as `/txs/chain` renders it, per API.md and the measured example.
+
+        `Any` because a test mangles one field of it to script a refusal, and that is the
+        whole point of returning a plain mutable document.
+        """
+        vin: list[dict[str, Any]] = []
+        if self.coinbase:
+            vin.append(
+                {
+                    "txid": COINBASE_TXID,
+                    "vout": 4_294_967_295,
+                    "scriptsig": "03a1b2c3",
+                    "scriptsig_asm": "OP_PUSHBYTES_3 a1b2c3",
+                    "is_coinbase": True,
+                    "sequence": 4_294_967_295,
+                }
+            )
+        for index, spend in enumerate(self.inputs):
+            entry: dict[str, Any] = {
+                "txid": txid_of(self.seed * 1_000 + index + 1),
+                "vout": index,
+                "scriptsig": "",
+                "scriptsig_asm": "",
+                "witness": ["30440220"],
+                "is_coinbase": False,
+                "sequence": 4_294_967_293,
+            }
+            if spend is not None:
+                entry["prevout"] = _output_document(*spend)
+            vin.append(entry)
+        return {
+            "txid": self.txid,
+            "version": 2,
+            "locktime": 0,
+            "vin": vin,
+            "vout": [_output_document(owner, value) for owner, value in self.outputs],
+            "size": 223,
+            "weight": 562,
+            "fee": 564,
+            "status": {
+                "confirmed": True,
+                "block_height": 2_873_000 + self.seed,
+                "block_hash": txid_of(self.seed + 7_777_777),
+                "block_time": self.block_time,
+            },
+        }
+
+
+def _output_document(owner: str | None, value: int) -> dict[str, Any]:
+    """One `vout` entry, or a `prevout`, which API.md says has the same format."""
+    output: dict[str, Any] = {
+        "scriptpubkey": "0014abcdef",
+        "scriptpubkey_asm": "OP_0 OP_PUSHBYTES_20 abcdef",
+        "scriptpubkey_type": "v0_p2wpkh" if owner is not None else "op_return",
+        "value": value,
+    }
+    if owner is not None:
+        output["scriptpubkey_address"] = owner
+    return output
+
+
+def history_reply(
+    address: str,
+    transactions: Sequence[EsploraTx],
+    **overrides: Any,
+) -> Reply:
+    """An instance that serves `transactions` (newest first) and stats that agree with them.
+
+    `chain_stats` is computed from the transactions -- funded, spent, and the count of
+    distinct txids -- so a history test that changes nothing gets a history that proves
+    itself, and every incomplete arm is one override away: `tx_count=`, `funded=`, or a
+    different reply for the read after the paging.
+    """
+    distinct = {transaction.txid: transaction for transaction in transactions}
+    reply = Reply(
+        funded=sum(transaction.funded(address) for transaction in distinct.values()),
+        spent=sum(transaction.spent(address) for transaction in distinct.values()),
+        tx_count=len(distinct),
+        history=tuple(transaction.document() for transaction in transactions),
+    )
+    return replace(reply, **overrides)
+
+
+def history_address(request: httpx.Request) -> str:
+    """The address a `/address/{a}/txs/chain[/{txid}]` request is about."""
+    segments = request.url.path.split("/")
+    return segments[segments.index("address") + 1]
+
+
+def history_cursor(request: httpx.Request) -> str | None:
+    """The `last_seen_txid` a history request carried in its path, or `None` on page one."""
+    segments = request.url.path.split("/")
+    after_chain = segments[segments.index("chain") + 1 :]
+    return after_chain[0] if after_chain else None
+
+
+def is_history_request(request: httpx.Request) -> bool:
+    """Whether a request read a page of confirmed history rather than stats or the tip."""
+    return "/txs/chain" in request.url.path
 
 
 # --------------------------------------------------------------------------------------
@@ -128,6 +288,14 @@ class Reply:
     error: BaseException | None = None
     """Raised instead of answering, for the transport-failure arms."""
     tip: int = TIP_HEIGHT
+    tx_count: int = 2
+    """`chain_stats.tx_count` in the address body."""
+    history: Sequence[Mapping[str, Any]] = ()
+    """The confirmed transactions `/txs/chain` serves, newest first, as documents."""
+    page_size: int = 25
+    """How many transactions one page holds: 25, as both vendors document."""
+    ignore_cursor: bool = False
+    """Serve page one whatever the cursor says: a vendor that never ends the history."""
 
     def render(self, request: httpx.Request) -> str:
         """The body this reply sends for `request`.
@@ -142,13 +310,34 @@ class Reply:
             return self.body
         if request.url.path.endswith("/blocks/tip/height"):
             return str(self.tip)
+        if is_history_request(request):
+            return json.dumps(list(self.history_page(request)))
         return balance_body(
             requested_address(request),
             funded=self.funded,
             spent=self.spent,
             mempool_funded=self.mempool_funded,
             mempool_spent=self.mempool_spent,
+            tx_count=self.tx_count,
         )
+
+    def history_page(self, request: httpx.Request) -> Sequence[Mapping[str, Any]]:
+        """The page after the cursor, as Esplora pages: newest first, `page_size` long.
+
+        **An unknown cursor answers an empty page**, exactly as both hosts were measured to
+        on 2026-10-08 -- which is what makes an empty page useless as proof of the end. A
+        cursor that appears more than once answers from after its first appearance, so a
+        history scripted with a repeated transaction is served it twice.
+        """
+        cursor = None if self.ignore_cursor else history_cursor(request)
+        txids = [str(document.get("txid")) for document in self.history]
+        if cursor is None:
+            begin = 0
+        elif cursor in txids:
+            begin = txids.index(cursor) + 1
+        else:
+            begin = len(txids)
+        return self.history[begin : begin + self.page_size]
 
 
 def requested_address(request: httpx.Request) -> str:
@@ -236,6 +425,10 @@ class EsploraFake:
             for request in self._instances[host].requests
             if not request.url.path.endswith("/blocks/tip/height")
         ]
+
+    def history_requests(self) -> list[httpx.Request]:
+        """Every request that read a page of history, across both hosts, in order."""
+        return [request for request in self.requests if is_history_request(request)]
 
 
 # --------------------------------------------------------------------------------------

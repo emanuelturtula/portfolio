@@ -39,6 +39,7 @@ from portfolio.providers.prices.base import (
     SUPPORTED_PAIRS,
     DailyClose,
     DailyCloseSource,
+    HistoricalCloseSource,
     PriceQuote,
     PriceSource,
 )
@@ -91,6 +92,8 @@ def lifespan_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
     monkeypatch.setenv("PORTFOLIO_BALANCE_SYNC_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_REFRESH_ENABLED", "false")
     monkeypatch.setenv("PORTFOLIO_PRICE_BACKFILL_ENABLED", "false")
+    # Spec 038's rebuild reads every wallet's history at startup; its own suite turns it on.
+    monkeypatch.setenv("PORTFOLIO_BALANCE_REBUILD_ENABLED", "false")
     # #22's backup timer too. It is the first timer to reach its sleep when a copy is recent,
     # which is what `PacedSleep.reached()` waits for, so left on it answered for the timer a
     # test is about. Its directory is under `tmp_path` in case a test turns it back on.
@@ -1122,16 +1125,64 @@ class FakeDailyCloses:
 
 _CONFORMS_AS_A_DAILY_CLOSE_SOURCE: DailyCloseSource = FakeDailyCloses()
 
+#: The older fake's first day, three days before the recent fake's first.
+FAKE_OLDER_FIRST: Final = date(2026, 10, 3)
 
-def stub_daily_closes(monkeypatch: pytest.MonkeyPatch, source: FakeDailyCloses) -> list[object]:
-    """Replace `KrakenDailyCloses` where `main` imported it; return the clients it was given."""
+
+class FakeOlderCloses:
+    """A `HistoricalCloseSource` for BTC/USD, answering `closes` days inside the asked window.
+
+    The lifespan builds the real one as `CoinbaseDailyCloses(client)`; `stub_daily_closes`
+    replaces that name in `main` too. Answers nothing by default, so the day counts the
+    other tests assert are the recent fake's alone.
+    """
+
+    name = "an-older-candle-vendor"
+    pairs: frozenset[PricePair] = frozenset({("BTC", "USD")})
+    earliest_day = FAKE_OLDER_FIRST
+
+    def __init__(self, *, closes: Sequence[date] = ()) -> None:
+        self.closes = tuple(closes)
+        self.asked: list[tuple[PricePair, date, date]] = []
+
+    async def daily_closes_between(
+        self, pair: PricePair, first_day: date, last_day: date
+    ) -> Sequence[DailyClose]:
+        self.asked.append((pair, first_day, last_day))
+        return tuple(
+            DailyClose(day=day, close=FAKE_CLOSE)
+            for day in self.closes
+            if first_day <= day <= last_day
+        )
+
+
+_CONFORMS_AS_AN_OLDER_CLOSE_SOURCE: HistoricalCloseSource = FakeOlderCloses()
+
+
+def stub_daily_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    source: FakeDailyCloses,
+    older: FakeOlderCloses | None = None,
+) -> list[object]:
+    """Replace `KrakenDailyCloses` and `CoinbaseDailyCloses` where `main` imported them.
+
+    Returns the clients each was given, in the order they were built. Both are stubbed in
+    every test that runs the timer, because the real Coinbase source would otherwise ask
+    for the days before the fake's first close -- and the offline client refuses it.
+    """
     clients: list[object] = []
+    older_source = older if older is not None else FakeOlderCloses()
 
     def build(client: object) -> FakeDailyCloses:
         clients.append(client)
         return source
 
+    def build_older(client: object) -> FakeOlderCloses:
+        clients.append(client)
+        return older_source
+
     monkeypatch.setattr("portfolio.main.KrakenDailyCloses", build)
+    monkeypatch.setattr("portfolio.main.CoinbaseDailyCloses", build_older)
     return clients
 
 
@@ -1190,12 +1241,17 @@ async def test_the_price_backfill_is_scheduled_and_stores_closes_at_startup(
     """A fresh install backfills at startup: a running timer, and `close` rows on disk.
 
     Asserted as rows and as the log line, not as an object: a timer whose first tick is a
-    day away would satisfy `is not None` and fill nothing. The source is built once, over
+    day away would satisfy `is not None` and fill nothing. Both sources are built once, over
     the process-wide client the lifespan owns, and the timer stops with the application.
+
+    The older source (spec 038) is asked for the days before the recent fake's first close,
+    from its own first day, and its closes are stored under its own name.
     """
     await bring_the_schema_up(backfilled_lifespan)
     source = FakeDailyCloses()
-    clients = stub_daily_closes(monkeypatch, source)
+    older_days = (FAKE_OLDER_FIRST, FAKE_OLDER_FIRST + timedelta(days=2))
+    older = FakeOlderCloses(closes=older_days)
+    clients = stub_daily_closes(monkeypatch, source, older)
     app = create_app()
 
     with capture_logs() as captured:
@@ -1205,7 +1261,7 @@ async def test_the_price_backfill_is_scheduled_and_stores_closes_at_startup(
             assert scheduler.name == "price-backfill"
             assert scheduler.interval_seconds == 1440 * 60, "daily by default"
             assert is_running(scheduler) is True
-            assert clients == [app.state.http_client], "one source, over the shared client"
+            assert clients == [app.state.http_client] * 2, "two sources, one shared client"
             await asyncio.wait_for(
                 until(lambda: bool(events_named(captured, "price_backfill_finished"))),
                 timeout=5,
@@ -1213,10 +1269,17 @@ async def test_the_price_backfill_is_scheduled_and_stores_closes_at_startup(
 
     assert is_running(scheduler) is False
     rows = await history_in(backfilled_lifespan)
-    assert len(rows) == len(BACKFILL_PAIRS_UNDER_TEST) * len(FAKE_DAYS)
+    recent_rows = len(BACKFILL_PAIRS_UNDER_TEST) * len(FAKE_DAYS)
+    assert len(rows) == recent_rows + len(older_days)
     assert {row["basis"] for row in rows} == {"close"}
-    assert {row["source"] for row in rows} == {source.name}
+    assert [row["source"] for row in rows].count(older.name) == len(older_days)
+    assert {row["source"] for row in rows} == {source.name, older.name}
     assert sorted(source.asked) == sorted(BACKFILL_PAIRS_UNDER_TEST), "each pair asked once"
+    assert older.asked == [(("BTC", "USD"), FAKE_OLDER_FIRST, FAKE_DAYS[0] - timedelta(days=1))], (
+        "from its first day to the day before the earliest stored close"
+    )
+    (finished,) = events_named(captured, "price_backfill_finished")
+    assert finished["days"] == recent_rows + len(older_days)
 
 
 async def test_a_finished_backfill_logs_its_day_count_and_never_a_price(
@@ -1264,7 +1327,7 @@ async def test_an_incomplete_backfill_is_a_warning_naming_pairs_and_never_amount
 
     (incomplete,) = events_named(captured, "price_backfill_incomplete")
     assert incomplete["log_level"] == "warning"
-    assert incomplete["failed"] == ("KAS/USD",)
+    assert incomplete["failed"] == ("KAS/USD via a-candle-vendor",)
     assert incomplete["days"] == len(FAKE_DAYS)
     assert str(FAKE_CLOSE) not in repr(incomplete), "a price must never reach a log line"
     assert "did not answer" not in repr(incomplete), "nor the vendor's message"
@@ -1288,7 +1351,7 @@ async def test_the_price_backfill_is_not_built_when_disabled(
 
     disabled = [entry["scheduler"] for entry in events_named(captured, "scheduler_disabled")]
     assert disabled.count("price-backfill") == 1
-    assert clients == [], "a disabled timer builds no source"
+    assert clients == [], "a disabled timer builds neither source"
     assert source.asked == []
     assert await history_in(lifespan_database) == []
 

@@ -1,6 +1,6 @@
 """How the application's own sources stand, for `GET /api/health/detail` (#23, spec 030).
 
-`HealthService.detail` composes four sections: the backups (#22), the four timers, the
+`HealthService.detail` composes four sections: the backups (#22), the five timers, the
 balance sync per chain, and the prices. Each reports what its **last recorded attempt** says.
 
 ## No vendor is called, and nothing is configured into the answer
@@ -24,7 +24,7 @@ is held in memory.
 
 ## The sections, one by one
 
-* **`schedulers`** -- the four timers, by `SchedulerName`, in a fixed order. A timer that was
+* **`schedulers`** -- the five timers, by `SchedulerName`, in a fixed order. A timer that was
   never built is `disabled`; one that was is what `IntervalScheduler.status` says.
 * **`chains`** -- one entry per chain key that has an outcome in the latest finished balance
   run or is used by an active wallet, sorted by key. `state` is the newest finished run's
@@ -95,6 +95,7 @@ SCHEDULER_ORDER: Final[tuple[SchedulerName, ...]] = (
     SchedulerName.BALANCE_SYNC,
     SchedulerName.PRICE_REFRESH,
     SchedulerName.PRICE_BACKFILL,
+    SchedulerName.BALANCE_REBUILD,
     SchedulerName.BACKUP,
 )
 """The order the timers are served in: the order `main.lifespan` builds them."""
@@ -244,7 +245,7 @@ class HealthService:
         return None
 
     def _schedulers(self, now: datetime) -> tuple[SchedulerHealth, ...]:
-        """The four timers, in `SCHEDULER_ORDER`; one never built is `disabled`."""
+        """The five timers, in `SCHEDULER_ORDER`; one never built is `disabled`."""
         healths: list[SchedulerHealth] = []
         for name in SCHEDULER_ORDER:
             timer = self._timers.get(name)

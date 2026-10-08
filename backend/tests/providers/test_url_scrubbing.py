@@ -22,6 +22,7 @@ import pytest
 from portfolio.providers.http import (
     ADDRESS_BALANCE,
     ADDRESS_BALANCES,
+    ADDRESS_HISTORY,
     ASSET_DAILY_CLOSES,
     ASSET_PRICE,
     ASSET_PRICES,
@@ -388,10 +389,16 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     candles, Kraken's OHLC. Its own label rather than `asset_prices`, because it is a
     different call on a different schedule -- one per pair, once a day -- and a log that
     showed it hourly would be a timer misbehaving, which only a distinct label can show.
+
+    Eight at spec 038: `address_history` is one page of an address's confirmed transactions,
+    or the count the history is checked against. It comes in dozens for one wallet, so a log
+    full of these is a rebuild running -- and one full of them every hour is a timer
+    misbehaving, which a balance label could not show.
     """
     assert sorted(ENDPOINT_LABELS) == [
         "address_balance",
         "address_balances",
+        "address_history",
         "asset_daily_closes",
         "asset_price",
         "asset_prices",
@@ -400,6 +407,7 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     ]
     assert ADDRESS_BALANCE == "address_balance"
     assert ADDRESS_BALANCES == "address_balances"
+    assert ADDRESS_HISTORY == "address_history"
     assert ASSET_DAILY_CLOSES == "asset_daily_closes"
     assert ASSET_PRICE == "asset_price"
     assert ASSET_PRICES == "asset_prices"

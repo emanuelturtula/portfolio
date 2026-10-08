@@ -662,3 +662,125 @@ async def test_a_post_that_exhausts_every_endpoint_is_classified_the_same_way() 
             await endpoints.post(PATH, ADDRESS_BALANCES, 0, json={"addresses": []}, idempotent=True)
 
     assert recorder.counts == {FIRST_HOST: 1, SECOND_HOST: 1}
+
+
+# --------------------------------------------------------------------------------------
+# A read that also returns the response's headers (spec 038)
+# --------------------------------------------------------------------------------------
+
+#: A response header name in the vendor's own spelling, and the value each host sends for
+#: it -- different per host, so an assertion can tell whose headers came back.
+CURSOR_HEADER: Final = "X-Next-Page-Before"
+FIRST_CURSOR: Final = "1791399355848"
+SECOND_CURSOR: Final = "1791399300001"
+
+
+class HeaderRecorder:
+    """Like `Recorder`, but every answer carries a header naming the host that sent it.
+
+    The failover arm is only meaningful if the two hosts' headers differ: a read that
+    returned the first host's headers alongside the second host's body would pass any test
+    in which both hosts sent the same value.
+    """
+
+    def __init__(self, first: int, second: int = 200) -> None:
+        self._statuses = {FIRST_HOST: first, SECOND_HOST: second}
+        self._cursors = {FIRST_HOST: FIRST_CURSOR, SECOND_HOST: SECOND_CURSOR}
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        host = str(request.url.host)
+        return httpx.Response(
+            self._statuses[host],
+            headers={CURSOR_HEADER: self._cursors[host]},
+            content=f'{{"host": "{host}"}}',
+        )
+
+    @property
+    def hosts_in_order(self) -> list[str]:
+        return [str(request.url.host) for request in self.requests]
+
+
+async def test_a_read_with_headers_returns_the_body_the_headers_and_the_index() -> None:
+    """The three things a header-cursor pager needs, from one request.
+
+    The headers are `httpx`'s own case-insensitive mapping, so the vendor's capitalisation
+    and a lower-case lookup are the same key -- which is what lets the caller name the
+    header once without guessing how a CDN will have re-cased it.
+    """
+    recorder = HeaderRecorder(200)
+    client = client_over(recorder)
+    endpoints = endpoint_set(client, FIRST_URL, SECOND_URL)
+
+    async with client:
+        body, headers, index = await endpoints.read_with_headers(PATH, ADDRESS_BALANCE)
+
+    assert json.loads(body) == {"host": FIRST_HOST}
+    assert headers[CURSOR_HEADER] == FIRST_CURSOR
+    assert headers.get(CURSOR_HEADER.lower()) == FIRST_CURSOR
+    assert index == 0
+    assert recorder.hosts_in_order == [FIRST_HOST]
+    request = recorder.requests[0]
+    assert request.method == "GET"
+    assert request.url == f"{FIRST_URL}{PATH}"
+    assert request.extensions.get(ENDPOINT_EXTENSION) == ADDRESS_BALANCE
+
+
+async def test_a_read_with_headers_fails_over_and_returns_the_answering_hosts_headers() -> None:
+    """The same rule as `read`, and the headers belong to the host whose body came back.
+
+    A cursor taken from one host and a page from another would be a pager following a
+    position in a history it is not reading.
+    """
+    recorder = HeaderRecorder(403)
+    client = client_over(recorder)
+    endpoints = endpoint_set(client, FIRST_URL, SECOND_URL)
+
+    async with client:
+        body, headers, index = await endpoints.read_with_headers(PATH, ADDRESS_BALANCE, 0)
+
+    assert json.loads(body) == {"host": SECOND_HOST}
+    assert headers[CURSOR_HEADER] == SECOND_CURSOR
+    assert index == 1
+    assert recorder.hosts_in_order == [FIRST_HOST, SECOND_HOST]
+
+
+async def test_a_read_with_headers_is_sticky_from_the_start_index() -> None:
+    """Starting at 1 skips the first host entirely, as for `read`."""
+    recorder = HeaderRecorder(200)
+    client = client_over(recorder)
+    endpoints = endpoint_set(client, FIRST_URL, SECOND_URL)
+
+    async with client:
+        _body, headers, index = await endpoints.read_with_headers(PATH, ADDRESS_BALANCE, 1)
+
+    assert headers[CURSOR_HEADER] == SECOND_CURSOR
+    assert index == 1
+    assert recorder.hosts_in_order == [SECOND_HOST]
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [
+        (429, ProviderRateLimitedError),
+        (503, ProviderUnavailableError),
+        (404, ProviderResponseError),
+    ],
+)
+async def test_a_read_with_headers_that_exhausts_every_endpoint_is_classified_as_read_is(
+    status: int, error: type[Exception]
+) -> None:
+    """The classification is the shared loop's, so the three outcomes are `read`'s three."""
+    recorder = HeaderRecorder(status, status)
+    client = client_over(recorder)
+    endpoints = endpoint_set(client, FIRST_URL, SECOND_URL)
+
+    async with client:
+        with pytest.raises(error) as caught:
+            await endpoints.read_with_headers(PATH, ADDRESS_BALANCE, 0)
+
+    assert getattr(caught.value, "status", None) == status
+    assert recorder.hosts_in_order == [FIRST_HOST, SECOND_HOST]
+    assert FIRST_CURSOR not in str(caught.value)
+    assert SECOND_CURSOR not in str(caught.value)

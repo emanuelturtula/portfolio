@@ -35,6 +35,7 @@ export const TIMER_NAMES: Record<SchedulerName, string> = {
   'balance-sync': 'Balance sync',
   'price-refresh': 'Price refresh',
   'price-backfill': 'Price backfill',
+  'balance-rebuild': 'Balance rebuild',
   backup: 'Backup',
 };
 

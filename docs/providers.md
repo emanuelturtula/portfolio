@@ -447,7 +447,9 @@ The statuses are the ones the sections below establish, and each row's detail is
 | rate limit, mempool.space | no number published. Exceeding it is a 429, and exceeding it repeatedly may end in a ban | **confirmed** 2026-09-22, read again 2026-10-03 |
 | rate limit, blockstream.info | none documented | **confirmed** 2026-09-22, read again 2026-10-03 |
 | our pacing | one request a second per host, `DEFAULT_MIN_HOST_INTERVAL_MS` | **unverified**: a guess from the ban warning. A 429 in a production log would settle it, and the operator is the one to see it |
-| retention or history window | none needed: a balance read asks for no history | **unverified** for both vendors, and moot until something reads transaction history. No issue owns it |
+| history read, for the rebuild | `GET /address/{address}/txs/chain/{last_seen_txid}`, 25 a page, labelled `address_history`, between two balance reads | **confirmed** 2026-10-08, both vendors' documentation; **measured** 2026-10-08 on both hosts. Detail in *Transaction history, for the balance rebuild* |
+| an empty page | not proof of the end: a cursor not in the history answers `200 []` too. Completeness is proven by the count and the balance instead | **measured** 2026-10-08 |
+| retention or history window | none: every history measured reached its first transaction | **measured** 2026-10-08 back to 2025-09 on mainnet; **unverified** further back |
 | error statuses | none documented, so every mapping is by status alone | **unverified**: neither vendor documents one. An address is validated offline, so the case is not asked |
 | an address never used | assumed to answer in the documented shape, with zeros | **unverified**. A 404 instead would fail the scan as `response`, loudly; no issue owns it |
 | `mempool_stats` | read as `pending=None` when it is absent | **unverified** that it is always sent |
@@ -468,7 +470,9 @@ The statuses are the ones the sections below establish, and each row's detail is
 | what is in front | Cloudflare, with `Cache-Control: public, max-age=8` on a balance answer and on an error | **measured** 2026-09-23 |
 | networks | the public instance serves mainnet only; a test-network address is a 422 | **measured** 2026-09-23 |
 | checksums | the vendor does not check them | **measured** 2026-09-23 |
-| retention or history window | none needed: a balance read asks for no history | **unverified**, and moot until something reads transaction history. No issue owns it |
+| history read, for the rebuild | `GET /addresses/{address}/full-transactions-page?limit=500&resolve_previous_outpoints=light`, paged by `X-Next-Page-Before`, labelled `address_history`, between reads of `transactions-count` and `balance` | **confirmed** 2026-10-08, from the live OpenAPI document; **measured** 2026-10-08. Detail in *Transaction history, for the balance rebuild* |
+| `block_time` | epoch **milliseconds** | **measured** 2026-10-08: the document gives no unit for the field, only for the cursors |
+| retention or history window | none: a history from 2023-01-29 was served whole | **measured** 2026-10-08; **unverified** before 2023-01 |
 | `isUtxoIndexed` | required true for a node to count as usable | **unverified** what the field means when false. The vendor's documentation or source would settle it; no issue owns it |
 
 ### Confirmed against the published documentation, read on 2026-09-22
@@ -703,6 +707,122 @@ vendor's own documentation, and record here what you confirmed and what you assu
 those words, **with the date you read it** -- an unverified fact and a fact verified two
 years ago are different things, and only one of them says so.
 
+### Transaction history, for the balance rebuild: confirmed and measured on 2026-10-08
+
+The balance rebuild (spec 038) reads every confirmed transaction of an address. Everything
+below was read on **2026-10-08** in each vendor's own documentation and measured against the
+live services the same day, with addresses taken at run time from blocks the services served
+and kept in memory only. None is written here.
+
+#### Esplora: `/address/{address}/txs/chain`
+
+**Confirmed against the documentation** (Blockstream's `API.md`, and mempool.space's REST
+documentation, read from the page's own script bundle because the page is a single-page app):
+
+- Amounts: "Amounts are always represented in satoshis."
+- `GET /address/:address/txs/chain[/:last_seen_txid]`: "Get confirmed transaction history for
+  the specified address/scripthash, sorted with newest first. Returns 25 transactions per page.
+  More can be requested by specifying the last txid seen by the previous query." mempool.space
+  carries the same text, but its URL template shows only `/address/:address/txs/chain`.
+- `GET /address/:address` answers `chain_stats` and `mempool_stats`, each with `tx_count`,
+  `funded_txo_count`, `funded_txo_sum`, `spent_txo_count` and `spent_txo_sum`.
+- A transaction carries `vin[]` with `is_coinbase` and `prevout` ("previous output in the same
+  format as in vout"), `vout[]` with `scriptpubkey_address` and `value`, and `status` with
+  `confirmed`, `block_height`, `block_hash` and `block_time`.
+- Rate limits: mempool.space enforces them, with a 429 and possibly a ban, and publishes no
+  number. Blockstream's `API.md` says nothing about them.
+
+**Measured on both hosts**, over five histories (two mainnet, one of them fully spent; one
+testnet3; one testnet4 address of coinbase transactions only; and the first page of an
+address with about 1.2 million transactions):
+
+| | What came back |
+|---|---|
+| page size | 25, then the remainder, then `[]` |
+| paging by the last txid of the previous page | reaches the oldest transaction, no duplicate, and the total equals `chain_stats.tx_count` in every case |
+| **a cursor not in the history** | **`200 []`, the same answer as the end of the history**. An empty page does not prove the end |
+| `?after_txid=` on `/txs/chain` | **ignored by both hosts**: the first page again. A pager relying on it loops on page 1 |
+| `/txs` (not used) | up to 50 confirmed on mempool.space, 25 on blockstream.info, with pending ones mixed in |
+| order | newest first by `block_height` |
+| `funded_txo_sum` and `spent_txo_sum` | the outputs to the address and the `prevout` values of the inputs from it, summed over every transaction |
+| the walk back from `funded_txo_sum − spent_txo_sum` | ends at exactly 0, never below, in all five histories |
+| a coinbase input | `is_coinbase: true`, no `prevout` |
+| types | every amount, height and time a JSON integer; `block_time` in Unix seconds, equal to the block header's time |
+| a pending transaction's `status` | `{"confirmed": false}`: the other keys are **absent**, not `null` as `API.md` says |
+| rate-limit headers | none on either host |
+
+**Not documented, and not relied on:** the order of transactions within one block; how a
+reorganisation affects a cursor (measured: an unknown one answers `[]`); any retention limit
+(every history measured reached its first transaction, back to 2025-09 on mainnet; a
+multi-year walk was not run). Header times are not guaranteed to rise with height, so two
+transactions a block apart can fall on days in the other order; the rebuild dates each by its
+own block time, and a walk that this would take below zero is refused rather than stored.
+
+**What the reader does with that.** It pages with the path form only, the one both hosts
+honour, at most `tx_count // 25 + 2` pages, checking each txid before it goes back into a
+path. It does not take an empty page as proof: it reads `/address/{address}` before and
+after the paging, and calls the history complete only when the two reads agree, the distinct
+transactions collected number `chain_stats.tx_count`, and their effects add up to
+`funded_txo_sum − spent_txo_sum`. Otherwise it answers `count_mismatch`, `balance_mismatch` or
+`moved_during_read`, and the rebuild stores nothing.
+
+#### Kaspa: `/addresses/{address}/full-transactions-page`
+
+**Confirmed against the live OpenAPI document** (https://api.kaspa.org/openapi.json, version
+`d0ea012`):
+
+- `limit`: "The max number of records to get. For paging combine with using 'before/after'
+  from oldest previous result. Use value of X-Next-Page-Before/-After as long as header is
+  present to continue paging. The actual number of transactions returned for each page can be
+  != limit." Minimum 1, **maximum 500**, default 50.
+- `before` and `after`: "block time before / after this (epoch-millis)".
+- `resolve_previous_outpoints`: `no`, `light` or `full`; "Light fetches only the adress and
+  amount."
+- A transaction carries `transaction_id`, `block_time`, `is_accepted`, `inputs[]` and
+  `outputs[]`. An input's `previous_outpoint_address` and `previous_outpoint_amount` are
+  **optional** in the schema; an output's `amount` is a required integer. No unit is given for
+  `block_time`.
+- `GET /addresses/{address}/transactions-count` answers `{"total": <int>}`, and
+  `GET /addresses/{address}/balance` answers `{"address", "balance"}`.
+- No rate limit is documented.
+- `GET /addresses/{address}/balance/{day_or_month}` is titled "EXPERIMENTAL - EXPECT BREAKING
+  CHANGES" and is "only available for larger addresses". **Not used**: it answered `[]` for
+  every mainnet address measured and is disabled on the test network.
+
+**Measured**, over five histories (four mainnet, of 66, 118, 702 and 2,247 transactions, the
+largest from 2023-01-29 to 2024-01-25; one testnet-10):
+
+| | What came back |
+|---|---|
+| page size | up to `limit`, and **once 501 for 500**: the server completes the millisecond at the boundary, so the exclusive `before` cursor loses nothing |
+| `X-Next-Page-Before` | present on every page but the last, and equal to the smallest `block_time` on the page |
+| following it | reaches the oldest transaction, with no duplicate and no gap; the count equals `transactions-count.total` in every case |
+| the end | the last page has no `X-Next-Page-Before`; no trailing empty page |
+| `limit=501` | 422 |
+| order | newest first |
+| `block_time` | **epoch milliseconds** |
+| amounts | JSON integers in sompi; `mass` and `previous_outpoint_index` are strings |
+| `light` resolution | every input of every history had its address and amount |
+| reconciliation | outputs to the address minus resolved inputs from it equals `/balance`, before and after the paging, and the walk back ends at exactly 0 |
+| `is_accepted` | `true` on all 3,154 rows read; `acceptance=rejected` answered `[]` |
+| caching | Cloudflare, `max-age=8` |
+
+**Not documented, and not relied on:** what an unaccepted transaction looks like, and whether
+`transactions-count` counts it (none was ever seen); that the boundary millisecond is always
+completed (seen once); any rate limit; any retention before 2023-01.
+
+**What the reader does with that.** It pages with `limit=500` and
+`resolve_previous_outpoints=light`, following `X-Next-Page-Before` while it is sent, never
+computing the cursor itself, and de-duplicating by `transaction_id`. It counts only accepted
+transactions, and an input without its address or amount is `unresolved_input`, never a zero.
+The cursor is checked to be digits before it goes into the URL, and the paging stops at
+`total // 500 + 2` pages. Cloudflare's eight-second cache can serve the "after" reads from the
+same copy as the "before" ones on a short history, which weakens the before-and-after check;
+the count and the sum still have to agree with each other.
+It reads the count and the balance before and after the paging, and the history is complete
+only when both agree, the transactions number the count, and their effects add up to the
+balance. A transaction's day is the UTC date of its `block_time`, in milliseconds.
+
 ## Extended public keys
 
 Spec 031. A Bitcoin wallet can be registered by its account extended public key instead of
@@ -905,6 +1025,24 @@ detail beneath each status is in *Kraken's daily candles, confirmed and measured
 | a close, once committed | assumed never to change | **unverified**: nothing documents it either way. The backfill rewrites every day it receives, every day, so a correction inside the window would be picked up |
 | rate limit | per-API-key call counters are documented; a public, unauthenticated call is not addressed | **confirmed** 2026-10-08, Kraken's Spot REST rate-limit guide. **Not measured**. Two calls a day, at the shared one-request-a-second floor |
 
+#### Coinbase Exchange's daily candles, for BTC before Kraken's window
+
+Read by `CoinbaseDailyCloses` in `providers/prices/coinbase.py`, only by the price backfill and
+only for days before the earliest stored close (spec 038, R8). Detail in *Coinbase Exchange's
+daily candles, confirmed and measured on 2026-10-08*, below.
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| endpoint | `GET https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400&start=<day>T00:00:00Z&end=<day>T00:00:00Z`, labelled `asset_daily_closes` | **confirmed** 2026-10-08, Coinbase's API reference; **measured** 2026-10-08 |
+| key | none: `security: []` | **confirmed** 2026-10-08 |
+| pairs | BTC/USD only. Coinbase Exchange lists no KAS product | **measured** 2026-10-08 |
+| a window | at most 300 days, both ends sent; the next starts the day after | **confirmed** 2026-10-08 as "300 candles"; **measured** as 300 *intervals*, both ends inclusive |
+| a candle | `[time, low, high, open, close, volume]`, prices as **JSON numbers**, parsed straight to `Decimal`. The close is index 4 | **measured** 2026-10-08: the documentation's "decimals as strings" rule does not hold here |
+| a candle's day | the UTC date of `time`; any time not at 00:00 UTC is refused, any day outside the window dropped | **measured** 2026-10-08 |
+| first day | 2015-07-20; nothing before it is asked | **measured** 2026-10-08 |
+| today | never asked: the range ends yesterday at the latest | **measured** 2026-10-08 that a range reaching today returns today's moving candle |
+| rate limit | 10 requests a second per IP, bursts to 15, a 429 beyond | **confirmed** 2026-10-08. Twelve requests on the first fill, none after, at the shared floor |
+
 #### Coinbase, the first fallback for bitcoin
 
 | | What the code uses or assumes | Status |
@@ -1101,9 +1239,60 @@ window would be picked up by the next run.
 **What the window means for the history.** A day more than 720 days old can only be in
 `price_history` because the backfill ran while that day was still inside the window. The
 daily timer keeps the history complete from the first deploy onward; days that had already
-left the window by then are a gap. PR 4 of the owner's plan (spec 037, *Scope*) adds Coinbase
-candles for older BTC days. **KAS before 2024-11-19 has no Kraken price at all**, so those days
-show as a gap — never as zero.
+left the window by then are a gap, except BTC's: Coinbase's candles fill those back to
+2015-07-20 (spec 038, below). **KAS before 2024-11-19 has no price at all** -- Kraken has none
+and Coinbase lists no KAS -- so those days show as a gap, never as zero.
+
+### Coinbase Exchange's daily candles, confirmed and measured on 2026-10-08
+
+Kraken keeps 720 daily candles, so BTC before 2024-10-18 needs a second source (spec 038,
+R8). Read on **2026-10-08** in Coinbase's own documentation --
+https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-candles,
+the Exchange rate-limit and types pages, and the Exchange OpenAPI specification -- and measured
+against the live API the same day.
+
+**Confirmed against the documentation:**
+
+- `GET /products/{product_id}/candles` at `https://api.exchange.coinbase.com/`, with
+  `security: []`: no key.
+- "Historic rates for a product. Rates are returned in grouped buckets." The response items
+  are "`time` bucket start time, `low`, `high`, `open`, `close`, `volume`".
+- `granularity` "must be one of the following "second" values: `{60, 300, 900, 3600, 21600,
+  86400}`, or your request is rejected." 86400 is a day.
+- "If the `start` or `end` fields are not provided, both fields are ignored." Both are always
+  sent.
+- "The maximum number of data points for a single request is `300` candles."
+- "Historical rate data may be incomplete. No data is published for intervals where there are
+  no ticks." and "Historical rates should *not* be polled frequently."
+- Rate limits for public endpoints: "Requests per second per IP: 10", bursts "Up to 15", and a
+  `429 Too Many Requests` beyond.
+- The format of `start` and `end`, the order of the candles and the type of each element are
+  **not documented**.
+
+**Measured against the live API:**
+
+| | What came back |
+|---|---|
+| `BTC-USD`, a day granularity, 2023-01-01 to 2023-10-01 | 274 candles: both ends inclusive, newest first, every `time` at 00:00 UTC in Unix seconds, no missing day |
+| a candle's types | `time` an integer; the four prices JSON **numbers** -- some bare integers -- and never strings, against the documentation's general rule that "decimal numbers are returned as strings" |
+| 300 intervals in one request | 301 candles; 301 intervals is a `400` naming the count. The limit counts intervals, not candles |
+| `start` or `end` alone | both ignored: the 350 most recent candles, today's moving one included |
+| `start` and `end` as ISO 8601 with `Z`, a date alone, or Unix seconds | all accepted alike |
+| 2015-07-01 to 2015-08-01 | the first candle is **2015-07-20**; 2014 answers `[]` |
+| 2015-07-20 to 2024-10-18, in twelve windows | 3,379 candles, no missing day, no duplicate |
+| `KAS-USD` | 404; `GET /products` lists no KAS product |
+| headers | Cloudflare, `max-age=300`; no rate-limit header |
+
+**The float boundary.** The prices arrive as JSON numbers, so a plain `json.loads` would make
+floats in `providers/` -- what rule 2 bans. `decode_json` builds every JSON number as a
+`Decimal` from the digits the vendor sent, a bare integer arrives as an `int`, and
+`require_price` decides each close, as for every source.
+
+**Assumed, and written down as an assumption:** that a past day's candle does not change.
+Nothing documents it either way, and a response can be five minutes stale through the cache.
+Unlike Kraken's window, the range Coinbase fills is asked **once**: a correction made after the
+first fill is not picked up. A day it has no candle for is a gap, never a zero, and is not
+asked for again.
 
 ### The Kaspa price endpoint's currency is an assumption, not a fact
 
@@ -1328,11 +1517,21 @@ Inside the application, two things reach a **price** source, and both are timers
 - **the price backfill** (spec 037), every `PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES`
   minutes -- 1440, a day, by default -- plus once at startup when the newest `close` row's
   `recorded_at` is older than one interval, which also counts successes. It asks Kraken's
-  OHLC endpoint for each of its two pairs and writes every committed close. While both pairs
-  fail, a crash loop costs two calls per restart.
+  OHLC endpoint for each of its two pairs and writes every committed close, then asks
+  Coinbase Exchange for any BTC/USD days before the earliest stored close -- twelve calls
+  the first time, none once filled. While both Kraken pairs fail, a crash loop costs two
+  calls per restart, plus up to Coinbase's twelve while its range is unfilled.
 
-There is no coordinator and no join for either, because there is no endpoint that can ask for
-one: nothing in a request path may reach a price vendor, which is the contract.
+A third thing reaches a **chain** provider, and it is a timer too: **the balance rebuild**
+(spec 038), every `PORTFOLIO_BALANCE_REBUILD_INTERVAL_MINUTES` minutes -- 1440 by default --
+plus once at startup when the newest `reconstructed_balances.rebuilt_at` is older than one
+interval. It reads each active wallet's addresses' whole confirmed history, one address at a
+time through the same shared client, so the per-host floor counts its requests with the
+sync's. It has no coordinator either: no endpoint asks for a rebuild.
+`portfolio rebuild-balances` is the same work on demand.
+
+There is no coordinator and no join for either price timer, because there is no endpoint that
+can ask for one: nothing in a request path may reach a price vendor, which is the contract.
 `portfolio refresh-prices` and `portfolio backfill-prices` are the same work on demand, each in
 a process of its own with a client of its own.
 
@@ -1341,8 +1540,8 @@ is left, rounded up to a whole second, so a deploy resumes the schedule rather t
 it back -- the first version pushed it back, and every deploy left prices stale for most of
 an hour.
 
-**Three timers reach a provider, each its own task with its own switch, and they share no
-state.** A fourth, the backup timer (#22), reaches none. `services/scheduler.py` is generic
+**Four timers reach a provider, each its own task with its own switch, and they share no
+state.** A fifth, the backup timer (#22), reaches none. `services/scheduler.py` is generic
 over what it ticks -- it takes "when did this last happen" and "do it" -- so the timers are
 instances rather than loops, and none can stop another. They are separate because they
 answer to different vendors, or to the same vendor on a different schedule:

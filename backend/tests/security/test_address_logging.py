@@ -611,6 +611,11 @@ ADDRESS_HANDLING_MODULES: Final = (
     SOURCE_ROOT / "domain" / "extended_keys.py",
     SOURCE_ROOT / "providers" / "chains" / "bitcoin.py",
     SOURCE_ROOT / "repositories" / "derived_addresses.py",
+    # Spec 038. The rebuild reads every address a wallet owns, one history at a time, and
+    # the Kaspa reader is handed each of them; a reason it reports is a wallet id and a word.
+    SOURCE_ROOT / "providers" / "chains" / "kaspa.py",
+    SOURCE_ROOT / "services" / "balance_rebuild.py",
+    SOURCE_ROOT / "main.py",
 )
 
 #: Names that would carry an address into a log call's keyword arguments.

@@ -7,7 +7,8 @@ price a day should have beyond the one rule the table exists to keep (R2), and n
 
 `amount` is a `TEXT` column, and `SUM()`, `ORDER BY` and `<` on it go through SQLite's numeric
 affinity, the float this application keeps money away from. Rows are read whole and ordered
-by `day`, a date stored as `YYYY-MM-DD` text, which orders as dates do.
+by `day`, a date stored as `YYYY-MM-DD` text, which orders as dates do -- and for the same
+reason `earliest_close_day` may take a `MIN()` over it.
 
 ## Why read-then-write
 
@@ -129,6 +130,23 @@ class PriceHistoryRepository:
         found: dict[int, dict[date, Decimal]] = {}
         for row in rows:
             found.setdefault(row.asset_id, {})[row.day] = row.amount
+        return found
+
+    async def earliest_close_day(self, asset_id: int, quote_currency: str) -> date | None:
+        """The first day this pair has a `close` for, or `None` when it has none (spec 038).
+
+        Where the backfill's older source stops: it fills only the days before this one (R8).
+        An `observed` row does not count -- it is the refresh's price, not a close, and a
+        close for its day is still owed. `MIN()` over `day`, a date stored as `YYYY-MM-DD`
+        text, is an ordering on a date, not on money.
+        """
+        found: date | None = await self._session.scalar(
+            select(func.min(PriceHistory.day)).where(
+                PriceHistory.asset_id == asset_id,
+                PriceHistory.quote_currency == quote_currency,
+                PriceHistory.basis == CLOSE,
+            )
+        )
         return found
 
     async def latest_close_recorded_at(self) -> datetime | None:

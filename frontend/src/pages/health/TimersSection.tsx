@@ -46,12 +46,12 @@ function TimerItem({ timer }: { readonly timer: SchedulerStatus }) {
 }
 
 /**
- * The four timers: the balance sync, the price refresh, the price backfill and the backup.
- * Each shows its state in words, when it last finished a tick and how that tick ended. A timer
- * that never ticked says so ("none since the server started": the record is in memory). A timer
- * that is `disabled` is told apart from one that is `stopped` and shows its state only, since a
- * switched-off timer never ticks (spec 030, R11). The backend always lists all four, so there is
- * no empty state. See docs/specs/030-observability.md.
+ * The five timers: the balance sync, the price refresh, the price backfill, the balance rebuild
+ * and the backup. Each shows its state in words, when it last finished a tick and how that tick
+ * ended. A timer that never ticked says so ("none since the server started": the record is in
+ * memory). A timer that is `disabled` is told apart from one that is `stopped` and shows its
+ * state only, since a switched-off timer never ticks (spec 030, R11). The backend always lists
+ * all five, so there is no empty state. See docs/specs/030-observability.md.
  */
 export function TimersSection({ timers }: TimersSectionProps) {
   return (

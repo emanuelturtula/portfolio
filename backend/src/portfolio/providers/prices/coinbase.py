@@ -27,30 +27,42 @@ The shared per-host floor applies.
 one pair in its path -- there is no batch form -- so valuing both BTC pairs from here costs
 two requests where Kraken costs part of one. It is a fallback that is only reached when the
 primary has failed, so the cost is paid on a bad day rather than every hour.
+
+## Daily candles, from a different host (spec 038)
+
+`CoinbaseDailyCloses`, at the bottom, reads BTC/USD daily candles from **Coinbase Exchange**,
+`api.exchange.coinbase.com` -- a different API on a different host from the spot price above.
+Kraken keeps 720 daily candles; Coinbase Exchange has BTC-USD from 2015-07-20 with no missing
+day, measured on 2026-10-08, so the backfill asks it for the days before the earliest close
+it has stored and nothing else (R8). There is no KAS product on Coinbase Exchange either.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, date, timedelta
 from typing import TYPE_CHECKING, Final
 
-from portfolio.providers.base import require_json_object
+from portfolio.providers.base import decode_json, require_json_object
 from portfolio.providers.endpoints import PRIMARY, EndpointSet
 from portfolio.providers.errors import (
     ProviderError,
     ProviderRateLimitedError,
     ProviderResponseError,
 )
-from portfolio.providers.http import ASSET_PRICE
+from portfolio.providers.http import ASSET_DAILY_CLOSES, ASSET_PRICE, utc_now
 from portfolio.providers.prices.base import (
     BTC,
     EUR,
     USD,
+    DailyClose,
     PriceQuote,
     require_price,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Mapping, Sequence
+    from datetime import datetime
+    from decimal import Decimal
 
     import httpx
 
@@ -58,11 +70,20 @@ if TYPE_CHECKING:
     from portfolio.providers.prices.base import PricePair
 
 __all__ = [
+    "CANDLES_PATH",
+    "CANDLE_PRODUCTS",
     "COINBASE",
     "COINBASE_API_URL",
+    "COINBASE_EXCHANGE_API_URL",
+    "DAILY_GRANULARITY_SECONDS",
+    "EARLIEST_CANDLE_DAY",
+    "MAX_DAYS_PER_REQUEST",
     "SPOT_PAIRS",
     "SPOT_PATH",
+    "CoinbaseDailyCloses",
     "CoinbasePriceSource",
+    "candle_windows",
+    "parse_candles",
     "parse_spot",
 ]
 
@@ -232,3 +253,244 @@ class CoinbasePriceSource:
         path = SPOT_PATH.format(pair=f"{asset_symbol}-{quote_currency}")
         body, _index = await self._endpoint.read(path, ASSET_PRICE)
         return parse_spot(body, pair)
+
+
+# --------------------------------------------------------------------------------------
+# Daily candles from Coinbase Exchange, for the days before Kraken's window (spec 038)
+# --------------------------------------------------------------------------------------
+
+COINBASE_EXCHANGE_API_URL: Final = "https://api.exchange.coinbase.com"
+"""Coinbase Exchange's public REST root, a constant for the reason `COINBASE_API_URL` is one.
+
+**Not the same host as `COINBASE_API_URL`.** The spot price is Coinbase's retail API; candles
+are the Exchange API's, documented at docs.cdp.coinbase.com with this server and
+`security: []` -- no key. Measured on 2026-10-08.
+"""
+
+CANDLES_PATH: Final = "/products/{product}/candles"
+"""Confirmed against Coinbase's documentation and the live service on 2026-10-08.
+
+`{product}` comes only from `CANDLE_PRODUCTS`, never from a caller's string."""
+
+EXCHANGE_VENDOR: Final = "Coinbase Exchange"
+"""What the upstream is called in a refusal or an exhaustion message: the brand, never a host."""
+
+CANDLE_PRODUCTS: Final[Mapping[PricePair, str]] = {(BTC, USD): "BTC-USD"}
+"""Our pair to Coinbase Exchange's product id. BTC/USD only.
+
+USD only for the reason `kraken.BACKFILL_PAIRS` gives, and no KAS because there is none to
+ask for: `GET /products/KAS-USD` is a 404 and `GET /products` lists no KAS product, measured
+on 2026-10-08. KAS before Kraken's first KAS candle stays a gap (spec 038).
+"""
+
+EARLIEST_CANDLE_DAY: Final = date(2015, 7, 20)
+"""The first day BTC-USD has a daily candle, measured: 2015-07-01..08-01 starts on the 20th,
+and 2014 answers `[]`. Nothing before it is ever asked for."""
+
+DAILY_GRANULARITY_SECONDS: Final = 86_400
+"""One candle per day: `86400` is one of the six documented granularities."""
+
+MAX_DAYS_PER_REQUEST: Final = 300
+"""The most days one request asks for: a window of `start=D`, `end=D+299 days`.
+
+Documented as "the maximum number of data points for a single request is 300 candles", and
+measured as a limit on *intervals* with both ends inclusive: 300 intervals answered 301
+candles and 301 intervals were a `400`. A window of 300 days is 299 intervals, so it is
+inside both readings and never asks for more than 300 candles.
+"""
+
+CANDLE_CLOSE_INDEX: Final = 4
+"""Where the close is: `[time, low, high, open, close, volume]`. Not Kraken's order, whose
+index 4 is also the close but whose index 1 is the open rather than the low."""
+
+_EPOCH_DAY: Final = date(1970, 1, 1)
+
+
+def candle_windows(first_day: date, last_day: date) -> tuple[tuple[date, date], ...]:
+    """The `(start, end)` days of each request covering `first_day..last_day`, oldest first.
+
+    Each window holds at most `MAX_DAYS_PER_REQUEST` days, both ends inclusive, and the next
+    starts the day after the previous one ends, so no day is asked for twice. An empty range
+    is no window at all.
+    """
+    windows: list[tuple[date, date]] = []
+    start = first_day
+    while start <= last_day:
+        end = min(start + timedelta(days=MAX_DAYS_PER_REQUEST - 1), last_day)
+        windows.append((start, end))
+        start = end + timedelta(days=1)
+    return tuple(windows)
+
+
+def parse_candles(
+    body: str | bytes,
+    product: str,
+    first_day: date,
+    last_day: date,
+) -> tuple[DailyClose, ...]:
+    """Every daily close from `first_day` to `last_day` in one candles response, oldest first.
+
+    **The prices are JSON numbers, not strings**, measured on 2026-10-08 against the
+    documentation's general rule; `decode_json` builds each one as a `Decimal` from the digits
+    the vendor sent, and a bare JSON integer arrives as an `int`, which `require_price` takes
+    exactly. Nothing here goes near a float.
+
+    The candles are keyed by their time and never read by position: they were measured newest
+    first, which is undocumented. A candle outside the asked window is dropped rather than
+    refused, because the documentation warns that some "may precede your declared `start`".
+
+    The refusals, and why each is one:
+
+    | Body | Why it is a refusal |
+    |---|---|
+    | not a JSON array | not the documented shape |
+    | an entry that is not an array of at least five | not a candle with a close |
+    | a time that is not an integer, or not a UTC midnight | not a daily candle's open |
+    | a close in the window that is not a positive, finite price | `require_price` decides |
+    | two candles for one day in the window | the series cannot be trusted as a whole |
+
+    Raises:
+        ProviderResponseError: any of the above.
+    """
+    document = decode_json(body)
+    if not isinstance(document, list):
+        message = (
+            f"The {EXCHANGE_VENDOR} candles response for {product} is a "
+            f"{type(document).__name__} rather than the JSON array this endpoint documents."
+        )
+        raise ProviderResponseError(message)
+    earliest = _epoch_second(first_day)
+    latest = _epoch_second(last_day)
+    closes: dict[date, Decimal] = {}
+    for entry in document:
+        opened, close = _candle(entry, product)
+        if not earliest <= opened <= latest:
+            # Outside the window, which includes a candle for a day still trading: the
+            # source never asks for today, so today is always outside it.
+            continue
+        day = _EPOCH_DAY + timedelta(days=opened // DAILY_GRANULARITY_SECONDS)
+        if day in closes:
+            message = f"The {EXCHANGE_VENDOR} candles for {product} carry two for one day."
+            raise ProviderResponseError(message)
+        closes[day] = require_price(close, source=EXCHANGE_VENDOR)
+    return tuple(DailyClose(day=day, close=closes[day]) for day in sorted(closes))
+
+
+def _epoch_second(day: date) -> int:
+    """The Unix time of `day`'s UTC midnight, in integer arithmetic."""
+    return (day - _EPOCH_DAY).days * DAILY_GRANULARITY_SECONDS
+
+
+def _candle(entry: object, product: str) -> tuple[int, object]:
+    """A candle's open time and its raw close, refusing every candle that is not a daily one.
+
+    The time is compared with the window as an integer before it is ever made a date, so a
+    time no `date` can hold is dropped as outside the window rather than raising
+    `OverflowError` out of a parser whose contract is `ProviderResponseError`.
+
+    Raises:
+        ProviderResponseError: not an array of at least five, or its time is not an integer
+            at a UTC midnight. `False` is refused although it equals 0, a UTC midnight.
+    """
+    if not isinstance(entry, list) or len(entry) <= CANDLE_CLOSE_INDEX:
+        message = f"A {EXCHANGE_VENDOR} candle for {product} is not the documented array."
+        raise ProviderResponseError(message)
+    opened = entry[0]
+    if (
+        not isinstance(opened, int)
+        or isinstance(opened, bool)
+        or opened % DAILY_GRANULARITY_SECONDS
+    ):
+        message = f"A {EXCHANGE_VENDOR} candle for {product} does not open at a UTC midnight."
+        raise ProviderResponseError(message)
+    return opened, entry[CANDLE_CLOSE_INDEX]
+
+
+class CoinbaseDailyCloses:
+    """Reads BTC/USD daily closes for a range of past days from Coinbase Exchange's candles.
+
+    Satisfies `HistoricalCloseSource` structurally. One endpoint and no fallback, through
+    `EndpointSet` for the reason `KrakenPriceSource` gives.
+    """
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
+        """Bind to the shared client. No key and no configuration.
+
+        `clock` is read once per call, only to know which UTC day is still trading: the
+        candle for today moves until midnight, so the last day ever asked for is yesterday.
+        """
+        self._endpoint = EndpointSet.configured(
+            client, ((PRIMARY, COINBASE_EXCHANGE_API_URL),), vendor=EXCHANGE_VENDOR
+        )
+        self._clock = clock
+
+    @property
+    def name(self) -> str:
+        """`coinbase`, the string written to `price_history.source`."""
+        return COINBASE
+
+    @property
+    def pairs(self) -> frozenset[PricePair]:
+        """Every pair in `CANDLE_PRODUCTS`: BTC/USD."""
+        return frozenset(CANDLE_PRODUCTS)
+
+    @property
+    def earliest_day(self) -> date:
+        """`EARLIEST_CANDLE_DAY`, 2015-07-20."""
+        return EARLIEST_CANDLE_DAY
+
+    async def daily_closes_between(
+        self,
+        pair: PricePair,
+        first_day: date,
+        last_day: date,
+    ) -> tuple[DailyClose, ...]:
+        """The committed closes from `first_day` to `last_day`, oldest first.
+
+        The range is narrowed to `EARLIEST_CANDLE_DAY..yesterday` (UTC) before anything is
+        asked: no day before the first candle exists, and today's is still trading. What is
+        left is asked for in windows of at most `MAX_DAYS_PER_REQUEST` days, **one after the
+        other**, never gathered, for the reason `CoinbasePriceSource.fetch` gives -- and the
+        shared per-host floor paces them well under the documented 10 requests a second.
+        Both `start` and `end` are always sent, as ISO 8601 UTC midnights: either one alone
+        is ignored and the vendor answers the last 350 days instead.
+
+        Every window must answer: a failure on any of them raises, and the backfill stores
+        nothing for the range rather than a range with a hole in the middle that nothing
+        would ask for again.
+
+        The query carries a product id, a granularity and two dates -- nothing about the
+        owner -- and the transport logs only the label.
+
+        Raises:
+            ProviderRateLimitedError: a 429 that survived the transport's retries.
+            ProviderUnavailableError: the vendor did not answer, or failed with a 5xx.
+            ProviderResponseError: the pair is not one this source reads, or an answer
+                cannot be trusted.
+        """
+        product = CANDLE_PRODUCTS.get(pair)
+        if product is None:
+            message = f"{pair[0]}/{pair[1]} is not a pair the {EXCHANGE_VENDOR} backfill reads."
+            raise ProviderResponseError(message)
+        yesterday = self._clock().astimezone(UTC).date() - timedelta(days=1)
+        closes: list[DailyClose] = []
+        windows = candle_windows(max(first_day, EARLIEST_CANDLE_DAY), min(last_day, yesterday))
+        for start, end in windows:
+            path = (
+                f"{CANDLES_PATH.format(product=product)}"
+                f"?granularity={DAILY_GRANULARITY_SECONDS}"
+                f"&start={_iso_midnight(start)}&end={_iso_midnight(end)}"
+            )
+            body, _index = await self._endpoint.read(path, ASSET_DAILY_CLOSES)
+            closes.extend(parse_candles(body, product, start, end))
+        return tuple(closes)
+
+
+def _iso_midnight(day: date) -> str:
+    """`day`'s UTC midnight as ISO 8601 with a `Z`, the form the measurement used."""
+    return f"{day.isoformat()}T00:00:00Z"

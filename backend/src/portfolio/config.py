@@ -303,6 +303,13 @@ class Settings(BaseSettings):
     price_backfill_enabled: bool = True
     price_backfill_interval_minutes: int = 1440
 
+    # The balance rebuild (spec 038), on its own timer: every wallet's past daily balances,
+    # walked back from its confirmed transactions. A day, because a balance closes once a day
+    # and a rebuild reads every transaction again. `enabled` stops the timer only:
+    # `python -m portfolio rebuild-balances` works either way.
+    balance_rebuild_enabled: bool = True
+    balance_rebuild_interval_minutes: int = 1440
+
     # Scheduled copies of the database (#22, spec 029): the wallets, their balance history and
     # the price cache exist nowhere else.
     #
@@ -481,6 +488,11 @@ class Settings(BaseSettings):
                 "PORTFOLIO_PRICE_BACKFILL_INTERVAL_MINUTES",
                 self.price_backfill_interval_minutes,
                 "PORTFOLIO_PRICE_BACKFILL_ENABLED",
+            ),
+            (
+                "PORTFOLIO_BALANCE_REBUILD_INTERVAL_MINUTES",
+                self.balance_rebuild_interval_minutes,
+                "PORTFOLIO_BALANCE_REBUILD_ENABLED",
             ),
         ):
             if minutes < 1:

@@ -47,6 +47,7 @@ from portfolio.db.models import (
     _BALANCE_SNAPSHOT_CONFIRMED_CHECK,
     _PRICE_HISTORY_BASIS_CHECK,
     _PRICE_QUOTE_CURRENCY_CHECK,
+    _RECONSTRUCTED_BALANCE_CONFIRMED_CHECK,
     _SYNC_RUN_CHAIN_ERROR_KIND_CHECK,
     _SYNC_RUN_CHAIN_STATUS_CHECK,
     _SYNC_RUN_STATUS_CHECK,
@@ -81,6 +82,8 @@ APPLICATION_TABLES = frozenset(
         # Spec 037. One price per asset, quote currency and UTC day, so a past day can be
         # valued; the hourly refresh and the daily backfill write it.
         "price_history",
+        # Spec 038. Each wallet's closing balance per day, rebuilt from its transactions.
+        "reconstructed_balances",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -146,6 +149,10 @@ DERIVED_ADDRESS_TABLES = frozenset({"derived_addresses"})
 #: Spec 037's one. Its revision sits on top of `0012`, so every single-step reversal below
 #: `0013_price_history` takes it down as well, and each test subtracts it.
 PRICE_HISTORY_TABLES = frozenset({"price_history"})
+
+#: Spec 038's one. Its revision sits on top of `0013`, so every single-step reversal below
+#: `0014_reconstructed_balances` takes it down as well, and each test subtracts it.
+RECONSTRUCTED_TABLES = frozenset({"reconstructed_balances"})
 
 #: Spec 036's revision, and the one below it: the last schema that has the tables it drops.
 DROP_REVISION = "0012_drop_exchanges_accounting"
@@ -228,6 +235,14 @@ EXPECTED_CONSTRAINT_NAMES = {
         "ck_price_history_quote_currency",
         "ck_price_history_basis",
         "fk_price_history_asset_id_assets",
+    },
+    # Spec 038. One CHECK, the balance's sign, compared with its constant by
+    # `test_the_reconstructed_balance_check_matches_the_model`.
+    "reconstructed_balances": {
+        "pk_reconstructed_balances",
+        "uq_reconstructed_balances_wallet_day",
+        "ck_reconstructed_balances_confirmed",
+        "fk_reconstructed_balances_wallet_id_wallets",
     },
     "derived_addresses": {
         "pk_derived_addresses",
@@ -510,6 +525,7 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
         - BALANCE_TABLES
         - DERIVED_ADDRESS_TABLES
         - PRICE_HISTORY_TABLES
+        - RECONSTRUCTED_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -541,7 +557,11 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
     # `0012`'s downgrade recreates the exchange tables on the way down, and `0010` to `0006`
     # drop them again, so none of them is left over.
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - BALANCE_TABLES - DERIVED_ADDRESS_TABLES - PRICE_HISTORY_TABLES
+        APPLICATION_TABLES
+        - BALANCE_TABLES
+        - DERIVED_ADDRESS_TABLES
+        - PRICE_HISTORY_TABLES
+        - RECONSTRUCTED_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -611,7 +631,7 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
     command.downgrade(config, BALANCES_REVISION)
 
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - DERIVED_ADDRESS_TABLES - PRICE_HISTORY_TABLES
+        APPLICATION_TABLES - DERIVED_ADDRESS_TABLES - PRICE_HISTORY_TABLES - RECONSTRUCTED_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:
@@ -851,7 +871,9 @@ def test_the_dropped_tables_carry_the_convention_names_below_the_drop(
 
     assert set(PRE_DROP_CONSTRAINT_NAMES) == DROPPED_TABLES
     assert table_names(sync_engine) == (
-        (APPLICATION_TABLES - PRICE_HISTORY_TABLES) | DROPPED_TABLES | {STAMP_TABLE}
+        (APPLICATION_TABLES - PRICE_HISTORY_TABLES - RECONSTRUCTED_TABLES)
+        | DROPPED_TABLES
+        | {STAMP_TABLE}
     )
     for table, expected in PRE_DROP_CONSTRAINT_NAMES.items():
         found = {inspector.get_pk_constraint(table)["name"]}
@@ -1075,8 +1097,55 @@ def test_the_price_history_migration_reverses_on_its_own(
 
     command.downgrade(build_alembic_config(database_url), DROP_REVISION)
 
-    assert table_names(sync_engine) == (APPLICATION_TABLES - PRICE_HISTORY_TABLES) | {STAMP_TABLE}
+    assert table_names(sync_engine) == (
+        APPLICATION_TABLES - PRICE_HISTORY_TABLES - RECONSTRUCTED_TABLES
+    ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
+def test_the_reconstructed_balance_check_matches_the_model(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Spec 038's one `CHECK`, and the wallet foreign key's cascade."""
+    upgrade_to_head(database_url)
+    inspector = inspect(sync_engine)
+
+    reflected = {
+        str(found["name"]): normalise_sql(str(found["sqltext"]))
+        for found in inspector.get_check_constraints("reconstructed_balances")
+    }
+    foreign = inspector.get_foreign_keys("reconstructed_balances")
+
+    assert reflected == {
+        "ck_reconstructed_balances_confirmed": normalise_sql(_RECONSTRUCTED_BALANCE_CONFIRMED_CHECK)
+    }
+    assert _RECONSTRUCTED_BALANCE_CONFIRMED_CHECK == "confirmed >= 0"
+    assert [(fk["referred_table"], fk["options"].get("ondelete")) for fk in foreign] == [
+        ("wallets", "CASCADE")
+    ]
+
+
+def test_the_reconstructed_balances_migration_reverses_on_its_own(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """One step down drops `reconstructed_balances` and nothing else; the upgrade restores it."""
+    upgrade_to_head(database_url)
+    revisions = [
+        script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+    ]
+    assert revisions.index("0014_reconstructed_balances") == (
+        revisions.index("0013_price_history") - 1
+    )
+
+    command.downgrade(build_alembic_config(database_url), "0013_price_history")
+
+    assert table_names(sync_engine) == (APPLICATION_TABLES - RECONSTRUCTED_TABLES) | {STAMP_TABLE}
 
     upgrade_to_head(database_url)
 

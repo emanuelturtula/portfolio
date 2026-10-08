@@ -135,6 +135,12 @@ _SYNC_RUN_CHAIN_ERROR_KIND_CHECK: Final = (
 # the ordinary case.
 _BALANCE_SNAPSHOT_CONFIRMED_CHECK: Final = "confirmed >= 0"
 
+# A rebuilt balance is never negative either (spec 038, R4): the domain refuses a walk that
+# goes below zero, and this refuses one again for a writer that bypasses it. The same
+# duplication hazard as the constants above -- repeated verbatim in
+# `0014_reconstructed_balances` -- and the same reflection test.
+_RECONSTRUCTED_BALANCE_CONFIRMED_CHECK: Final = "confirmed >= 0"
+
 PRICE_SCALE: Final = 12
 """Decimal places `prices.amount` rounds to and stores. Public, because a test pins it.
 
@@ -591,6 +597,33 @@ class BalanceSnapshot(Base):
     pending: Mapped[int | None] = mapped_column(BaseUnits, nullable=True)
     decimals: Mapped[int] = mapped_column(Integer, nullable=False)
     observed_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
+class ReconstructedBalance(Base):
+    """A wallet's closing balance on one UTC day, rebuilt from its transactions (spec 038).
+
+    Not a snapshot: nothing read this balance on that day. It is the current balance walked
+    back through every confirmed transaction, stored only when the walk reached exactly zero
+    before the first one (R1, R4), and replaced whole for the wallet by every complete rebuild
+    (R6). The value history reads it only for days before the wallet's first snapshot (R7).
+
+    `confirmed` is `BaseUnits`, as a snapshot's is, with its `decimals` beside it.
+    """
+
+    __tablename__ = "reconstructed_balances"
+    __table_args__ = (
+        UniqueConstraint("wallet_id", "day", name="uq_reconstructed_balances_wallet_day"),
+        CheckConstraint(_RECONSTRUCTED_BALANCE_CONFIRMED_CHECK, name="confirmed"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wallet_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("wallets.id", ondelete="CASCADE"), nullable=False
+    )
+    day: Mapped[date] = mapped_column(Date, nullable=False)
+    confirmed: Mapped[int] = mapped_column(BaseUnits, nullable=False)
+    decimals: Mapped[int] = mapped_column(Integer, nullable=False)
+    rebuilt_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 # Re-exported so that anything needing the schema -- Alembic's `env.py`, the drift check --

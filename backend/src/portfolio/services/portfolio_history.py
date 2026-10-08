@@ -1,7 +1,8 @@
 """The value-history chart's data: what the wallets were worth on each day (spec 037).
 
-`PortfolioHistoryService` reads each active wallet's closing snapshot per day and the daily
-prices in `price_history`, and hands the arithmetic to `domain.portfolio_history`. Like the
+`PortfolioHistoryService` reads each active wallet's closing snapshot per day -- preceded by
+its rebuilt days before the first snapshot (spec 038) -- and the daily prices in
+`price_history`, and hands the arithmetic to `domain.portfolio_history`. Like the
 summary it reads only what is stored: no chain and no price source is asked, and this module
 imports nothing under `portfolio.providers`.
 
@@ -30,6 +31,7 @@ from portfolio.domain.portfolio_history import (
 from portfolio.repositories.assets import AssetRepository
 from portfolio.repositories.balances import BalanceRepository
 from portfolio.repositories.price_history import PriceHistoryRepository
+from portfolio.repositories.reconstructed_balances import ReconstructedBalanceRepository
 from portfolio.repositories.wallets import WalletRepository
 from portfolio.services.prices import utc_now
 from portfolio.services.wallets import WalletNotFoundError
@@ -41,7 +43,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from portfolio.db.models import BalanceSnapshot, Wallet
+    from portfolio.db.models import BalanceSnapshot, ReconstructedBalance, Wallet
 
 __all__ = [
     "HistoryRange",
@@ -88,10 +90,12 @@ class PortfolioHistoryService:
         balances: BalanceRepository,
         history: PriceHistoryRepository,
         assets: AssetRepository,
+        rebuilt: ReconstructedBalanceRepository,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._wallets = wallets
         self._balances = balances
+        self._rebuilt = rebuilt
         self._history = history
         self._assets = assets
         self._clock = clock
@@ -131,11 +135,16 @@ class PortfolioHistoryService:
 
     async def _readings(self, wallets: Sequence[Wallet]) -> list[WalletReadings]:
         """Each wallet's asset and its closing reading per day, in the order given."""
-        closing = await self._balances.daily_closing([wallet.id for wallet in wallets])
+        ids = [wallet.id for wallet in wallets]
+        closing = await self._balances.daily_closing(ids)
+        rebuilt = await self._rebuilt.for_wallets(ids)
         return [
             WalletReadings(
                 asset=ChainKey(wallet.chain_key).asset_symbol,
-                readings=tuple(_reading(row) for row in closing.get(wallet.id, [])),
+                readings=_merged(
+                    rebuilt.get(wallet.id, []),
+                    tuple(_reading(row) for row in closing.get(wallet.id, [])),
+                ),
             )
             for wallet in wallets
         ]
@@ -160,6 +169,23 @@ def _reading(row: BalanceSnapshot) -> DailyReading:
     )
 
 
+def _merged(
+    rebuilt: Sequence[ReconstructedBalance], snapshots: tuple[DailyReading, ...]
+) -> tuple[DailyReading, ...]:
+    """Rebuilt days strictly before the first snapshot's day, then the snapshots (spec 038, R7).
+
+    From the first snapshot on, what the chain reported that day wins over a balance walked
+    back to it; a wallet never rebuilt is its snapshots alone, as in spec 037.
+    """
+    first_snapshot = snapshots[0].day if snapshots else None
+    earlier = tuple(
+        DailyReading(day=row.day, quantity=from_base_units(row.confirmed, row.decimals))
+        for row in rebuilt
+        if first_snapshot is None or row.day < first_snapshot
+    )
+    return earlier + snapshots
+
+
 def _first_day(series: Sequence[WalletReadings]) -> date | None:
     """The first day any of these wallets was read, or `None`."""
     return min(
@@ -177,5 +203,6 @@ def build_portfolio_history_service(
         balances=BalanceRepository(session),
         history=PriceHistoryRepository(session),
         assets=AssetRepository(session),
+        rebuilt=ReconstructedBalanceRepository(session),
         clock=clock,
     )
