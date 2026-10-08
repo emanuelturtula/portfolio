@@ -279,8 +279,9 @@ ASSET_DAILY_CLOSES: Final = "asset_daily_closes"
 Coinbase Exchange's candles for the days before Kraken's window (spec 038).
 
 Separate from `ASSET_PRICES` because it is a different call on a different schedule: one per
-pair -- or per 300-day window, for Coinbase's first fill -- once a day, for the backfill. A log showing these more often than daily is a timer
-misbehaving. The label does not carry the pair, for the reason `ASSET_PRICE` does not.
+pair -- or per 300-day window, for Coinbase's first fill -- once a day, for the backfill. A
+log showing these more often than daily is a timer misbehaving. The label does not carry the
+pair, for the reason `ASSET_PRICE` does not.
 """
 
 ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
