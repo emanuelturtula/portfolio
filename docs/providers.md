@@ -827,7 +827,7 @@ served and kept in memory only:
 
 | | What came back |
 |---|---|
-| a count ahead of every id the pages served | 3 of 22 histories: 721 against 720, 1,297 against 1,295, 2,554 against 2,553. The offset-paged `full-transactions` serves the same ids, with one window of 500 index rows answering 499 |
+| a count ahead of every id the pages served | 5 of 25 histories: 721 against 720, 1,297 against 1,295, 2,554 against 2,553, 5,082 against 5,079, 5,098 against 5,094. The offset-paged `full-transactions` serves the same ids, with one window of 500 index rows answering 499 |
 | unaccepted rows among the served | one history of 2,553 rows served about 2,000 with `is_accepted: false` beside 540 accepted |
 | the accepted rows' effects against `/balance` | equal in every history, those above included |
 
@@ -835,7 +835,8 @@ So the count is checked against **every id served, accepted or not**, and may ru
 by **two, or one in a hundred, whichever is more** (`unserved_allowance`). It may never fall
 behind. A history inside that allowance is complete only when its accepted effects sum
 exactly to the balance, as before. Until 2026-10-09 the count was compared with the accepted
-ids alone, which reported every history above `count_mismatch`.
+ids alone, which reported every history above `count_mismatch`; re-read with the amended
+check, each of them proved itself.
 
 **What the reader does with that.** It pages with `limit=500` and
 `resolve_previous_outpoints=light`, following `X-Next-Page-Before` while it is sent, never

@@ -136,7 +136,7 @@ balances. Read off the live OpenAPI document and measured on **2026-10-08**
   never computed. **`block_time` is epoch milliseconds**.
 * **Measured on 2026-10-09, against the server's own source at the deployed commit:**
   `total` is the number of rows in the address's index, and **it counts rows the pages
-  cannot serve and rows that are not accepted**. Of 22 live histories, 3 counted one or two
+  cannot serve and rows that are not accepted**. Of 25 live histories, 5 counted one to four
   more ids than any page served, and one served about two thousand `is_accepted: false` rows
   among 540 accepted ones -- and in every case the accepted rows summed exactly to
   `/balance`. Comparing `total` with the accepted ids reported all of those
@@ -314,9 +314,10 @@ hundred, whichever is more (see `unserved_allowance`).
 **Measured on 2026-10-09, not documented.** The count is the number of rows in the server's
 address-to-transaction index (`addresses_transactions`, kaspa-rest-server at the deployed
 commit, read the same day), and the pages serve only the ids of that index that its
-transactions table also holds. The two disagree: of 22 live histories, 3 counted one or two
-more than any page served -- 721 against 720, 1,297 against 1,295, 2,554 against 2,553 --
-and every one of those still summed exactly to `/balance`. The allowance is what lets such a
+transactions table also holds. The two disagree: of 25 live histories, 5 counted one to four
+more than any page served -- 721 against 720, 1,297 against 1,295, 2,554 against 2,553,
+5,082 against 5,079, 5,098 against 5,094 -- and every one of those still summed exactly to
+`/balance`. The allowance is what lets such a
 history prove itself on the money alone; a shortfall past it is still `count_mismatch`."""
 
 LATEST_BLOCK_TIME_MS: Final = 253_402_300_799_999
