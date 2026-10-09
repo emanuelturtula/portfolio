@@ -593,6 +593,25 @@ p[role='alert'] {
   color: var(--color-error);
 }
 
+.export-reminder ul {
+  margin: 0.4rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.export-reminder li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  padding: 0.25rem 0;
+}
+
+.export-reminder .note-error {
+  margin-top: 0.4rem;
+}
+
 .note a {
   color: inherit;
   font-weight: 500;

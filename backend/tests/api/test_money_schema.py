@@ -404,6 +404,10 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         # nothing can value a `null`.
         "/api/portfolio/history",
         "/api/wallets/{wallet_id}/value-history",
+        # The monthly export reminder (spec 040): months as `YYYY-MM` and exchange names. No
+        # money crosses it.
+        "/api/exports/reminder",
+        "/api/exports/months/{month}/done",
     }
 
 

@@ -97,6 +97,11 @@ EXPECTED_NAMES = {
         "ck_reconstructed_balances_confirmed",
         "fk_reconstructed_balances_wallet_id_wallets",
     },
+    "export_months": {
+        "pk_export_months",
+        "uq_export_months_user_month",
+        "fk_export_months_user_id_users",
+    },
     "price_history": {
         "pk_price_history",
         "uq_price_history_asset_day",

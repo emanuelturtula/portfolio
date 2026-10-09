@@ -626,6 +626,25 @@ class ReconstructedBalance(Base):
     rebuilt_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
+class ExportMonth(Base):
+    """A month whose manual exchange exports the owner has marked done (spec 040).
+
+    One row per owner and month. `month` is the first day of the calendar month in Argentina
+    time, which is how `domain.export_reminders` names a month. The row's existence is the
+    whole fact: a month without one is still owed, from the day after it ends.
+    """
+
+    __tablename__ = "export_months"
+    __table_args__ = (UniqueConstraint("user_id", "month", name="uq_export_months_user_month"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    month: Mapped[date] = mapped_column(Date, nullable=False)
+    done_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
 # Re-exported so that anything needing the schema -- Alembic's `env.py`, the drift check --
 # imports it from the module that defines the tables. Importing `Base.metadata` directly
 # from `base` would hand back an empty MetaData unless this module happened to have been
