@@ -4,9 +4,9 @@ Day-two tasks on the running instance: creating the account, tuning the password
 hardware, changing the password, understanding when a session ends, pointing the application
 at the chain index it reads balances from, refreshing the prices that turn a balance into
 a value, backfilling the daily prices the value-over-time chart is drawn from, backing the
-database up and restoring it, reading the logs, and reading how every source stands. Section
-12 records what an operator does about the exchange sync, the accounting and the holdings
-check, which were removed.
+database up and restoring it, reading the logs, reading how every source stands, and reaching
+the application from outside the home network. Section 12 records what an operator does about
+the exchange sync, the accounting and the holdings check, which were removed.
 
 `docs/deployment.md` covers getting the image onto the host. This covers living with it.
 
@@ -60,35 +60,23 @@ exists.
 A plain restart silently keeps the old values. That is already the last row of the
 troubleshooting table in `docs/deployment.md`, and it catches people here too.
 
-### Serving over plain HTTP on the local network
+### Plain HTTP on the local network is no longer offered
 
-The application is built to sit behind HTTPS, and its defaults assume it. If you would rather
-open it at the address the Raspberry Pi has on your own network, with no TLS in front, `prod`
-accepts that when you say so twice — in the origin and in the cookie flag:
+Until spec 038, this section described opening the application at the address the Raspberry
+Pi has on your own network, over plain HTTP, with an `http://` origin and
+`PORTFOLIO_SESSION_COOKIE_SECURE=false`. The port is now published on the host's loopback
+interface only, so that address no longer answers, and the application is reached through
+the Cloudflare tunnel instead — section 20.
 
-```
-PORTFOLIO_ALLOWED_ORIGIN=http://<host-address>:<port>
-PORTFOLIO_SESSION_COOKIE_SECURE=false
-```
+If `secrets.env` still carries those two lines, replace the origin with the tunnel's
+`https://` hostname and delete the cookie flag, as section 20 says, then recreate the
+container. The application still accepts the pair at startup, because a development setup on
+plain HTTP needs it, but a production deployment no longer has a way to use it.
 
-Both lines are required. A browser drops a `Secure` cookie that arrives over plain HTTP from
-any host but `localhost`, so with only the origin set, login returns `204` and the page stays
-on the sign-in form. The flag on its own is refused unless the origin starts with `http://`:
-on an `https://` origin `Secure` stays mandatory.
-
-**What this costs.** The password and the session cookie cross the network unencrypted, so
-anyone who can capture traffic on that network can sign in as you. That is a reasonable trade
-on a home network you control and not on a shared one, and the port must never be forwarded
-to the internet.
-
-A second cost is easy to miss. Without `Secure` the cookie is named `psid` rather than
-`__Host-psid`, and browsers do not isolate cookies by port (RFC 6265 §8.5): every other
-plain-HTTP service on the same address receives `psid` with each request and could log or
-overwrite it, with no network capture needed. On a host that also runs other web applications,
-that means trusting each of them with a live session token. Signing out deletes the session
-server-side, which limits what a leaked token is worth afterwards.
-
-Recreate the container after editing the file, exactly as above.
+What that mode cost is why it went: the password and the session cookie crossed the network
+unencrypted, and without `Secure` the cookie was named `psid`, which every other plain-HTTP
+service on the same address received with each request, because browsers do not isolate
+cookies by port (RFC 6265 §8.5).
 
 ## 2. Creating the account without a bootstrap password
 
@@ -247,6 +235,11 @@ before the password is even verified. A successful login clears the counter.
 The counter is held in the application process, not the database, so a deployment or a
 restart clears it. That is an accepted trade-off for a single-user application on a private
 network — see `docs/specs/003-single-user-password-login.md`.
+
+The counter is keyed on the username, not the caller's address, so anyone who could reach the
+login page could lock you out for fifteen minutes at a time. Nobody but you can reach it:
+Cloudflare Access lets only your email address through to the application at all
+(section 20). The trade-off above holds for exactly as long as that Access application does.
 
 If you lock yourself out, wait 15 minutes or recreate the container.
 
@@ -1632,15 +1625,230 @@ and `error_type`, the exception's class name:
 
 A lasting one is a defect to report, with the `error_type` and the `request_id`.
 
+## 20. Reaching the application from outside the home network
+
+The application is opened from anywhere, in any browser, through a **Cloudflare Tunnel**, with
+**Cloudflare Access** in front of it. The tunnel's connector, `cloudflared`, runs on the host
+and makes an outbound connection to Cloudflare, so nothing on the router is opened. Access asks
+for your email address and a one-time PIN before anything reaches the application, and lets
+only your address through. The application's own sign-in comes after that, unchanged.
+
+The application's port is published on the host's loopback interface only, so the tunnel is
+the only way in from anywhere but the host itself. `docs/specs/038-remote-access-through-cloudflare.md`
+records why, and what was checked against Cloudflare's documentation.
+
+You need:
+
+- a domain whose DNS is on Cloudflare;
+- a Cloudflare account with Zero Trust;
+- a hostname **one level** under the domain. A deeper one needs an Advanced Certificate.
+
+Throughout this section that hostname is `portfolio.example`, `<team-name>` is your Zero
+Trust team name and `<aud-tag>` is the Access application's audience tag. None of the three,
+and nothing else from the dashboard, belongs in this repository.
+
+**Do the steps in this order.**
+
+- A route published before its Access application exists is open to anyone on the internet.
+- Changing the origin before the tunnel works leaves you with no way in from a browser.
+
+### 1. Access first
+
+1. In Zero Trust, go to **Integrations > Identity providers**, select **Add new identity
+   provider**, and choose **One-time PIN**. It is not there by default.
+2. In **Access controls > Applications**, select **Create new application**, then
+   **Self-hosted and private**. Set:
+   - the public hostname: `portfolio` on your domain;
+   - a policy with action **Allow** that includes **your email address and nothing else**.
+     Access denies everything an Allow policy does not match;
+   - One-time PIN among the identity providers;
+   - a session duration of 24 hours.
+3. Open the application's configuration, and under **Additional settings** copy the
+   **Application Audience (AUD) Tag**: that is `<aud-tag>`.
+
+`<team-name>` is the first label of `<team-name>.cloudflareaccess.com`, the address the PIN
+page is served from.
+
+A PIN is emailed only to an address a policy allows, expires ten minutes after it is asked
+for, and works once.
+
+### 2. The tunnel's connector on the host
+
+Create the tunnel in the dashboard under **Networking > Tunnels > Create a tunnel**, and name
+it `portfolio`. The dashboard then shows an install command with the tunnel's **token** at
+the end. **Do not run that command.** It puts the token on a command line, where it lands in
+your shell history and in `ps`. Copy only the token.
+
+The token is a credential: anyone who has it can run a connector for this tunnel and receive
+its traffic. It lives in one root-only file on the host and nowhere else, never in GitHub and
+never in this repository.
+
+Install `cloudflared` from Cloudflare's package repository:
+
+```bash
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update && sudo apt-get install cloudflared
+cloudflared --version
+command -v cloudflared
+```
+
+The version must be 2025.4.0 or later, the first to read the token from a file.
+
+Write the token into its file from standard input:
+
+```bash
+sudo install -d -m 0755 /etc/cloudflared
+sudo sh -c 'umask 077 && cat > /etc/cloudflared/token'
+```
+
+Paste the token, press Enter, then Ctrl-D. A trailing newline is harmless, because
+`cloudflared` trims the file's whitespace. `sudo ls -l /etc/cloudflared/token` should show
+`-rw-------` and `root root`.
+
+Then the service. This is the unit `cloudflared service install` writes on Linux from 2026.7.2
+on. It is written by hand here so that the token is never an argument, not even once. If
+`command -v cloudflared` printed a path other than `/usr/bin/cloudflared`, use that one in
+`ExecStart`:
+
+```bash
+sudo tee /etc/systemd/system/cloudflared.service >/dev/null <<'EOF'
+[Unit]
+Description=Cloudflare Tunnel client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+TimeoutStartSec=15
+Type=notify
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/token
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now cloudflared
+systemctl status cloudflared
+```
+
+`apt-get upgrade` keeps it current. Restart the service after an upgrade with
+`sudo systemctl restart cloudflared`. Cloudflare supports versions within a year of its
+latest release. If outbound traffic from the host is filtered, the connector needs port 7844.
+
+### 3. The route, protected by Access
+
+On the tunnel's **Routes** tab, select **Add route**, then **Published application**:
+
+- **Subdomain** `portfolio`, your domain, and no path.
+- **Service URL** `http://127.0.0.1:8083`. Not `localhost`: it can resolve to the IPv6
+  `::1`, and the port is published on IPv4 only.
+- Under **Additional application settings**, turn on **Protect with Access**, with
+  `<team-name>` and `<aud-tag>`. The connector then refuses any request Access did not sign.
+  Without it, an Access application that is deleted, or taken off the hostname, would open
+  the hostname instead of closing it. It cannot catch a policy that allows too much: Access
+  signs for everyone its policy lets through, so the policy is where your address alone is
+  enforced.
+
+### 4. The origin
+
+The application accepts writes from one origin only, so it is now the tunnel's hostname. In
+`~/portfolio-app/prod/secrets.env`:
+
+```
+PORTFOLIO_ALLOWED_ORIGIN=https://portfolio.example
+```
+
+Delete `PORTFOLIO_SESSION_COOKIE_SECURE=false` if the file has it. The session cookie goes
+back to `__Host-psid`, `Secure`. Then recreate the container, as section 1 explains:
+
+```bash
+~/portfolio-app/prod/compose.sh up -d --force-recreate app
+```
+
+### Checking it
+
+From anywhere, with no cookie, the hostname must **never** answer `200`. Access answers
+instead, normally with a redirect to `<team-name>.cloudflareaccess.com`:
+
+```bash
+curl -sI https://portfolio.example/api/health
+```
+
+**If it answers `200`, Access is not in front of it.** Stop the connector until it is:
+`sudo systemctl stop cloudflared`.
+
+Then, from a phone on mobile data rather than your own network:
+
+1. The PIN arrives.
+2. The application's sign-in works and the dashboard loads.
+3. A write works too, such as renaming a wallet. A `403` there means the origin in step 4
+   does not match the hostname exactly.
+
+On the host, the application still answers on loopback:
+
+```bash
+curl -s http://127.0.0.1:8083/api/health
+```
+
+From any other machine on your network, `http://<host-address>:8083/` is refused. That is
+intended, and it holds on Docker Engine 28.0.0 or later only. Before that release, a machine
+on the same network segment could reach a port published on loopback, so check the
+`Server` engine version that `docker version` prints on the host.
+
+**Moving from the plain-HTTP setup** that section 1 used to describe: finish steps 1 to 4 and
+check the hostname before the release carrying spec 038 is deployed. That release publishes
+the port on loopback only, and from then on the local-network address stops answering.
+
+### What each part is for
+
+| Part | What it does | Without it |
+|---|---|---|
+| The Access application's Allow policy | Decides who reaches the hostname: your address and nobody else | A policy that allows more lets more people reach the sign-in, and nothing after it notices |
+| Protect with Access | Makes the connector refuse what Access did not sign | Deleting the Access application, or taking it off the hostname, opens the hostname rather than closing it |
+| The application's own sign-in | The password, the session and the throttle of sections 4 to 7 | Anyone past Access is you |
+| The loopback binding | Keeps the port off the local network | Plain HTTP to anything on the network |
+
+### When Access asks again
+
+The Access session lasts 24 hours. When it runs out mid-use, the page stays on screen, but
+every figure fails to load: the browser cannot follow Access's redirect to the PIN page from
+inside a request. Reload the page, and it asks for a PIN.
+
+### Replacing the token
+
+If the token may have leaked, rotate it in the dashboard, following Cloudflare's tunnel token
+documentation. Then write the new one over the old exactly as in step 2, and restart:
+
+```bash
+sudo sh -c 'umask 077 && cat > /etc/cloudflared/token'
+sudo systemctl restart cloudflared
+```
+
+### What this costs
+
+- Cloudflare terminates TLS, so your figures are in clear text on Cloudflare's network.
+  That is the price of any-browser access without a VPN client on each device.
+- If Cloudflare is down, there is no way in from a browser. The timers keep reading balances
+  and prices, and nothing is lost.
+- The hostname is public, in DNS and in Certificate Transparency logs. Its name, not its
+  content.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
 | Container never becomes healthy after the auth deployment, deployment rolls back | `PORTFOLIO_ALLOWED_ORIGIN` not set in `secrets.env` — section 1 |
 | Container refuses to start, log names the bootstrap password | It is blank, under 12 characters, or a deny-listed default |
-| Container refuses to start, log names `PORTFOLIO_SESSION_COOKIE_SECURE` | The flag is `false` but `PORTFOLIO_ALLOWED_ORIGIN` does not start with `http://` — section 1 |
-| Login returns 204 but the app still shows the login page | The cookie was dropped. `__Host-` requires `Secure`, which requires HTTPS. On a plain `http://` origin, also set `PORTFOLIO_SESSION_COOKIE_SECURE=false` — section 1 |
-| Reads work, every write returns 403 | `PORTFOLIO_ALLOWED_ORIGIN` does not match the address bar exactly |
+| Container refuses to start, log names `PORTFOLIO_SESSION_COOKIE_SECURE` | The flag is `false` but `PORTFOLIO_ALLOWED_ORIGIN` does not start with `http://`. In production, delete the flag: the origin is the tunnel's `https://` hostname — sections 1 and 20 |
+| Login returns 204 but the app still shows the login page | The cookie was dropped. `__Host-` requires `Secure`, which requires HTTPS: open the application at the tunnel's hostname, not at an `http://` address — section 20 |
+| Reads work, every write returns 403 | `PORTFOLIO_ALLOWED_ORIGIN` does not match the address bar exactly: it must be the tunnel's `https://` hostname — section 20 |
+| The hostname asks for an email address, but no PIN arrives | The address is not in the Access application's Allow policy, or One-time PIN is not one of its identity providers — section 20 |
+| After the PIN, a Cloudflare error page rather than the application | The connector is not running (`systemctl status cloudflared`), or the route's Service URL is not `http://127.0.0.1:8083` — section 20 |
+| `curl -sI` to the hostname answers 200 with no cookie | Access is not in front of it. Stop the connector at once with `sudo systemctl stop cloudflared`, then fix the Access application and Protect with Access — section 20 |
+| The page is on screen but every figure fails to load, after about a day | The Access session ran out. Reload the page and enter a new PIN — section 20 |
+| `http://<host-address>:8083` no longer answers on the local network | Working as intended: the port is published on loopback only, and the tunnel is the way in — section 20 |
 | `/api/docs` returns 401 in the browser | Working as intended — sign in first, section 6 |
 | Login returns 429 | Throttled — section 7 |
 | Logged out roughly weekly | Working as intended: the 7-day idle window |

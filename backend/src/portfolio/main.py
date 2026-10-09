@@ -14,6 +14,7 @@ from anyio import to_thread
 from fastapi import FastAPI
 
 from portfolio import __version__
+from portfolio.api.cache_control import ApiCacheControlMiddleware
 from portfolio.api.dependencies import auth_service_for, install_auth_runtime
 from portfolio.api.errors import register_exception_handlers
 from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware, is_api_path
@@ -683,6 +684,9 @@ def create_app() -> FastAPI:
     # Middleware runs before routing, which is the whole point: a check that ran after
     # routing would see an API request only when a route happened to exist for it.
     app.add_middleware(RequestGuardMiddleware, settings=settings)
+    # Outside the guard, so its refusals carry `Cache-Control: no-store` as much as a route's
+    # answer does (spec 038). `api/cache_control.py` says why nothing under `/api` is kept.
+    app.add_middleware(ApiCacheControlMiddleware, is_api_path=is_api_path)
     # Added last, so it is the outermost of the application's own middleware: the request id
     # it binds reaches the guard above, every route, and the 500 handler outside them all
     # (#23). A pure ASGI middleware, for the reason `api/request_context.py` gives. It labels

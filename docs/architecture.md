@@ -532,6 +532,15 @@ round-trip. `SameSite=Lax` on the cookie is the belt to that pair of braces.
 
 See `docs/specs/003-single-user-password-login.md` for the decisions and what they cost.
 
+Those costs were accepted for an application only its owner can reach. The application's port
+is published on the host's loopback interface only. From anywhere else it is reached through a
+Cloudflare Tunnel, with Cloudflare Access in front letting only the owner's email address
+through, so the login page and its per-username throttle stay private. Every response under
+`/api` carries `Cache-Control: no-store` (`api/cache_control.py`), because there is now a
+network that is not the owner's between the browser and the application. See
+`docs/specs/038-remote-access-through-cloudflare.md`, and `docs/operations.md` section 20 for
+the setup.
+
 ## Related documents
 
 - `CLAUDE.md` — the working agreement, and the enforcement behind each rule.
