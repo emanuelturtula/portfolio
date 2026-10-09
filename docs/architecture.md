@@ -523,12 +523,18 @@ endpoint is the exact failure mode, and a rule that can be forgotten is a rule t
 eventually is. A contract test walks every registered route and asserts `401` without a
 cookie, and a second pins the allowlist's contents.
 
-The same middleware, `RequestGuardMiddleware` in `api/middleware.py`, enforces a matching
-`Origin` and a `Content-Type` of `application/json` on every request whose method is not
-`GET`, `HEAD` or `OPTIONS`. A missing `Origin` is refused like a wrong one. The
-content-type rule is the one that does the work: a form-encoded POST is the shape an HTML
-form can send cross-site without a preflight, so refusing it closes CSRF without a token
-round-trip. `SameSite=Lax` on the cookie is the belt to that pair of braces.
+The same middleware, `RequestGuardMiddleware` in `api/middleware.py`, enforces a
+`Content-Type` of `application/json` on every request whose method is not `GET`, `HEAD` or
+`OPTIONS`. A form-encoded POST is the shape an HTML form can send cross-site without a
+preflight, so refusing it closes CSRF without a token round-trip. `SameSite=Lax` on the
+cookie is the belt to those braces.
+
+There is no `Origin` check. It used to require one configured origin, and the deployment is
+reached at two -- through the tunnel over HTTPS and at the Pi's address on the home network
+-- so it refused every sign-in on the second. For the same reason the session cookie follows
+the scheme the browser used, read from `Origin` (`api/session_cookie.py`): `__Host-psid`,
+`Secure`, over HTTPS, and `psid` without `Secure` over plain HTTP, where a browser would drop
+a `Secure` cookie.
 
 See `docs/specs/003-single-user-password-login.md` for the decisions and what they cost.
 

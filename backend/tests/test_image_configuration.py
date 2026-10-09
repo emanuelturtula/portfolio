@@ -84,27 +84,3 @@ def test_the_dockerfile_builds_the_application_in_production_mode(
     settings = Settings(_env_file=None)
 
     assert settings.environment == "prod"
-
-
-def test_the_smoke_check_supplies_an_origin(build_environment: dict[str, str]) -> None:
-    """Named explicitly, because it is the value whose absence broke the build.
-
-    Asserted as *some* non-default origin rather than a literal one: the point is that the
-    build supplies one, not which placeholder it chose.
-    """
-    origin = build_environment.get("PORTFOLIO_ALLOWED_ORIGIN")
-
-    assert origin is not None
-    assert origin != Settings.model_fields["allowed_origin"].default
-
-
-def test_the_build_origin_never_reaches_a_running_container() -> None:
-    """The placeholder must be unresolvable, so a misconfigured deployment cannot use it.
-
-    `.invalid` is reserved by RFC 2606 and can never be registered. If this value were ever
-    a real host, an image deployed without its environment file would accept writes from it
-    instead of refusing them.
-    """
-    origin = image_environment()["PORTFOLIO_ALLOWED_ORIGIN"]
-
-    assert origin.endswith(".invalid")

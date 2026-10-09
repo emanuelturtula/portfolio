@@ -10,11 +10,9 @@ Three things are arranged here and nowhere else:
   that matters is asserted against the *defaults* in `test_password_hasher.py`, which is
   immune to these overrides -- if it were asserted against the live settings, this file
   would be able to turn that check off.
-* **An HTTPS base URL.** The session cookie is `Secure` in the default configuration, and
-  a cookie jar will not return a `Secure` cookie over `http://`. A test suite that quietly
-  set `session_cookie_secure=False` to get around that would be testing a cookie the
-  default deployment never sends. The plain-HTTP deployment has a test of its own in
-  `test_login.py`, which builds the environment that mode is defined by.
+* **An HTTPS base URL and origin.** The session cookie follows the scheme the browser
+  used, and HTTPS is the one that gets the `Secure`, `__Host-` cookie. The plain-HTTP
+  address on the home network has tests of its own in `test_login.py`.
 * **Every vendor schedule off, and an HTTP client that refuses every request.** The lifespan
   starts three timers that reach vendors at startup (since #10, and spec 037's backfill) and
   builds the shared client,
@@ -77,14 +75,11 @@ def apply_auth_environment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     *,
-    secure_cookie: bool = True,
     bootstrap: str | None = OWNER_PHRASE,
 ) -> Path:
     """Point the process-wide settings at a temporary database and cheap hash parameters."""
     database_path = tmp_path / "auth" / "portfolio.db"
     monkeypatch.setenv("PORTFOLIO_DATABASE_URL", f"sqlite+aiosqlite:///{database_path.as_posix()}")
-    monkeypatch.setenv("PORTFOLIO_ALLOWED_ORIGIN", BASE_URL)
-    monkeypatch.setenv("PORTFOLIO_SESSION_COOKIE_SECURE", "true" if secure_cookie else "false")
     monkeypatch.setenv("PORTFOLIO_ARGON2_TIME_COST", "1")
     monkeypatch.setenv("PORTFOLIO_ARGON2_MEMORY_COST", "64")
     monkeypatch.setenv("PORTFOLIO_ARGON2_PARALLELISM", "1")
