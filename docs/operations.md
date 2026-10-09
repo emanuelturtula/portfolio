@@ -853,7 +853,7 @@ together is a 422, and so is a cursor the endpoint did not issue.
 
 ### Reading the value over time
 
-The dashboard's chart and the Details page's per-wallet chart read two endpoints (spec 037).
+The dashboard's chart and the Wallets page's per-wallet chart read two endpoints (spec 037).
 Both need a session, and **neither asks a vendor anything**: they read the stored snapshots
 and `price_history` (section 10).
 

@@ -17,11 +17,11 @@ Single user, single production instance, running on a Raspberry Pi on a home net
 | Prices | Kraken, Coinbase, the Kaspa API and, with an optional key, CoinGecko, cached and refreshed on a schedule. Prices are kept in EUR and USD, each priced directly rather than converted from the other; the dashboard reads the USD price as USDT. A missing price shows as missing, never as zero. |
 | Price history | One price per asset per UTC day: the day's close from Kraken's daily candles, backfilled once a day for the 720 days Kraken keeps, older Bitcoin closes from Coinbase back to 2015-07-20, and the hourly price for today. |
 | Past balances | Each wallet's balance on every day before it was added here, rebuilt once a day from its confirmed transactions and stored only when the history proves complete: the transactions add up to today's balance and walk back to exactly zero. |
-| Dashboard | The total value and each holding in USDT, from the cached USD price read as USDT one for one, with each holding's share. A wallet that has not been read or whose reading is stale, and a price that is missing or stale, are named beside the figures rather than counted as zero. |
-| Value over time | An area chart of the total value per day on the dashboard, over 30 days, 90 days, a year or everything, back to each wallet's first transaction, and a chart of each wallet's value on the Details page. A day that cannot be valued, because no price or no reading exists for it, is a gap in the line, never a zero. |
+| Dashboard | The total value in USDT as the page's headline, from the cached USD price read as USDT one for one, then its history, then each holding with its share. A wallet that has not been read or whose reading is stale, and a price that is missing or stale, are named under the total rather than counted as zero. |
+| Value over time | An area chart of the total value per day on the dashboard, over 30 days, 90 days, a year or everything, back to each wallet's first transaction, and a chart of each wallet's value on the Wallets page. A day that cannot be valued, because no price or no reading exists for it, is a gap in the line, never a zero. |
 | Operations | Scheduled SQLite backups with daily and weekly retention, and a restore command. A health page that reports every source. One log line per record, a correlation id per request, and credentials and extended keys redacted from every line. |
 
-The pages are Dashboard, Details, Wallets, and Health at `/health`.
+Two pages are in the navigation: Dashboard, and Wallets, which lists each wallet's balance and value above the form that adds one and the list that archives one. Health is at `/health`, linked from the dashboard when a backup needs attention, and `/details` redirects to Wallets.
 
 No key that can spend is ever given to it. A wallet is a public address or an extended
 public key, and a value that looks like a private key is refused before it is stored.

@@ -19,8 +19,8 @@ import { renderApp, type ProvidedRender } from '@/test/render';
 import { fakeSession, server, TEST_USERNAME } from '@/test/server';
 
 /**
- * The Details page's chart of one wallet's value over time (spec 037): which wallet, which
- * range, and its four states.
+ * The Wallets page's chart of one wallet's value over time (spec 037): which wallet, which
+ * range, and its four states. It was the Details page's until spec 039 folded that page in.
  */
 
 const CARD = 'Wallet value over time';
@@ -31,7 +31,7 @@ interface Opened extends ProvidedRender {
   readonly fake: FakePortfolio;
 }
 
-function openDetails(
+function openWalletsPage(
   options: FakePortfolioOptions = {},
   overrides: readonly HttpHandler[] = [],
 ): Opened {
@@ -42,7 +42,7 @@ function openDetails(
     ...fakeSession({ initialUser: TEST_USERNAME }).handlers,
     ...fake.handlers,
   );
-  return Object.assign(renderApp(['/details']), { user, fake });
+  return Object.assign(renderApp(['/wallets']), { user, fake });
 }
 
 /**
@@ -86,9 +86,9 @@ function walletSelect(card: HTMLElement): HTMLSelectElement {
   return within(card).getByRole('combobox', { name: 'Wallet' });
 }
 
-describe('DetailsPage: one wallet over time', () => {
+describe('WalletsPage: one wallet over time', () => {
   it('offers every wallet the tables list, named as they name it, and starts on the first', async () => {
-    const { fake } = openDetails();
+    const { fake } = openWalletsPage();
 
     const card = await historySettled(CARD);
 
@@ -103,7 +103,7 @@ describe('DetailsPage: one wallet over time', () => {
   });
 
   it('says when the line will start for a wallet not read yet, without a zero', async () => {
-    openDetails();
+    openWalletsPage();
 
     const card = await historySettled(CARD);
 
@@ -113,7 +113,7 @@ describe('DetailsPage: one wallet over time', () => {
   });
 
   it("draws the wallet's value in its asset's colour", async () => {
-    openDetails({ walletHistory: valued });
+    openWalletsPage({ walletHistory: valued });
 
     const card = await historySettled(CARD);
 
@@ -130,7 +130,7 @@ describe('DetailsPage: one wallet over time', () => {
   });
 
   it('reads another wallet when chosen, never showing the last one under its name', async () => {
-    const { user, fake } = openDetails({ walletHistory: valued });
+    const { user, fake } = openWalletsPage({ walletHistory: valued });
     const card = await historySettled(CARD);
 
     const held = holdWalletHistory();
@@ -157,7 +157,7 @@ describe('DetailsPage: one wallet over time', () => {
   });
 
   it("reads the range chosen, keeping the same wallet's line until it arrives", async () => {
-    const { user, fake } = openDetails({ walletHistory: valued });
+    const { user, fake } = openWalletsPage({ walletHistory: valued });
     const card = await historySettled(CARD);
 
     const held = holdWalletHistory();
@@ -184,7 +184,7 @@ describe('DetailsPage: one wallet over time', () => {
   it('says a wallet the server does not know could not be read', async () => {
     // A wallet in the balances that the registry no longer has: deleted between the two reads.
     const scenario = healthyPortfolio();
-    openDetails({
+    openWalletsPage({
       current: currentBalances({
         ...scenario.current,
         wallets: [walletBalance({ wallet_id: 7, label: 'Gone' })],
@@ -199,7 +199,7 @@ describe('DetailsPage: one wallet over time', () => {
   });
 
   it('goes back to the first wallet when the chosen one leaves the list', async () => {
-    const { user, fake, queryClient } = openDetails({ walletHistory: valued });
+    const { user, fake, queryClient } = openWalletsPage({ walletHistory: valued });
     const card = await historySettled(CARD);
     await user.selectOptions(walletSelect(card), 'Spending (BTC)');
     await within(card).findByRole('figure', { name: 'Spending value, the last 90 days' });

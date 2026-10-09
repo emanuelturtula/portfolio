@@ -1,5 +1,3 @@
-import { Link } from 'react-router-dom';
-
 import { useCurrentBalances, useSyncBalances, useSyncRuns } from '@/api/balances';
 import { describeApiError } from '@/api/client';
 import { useWallets } from '@/api/wallets';
@@ -59,14 +57,14 @@ const RUNS_UNAVAILABLE_FALLBACK = 'The run log could not be read.';
 const BALANCES_REFETCH_FALLBACK = 'The server could not be reached.';
 
 /**
- * The Details page's content: the total, a bar per wallet, per-asset and per-wallet
+ * The Wallets page's balances: the total, a bar per wallet, per-asset and per-wallet
  * value, a refresh button and a "last updated" indicator, every figure in USDT. See
  * docs/specs/011-wallets-page-value-dashboard.md. Under the tables, one wallet's value over
  * time (spec 037), chosen from the same rows.
  *
- * It was the whole of `DashboardPage` until #154 moved it to the Details page, and its
- * behaviour is unchanged. Its early returns are this section's own loading, error and empty
- * states.
+ * It was the whole of `DashboardPage` until #154 moved it to a Details page, and spec 039
+ * folded that page into the Wallets page; its behaviour is unchanged. Its early returns are
+ * this section's own loading, error and empty states.
  *
  * Only the current-balances query failing is a failure of the whole section - the runs
  * query and the wallets query each degrade to a notice instead, because neither one's
@@ -104,12 +102,14 @@ export function ValueSection() {
 
   const data = balances.data;
 
+  // The add form is below this section on the same page, so the empty state points to it
+  // rather than linking to the page it is on, and is worded apart from the list's own "No
+  // wallets yet" (spec 039, R3).
   if (data.wallets.length === 0) {
     return (
       <EmptyState
-        title="No wallets yet"
-        description="Add a wallet to start tracking its balance and value."
-        action={<Link to="/wallets">Add a wallet</Link>}
+        title="No balances yet"
+        description="Add a wallet with the form below to start tracking its balance and value."
       />
     );
   }

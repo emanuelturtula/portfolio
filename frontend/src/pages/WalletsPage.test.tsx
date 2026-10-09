@@ -228,13 +228,15 @@ describe('WalletsPage: list', () => {
     // three identical controls to choose between. Each name carries the row's
     // label, or its chain and truncated address when it has none.
     openWalletsPage({ wallets: threeWallets() });
-    await walletList();
+    const list = await walletList();
 
     // Three archive buttons and three copy buttons, and each exact name
-    // matches exactly one control on the page: together, one distinct name
-    // per row, and no row's name shared with anything else.
-    expect(screen.getAllByRole('button', { name: ARCHIVE })).toHaveLength(3);
-    expect(screen.getAllByRole('button', { name: COPY_ADDRESS })).toHaveLength(3);
+    // matches exactly one control in the list: together, one distinct name
+    // per row, and no row's name shared with another. The balances above the
+    // list (spec 039) have copy controls of their own for the same addresses,
+    // named the same way, because each copies the same thing.
+    expect(within(list).getAllByRole('button', { name: ARCHIVE })).toHaveLength(3);
+    expect(within(list).getAllByRole('button', { name: COPY_ADDRESS })).toHaveLength(3);
     for (const name of [
       'Archive Cold storage',
       'Archive Bitcoin mwgS2HRb…fFBmGq',
@@ -243,8 +245,10 @@ describe('WalletsPage: list', () => {
       'Copy address of Bitcoin mwgS2HRb…fFBmGq',
       'Copy address of Mining payouts',
     ]) {
-      expect(screen.getAllByRole('button', { name })).toHaveLength(1);
+      expect(within(list).getAllByRole('button', { name })).toHaveLength(1);
     }
+    // Archiving is the registry's alone: nothing above the list offers it.
+    expect(screen.getAllByRole('button', { name: ARCHIVE })).toHaveLength(3);
   });
 
   it('names the confirm, cancel and restore controls for their row', async () => {
@@ -983,7 +987,9 @@ describe('WalletsPage: extended keys (spec 031)', () => {
     expect(within(row).queryByRole('button', { name: COPY_ADDRESS })).not.toBeInTheDocument();
     expect(within(row).getByRole('button', { name: 'Archive Savings' })).toBeInTheDocument();
     // The other rows keep theirs.
-    expect(screen.getAllByRole('button', { name: COPY_ADDRESS })).toHaveLength(3);
+    expect(within(await walletList()).getAllByRole('button', { name: COPY_ADDRESS })).toHaveLength(
+      3,
+    );
     expect((await rowFor('Cold storage')).textContent).not.toContain('Extended key');
   });
 
@@ -1562,8 +1568,12 @@ describe('WalletsPage: focus after a slow archive or restore', () => {
     await act(async () => {
       await queryClient.invalidateQueries({ queryKey: ['wallets'] });
     });
+    // Gone from the list. The balances above it keep the row until their own read, which
+    // only `['wallets']` was invalidated for here.
     await waitFor(() => {
-      expect(screen.queryByText('Cold storage')).not.toBeInTheDocument();
+      expect(
+        within(screen.getByRole('region', { name: 'Your wallets' })).queryByText('Cold storage'),
+      ).not.toBeInTheDocument();
     });
     await user.click(addressInput());
     await user.keyboard('tb1q');
@@ -1592,8 +1602,12 @@ describe('WalletsPage: focus after a slow archive or restore', () => {
     await act(async () => {
       await queryClient.invalidateQueries({ queryKey: ['wallets'] });
     });
+    // Gone from the list. The balances above it keep the row until their own read, which
+    // only `['wallets']` was invalidated for here.
     await waitFor(() => {
-      expect(screen.queryByText('Cold storage')).not.toBeInTheDocument();
+      expect(
+        within(screen.getByRole('region', { name: 'Your wallets' })).queryByText('Cold storage'),
+      ).not.toBeInTheDocument();
     });
     expect(document.body).toHaveFocus();
 

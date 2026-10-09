@@ -98,7 +98,7 @@ function openDashboard(
   server.use(...fakeSession({ initialUser: TEST_USERNAME }).handlers, ...fake.handlers);
   server.use(...overrides);
 
-  renderApp(['/details']);
+  renderApp(['/wallets']);
 
   return { user, fake };
 }
@@ -250,7 +250,7 @@ function withWalletRow(
   };
 }
 
-describe('DetailsPage: values', () => {
+describe('WalletsPage balances: values', () => {
   it("renders the total, each wallet's value and each asset's quantity and value", async () => {
     openDashboard();
 
@@ -428,7 +428,7 @@ describe('DetailsPage: values', () => {
   });
 });
 
-describe('DetailsPage: on a phone (#118)', () => {
+describe('WalletsPage balances: on a phone (#118)', () => {
   // jsdom lays nothing out, so the widths are checked in a browser. What a test can pin is the
   // structure that keeps a table too wide for a phone from widening the page: each table
   // scrolls inside a region of its own, which a keyboard can reach.
@@ -461,7 +461,7 @@ describe('DetailsPage: on a phone (#118)', () => {
   });
 });
 
-describe('DetailsPage: precision', () => {
+describe('WalletsPage balances: precision', () => {
   it('a balance past MAX_SAFE_INTEGER base units renders exactly', async () => {
     // 2870000000000000123 sompi. Through a JavaScript number the trailing 123
     // is lost; the <data value> attribute is where that would show.
@@ -529,7 +529,7 @@ describe('DetailsPage: precision', () => {
   });
 });
 
-describe('DetailsPage: last updated', () => {
+describe('WalletsPage balances: last updated', () => {
   it('shows balances-as-of and the last sync, relative to now', async () => {
     openDashboard();
     await loaded();
@@ -676,7 +676,7 @@ describe('DetailsPage: last updated', () => {
   });
 });
 
-describe('DetailsPage: refresh', () => {
+describe('WalletsPage balances: refresh', () => {
   it('refresh posts a sync and re-reads the balances', async () => {
     const scenario = healthyPortfolio();
     const manualRunAt = '2026-09-24T11:59:50.000Z';
@@ -854,7 +854,7 @@ describe('DetailsPage: refresh', () => {
   });
 });
 
-describe('DetailsPage: stale prices and provider failures', () => {
+describe('WalletsPage balances: stale prices and provider failures', () => {
   it('a stale price is labelled stale on the asset and wallet rows', async () => {
     const stale = price({ as_of: STALE_PRICE_AS_OF, stale: true });
     let scenario = withWalletRow(healthyPortfolio(), 1, { price: stale });
@@ -1167,7 +1167,7 @@ describe('DetailsPage: stale prices and provider failures', () => {
   });
 });
 
-describe('DetailsPage: a total with nothing in it', () => {
+describe('WalletsPage balances: a total with nothing in it', () => {
   it('an incomplete total with no valued wallet renders no zero', async () => {
     // Every wallet unread: the backend sends `total: "0"` with `complete: false`.
     // "0.00 EUR - Partial" would still put a zero where the owner looks first.
@@ -1241,7 +1241,7 @@ describe('DetailsPage: a total with nothing in it', () => {
   });
 });
 
-describe('DetailsPage: partial failure', () => {
+describe('WalletsPage balances: partial failure', () => {
   it("one chain down: the other chain's rows are fresh, the failed chain's rows say so, and the total says what it includes", async () => {
     openDashboard(kaspaDownPortfolio('unavailable'));
 
@@ -1402,10 +1402,15 @@ describe('DetailsPage: partial failure', () => {
       ),
     ]);
 
-    const notice = await screen.findByRole('alert');
-    expect(notice).toHaveTextContent(/addresses are unavailable/i);
+    const notice = (await screen.findByText(/addresses are unavailable/i)).closest('p');
+    expect(notice).toHaveAttribute('role', 'alert');
 
     expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
+    // The registry below says its own failure, and its form still works (spec 039, R2).
+    expect(
+      await screen.findByRole('heading', { name: 'Could not load your wallets' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('form', { name: 'Add a wallet' })).toBeInTheDocument();
     // Labelled rows keep their label; the unlabelled one falls back to chain and id.
     expect(await walletRow('Cold storage')).toBeInTheDocument();
     const fallback = await walletRow('Kaspa wallet #3');
@@ -1439,7 +1444,7 @@ describe('DetailsPage: partial failure', () => {
   });
 });
 
-describe('DetailsPage: a backend that misbehaves', () => {
+describe('WalletsPage balances: a backend that misbehaves', () => {
   /** A 200 whose body was cut off mid-document, as a dropped proxy connection leaves it. */
   function truncated(): Response {
     return new HttpResponse('{"quote_currency":"EUR","total":"12', {
@@ -1468,7 +1473,8 @@ describe('DetailsPage: a backend that misbehaves', () => {
   it('a truncated wallets response degrades to the notice', async () => {
     openDashboard(healthyPortfolio(), [http.get(WALLETS_PATH, truncated)]);
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/addresses are unavailable/i);
+    const notice = (await screen.findByText(/addresses are unavailable/i)).closest('p');
+    expect(notice).toHaveAttribute('role', 'alert');
     expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
   });
 
@@ -1526,7 +1532,7 @@ describe('DetailsPage: a backend that misbehaves', () => {
   });
 });
 
-describe('DetailsPage: after a wallet changes', () => {
+describe('WalletsPage balances: after a wallet changes', () => {
   /**
    * The healthy portfolio as the backend would compute it for whichever
    * wallets are active: archived wallets leave the rows and the total. Totals
@@ -1551,25 +1557,20 @@ describe('DetailsPage: after a wallet changes', () => {
     };
   }
 
-  it('archiving on the wallets page takes the wallet off the details page', async () => {
-    // Witness for M1: without the `['balances']` invalidation on archive, the
-    // dashboard's cached reading is still fresh by `staleTime` when the owner
-    // comes back, so it is served as-is - wallet and value included. The
-    // clock is frozen here, so "within staleTime" is every return.
+  it('archiving a wallet in the list takes it off the balances above', async () => {
+    // Witness for M1: without the `['balances']` invalidation on archive, the balances above
+    // the list keep their cached reading - wallet and value included - until the next poll.
+    // The clock is frozen here, so that poll never comes.
     const { user, fake } = openDashboard({ ...healthyPortfolio(), current: healthyFor });
     await loaded();
     expect(await walletRow(ADDRESSES.kasPrimary)).toBeInTheDocument();
 
-    const nav = screen.getByRole('navigation', { name: 'Main' });
-    await user.click(within(nav).getByRole('link', { name: 'Wallets' }));
     const kasName = 'Kaspa kaspatest:qxaqrl…gdmpks';
     await user.click(await screen.findByRole('button', { name: `Archive ${kasName}` }));
     await user.click(screen.getByRole('button', { name: `Confirm archive of ${kasName}` }));
     await waitFor(() => {
       expect(fake.wallets().find((entry) => entry.id === 3)?.archived).toBe(true);
     });
-
-    await user.click(within(nav).getByRole('link', { name: 'Details' }));
 
     await waitFor(async () => {
       expect(dataValues(await totalRegion())).toEqual(['84419.7525600000']);
@@ -1580,7 +1581,7 @@ describe('DetailsPage: after a wallet changes', () => {
   });
 });
 
-describe('DetailsPage: an extended-key wallet (spec 031)', () => {
+describe('WalletsPage balances: an extended-key wallet (spec 031)', () => {
   /** The healthy portfolio with wallet 2 registered as an extended public key. */
   function withExtendedKey(label: string | null): PortfolioScenario {
     const scenario = healthyPortfolio();
@@ -1625,7 +1626,7 @@ describe('DetailsPage: an extended-key wallet (spec 031)', () => {
   });
 });
 
-describe('DetailsPage: states', () => {
+describe('WalletsPage balances: states', () => {
   it('announces that the portfolio is loading', async () => {
     let release: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => {
@@ -1649,22 +1650,24 @@ describe('DetailsPage: states', () => {
     expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
   });
 
-  it('no wallets: the dashboard links to the wallets page', async () => {
-    const { user } = openDashboard(emptyPortfolio());
+  it('no wallets: the balances point to the form below them, not to the page they are on', async () => {
+    openDashboard(emptyPortfolio());
 
     const main = await screen.findByRole('main');
-    expect(
-      await within(main).findByRole('heading', { name: /no wallets yet/i }),
-    ).toBeInTheDocument();
+    const empty = await within(main).findByRole('heading', { name: 'No balances yet' });
+    expect(empty.parentElement).toHaveTextContent(
+      'Add a wallet with the form below to start tracking its balance and value.',
+    );
     // An empty portfolio is not a total of zero.
     expect(screen.queryByRole('region', { name: 'Total value' })).not.toBeInTheDocument();
     expect(main.querySelector('data')).toBeNull();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-
-    await user.click(within(main).getByRole('link', { name: /add a wallet/i }));
-
-    expect(await screen.findByRole('form', { name: 'Add a wallet' })).toBeInTheDocument();
-    expect(currentPath()).toBe('/wallets');
+    // One "no wallets" message on the page: the list's own (spec 039, R3).
+    expect(
+      await within(main).findByRole('heading', { name: 'No wallets yet' }),
+    ).toBeInTheDocument();
+    expect(within(main).queryByRole('link', { name: /add a wallet/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('form', { name: 'Add a wallet' })).toBeInTheDocument();
   });
 
   it('a failed balances read is the whole-page failure, with a retry', async () => {
@@ -1894,7 +1897,7 @@ describe('DetailsPage: states', () => {
     const session = fakeSession({ initialUser: TEST_USERNAME });
     const fake = fakePortfolio({ ...healthyPortfolio(), session });
     server.use(...session.handlers, ...fake.handlers);
-    renderApp(['/details']);
+    renderApp(['/wallets']);
     expect(dataValues(await totalRegion())).toContain(HEALTHY.total);
 
     // The session dies on the server; the next request finds out.
