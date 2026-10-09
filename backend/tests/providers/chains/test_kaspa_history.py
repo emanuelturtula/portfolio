@@ -4,7 +4,8 @@ The fake pages `full-transactions-page` the way the public instance was measured
 2026-10-08: newest first, `limit` rows and then the rest of the boundary millisecond, and an
 `X-Next-Page-Before` header carrying the page's smallest `block_time` while more rows remain.
 The provider has to follow that header, never compute a cursor, and prove the history it
-collected (R1) -- the distinct accepted ids number `/transactions-count`, their effects sum
+collected (R1) -- the distinct ids served, accepted or not, are no more than
+`/transactions-count` and at most `unserved_allowance` fewer, the accepted ones' effects sum
 to `/balance`, every input was resolved, and the count and balance agree before and after.
 
 As for Bitcoin, the assertions that carry the weight are **which requests went where, with
@@ -35,10 +36,15 @@ from portfolio.providers.chains.kaspa import (
     HISTORY_PAGE_LIMIT,
     KASPA_DECIMALS,
     LATEST_BLOCK_TIME_MS,
+    UNSERVED_ALLOWANCE_FLOOR,
+    UNSERVED_ALLOWANCE_RATIO,
+    HistoryPage,
     KaspaProvider,
+    parse_history_page,
     parse_next_page_before,
     parse_transaction_count,
     parse_transactions_page,
+    unserved_allowance,
 )
 from portfolio.providers.errors import ProviderResponseError, ProviderUnavailableError
 from portfolio.providers.http import ADDRESS_BALANCE, ADDRESS_HISTORY, ENDPOINT_EXTENSION
@@ -304,7 +310,8 @@ async def test_an_address_with_no_history_is_complete_and_empty() -> None:
 async def test_an_unaccepted_row_is_left_out_of_the_history() -> None:
     """`is_accepted: false` is not a transaction this address made (R2), whatever it pays.
 
-    The vendor's count here leaves it out too, so the rest prove themselves.
+    The vendor counts it all the same -- its count is every row of its address index,
+    measured on 2026-10-09 -- so it is counted as served, and the rest prove themselves.
     """
     rejected = KaspaTx(seed=5, block_time=at(5), outputs=((ADDRESS, 7 * ONE_COIN),), accepted=False)
     fake = serving((*FOUR_KINDS, rejected))
@@ -316,14 +323,19 @@ async def test_an_unaccepted_row_is_left_out_of_the_history() -> None:
     assert history.balance == FOUR_KINDS_BALANCE
 
 
-async def test_an_unaccepted_row_the_vendor_counts_is_a_count_mismatch() -> None:
-    """If `/transactions-count` counts it, the history is reported incomplete, not wrong."""
+async def test_more_rows_served_than_the_vendor_counts_is_a_count_mismatch() -> None:
+    """Five ids served against a count of four: the count is not this history's.
+
+    The extra row is an unaccepted one, so the accepted four still sum to the balance; a
+    count that falls behind the rows is refused all the same, never allowed for.
+    """
     rejected = KaspaTx(seed=5, block_time=at(5), outputs=((ADDRESS, 7 * ONE_COIN),), accepted=False)
-    fake = serving((*FOUR_KINDS, rejected), tx_total=5)
+    fake = serving((*FOUR_KINDS, rejected), tx_total=4)
 
     history = await read_history(fake)
 
     assert history.incomplete is HistoryIncomplete.COUNT_MISMATCH
+    assert sum(effect.delta for effect in history.effects) == history.balance
 
 
 def _pages(*pages: tuple[Sequence[KaspaTx], int | None]) -> list[Reply]:
@@ -337,11 +349,15 @@ def _pages(*pages: tuple[Sequence[KaspaTx], int | None]) -> list[Reply]:
     ]
 
 
-@pytest.mark.parametrize(("total", "expected"), [(3, None), (4, HistoryIncomplete.COUNT_MISMATCH)])
+@pytest.mark.parametrize(("total", "expected"), [(3, None), (2, HistoryIncomplete.COUNT_MISMATCH)])
 async def test_a_row_served_on_two_pages_is_counted_once(
     total: int, expected: HistoryIncomplete | None
 ) -> None:
-    """A transaction repeated across a page boundary is one transaction; the count decides."""
+    """A transaction repeated across a page boundary is one transaction; the count decides.
+
+    Counted twice it would be four served against three; counted once it is three, and a
+    count of two is one the rows outnumber.
+    """
     totals = history_reply(ADDRESS, newest_first(FOUR_KINDS[1:]), tx_total=total)
     first, second = _pages(
         ((SELF_TRANSFER, SPENT), at(3)),
@@ -360,13 +376,51 @@ async def test_a_row_served_on_two_pages_is_counted_once(
 # --------------------------------------------------------------------------------------
 
 
-async def test_fewer_accepted_rows_than_the_vendor_counts_is_a_count_mismatch() -> None:
-    fake = serving(FOUR_KINDS, tx_total=5)
+@pytest.mark.parametrize("unserved", [1, 2])
+async def test_a_count_a_row_or_two_ahead_of_the_pages_proves_itself_on_the_money(
+    unserved: int,
+) -> None:
+    """The vendor counts index rows its pages cannot serve: 721 against 720 live (2026-10-09).
+
+    Within the allowance, the history is complete when its effects sum to the balance.
+    """
+    fake = serving(FOUR_KINDS, tx_total=4 + unserved)
+
+    history = await read_history(fake)
+
+    assert history.incomplete is None
+    assert len(history.effects) == 4
+
+
+async def test_a_count_further_ahead_than_the_allowance_is_a_count_mismatch() -> None:
+    """Three unserved of seven is past the floor of two: rows were missed, not unindexed."""
+    fake = serving(FOUR_KINDS, tx_total=4 + UNSERVED_ALLOWANCE_FLOOR + 1)
 
     history = await read_history(fake)
 
     assert history.incomplete is HistoryIncomplete.COUNT_MISMATCH
     assert len(history.effects) == 4
+
+
+async def test_a_count_within_the_allowance_still_needs_the_money_to_add_up() -> None:
+    """The allowance excuses the count, never the sum: one unserved row and a balance off by
+    dust is a balance mismatch."""
+    fake = serving(FOUR_KINDS, tx_total=5, balance=FOUR_KINDS_BALANCE + DUST)
+
+    history = await read_history(fake)
+
+    assert history.incomplete is HistoryIncomplete.BALANCE_MISMATCH
+
+
+@pytest.mark.parametrize(
+    ("counted", "allowed"),
+    [(0, 2), (1, 2), (299, 2), (300, 3), (721, 7), (2_554, 25), (100_000, 1_000)],
+)
+def test_the_allowance_is_two_or_one_in_a_hundred_whichever_is_more(
+    counted: int, allowed: int
+) -> None:
+    assert (UNSERVED_ALLOWANCE_FLOOR, UNSERVED_ALLOWANCE_RATIO) == (2, 100)
+    assert unserved_allowance(counted) == allowed
 
 
 async def test_effects_that_do_not_sum_to_the_balance_are_a_balance_mismatch() -> None:
@@ -626,12 +680,39 @@ def test_the_parser_returns_accepted_rows_in_the_vendors_order() -> None:
 
 
 def test_an_unaccepted_row_is_dropped_before_any_of_its_fields_are_read() -> None:
-    """Nothing on a row that is not part of the history can refuse the page."""
+    """Nothing on a row that is not part of the history can refuse the page but its id."""
     document = KaspaTx(seed=9, accepted=False).document()
     document["block_time"] = "garbage"
     document["outputs"] = "garbage"
 
     assert parse_transactions_page(page_of(document), ADDRESS) == ()
+
+
+def test_a_page_serves_every_id_and_keeps_only_the_accepted_transactions() -> None:
+    """What the count is checked against: every row's id, the unaccepted one's too."""
+    rejected = KaspaTx(seed=9, accepted=False)
+    body = json.dumps([SPENT.document(), rejected.document(), RECEIVED.document()])
+
+    page = parse_history_page(body, ADDRESS)
+
+    assert isinstance(page, HistoryPage)
+    assert [transaction.transaction_id for transaction in page.accepted] == [
+        SPENT.transaction_id,
+        RECEIVED.transaction_id,
+    ]
+    assert page.served == frozenset(
+        {SPENT.transaction_id, rejected.transaction_id, RECEIVED.transaction_id}
+    )
+    assert page.accepted == parse_transactions_page(body, ADDRESS)
+
+
+def test_an_unaccepted_row_without_a_string_id_refuses_the_page() -> None:
+    """Every row is one the vendor counts, so each must say which transaction it is."""
+    document = KaspaTx(seed=9, accepted=False).document()
+    document["transaction_id"] = 42
+
+    with pytest.raises(ProviderResponseError, match="'transaction_id' is a int"):
+        parse_history_page(page_of(document), ADDRESS)
 
 
 def test_outputs_given_as_null_are_none() -> None:

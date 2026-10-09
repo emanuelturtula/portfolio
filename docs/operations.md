@@ -942,7 +942,7 @@ its rows, if it had any, are kept.
 
 | Printed | What it means | What to do |
 |---|---|---|
-| `incomplete: count_mismatch` | fewer or more transactions were read than the index counts | run it again; if it persists, report it with the chain |
+| `incomplete: count_mismatch` | fewer or more transactions were read than the index counts. On Kaspa the index may count a couple of rows it cannot serve, and that alone is no longer a mismatch (since 2026-10-09) | run it again; if it persists, report it with the chain |
 | `incomplete: balance_mismatch` | the transactions read do not add up to the balance | as above |
 | `incomplete: moved_during_read` | the address received or spent while it was read | run it again later |
 | `incomplete: unresolved_input` | a Kaspa input came back without its source address or amount | run it again later |

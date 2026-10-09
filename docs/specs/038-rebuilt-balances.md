@@ -62,6 +62,11 @@ is index 4 (`[time, low, high, open, close, volume]`). No KAS product exists.
   collected (unique ids) number exactly what the vendor's count says; their net effects sum to
   the current confirmed balance; and the count and balance read before the paging equal those
   read after it. Anything else is `incomplete`, with a reason, and stores nothing.
+  - **Amended on 2026-10-09 for Kaspa.** Its count is the rows of its address index, which
+    holds unaccepted transactions and, measured, ids its pages cannot serve. So on Kaspa the
+    count is checked against every id served, accepted or not, and may run ahead of it by
+    two or one in a hundred, whichever is more, but never fall behind. The sum check is
+    unchanged and still exact. Esplora's `tx_count` is still matched exactly.
 - **R2. A transaction's net effect** on an address is the sum of its outputs to the address
   minus the sum of its resolved inputs from it. Confirmed (Bitcoin) or accepted (Kaspa) only;
   an input whose source cannot be resolved makes the history incomplete.

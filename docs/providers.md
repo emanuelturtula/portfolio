@@ -807,9 +807,36 @@ largest from 2023-01-29 to 2024-01-25; one testnet-10):
 | `is_accepted` | `true` on all 3,154 rows read; `acceptance=rejected` answered `[]` |
 | caching | Cloudflare, `max-age=8` |
 
-**Not documented, and not relied on:** what an unaccepted transaction looks like, and whether
-`transactions-count` counts it (none was ever seen); that the boundary millisecond is always
-completed (seen once); any rate limit; any retention before 2023-01.
+**Not documented, and not relied on:** that the boundary millisecond is always completed
+(seen once); any rate limit; any retention before 2023-01.
+
+**What `transactions-count` counts: measured on 2026-10-09, after an owner's wallet reported
+`count_mismatch`.** The server's source at the deployed commit
+(`kaspa-ng/kaspa-rest-server`, `d0ea012`, the `info.version` of the live document) was read
+the same day.
+
+- `transactions-count` is the number of rows in the server's address-to-transaction index
+  (`addresses_transactions`), or a helper table that counts them.
+- `full-transactions-page` pages the same index, then fetches each id from the transactions
+  table. An id the transactions table does not hold is left out of the page silently.
+- `is_accepted` is whether the transaction has a row in the server's acceptance table. A
+  row without one is served with `is_accepted: false`; the count includes it.
+
+Measured over live histories, with addresses taken at run time from blocks the service
+served and kept in memory only:
+
+| | What came back |
+|---|---|
+| a count ahead of every id the pages served | 5 of 25 histories: 721 against 720, 1,297 against 1,295, 2,554 against 2,553, 5,082 against 5,079, 5,098 against 5,094. The offset-paged `full-transactions` serves the same ids, with one window of 500 index rows answering 499 |
+| unaccepted rows among the served | one history of 2,553 rows served about 2,000 with `is_accepted: false` beside 540 accepted |
+| the accepted rows' effects against `/balance` | equal in every history, those above included |
+
+So the count is checked against **every id served, accepted or not**, and may run ahead of it
+by **two, or one in a hundred, whichever is more** (`unserved_allowance`). It may never fall
+behind. A history inside that allowance is complete only when its accepted effects sum
+exactly to the balance, as before. Until 2026-10-09 the count was compared with the accepted
+ids alone, which reported every history above `count_mismatch`; re-read with the amended
+check, each of them proved itself.
 
 **What the reader does with that.** It pages with `limit=500` and
 `resolve_previous_outpoints=light`, following `X-Next-Page-Before` while it is sent, never
@@ -820,8 +847,9 @@ The cursor is checked to be digits before it goes into the URL, and the paging s
 same copy as the "before" ones on a short history, which weakens the before-and-after check;
 the count and the sum still have to agree with each other.
 It reads the count and the balance before and after the paging, and the history is complete
-only when both agree, the transactions number the count, and their effects add up to the
-balance. A transaction's day is the UTC date of its `block_time`, in milliseconds.
+only when both agree, the ids served are within the allowance of the count and never more
+than it, and the accepted transactions' effects add up to the balance. A transaction's day is
+the UTC date of its `block_time`, in milliseconds.
 
 ## Extended public keys
 
