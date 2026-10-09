@@ -241,9 +241,11 @@ class KaspaTx:
 def history_reply(address: str, transactions: Sequence[KaspaTx], **overrides: Any) -> Reply:
     """An instance serving `transactions` (newest first) with a count and balance that agree.
 
-    The count is the distinct **accepted** ids and the balance their net, so a test that
-    changes nothing gets a history that proves itself, and each incomplete arm is one
-    override away: `tx_total=`, `balance=`, or a different reply after the paging.
+    The count is every distinct id, **accepted or not** -- the vendor counts every row of its
+    address index, measured on 2026-10-09 -- and the balance is the net of the accepted ones.
+    A test that changes nothing therefore gets a history that proves itself, and each
+    incomplete arm is one override away: `tx_total=`, `balance=`, or a different reply after
+    the paging.
     """
     accepted = {
         transaction.transaction_id: transaction
@@ -255,7 +257,7 @@ def history_reply(address: str, transactions: Sequence[KaspaTx], **overrides: An
             transaction.funded(address) - transaction.spent(address)
             for transaction in accepted.values()
         ),
-        tx_total=len(accepted),
+        tx_total=len({transaction.transaction_id for transaction in transactions}),
         rows=tuple(transaction.document() for transaction in transactions),
     )
     return replace(reply, **overrides)

@@ -131,16 +131,20 @@ balances. Read off the live OpenAPI document and measured on **2026-10-08**
   that a page "can be != limit". `GET /addresses/{a}/transactions-count` returns
   `{"total": integer}`. The resolved input fields are **optional** in the schema.
 * **Measured:** following the header reaches the oldest transaction with no duplicate and no
-  gap, the rows equal `total`, and outputs minus resolved inputs equal `/balance`. A page can
-  exceed `limit` because the server completes the boundary millisecond, which is why the
-  cursor is followed and never computed. **`block_time` is epoch milliseconds**. Every row
-  read was `is_accepted: true`.
-* **Assumed:** what an unaccepted row looks like, and whether `total` counts one. Only
-  accepted rows are used (R2); if `total` counted others, the history would be reported
-  `count_mismatch` rather than be wrong.
+  gap, and outputs minus resolved inputs equal `/balance`. A page can exceed `limit` because
+  the server completes the boundary millisecond, which is why the cursor is followed and
+  never computed. **`block_time` is epoch milliseconds**.
+* **Measured on 2026-10-09, against the server's own source at the deployed commit:**
+  `total` is the number of rows in the address's index, and **it counts rows the pages
+  cannot serve and rows that are not accepted**. Of 22 live histories, 3 counted one or two
+  more ids than any page served, and one served about two thousand `is_accepted: false` rows
+  among 540 accepted ones -- and in every case the accepted rows summed exactly to
+  `/balance`. Comparing `total` with the accepted ids reported all of those
+  `count_mismatch`, an owner's real wallet among them.
 
-The history proves itself or is reported incomplete (R1): the distinct accepted ids equal
-`total`, their effects sum to `/balance`, and the count and balance read before the paging
+The history proves itself or is reported incomplete (R1): the distinct ids served, accepted
+or not, are no more than `total` and no more than `unserved_allowance` short of it; the
+accepted rows' effects sum to `/balance`; and the count and balance read before the paging
 equal those read after it. **The balance and the paging responses carry
 `Cache-Control: public, max-age=8`**, so two reads a few seconds apart can come from the same
 edge cache; the before-and-after comparison is only as fresh as the cache lets it be.
@@ -215,16 +219,21 @@ __all__ = [
     "PRIMARY",
     "TRANSACTIONS_COUNT_PATH",
     "TRANSACTIONS_PAGE_PATH",
+    "UNSERVED_ALLOWANCE_FLOOR",
+    "UNSERVED_ALLOWANCE_RATIO",
     "VENDOR",
     "AcceptedTransaction",
+    "HistoryPage",
     "KaspaProvider",
     "NodeHealth",
     "parse_address_balance",
     "parse_balances",
     "parse_health",
+    "parse_history_page",
     "parse_next_page_before",
     "parse_transaction_count",
     "parse_transactions_page",
+    "unserved_allowance",
 ]
 
 KASPA_DECIMALS: Final = 8
@@ -296,6 +305,19 @@ declares `strict_query_params`, so nothing else may be added here."""
 
 NEXT_PAGE_HEADER: Final = "X-Next-Page-Before"
 """Where the next page starts, present on every page but the last (measured 2026-10-08)."""
+
+UNSERVED_ALLOWANCE_FLOOR: Final = 2
+UNSERVED_ALLOWANCE_RATIO: Final = 100
+"""How far `/transactions-count` may run ahead of the rows the pages serve: two, or one in a
+hundred, whichever is more (see `unserved_allowance`).
+
+**Measured on 2026-10-09, not documented.** The count is the number of rows in the server's
+address-to-transaction index (`addresses_transactions`, kaspa-rest-server at the deployed
+commit, read the same day), and the pages serve only the ids of that index that its
+transactions table also holds. The two disagree: of 22 live histories, 3 counted one or two
+more than any page served -- 721 against 720, 1,297 against 1,295, 2,554 against 2,553 --
+and every one of those still summed exactly to `/balance`. The allowance is what lets such a
+history prove itself on the money alone; a shortfall past it is still `count_mismatch`."""
 
 LATEST_BLOCK_TIME_MS: Final = 253_402_300_799_999
 """The last epoch millisecond a `datetime` can hold, 9999-12-31T23:59:59.999Z.
@@ -657,6 +679,40 @@ class AcceptedTransaction:
     resolved: bool
 
 
+@dataclass(frozen=True, slots=True)
+class HistoryPage:
+    """One `full-transactions-page`: its accepted transactions, and every id it served.
+
+    `served` holds every row's `transaction_id`, accepted or not. `/transactions-count` counts
+    every row of the address's index, unaccepted ones included (measured 2026-10-09), so the
+    ids served -- not the accepted ones -- are what the count is checked against (R1).
+    """
+
+    accepted: tuple[AcceptedTransaction, ...]
+    served: frozenset[str]
+
+
+def parse_history_page(body: str | bytes, address: str) -> HistoryPage:
+    """One page read whole: `parse_transactions_page`'s transactions, and every id served.
+
+    Every row must carry a string `transaction_id`, an unaccepted one too, since each is one
+    of the rows the vendor counts. Every other refusal is `parse_transactions_page`'s.
+
+    Raises:
+        ProviderResponseError: a row of `parse_transactions_page`'s table, or an unaccepted
+            row whose `transaction_id` is not a string.
+    """
+    accepted: list[AcceptedTransaction] = []
+    served: set[str] = set()
+    for entry in _require_array(body):
+        row = _require_row(entry)
+        transaction = _accepted_transaction(row, address)
+        if transaction is not None:
+            accepted.append(transaction)
+        served.add(_transaction_id(row))
+    return HistoryPage(accepted=tuple(accepted), served=frozenset(served))
+
+
 def parse_transactions_page(body: str | bytes, address: str) -> tuple[AcceptedTransaction, ...]:
     """Every accepted transaction on one `full-transactions-page`, in the vendor's order.
 
@@ -682,13 +738,7 @@ def parse_transactions_page(body: str | bytes, address: str) -> tuple[AcceptedTr
     Raises:
         ProviderResponseError: any row of the table above.
     """
-    rows = _require_array(body)
-    transactions: list[AcceptedTransaction] = []
-    for row in rows:
-        transaction = _accepted_transaction(row, address)
-        if transaction is not None:
-            transactions.append(transaction)
-    return tuple(transactions)
+    return parse_history_page(body, address).accepted
 
 
 def parse_next_page_before(value: str | None) -> int | None:
@@ -713,14 +763,19 @@ def parse_next_page_before(value: str | None) -> int | None:
     return int(value)
 
 
-def _accepted_transaction(row: object, address: str) -> AcceptedTransaction | None:
-    """One history row, or `None` if it was not accepted. See `parse_transactions_page`."""
+def _require_row(row: object) -> Mapping[str, object]:
+    """A history row as an object, or a refusal naming what it is instead."""
     if not isinstance(row, dict):
         message = (
             f"The history page carried a row that is a {type(row).__name__} rather than a "
             "transaction object."
         )
         raise ProviderResponseError(message)
+    return row
+
+
+def _accepted_transaction(row: Mapping[str, object], address: str) -> AcceptedTransaction | None:
+    """One history row, or `None` if it was not accepted. See `parse_transactions_page`."""
     accepted = row.get(IS_ACCEPTED_FIELD)
     if not isinstance(accepted, bool):
         message = (
@@ -730,13 +785,7 @@ def _accepted_transaction(row: object, address: str) -> AcceptedTransaction | No
         raise ProviderResponseError(message)
     if not accepted:
         return None
-    transaction_id = row.get(TRANSACTION_ID_FIELD)
-    if not isinstance(transaction_id, str):
-        message = (
-            f"A transaction's {TRANSACTION_ID_FIELD!r} is a {type(transaction_id).__name__} "
-            "rather than a string."
-        )
-        raise ProviderResponseError(message)
+    transaction_id = _transaction_id(row)
     occurred_at = _block_time_ms(row.get(BLOCK_TIME_FIELD))
 
     received = 0
@@ -762,6 +811,18 @@ def _accepted_transaction(row: object, address: str) -> AcceptedTransaction | No
         effect=TxEffect(occurred_at=occurred_at, delta=received - spent),
         resolved=resolved,
     )
+
+
+def _transaction_id(row: Mapping[str, object]) -> str:
+    """A row's `transaction_id`, or a refusal naming its type: there is nothing to count by."""
+    transaction_id = row.get(TRANSACTION_ID_FIELD)
+    if not isinstance(transaction_id, str):
+        message = (
+            f"A transaction's {TRANSACTION_ID_FIELD!r} is a {type(transaction_id).__name__} "
+            "rather than a string."
+        )
+        raise ProviderResponseError(message)
+    return transaction_id
 
 
 def _block_time_ms(value: object) -> datetime:
@@ -823,12 +884,22 @@ def _require_amount(value: object, field: str) -> int:
     return value
 
 
+def unserved_allowance(counted: int) -> int:
+    """How many of `counted` may go unserved and the history still prove itself (R1).
+
+    `UNSERVED_ALLOWANCE_FLOOR`, or one in `UNSERVED_ALLOWANCE_RATIO`, whichever is more. A
+    page the pager missed would leave out hundreds of rows, not a handful, and would also
+    have to net to exactly zero to pass the balance check after this one.
+    """
+    return max(UNSERVED_ALLOWANCE_FLOOR, counted // UNSERVED_ALLOWANCE_RATIO)
+
+
 def _history_verdict(
     *,
     moved: bool,
     resolved: bool,
     ended: bool,
-    collected: int,
+    served: int,
     counted: int,
     summed: int,
     balance: int,
@@ -838,12 +909,18 @@ def _history_verdict(
     The same order as the Esplora provider's, for the same reason: each earlier reason
     explains the later ones. A history whose cursor did not run out within the page cap is a
     count mismatch -- the vendor served more pages than its own count allows.
+
+    **The count is checked against every id served, accepted or not, and may run ahead of it
+    by `unserved_allowance`** -- the vendor counts rows its pages cannot serve (see
+    `UNSERVED_ALLOWANCE_RATIO`). It may never fall behind: more ids than counted means the
+    count is not this history's. Either way the effects must still sum exactly to the
+    balance, which is the check that carries the weight.
     """
     if moved:
         return HistoryIncomplete.MOVED_DURING_READ
     if not resolved:
         return HistoryIncomplete.UNRESOLVED_INPUT
-    if not ended or collected != counted:
+    if not ended or served > counted or counted - served > unserved_allowance(counted):
         return HistoryIncomplete.COUNT_MISMATCH
     if summed != balance:
         return HistoryIncomplete.BALANCE_MISMATCH
@@ -1047,7 +1124,8 @@ class KaspaProvider:
         4. **`transactions-count` and `balance` again.** Any difference from step 2 is a
            transaction accepted during the read.
 
-        Complete only when it proves it (R1): the distinct accepted ids number `total`, their
+        Complete only when it proves it (R1): the distinct ids served, accepted or not, are
+        no more than `total` and within `unserved_allowance` of it, the accepted ones'
         effects sum to the balance, every input was resolved, and the two reads agree.
         Otherwise `incomplete` says why and nothing may store the effects.
 
@@ -1072,6 +1150,7 @@ class KaspaProvider:
 
         # Insertion-ordered, so newest first as the pages are; a repeat keeps the first.
         collected: dict[str, AcceptedTransaction] = {}
+        served: set[str] = set()
         first_page = TRANSACTIONS_PAGE_PATH.format(address=canonical)
         path = first_page
         ended = False
@@ -1079,7 +1158,9 @@ class KaspaProvider:
             body, headers, start = await self._instances.read_with_headers(
                 path, ADDRESS_HISTORY, start
             )
-            for transaction in parse_transactions_page(body, canonical):
+            page = parse_history_page(body, canonical)
+            served |= page.served
+            for transaction in page.accepted:
                 collected.setdefault(transaction.transaction_id, transaction)
             cursor = parse_next_page_before(headers.get(NEXT_PAGE_HEADER))
             if cursor is None:
@@ -1095,7 +1176,7 @@ class KaspaProvider:
             moved=before != after,
             resolved=all(transaction.resolved for transaction in oldest_first),
             ended=ended,
-            collected=len(collected),
+            served=len(served),
             counted=before.count,
             summed=sum(effect.delta for effect in effects),
             balance=before.balance,
