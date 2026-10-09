@@ -42,9 +42,6 @@ if TYPE_CHECKING:
 # changes, which it just did when `log_level` was added.
 type ProductionLoggingInstaller = Callable[..., None]
 
-#: A fictional origin, never a real hostname (rule 3). `Settings` refuses to build with
-#: `environment="prod"` while `allowed_origin` is still the development default.
-PRODUCTION_ORIGIN: Final = "https://portfolio.example"
 
 #: How many leading or trailing characters of an address count as a disclosure. A
 #: twenty-character run is as good as the whole string to whoever reads the log: it is
@@ -164,7 +161,6 @@ def production_logging(restored_logging: None) -> ProductionLoggingInstaller:
         configure_logging(
             Settings(
                 environment="prod",
-                allowed_origin=PRODUCTION_ORIGIN,
                 log_level=log_level,
                 argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
                 argon2_time_cost=OWASP_MINIMUM_TIME_COST,

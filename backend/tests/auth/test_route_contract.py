@@ -223,8 +223,8 @@ def test_the_application_registers_no_websocket_route(auth_app: FastAPI) -> None
     """A websocket would be authenticated by nothing, and `walk_routes` cannot see it.
 
     Two blind spots line up exactly. `BaseHTTPMiddleware.__call__` passes any scope whose
-    type is not `http` straight through to the application, so the origin check and the
-    session check never run for a websocket; and `walk_routes` keeps only routes that
+    type is not `http` straight through to the application, so the content-type check and
+    the session check never run for a websocket; and `walk_routes` keeps only routes that
     carry `methods`, which a `WebSocketRoute` does not, so the contract test above would
     stay green while the connection was accepted with no cookie at all. Driven with a real
     cookieless scope by review, a handler added at `/api/live` accepted and sent data.

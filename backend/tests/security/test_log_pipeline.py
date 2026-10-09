@@ -58,7 +58,6 @@ from tests.address_vectors import (
 )
 from tests.auth.conftest import apply_auth_environment
 from tests.security.conftest import (
-    PRODUCTION_ORIGIN,
     EveryRecord,
     assert_absent,
     assert_carried_something,
@@ -91,7 +90,6 @@ def with_secrets(log_level: str = "INFO", **secrets: str) -> Settings:
     return Settings(
         _env_file=None,
         environment="prod",
-        allowed_origin=PRODUCTION_ORIGIN,
         log_level=log_level,
         argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
         argon2_time_cost=OWASP_MINIMUM_TIME_COST,
@@ -538,7 +536,6 @@ async def test_a_real_uvicorn_server_writes_request_completed_and_no_access_line
     del restored_logging
     apply_auth_environment(monkeypatch, tmp_path)
     monkeypatch.setenv("PORTFOLIO_ENVIRONMENT", "prod")
-    monkeypatch.setenv("PORTFOLIO_ALLOWED_ORIGIN", PRODUCTION_ORIGIN)
     monkeypatch.setenv("PORTFOLIO_ARGON2_MEMORY_COST", str(OWASP_MINIMUM_MEMORY_COST))
     monkeypatch.setenv("PORTFOLIO_ARGON2_TIME_COST", str(OWASP_MINIMUM_TIME_COST))
     monkeypatch.setenv("PORTFOLIO_COINGECKO_API_KEY", KEY_SENTINEL)

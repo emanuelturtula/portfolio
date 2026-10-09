@@ -31,14 +31,9 @@ services:
     # GitHub Actions. The /dev/null default keeps compose valid before that file has any
     # content.
     #
-    # Two authentication variables live in that same file rather than here, because one is
-    # a host name and the other is a credential, and neither may enter the repository:
+    # The authentication variable lives in that same file rather than here, because it is
+    # a credential and may not enter the repository:
     #
-    #   PORTFOLIO_ALLOWED_ORIGIN     the scheme and host the browser shows, e.g.
-    #                                https://portfolio.example -- required in prod, and
-    #                                the application refuses to start without it, so the
-    #                                first deployment after authentication lands will roll
-    #                                back until it is set. docs/operations.md section 1.
     #   PORTFOLIO_BOOTSTRAP_PASSWORD optional; creates the account on first start and is
     #                                ignored once one exists. Prefer `create-user`, which
     #                                prompts and leaves no copy on disk.

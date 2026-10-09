@@ -53,7 +53,6 @@ from tests.address_vectors import (
 from tests.auth.conftest import BASE_URL as SECURE_BASE_URL
 from tests.auth.conftest import JSON_HEADERS
 from tests.security.conftest import (
-    PRODUCTION_ORIGIN,
     assert_absent,
     rendered,
 )
@@ -452,7 +451,6 @@ def exception_settings() -> Settings:
     return Settings(
         _env_file=None,
         environment="prod",
-        allowed_origin=PRODUCTION_ORIGIN,
         argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
         argon2_time_cost=OWASP_MINIMUM_TIME_COST,
         coingecko_api_key=SecretStr(EXCEPTION_SENTINEL),
@@ -555,7 +553,7 @@ def test_the_configured_pipeline_redacts_an_address_it_is_handed(
     vacuous pass impossible: an empty capture now fails on the event name.
     """
     del restored_logging  # The fixture's value is its teardown.
-    configure_logging(Settings(environment=environment, allowed_origin=PRODUCTION_ORIGIN))
+    configure_logging(Settings(environment=environment))
 
     structlog.get_logger("test").warning(
         "wallet_registered",

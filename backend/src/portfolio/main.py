@@ -682,7 +682,7 @@ def create_app() -> FastAPI:
 
     # Middleware runs before routing, which is the whole point: a check that ran after
     # routing would see an API request only when a route happened to exist for it.
-    app.add_middleware(RequestGuardMiddleware, settings=settings)
+    app.add_middleware(RequestGuardMiddleware)
     # Added last, so it is the outermost of the application's own middleware: the request id
     # it binds reaches the guard above, every route, and the 500 handler outside them all
     # (#23). A pure ASGI middleware, for the reason `api/request_context.py` gives. It labels

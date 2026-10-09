@@ -19,17 +19,6 @@ from portfolio.domain.passwords import (
     policy_violation,
 )
 
-# The Vite dev server. Harmless in development and wrong everywhere else, which is why
-# `prod` refuses to start while it is still the configured value.
-DEV_ALLOWED_ORIGIN: Final = "http://localhost:5173"
-
-# The `__Host-` prefix is only valid on a cookie that is `Secure`, has `Path=/` and has no
-# `Domain`; a browser silently drops one that arrives without them. The failure mode is a
-# login that returns 204 and then does not work, with nothing in any log -- so the name is
-# derived from the flag rather than written down twice.
-SECURE_SESSION_COOKIE_NAME: Final = "__Host-psid"
-INSECURE_SESSION_COOKIE_NAME: Final = "psid"
-
 PROVIDER_URL_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
 """The schemes a provider base URL may use. `https` everywhere except a local index."""
 
@@ -135,8 +124,6 @@ class Settings(BaseSettings):
     # synchronous engine that fails the moment it is awaited. Production already sets
     # `sqlite+aiosqlite:////app/data/portfolio.db`, so only the default was out of step.
     database_url: str = "sqlite+aiosqlite:///./data/portfolio.db"
-    allowed_origin: str = DEV_ALLOWED_ORIGIN
-    session_cookie_secure: bool = True
 
     # Argon2id cost, tuned on the deployment hardware rather than copied from a cloud
     # instance. `memory_cost` is in KiB, so 147456 is 144 MiB.
@@ -341,13 +328,6 @@ class Settings(BaseSettings):
     backup_keep_daily: int = 7
     backup_keep_weekly: int = 4
 
-    @property
-    def session_cookie_name(self) -> str:
-        """`__Host-psid`, degrading to `psid` on the one configuration that cannot use it."""
-        if self.session_cookie_secure:
-            return SECURE_SESSION_COOKIE_NAME
-        return INSECURE_SESSION_COOKIE_NAME
-
     @model_validator(mode="after")
     def _refuse_unsafe_configuration(self) -> Self:
         """Fail at construction, so an unsafe configuration never becomes a running server.
@@ -356,16 +336,6 @@ class Settings(BaseSettings):
 
         * a bootstrap password that is blank or one of the well-known defaults creates a
           real account with a password an attacker already has;
-        * `prod` on an `https://` origin without a `Secure` cookie means the session cookie
-          loses the `__Host-` prefix, and with it the guarantee that no other host on the
-          domain set it. A `http://` origin is exempt, and is the only one: a browser drops
-          a `Secure` cookie that arrives over plain HTTP from any host but `localhost`, so
-          there the flag does not protect the session, it makes sign-in impossible. Running
-          that way is a deliberate choice -- the password and the session travel in the
-          clear -- and takes two explicit variables, the origin and the flag, never one;
-        * `prod` still carrying the development origin rejects every write with a 403
-          while the health check stays green -- "login works, nothing else does", a
-          symptom that does not name its cause;
         * `prod` below the OWASP cost floor hashes passwords fast enough to be worth
           cracking, and says nothing about it at all. The realistic way to arrive there is
           not malice: `memory_cost` is in KiB, so an operator tuning after a
@@ -443,23 +413,6 @@ class Settings(BaseSettings):
             if reason is not None:
                 message = f"PORTFOLIO_BOOTSTRAP_PASSWORD is not acceptable: {reason}"
                 raise ValueError(message)
-        if (
-            self.environment == "prod"
-            and not self.session_cookie_secure
-            and not self.allowed_origin.startswith("http://")
-        ):
-            message = (
-                "PORTFOLIO_SESSION_COOKIE_SECURE cannot be false in production unless "
-                "PORTFOLIO_ALLOWED_ORIGIN is a plain http:// origin: the session cookie "
-                "would lose its __Host- prefix on a deployment that serves HTTPS."
-            )
-            raise ValueError(message)
-        if self.environment == "prod" and self.allowed_origin == DEV_ALLOWED_ORIGIN:
-            message = (
-                "PORTFOLIO_ALLOWED_ORIGIN must be set to the deployed origin in "
-                "production; it is still the development default."
-            )
-            raise ValueError(message)
         if self.environment == "prod" and self.argon2_memory_cost < OWASP_MINIMUM_MEMORY_COST:
             message = (
                 f"PORTFOLIO_ARGON2_MEMORY_COST is {self.argon2_memory_cost}, below the "
