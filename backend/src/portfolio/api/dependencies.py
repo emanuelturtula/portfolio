@@ -33,6 +33,10 @@ from portfolio.services.auth import (
 )
 from portfolio.services.backup import BackupService
 from portfolio.services.balances import BalanceService, build_balance_service
+from portfolio.services.export_reminders import (
+    ExportReminderService,
+    build_export_reminder_service,
+)
 from portfolio.services.health import (
     HealthService,
     SchedulerName,
@@ -179,6 +183,17 @@ async def get_portfolio_history_service(
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
     async with sessionmaker() as session:
         yield build_portfolio_history_service(session)
+
+
+async def get_export_reminder_service(request: Request) -> AsyncIterator[ExportReminderService]:
+    """Open a session for this request and hand the router the export reminder service.
+
+    The same shape as `get_wallet_service`: marking a month done writes, and the service
+    commits. The service's clock is the default one.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_export_reminder_service(session)
 
 
 def get_backup_service(request: Request) -> BackupService:

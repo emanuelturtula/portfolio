@@ -8,6 +8,7 @@ import { ErrorState } from '@/components/ErrorState';
 import { Skeleton } from '@/components/Skeleton';
 import { describeMissing } from '@/lib/portfolio';
 import { BackupNotice } from '@/pages/dashboard/BackupNotice';
+import { ExportReminder } from '@/pages/dashboard/ExportReminder';
 import { Holdings } from '@/pages/dashboard/Holdings';
 import { TotalHero } from '@/pages/dashboard/TotalHero';
 import { PortfolioHistory } from '@/pages/dashboard/ValueHistory';
@@ -35,7 +36,8 @@ function isEmpty(summary: PortfolioSummary): boolean {
  * its card: a history that fails to load never takes the figures above it down with it.
  *
  * Above everything, a warning when the scheduled backups failed or stopped (spec 029): it is
- * about the data underneath, not about any one figure.
+ * about the data underneath, not about any one figure. Below it, the monthly reminder to export
+ * each exchange's transactions by hand (spec 040), until the owner marks the month done.
  */
 export function DashboardPage() {
   const summary = usePortfolioSummary();
@@ -44,6 +46,7 @@ export function DashboardPage() {
   return (
     <div className="page">
       <BackupNotice />
+      <ExportReminder />
       <Overview summary={summary} sync={sync} />
     </div>
   );
