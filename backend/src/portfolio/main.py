@@ -18,7 +18,15 @@ from portfolio.api.dependencies import auth_service_for, install_auth_runtime
 from portfolio.api.errors import register_exception_handlers
 from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware, is_api_path
 from portfolio.api.request_context import RequestContextMiddleware, documentation_paths
-from portfolio.api.routers import auth, balances, health, history, portfolio, wallets
+from portfolio.api.routers import (
+    auth,
+    balances,
+    exchange_operations,
+    health,
+    history,
+    portfolio,
+    wallets,
+)
 from portfolio.config import get_settings
 from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import (
@@ -728,6 +736,8 @@ def create_app() -> FastAPI:
     # Full paths, like the balance router's: `/portfolio/history` beside `/portfolio/summary`,
     # and `/wallets/{wallet_id}/value-history` beside the wallet routes, none colliding.
     app.include_router(history.router, prefix=API_PREFIX)
+    # Spec 042: the uploaded exchange operations, and the invested figures built on them.
+    app.include_router(exchange_operations.router, prefix=API_PREFIX)
 
     # Mounted last and at the root: it matches every path outside `/api`, so a route
     # registered after it there would be unreachable. It never matches one under `/api`,

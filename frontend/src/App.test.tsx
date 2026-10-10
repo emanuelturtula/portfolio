@@ -82,7 +82,7 @@ describe('App', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
-  it('the header links to the two pages, the dashboard and the wallets', async () => {
+  it('the header links to the pages, the dashboard, the wallets and the operations', async () => {
     const user = userEvent.setup();
     server.use(...fakeSession({ initialUser: TEST_USERNAME }).handlers);
 
@@ -93,13 +93,13 @@ describe('App', () => {
     const wallets = within(nav).getByRole('link', { name: 'Wallets' });
     expect(dashboard).toHaveAttribute('href', '/');
     expect(wallets).toHaveAttribute('href', '/wallets');
-    // Two pages and nothing else (spec 039): Details is folded into Wallets, and Health is
-    // reached from the backup notice.
+    // Three pages and nothing else (spec 039, spec 042): Details is folded into Wallets, and
+    // Health is reached from the backup notice.
     expect(
       within(nav)
         .getAllByRole('link')
         .map((link) => link.textContent),
-    ).toEqual(['Dashboard', 'Wallets']);
+    ).toEqual(['Dashboard', 'Wallets', 'Operations']);
     // The current page is marked for assistive technology, not by colour alone.
     expect(dashboard).toHaveAttribute('aria-current', 'page');
     expect(wallets).not.toHaveAttribute('aria-current');

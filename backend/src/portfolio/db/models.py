@@ -141,6 +141,21 @@ _BALANCE_SNAPSHOT_CONFIRMED_CHECK: Final = "confirmed >= 0"
 # `0014_reconstructed_balances` -- and the same reflection test.
 _RECONSTRUCTED_BALANCE_CONFIRMED_CHECK: Final = "confirmed >= 0"
 
+# Spec 042, R1: the kinds an exchange operation is filed under, and R11: a manual entry is a
+# buy or a sell. The same duplication hazard as the constants above -- repeated verbatim in
+# `0016_exchange_operations` -- and the same reflection test.
+_EXCHANGE_OPERATION_KIND_CHECK: Final = (
+    "kind IN ('buy', 'sell', 'reward', 'deposit', 'withdrawal', 'transfer', 'other')"
+)
+_EXCHANGE_OPERATION_MANUAL_CHECK: Final = "source != 'manual' OR kind IN ('buy', 'sell')"
+
+OPERATION_SCALE: Final = 18
+"""Decimal places an exchange operation's quantities and amounts are stored at (spec 042).
+
+Eighteen holds every figure the exports write -- BingX writes an order value to seventeen --
+and leaves `MONEY_PRECISION - 18` = 20 digits in front of the point, enough for a peso amount.
+"""
+
 PRICE_SCALE: Final = 12
 """Decimal places `prices.amount` rounds to and stores. Public, because a test pins it.
 
@@ -650,6 +665,75 @@ class ReconstructedBalance(Base):
     confirmed: Mapped[int] = mapped_column(BaseUnits, nullable=False)
     decimals: Mapped[int] = mapped_column(Integer, nullable=False)
     rebuilt_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
+class ExchangeImport(Base):
+    """One uploaded file, and what it added (spec 042).
+
+    A record of the upload rather than a key anything depends on: an operation points at the
+    import that first stored it, and deleting an import is out of scope. `sha256` is the
+    uploaded bytes' digest, so the same file uploaded twice is visible as such.
+    """
+
+    __tablename__ = "exchange_imports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    stored: Mapped[int] = mapped_column(Integer, nullable=False)
+    already_stored: Mapped[int] = mapped_column(Integer, nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
+class ExchangeOperation(Base):
+    """One operation from an exchange's export, or entered by hand (spec 042).
+
+    **Every asset is stored**, tracked or not (R6): the owner asked for the whole history,
+    and only the figures filter. So `asset` is the symbol as text rather than a key into
+    `assets`, which holds the three coins the portfolio prices.
+
+    `UNIQUE (user_id, source, external_id)` is the deduplication (R3): an upload inserts only
+    the ids not already stored and never overwrites one. The amounts are `NumericText`, so no
+    sum of them is ever taken in SQL.
+    """
+
+    __tablename__ = "exchange_operations"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "source", "external_id", name="uq_exchange_operations_source_id"
+        ),
+        CheckConstraint(_EXCHANGE_OPERATION_KIND_CHECK, name="kind"),
+        CheckConstraint(_EXCHANGE_OPERATION_MANUAL_CHECK, name="manual"),
+        # The listing reads one owner's operations newest first.
+        Index("ix_exchange_operations_user_executed", "user_id", "executed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    venue: Mapped[str] = mapped_column(Text, nullable=False)
+    external_id: Mapped[str] = mapped_column(Text, nullable=False)
+    executed_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    asset: Mapped[str] = mapped_column(Text, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(NumericText(OPERATION_SCALE), nullable=False)
+    quote_currency: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quote_amount: Mapped[Decimal | None] = mapped_column(
+        NumericText(OPERATION_SCALE), nullable=True
+    )
+    fee_asset: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fee_amount: Mapped[Decimal | None] = mapped_column(NumericText(OPERATION_SCALE), nullable=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    # `SET NULL`, so that deleting an import, were it ever allowed, keeps its operations.
+    import_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("exchange_imports.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
 # Re-exported so that anything needing the schema -- Alembic's `env.py`, the drift check --

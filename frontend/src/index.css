@@ -1477,3 +1477,31 @@ tbody th {
     padding: var(--space-5) var(--space-4) var(--space-4);
   }
 }
+
+/* Spec 042: the dashboard's invested figures and the upload report. */
+.investment-totals {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: var(--space-3);
+  margin: 0 0 var(--space-3);
+}
+
+.investment-totals dd {
+  margin: var(--space-1) 0 0;
+}
+
+.investment-totals .change-up,
+.investment-card td .change-up {
+  color: var(--color-gain);
+}
+
+.investment-totals .change-down,
+.investment-card td .change-down {
+  color: var(--color-loss);
+}
+
+.upload-report {
+  margin: var(--space-2) 0 0;
+  padding-left: 1.25rem;
+  font-size: var(--text-sm);
+}
