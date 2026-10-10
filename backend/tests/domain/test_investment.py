@@ -217,3 +217,21 @@ def test_assets_are_by_symbol_and_movements_by_time_whatever_order_they_arrive_i
         InvestedOnDay(date(2026, 5, 5), Decimal(6)),
     )
     assert result.total.pnl_pct == Decimal("16.6667")
+
+
+def test_a_network_fee_entered_by_hand_lowers_the_explained_quantity_only() -> None:
+    # Spec 043: what a withdrawal cost on its way, which the export did not list, and what a
+    # miner paid: neither is invested, both change what the operations explain.
+    movements = [
+        buy("KAS", "1000", "USDT", "25"),
+        moved("KAS", OperationKind.FEE, "1.53"),
+        moved("KAS", OperationKind.REWARD, "3.27031957"),
+    ]
+
+    holding = Holding("KAS", Decimal("1001.74031957"), None)
+    (kas,) = summarize_investment(movements, [holding]).assets
+
+    assert kas.explained == Decimal("1001.74031957")
+    assert kas.difference == Decimal(0)
+    assert kas.invested == Decimal(25)
+    assert kas.trades == 1

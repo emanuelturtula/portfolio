@@ -170,13 +170,18 @@ export interface paths {
         };
         /**
          * The stored operations, newest first
-         * @description One page of every stored operation, of every asset, with the total count.
+         * @description One page of the stored operations, of every asset unless filtered, with how many the
+         *     filter keeps and every asset and venue there is to filter by.
+         *
+         *     A naive `since` or `until` is refused rather than assumed to be UTC, and so is a window
+         *     that ends at or before it starts.
          */
         get: operations["listExchangeOperations"];
         put?: never;
         /**
-         * Record a buy or a sell no export covers
-         * @description Store a manual entry, such as a swap inside a wallet app. It can be deleted later.
+         * Record a buy, a sell, a reward or a network fee no export covers
+         * @description Store a manual entry, such as a swap inside a wallet app, a miner's payout or a
+         *     withdrawal's unlisted network fee. It can be deleted later.
          */
         post: operations["createManualOperation"];
         delete?: never;
@@ -855,10 +860,12 @@ export interface components {
         };
         /**
          * ManualOperationRequest
-         * @description A buy or a sell the exports do not cover, such as a swap in a wallet app (R11).
+         * @description An operation the exports do not cover (R11): a swap in a wallet app, a miner's payout,
+         *     or a network fee a withdrawal paid that the export did not list (spec 043).
          *
-         *     `quantity` is what was bought or sold, and `quote_amount` what it cost or brought in, in
-         *     `quote_currency`, before any fee. A symbol is stored upper-cased.
+         *     A `buy` or `sell` says what it cost or brought in: `quantity` of `asset` for `quote_amount`
+         *     of `quote_currency`, before any fee. A `reward` or a `fee` is only `quantity` of `asset`,
+         *     and is refused with a counterpart or a fee of its own. A symbol is stored upper-cased.
          */
         ManualOperationRequest: {
             /** Asset */
@@ -881,19 +888,16 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "buy" | "sell";
+            kind: "buy" | "sell" | "reward" | "fee";
             /**
              * Quantity
              * @example 1234.56789012
              */
             quantity: string;
-            /**
-             * Quote Amount
-             * @example 1234.56789012
-             */
-            quote_amount: string;
+            /** Quote Amount */
+            quote_amount?: string | null;
             /** Quote Currency */
-            quote_currency: string;
+            quote_currency?: string | null;
             /** Venue */
             venue: string;
         };
@@ -925,18 +929,28 @@ export interface components {
          * @description What an operation did. The member is its own stored and wire form.
          * @enum {string}
          */
-        OperationKind: "buy" | "sell" | "reward" | "deposit" | "withdrawal" | "transfer" | "other";
+        OperationKind: "buy" | "sell" | "reward" | "deposit" | "withdrawal" | "transfer" | "other" | "fee";
         /**
          * OperationListResponse
-         * @description One page of operations, newest first, and how many there are in all.
+         * @description One page of operations, newest first, and how many the filter keeps.
          *
          *     `count` rather than `total`, which is a money property everywhere else in the schema.
          */
         OperationListResponse: {
+            /**
+             * Assets
+             * @description Every asset with a stored operation, alphabetically, whatever the filter.
+             */
+            assets: string[];
             /** Count */
             count: number;
             /** Operations */
             operations: components["schemas"]["OperationResponse"][];
+            /**
+             * Venues
+             * @description Every venue with a stored operation, alphabetically, whatever the filter.
+             */
+            venues: string[];
         };
         /**
          * OperationResponse
@@ -1796,6 +1810,14 @@ export interface operations {
             query?: {
                 limit?: number;
                 offset?: number;
+                /** @description Only this asset. */
+                asset?: string | null;
+                /** @description Only this venue, as `venues` lists it. */
+                venue?: string | null;
+                /** @description Only operations at or after this instant. Needs an offset. */
+                since?: string | null;
+                /** @description Only operations before this instant. Needs an offset. */
+                until?: string | null;
             };
             header?: never;
             path?: never;

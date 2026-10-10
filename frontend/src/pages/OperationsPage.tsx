@@ -1,8 +1,9 @@
-import { useState, type SubmitEvent } from 'react';
+import { useEffect, useState, type SubmitEvent } from 'react';
 
 import { describeApiError } from '@/api/client';
 import {
-  OPERATIONS_PAGE_SIZE,
+  DEFAULT_OPERATIONS_PAGE_SIZE,
+  OPERATIONS_PAGE_SIZES,
   useCreateManualOperation,
   useDeleteOperation,
   useImportOperations,
@@ -10,6 +11,7 @@ import {
   type ImportFileReport,
   type ImportReport,
   type Operation,
+  type OperationsPageSize,
 } from '@/api/operations';
 import { AbsoluteTime } from '@/components/AbsoluteTime';
 import { EmptyState } from '@/components/EmptyState';
@@ -33,6 +35,7 @@ const KIND_LABELS: Record<Operation['kind'], string> = {
   withdrawal: 'Withdrawal',
   transfer: 'Transfer',
   other: 'Other',
+  fee: 'Network fee',
 };
 
 /** One file of an upload in a sentence: what was new, or why it was skipped. */
@@ -131,20 +134,33 @@ function toInstant(local: string): string {
   return new Date(local).toISOString();
 }
 
-/** A buy or a sell no export covers, such as a swap inside a wallet app (R11). */
+/** The kinds an entry by hand can be, in the order the form offers them (spec 043). */
+const MANUAL_KINDS = ['buy', 'sell', 'reward', 'fee'] as const;
+type ManualKind = (typeof MANUAL_KINDS)[number];
+
+function manualKindOf(value: string): ManualKind {
+  return MANUAL_KINDS.find((kind) => kind === value) ?? 'buy';
+}
+
+/**
+ * What no export covers (R11): a buy or a sell, such as a swap inside a wallet app, or, with no
+ * counterpart, a miner's reward or a network fee a withdrawal paid that its report left out.
+ */
 function ManualForm() {
   const create = useCreateManualOperation();
   const [venue, setVenue] = useState('Tangem');
   const [executedAt, setExecutedAt] = useState('');
-  const [kind, setKind] = useState<'buy' | 'sell'>('buy');
+  const [kind, setKind] = useState<ManualKind>('buy');
   const [asset, setAsset] = useState('');
   const [quantity, setQuantity] = useState('');
   const [quoteCurrency, setQuoteCurrency] = useState('USDT');
   const [quoteAmount, setQuoteAmount] = useState('');
   const [description, setDescription] = useState('');
-  const complete = [venue, executedAt, asset, quantity, quoteCurrency, quoteAmount].every(
-    (value) => value.trim() !== '',
-  );
+  const trade = kind === 'buy' || kind === 'sell';
+  const required = trade
+    ? [venue, executedAt, asset, quantity, quoteCurrency, quoteAmount]
+    : [venue, executedAt, asset, quantity];
+  const complete = required.every((value) => value.trim() !== '');
 
   function handleSubmit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -155,8 +171,10 @@ function ManualForm() {
         kind,
         asset: asset.trim(),
         quantity: quantity.trim(),
-        quote_currency: quoteCurrency.trim(),
-        quote_amount: quoteAmount.trim(),
+        // A reward or a fee has no counterpart, and the server refuses one sent anyway.
+        ...(trade
+          ? { quote_currency: quoteCurrency.trim(), quote_amount: quoteAmount.trim() }
+          : {}),
         description: description.trim(),
       },
       {
@@ -174,8 +192,8 @@ function ManualForm() {
     <form className="card" onSubmit={handleSubmit} noValidate aria-labelledby="manual-heading">
       <h3 id="manual-heading">Add an operation by hand</h3>
       <p className="hint">
-        For a buy or a sell no report covers, such as a swap inside a wallet app. Amounts are before
-        any fee.
+        For what no report covers: a swap inside a wallet app, what a miner paid you, or a network
+        fee a withdrawal paid that its report left out. Amounts are before any fee.
       </p>
       <div className="field">
         <label htmlFor="manual-venue">Where</label>
@@ -205,11 +223,14 @@ function ManualForm() {
           id="manual-kind"
           value={kind}
           onChange={(event) => {
-            setKind(event.target.value === 'sell' ? 'sell' : 'buy');
+            setKind(manualKindOf(event.target.value));
           }}
         >
-          <option value="buy">Buy</option>
-          <option value="sell">Sell</option>
+          {MANUAL_KINDS.map((value) => (
+            <option key={value} value={value}>
+              {KIND_LABELS[value]}
+            </option>
+          ))}
         </select>
       </div>
       <div className="field">
@@ -236,29 +257,33 @@ function ManualForm() {
           }}
         />
       </div>
-      <div className="field">
-        <label htmlFor="manual-quote">Paid or received in</label>
-        <input
-          id="manual-quote"
-          type="text"
-          value={quoteCurrency}
-          onChange={(event) => {
-            setQuoteCurrency(event.target.value);
-          }}
-        />
-      </div>
-      <div className="field">
-        <label htmlFor="manual-amount">Amount paid or received</label>
-        <input
-          id="manual-amount"
-          type="text"
-          inputMode="decimal"
-          value={quoteAmount}
-          onChange={(event) => {
-            setQuoteAmount(event.target.value);
-          }}
-        />
-      </div>
+      {trade && (
+        <>
+          <div className="field">
+            <label htmlFor="manual-quote">Paid or received in</label>
+            <input
+              id="manual-quote"
+              type="text"
+              value={quoteCurrency}
+              onChange={(event) => {
+                setQuoteCurrency(event.target.value);
+              }}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="manual-amount">Amount paid or received</label>
+            <input
+              id="manual-amount"
+              type="text"
+              inputMode="decimal"
+              value={quoteAmount}
+              onChange={(event) => {
+                setQuoteAmount(event.target.value);
+              }}
+            />
+          </div>
+        </>
+      )}
       <div className="field">
         <label htmlFor="manual-description">Note</label>
         <input
@@ -338,11 +363,134 @@ function OperationRow({ operation, onDelete, deleting }: OperationRowProps) {
   );
 }
 
-/** The stored operations, every asset, newest first, a page at a time; four states. */
+interface Filters {
+  readonly asset: string;
+  readonly venue: string;
+  readonly from: string;
+  readonly to: string;
+}
+
+const NO_FILTERS: Filters = { asset: '', venue: '', from: '', to: '' };
+
+function filtering(filters: Filters): boolean {
+  return Object.values(filters).some((value) => value !== '');
+}
+
+/** "Showing 51–100 of 912": the rows on screen and how many the filters keep. */
+export function describeShown(page: number, pageSize: number, shown: number, count: number) {
+  const first = page * pageSize + 1;
+  const last = page * pageSize + shown;
+  return first === last
+    ? `Showing ${String(first)} of ${String(count)}`
+    : `Showing ${String(first)}–${String(last)} of ${String(count)}`;
+}
+
+interface FilterBarProps {
+  readonly filters: Filters;
+  readonly assets: readonly string[];
+  readonly venues: readonly string[];
+  readonly onChange: (filters: Filters) => void;
+}
+
+/** The table's filters: a range of days, an asset and a venue. */
+function FilterBar({ filters, assets, venues, onChange }: FilterBarProps) {
+  return (
+    <div className="operations-filters" role="group" aria-label="Filters">
+      <div className="field">
+        <label htmlFor="operations-from">From</label>
+        <input
+          id="operations-from"
+          type="date"
+          value={filters.from}
+          max={filters.to === '' ? undefined : filters.to}
+          onChange={(event) => {
+            const from = event.target.value;
+            // A start after the end would ask for an empty window: the end gives way.
+            const to = filters.to !== '' && filters.to < from ? '' : filters.to;
+            onChange({ ...filters, from, to });
+          }}
+        />
+      </div>
+      <div className="field">
+        <label htmlFor="operations-to">To</label>
+        <input
+          id="operations-to"
+          type="date"
+          value={filters.to}
+          min={filters.from === '' ? undefined : filters.from}
+          onChange={(event) => {
+            const to = event.target.value;
+            const from = filters.from !== '' && to !== '' && filters.from > to ? '' : filters.from;
+            onChange({ ...filters, from, to });
+          }}
+        />
+      </div>
+      <div className="field">
+        <label htmlFor="operations-asset">Asset</label>
+        <select
+          id="operations-asset"
+          value={filters.asset}
+          onChange={(event) => {
+            onChange({ ...filters, asset: event.target.value });
+          }}
+        >
+          <option value="">All assets</option>
+          {assets.map((asset) => (
+            <option key={asset} value={asset}>
+              {asset}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="field">
+        <label htmlFor="operations-venue">Where</label>
+        <select
+          id="operations-venue"
+          value={filters.venue}
+          onChange={(event) => {
+            onChange({ ...filters, venue: event.target.value });
+          }}
+        >
+          <option value="">Everywhere</option>
+          {venues.map((venue) => (
+            <option key={venue} value={venue}>
+              {venue}
+            </option>
+          ))}
+        </select>
+      </div>
+      <button
+        type="button"
+        disabled={!filtering(filters)}
+        onClick={() => {
+          onChange(NO_FILTERS);
+        }}
+      >
+        Clear filters
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The stored operations, every asset, newest first, a page at a time; four states. Filtered by
+ * days, asset and venue, with the page size the owner picks; a filter that keeps nothing says
+ * so beside the filters, never as "No operations yet".
+ */
 function OperationsTable() {
+  const [filters, setFilters] = useState<Filters>(NO_FILTERS);
+  const [pageSize, setPageSize] = useState<OperationsPageSize>(DEFAULT_OPERATIONS_PAGE_SIZE);
   const [page, setPage] = useState(0);
-  const operations = useOperations(page);
+  const operations = useOperations({ page, pageSize, ...filters });
   const remove = useDeleteOperation();
+  const stored = operations.data?.count;
+
+  // A deletion can empty the last page: step back to the page that is now the last.
+  useEffect(() => {
+    if (stored !== undefined && page > 0 && page * pageSize >= stored) {
+      setPage(Math.max(0, Math.ceil(stored / pageSize) - 1));
+    }
+  }, [stored, page, pageSize]);
 
   if (operations.isPending) {
     return <Skeleton label={OPERATIONS_LOADING_LABEL} />;
@@ -361,8 +509,8 @@ function OperationsTable() {
     );
   }
 
-  const { count, operations: rows } = operations.data;
-  if (count === 0) {
+  const { count, operations: rows, assets, venues } = operations.data;
+  if (count === 0 && !filtering(filters)) {
     return (
       <EmptyState
         title="No operations yet"
@@ -372,7 +520,7 @@ function OperationsTable() {
     );
   }
 
-  const pages = Math.ceil(count / OPERATIONS_PAGE_SIZE);
+  const pages = Math.max(1, Math.ceil(count / pageSize));
   return (
     <section
       className="card"
@@ -381,79 +529,117 @@ function OperationsTable() {
     >
       <div className="card-head">
         <h3 id="operations-heading">Operations</h3>
-        <span className="page-meta">
-          {count === 1 ? '1 operation' : `${String(count)} operations`}
+        <span className="page-meta" role="status">
+          {count === 0 ? 'None match' : describeShown(page, pageSize, rows.length, count)}
         </span>
       </div>
+      <FilterBar
+        filters={filters}
+        assets={assets}
+        venues={venues}
+        onChange={(next) => {
+          setFilters(next);
+          setPage(0);
+        }}
+      />
       {remove.isError && (
         <p className="note note-error" role="alert">
           Not deleted: {describeApiError(remove.error, WRITE_FAILURE_FALLBACK)}
         </p>
       )}
-      <div className="table-scroll">
-        <table className="data-table">
-          <caption className="visually-hidden">Stored operations, newest first</caption>
-          <thead>
-            <tr>
-              <th scope="col">When</th>
-              <th scope="col">Where</th>
-              <th scope="col">Kind</th>
-              <th scope="col">Asset</th>
-              <th scope="col" className="num">
-                Quantity
-              </th>
-              <th scope="col" className="num">
-                Paid or received
-              </th>
-              <th scope="col" className="num">
-                Fee
-              </th>
-              <th scope="col">Note</th>
-              <th scope="col">
-                <span className="visually-hidden">Actions</span>
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((operation) => (
-              <OperationRow
-                key={operation.id}
-                operation={operation}
-                deleting={remove.isPending}
-                onDelete={(id) => {
-                  remove.mutate(id);
-                }}
-              />
-            ))}
-          </tbody>
-        </table>
-      </div>
-      {pages > 1 && (
-        <nav className="state-actions" aria-label="Pages">
-          <button
-            type="button"
-            disabled={page === 0}
-            onClick={() => {
-              setPage(page - 1);
-            }}
-          >
-            Newer
-          </button>
-          <span>
-            Page {page + 1} of {pages}
-          </span>
-          <button
-            type="button"
-            disabled={page + 1 >= pages}
-            onClick={() => {
-              setPage(page + 1);
-            }}
-          >
-            Older
-          </button>
-        </nav>
+      {count === 0 ? (
+        <p className="history-empty">
+          No operations match these filters. Clear them, or widen the days.
+        </p>
+      ) : (
+        <div className="table-scroll">
+          <table className="data-table">
+            <caption className="visually-hidden">Stored operations, newest first</caption>
+            <thead>
+              <tr>
+                <th scope="col">When</th>
+                <th scope="col">Where</th>
+                <th scope="col">Kind</th>
+                <th scope="col">Asset</th>
+                <th scope="col" className="num">
+                  Quantity
+                </th>
+                <th scope="col" className="num">
+                  Paid or received
+                </th>
+                <th scope="col" className="num">
+                  Fee
+                </th>
+                <th scope="col">Note</th>
+                <th scope="col">
+                  <span className="visually-hidden">Actions</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((operation) => (
+                <OperationRow
+                  key={operation.id}
+                  operation={operation}
+                  deleting={remove.isPending}
+                  onDelete={(id) => {
+                    remove.mutate(id);
+                  }}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
+      <nav className="state-actions operations-pages" aria-label="Pages">
+        <div className="field">
+          <label htmlFor="operations-page-size">Rows per page</label>
+          <select
+            id="operations-page-size"
+            value={pageSize}
+            onChange={(event) => {
+              setPageSize(pageSizeOf(event.target.value));
+              setPage(0);
+            }}
+          >
+            {OPERATIONS_PAGE_SIZES.map((size) => (
+              <option key={size} value={size}>
+                {size}
+              </option>
+            ))}
+          </select>
+        </div>
+        <button
+          type="button"
+          disabled={page === 0}
+          onClick={() => {
+            setPage(page - 1);
+          }}
+        >
+          Newer
+        </button>
+        <span>
+          Page {page + 1} of {pages}
+        </span>
+        <button
+          type="button"
+          disabled={page + 1 >= pages}
+          onClick={() => {
+            setPage(page + 1);
+          }}
+        >
+          Older
+        </button>
+      </nav>
     </section>
+  );
+}
+
+/** A page size the select offers; anything else, which only a tampered page could send, is the
+ * default. */
+function pageSizeOf(value: string): OperationsPageSize {
+  return (
+    OPERATIONS_PAGE_SIZES.find((size) => String(size) === value) ?? DEFAULT_OPERATIONS_PAGE_SIZE
   );
 }
 

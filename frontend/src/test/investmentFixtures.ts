@@ -4,13 +4,7 @@
  * Amounts are written the way the backend serializes them, at the scale it stores them, so a
  * test that formats one formats what production formats.
  */
-import type {
-  AssetInvestment,
-  Investment,
-  Operation,
-  OperationList,
-  TotalInvestment,
-} from '@/api/operations';
+import type { AssetInvestment, Investment, Operation, TotalInvestment } from '@/api/operations';
 
 /** What the backend answers before anything is tracked or uploaded. */
 export function emptyInvestment(overrides: Partial<Investment> = {}): Investment {
@@ -97,8 +91,4 @@ export function operation(overrides: Partial<Operation> = {}): Operation {
     manual: false,
     ...overrides,
   };
-}
-
-export function operationList(operations: readonly Operation[], count?: number): OperationList {
-  return { count: count ?? operations.length, operations: [...operations] };
 }

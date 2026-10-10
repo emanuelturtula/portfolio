@@ -300,6 +300,64 @@ async def test_the_listing_pages_newest_first(api_environment: Path) -> None:
     assert too_large.status_code == 422
 
 
+async def test_the_listing_filters_by_asset_venue_and_time(api_environment: Path) -> None:
+    del api_environment
+    async with application() as (_app, client):
+        await upload(client, "fills.csv", BITGET_FILLS.encode())
+        await client.post(OPERATIONS, json=TANGEM_SWAP)
+        everything = await listed(client)
+        by_asset = await listed(client, "?asset=btc")
+        by_venue = await listed(client, "?venue=Tangem")
+        # The buy is 12:00Z on May 1, the swap 10:00Z on May 2, the sell 00:30Z on May 4.
+        window = await listed(
+            client, "?since=2026-05-01T13:00:00%2B00:00&until=2026-05-04T00:30:00Z"
+        )
+        combined = await listed(client, "?asset=BTC&venue=Bitget&since=2026-05-02T00:00:00Z")
+        none = await listed(client, "?asset=ETH")
+        paged = await listed(client, "?asset=BTC&limit=1&offset=1")
+
+    def kinds(body: dict[str, Any]) -> list[tuple[str, str]]:
+        return [(o["asset"], o["kind"]) for o in body["operations"]]
+
+    # The choices are every stored value, whatever the filter, so a filter can be changed
+    # from one that matches nothing.
+    assert everything["assets"] == none["assets"] == ["BTC", "KAS"]
+    assert everything["venues"] == none["venues"] == ["Bitget", "Tangem"]
+    assert by_asset["count"] == 2
+    assert kinds(by_asset) == [("BTC", "sell"), ("BTC", "buy")]
+    assert kinds(by_venue) == [("KAS", "buy")]
+    assert kinds(window) == [("KAS", "buy")]
+    assert window["count"] == 1
+    assert kinds(combined) == [("BTC", "sell")]
+    assert none == {
+        "count": 0,
+        "operations": [],
+        "assets": ["BTC", "KAS"],
+        "venues": ["Bitget", "Tangem"],
+    }
+    assert paged["count"] == 2
+    assert kinds(paged) == [("BTC", "buy")]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "?since=2026-05-01T00:00:00",
+        "?until=2026-05-01",
+        "?since=2026-05-02T00:00:00Z&until=2026-05-02T00:00:00Z",
+        "?since=2026-05-03T00:00:00Z&until=2026-05-02T00:00:00Z",
+        "?asset=",
+        "?venue=" + "x" * 81,
+    ],
+)
+async def test_a_filter_that_cannot_be_read_is_refused(api_environment: Path, query: str) -> None:
+    del api_environment
+    async with application() as (_app, client):
+        response = await client.get(OPERATIONS + query)
+
+    assert response.status_code == 422, response.text
+
+
 async def test_a_manual_entry_can_be_added_and_deleted_and_an_import_cannot(
     api_environment: Path,
 ) -> None:
@@ -339,6 +397,11 @@ async def test_a_manual_entry_can_be_added_and_deleted_and_an_import_cannot(
         {"quote_amount": "-1"},
         {"asset": ""},
         {"unexpected": "field"},
+        # A buy or a sell says what it cost; a reward or a fee has no counterpart (spec 043).
+        {"quote_currency": None},
+        {"quote_amount": None},
+        {"kind": "reward"},
+        {"kind": "fee", "quote_currency": None, "quote_amount": None, "fee_amount": "1"},
     ],
 )
 async def test_a_manual_entry_out_of_shape_is_refused(
@@ -417,6 +480,38 @@ async def test_the_investment_of_the_scenario(api_environment: Path) -> None:
     assert not re.search(
         r'"(invested|value|pnl|pnl_pct|held|explained|difference)":-?\d', response.text
     )
+
+
+async def test_a_reward_and_a_network_fee_entered_by_hand_close_the_difference(
+    api_environment: Path,
+) -> None:
+    # Spec 043: the scenario's wallet holds 100 KAS fewer than the swap explains. A miner paid
+    # 3.5 of them in, and 103.5 left as network fees no export listed.
+    no_counterpart = {"quote_currency": None, "quote_amount": None}
+    mined = {**TANGEM_SWAP, **no_counterpart, "kind": "reward", "quantity": "3.5"}
+    fee = {**TANGEM_SWAP, **no_counterpart, "kind": "fee", "quantity": "103.5", "venue": "BingX"}
+    del api_environment
+    async with application() as (app, client):
+        await plant_the_scenario(app)
+        await client.post(OPERATIONS, json=TANGEM_SWAP)
+        rewarded = await client.post(OPERATIONS, json=mined)
+        charged = await client.post(OPERATIONS, json=fee)
+        response = await client.get(INVESTMENT)
+        rows = await listed(client)
+        deleted = await client.delete(f"{OPERATIONS}/{charged.json()['id']}", headers=JSON)
+
+    assert rewarded.status_code == charged.status_code == 201, (rewarded.text, charged.text)
+    assert (charged.json()["kind"], charged.json()["quote_currency"]) == ("fee", None)
+    # One instant for all three, so the newest first is the last entered first.
+    assert [row["kind"] for row in rows["operations"]] == ["fee", "reward", "buy"]
+    kas = response.json()["assets"][1]
+    assert (dec(kas["invested"]), dec(kas["explained"]), dec(kas["difference"])) == (
+        Decimal(500),
+        Decimal(6000),
+        Decimal(0),
+    )
+    assert kas["trades"] == 1
+    assert deleted.status_code == 204
 
 
 async def test_an_unknown_figure_is_null_with_its_reason(api_environment: Path) -> None:

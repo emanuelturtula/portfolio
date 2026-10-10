@@ -142,12 +142,15 @@ _BALANCE_SNAPSHOT_CONFIRMED_CHECK: Final = "confirmed >= 0"
 _RECONSTRUCTED_BALANCE_CONFIRMED_CHECK: Final = "confirmed >= 0"
 
 # Spec 042, R1: the kinds an exchange operation is filed under, and R11: a manual entry is a
-# buy or a sell. The same duplication hazard as the constants above -- repeated verbatim in
-# `0016_exchange_operations` -- and the same reflection test.
+# buy or a sell -- or, since spec 043, a reward or a network fee. The same duplication hazard
+# as the constants above -- repeated verbatim in `0017_manual_rewards_and_fees` (and, as they
+# were, in `0016_exchange_operations`) -- and the same reflection test.
 _EXCHANGE_OPERATION_KIND_CHECK: Final = (
-    "kind IN ('buy', 'sell', 'reward', 'deposit', 'withdrawal', 'transfer', 'other')"
+    "kind IN ('buy', 'sell', 'reward', 'deposit', 'withdrawal', 'transfer', 'other', 'fee')"
 )
-_EXCHANGE_OPERATION_MANUAL_CHECK: Final = "source != 'manual' OR kind IN ('buy', 'sell')"
+_EXCHANGE_OPERATION_MANUAL_CHECK: Final = (
+    "source != 'manual' OR kind IN ('buy', 'sell', 'reward', 'fee')"
+)
 
 OPERATION_SCALE: Final = 18
 """Decimal places an exchange operation's quantities and amounts are stored at (spec 042).

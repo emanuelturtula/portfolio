@@ -11,9 +11,10 @@ movement of any other coin is ignored, unless a tracked coin paid for it.
   in the quote coin; a sell takes away what it brought in, net of such a fee. USDT, USDC and
   DAI count one for one. A buy or sell priced in anything else, or in nothing (a P2P purchase
   paid in pesos), makes the figure **unknown** -- never zero, never partial.
-* **R8. Explained** = buys - sells + rewards - every fee charged in the coin. A trade that
-  paid with the coin, or was paid in it, moves it too. Deposits, withdrawals and transfers
-  move coins between places the owner controls, and change nothing here.
+* **R8. Explained** = buys - sells + rewards - every fee charged in the coin, a network fee
+  entered by hand (spec 043) among them. A trade that paid with the coin, or was paid in it,
+  moves it too. Deposits, withdrawals and transfers move coins between places the owner
+  controls, and change nothing here.
 * **R9. Profit** = value now - invested, with the percentage over what was invested.
 * **R10.** The cumulative invested per UTC day, known until the first unvalued trade.
 
@@ -191,7 +192,7 @@ def _explained_change(movement: Movement, asset: str) -> Decimal:
     if movement.asset == asset:
         if movement.kind in {OperationKind.BUY, OperationKind.REWARD}:
             change = movement.quantity
-        elif movement.kind is OperationKind.SELL:
+        elif movement.kind in {OperationKind.SELL, OperationKind.FEE}:
             change = movement.quantity.copy_negate()
     elif movement.quote_currency == asset and movement.quote_amount is not None:
         if movement.kind is OperationKind.BUY:

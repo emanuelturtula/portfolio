@@ -1505,3 +1505,22 @@ tbody th {
   padding-left: 1.25rem;
   font-size: var(--text-sm);
 }
+
+/* Spec 043: the operations table's filters and its page controls, in a row that wraps. */
+.operations-filters,
+.operations-pages {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.operations-filters .field,
+.operations-pages .field {
+  margin: 0;
+}
+
+.operations-pages {
+  align-items: center;
+}

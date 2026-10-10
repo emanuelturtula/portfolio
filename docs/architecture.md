@@ -486,12 +486,14 @@ The exchanges' own CSV exports, uploaded by hand, are stored one row per operati
 `exchange_operations` (migration `0016_exchange_operations`), `UNIQUE (user_id, source,
 external_id)`, with each upload recorded in `exchange_imports`. Every operation is stored,
 whatever its asset; only the figures keep to the assets of the owner's active wallets.
+Migration `0017_manual_rewards_and_fees` lets a manual entry be a reward or a network fee
+(spec 043).
 
 | Endpoint | Answers |
 |---|---|
 | `POST /api/exchange-operations/imports` | one file, a CSV or a zip of them, as `{filename, content_base64}`: 201 with what each file held, stored and skipped; 422 naming the file and line it could not read, with nothing stored |
-| `GET /api/exchange-operations?limit=…&offset=…` | `count` and one page of `operations`, newest first |
-| `POST /api/exchange-operations` | a buy or a sell no export covers, entered by hand; 201 with the stored row |
+| `GET /api/exchange-operations?limit=…&offset=…&asset=…&venue=…&since=…&until=…` | `count` and one page of `operations`, newest first, kept by the filters; `assets` and `venues`, every value stored (spec 043) |
+| `POST /api/exchange-operations` | a buy or a sell no export covers, or a reward or network fee with no counterpart (spec 043), entered by hand; 201 with the stored row |
 | `DELETE /api/exchange-operations/{operation_id}` | 204; 404 for none of the owner's; 409 for a row that came from an upload |
 | `GET /api/investment` | per tracked asset and `overall`: invested, value, profit and its percentage, or the reason it is unknown; held, explained and their difference; and `invested_by_day` |
 

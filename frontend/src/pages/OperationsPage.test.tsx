@@ -185,7 +185,7 @@ describe('OperationsPage: the table', () => {
     await settledPage();
 
     const section = screen.getByRole('region', { name: 'Operations' });
-    expect(within(section).getByText('3 operations')).toBeInTheDocument();
+    expect(within(section).getByText('Showing 1–3 of 3')).toBeInTheDocument();
     expect(
       within(table())
         .getAllByRole('rowheader')
@@ -198,13 +198,15 @@ describe('OperationsPage: the table', () => {
     expect(within(table()).getAllByRole('button', { name: 'Delete' })).toHaveLength(1);
   });
 
-  it('counts a single operation in the singular', async () => {
+  it('shows a single operation as one, on a single page', async () => {
     openOperations({ operations: [operation()] });
 
     await settledPage();
 
-    expect(screen.getByText('1 operation')).toBeInTheDocument();
-    expect(screen.queryByRole('navigation', { name: 'Pages' })).not.toBeInTheDocument();
+    expect(screen.getByText('Showing 1 of 1')).toBeInTheDocument();
+    const pages = screen.getByRole('navigation', { name: 'Pages' });
+    expect(pages).toHaveTextContent('Page 1 of 1');
+    expect(within(pages).getByRole('button', { name: 'Older' })).toBeDisabled();
   });
 
   it('pages through more operations than fit on one page', async () => {
@@ -240,6 +242,33 @@ describe('OperationsPage: the table', () => {
     });
   });
 
+  it('steps back a page when a deletion empties the last one', async () => {
+    const many = Array.from({ length: 51 }, (_, index) =>
+      operation({
+        id: index + 1,
+        executed_at: `2026-05-01T00:${String(index).padStart(2, '0')}:00Z`,
+        source: index === 0 ? 'manual' : 'bitget',
+        manual: index === 0,
+      }),
+    );
+    const { user } = openOperations({ operations: many });
+    await settledPage();
+    const pages = screen.getByRole('navigation', { name: 'Pages' });
+    await user.click(within(pages).getByRole('button', { name: 'Older' }));
+    await waitFor(() => {
+      expect(pages).toHaveTextContent('Page 2 of 2');
+    });
+
+    await user.click(within(table()).getByRole('button', { name: 'Delete' }));
+
+    await waitFor(() => {
+      expect(pages).toHaveTextContent('Page 1 of 1');
+    });
+    await waitFor(() => {
+      expect(within(table()).getAllByRole('rowheader')).toHaveLength(50);
+    });
+  });
+
   it('says what failed and loads again on request', async () => {
     let fail = true;
     const { user } = openOperations({ operations: [operation()] }, [
@@ -265,7 +294,7 @@ describe('OperationsPage: the table', () => {
     await user.click(within(table()).getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => {
-      expect(screen.getByText('1 operation')).toBeInTheDocument();
+      expect(screen.getByText('Showing 1 of 1')).toBeInTheDocument();
     });
     expect(within(table()).queryByRole('rowheader', { name: 'KAS' })).not.toBeInTheDocument();
     expect(
@@ -510,5 +539,224 @@ describe('OperationsPage: an operation by hand', () => {
     expect(await within(form()).findByRole('alert')).toHaveTextContent(
       'Not added: The server could not be reached.',
     );
+  });
+});
+
+describe('OperationsPage: filters and page size', () => {
+  const MIXED: readonly Operation[] = [
+    operation({ id: 1, executed_at: '2026-05-01T12:00:00Z' }),
+    operation({ id: 2, executed_at: '2026-05-03T12:00:00Z', asset: 'KAS', quantity: '10' }),
+    MANUAL,
+    operation({ id: 4, executed_at: '2026-05-04T12:00:00Z', source: 'nexo', venue: 'Nexo' }),
+  ];
+
+  function filters(): HTMLElement {
+    return screen.getByRole('group', { name: 'Filters' });
+  }
+
+  function assets(): string[] {
+    return within(table())
+      .getAllByRole('rowheader')
+      .map((header) => header.textContent);
+  }
+
+  function shown(): string {
+    const region = screen.getByRole('region', { name: 'Operations' });
+    return within(region).getAllByRole('status')[0]?.textContent ?? '';
+  }
+
+  function lastSearch(fake: FakeOperations): URLSearchParams {
+    const reads = fake.requests
+      .filter((request) => request.method === 'GET')
+      .map((request) => new URL(request.url).searchParams);
+    return reads.at(-1) ?? new URLSearchParams();
+  }
+
+  it('offers every asset and venue stored, filters by each, and clears them', async () => {
+    const { user, fake } = openOperations({ operations: MIXED });
+    await settledPage();
+    const asset = within(filters()).getByLabelText('Asset');
+    const venue = within(filters()).getByLabelText('Where');
+    const clear = within(filters()).getByRole('button', { name: 'Clear filters' });
+
+    expect(
+      within(asset)
+        .getAllByRole('option')
+        .map((option) => option.textContent),
+    ).toEqual(['All assets', 'BTC', 'KAS']);
+    expect(
+      within(venue)
+        .getAllByRole('option')
+        .map((option) => option.textContent),
+    ).toEqual(['Everywhere', 'Bitget', 'Nexo', 'Tangem']);
+    expect(clear).toBeDisabled();
+
+    await user.selectOptions(asset, 'KAS');
+    await waitFor(() => {
+      expect(assets()).toEqual(['KAS', 'KAS']);
+    });
+    expect(shown()).toBe('Showing 1–2 of 2');
+    expect(lastSearch(fake).get('asset')).toBe('KAS');
+
+    await user.selectOptions(venue, 'Tangem');
+    await waitFor(() => {
+      expect(assets()).toEqual(['KAS']);
+    });
+    expect(lastSearch(fake).get('venue')).toBe('Tangem');
+
+    await user.click(clear);
+    await waitFor(() => {
+      expect(assets()).toEqual(['BTC', 'KAS', 'KAS', 'BTC']);
+    });
+    expect(clear).toBeDisabled();
+  });
+
+  it('filters by whole days in the zone of this browser, keeping the range in order', async () => {
+    inTimeZone('America/Argentina/Buenos_Aires');
+    const { fake } = openOperations({
+      operations: [
+        // 23:00 on May 1 in Buenos Aires, though May 2 in UTC.
+        operation({ id: 1, executed_at: '2026-05-02T02:00:00Z' }),
+        operation({ id: 2, executed_at: '2026-05-02T12:00:00Z', asset: 'KAS' }),
+      ],
+    });
+    await settledPage();
+    const from = within(filters()).getByLabelText('From');
+    const to = within(filters()).getByLabelText('To');
+
+    fireEvent.change(to, { target: { value: '2026-05-09' } });
+    await waitFor(() => {
+      expect(assets()).toEqual(['KAS', 'BTC']);
+    });
+
+    fireEvent.change(from, { target: { value: '2026-05-02' } });
+    await waitFor(() => {
+      expect(assets()).toEqual(['KAS']);
+    });
+    expect(lastSearch(fake).get('since')).toBe('2026-05-02T03:00:00.000Z');
+    expect(lastSearch(fake).get('until')).toBe('2026-05-10T03:00:00.000Z');
+    expect(to).toHaveAttribute('min', '2026-05-02');
+    expect(from).toHaveAttribute('max', '2026-05-09');
+
+    // An end before the start: the start gives way.
+    fireEvent.change(to, { target: { value: '2026-05-01' } });
+    await waitFor(() => {
+      expect(assets()).toEqual(['BTC']);
+    });
+    expect(from).toHaveValue('');
+
+    // A start after the end: the end gives way, and nothing that day matches.
+    fireEvent.change(from, { target: { value: '2026-05-03' } });
+    expect(await screen.findByText(/No operations match these filters/)).toBeInTheDocument();
+    expect(to).toHaveValue('');
+    expect(shown()).toBe('None match');
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+
+    fireEvent.change(from, { target: { value: '2026-05-02' } });
+    await waitFor(() => {
+      expect(assets()).toEqual(['KAS']);
+    });
+    fireEvent.change(to, { target: { value: '' } });
+    await waitFor(() => {
+      expect(lastSearch(fake).has('until')).toBe(false);
+    });
+    expect(from).toHaveValue('2026-05-02');
+  });
+
+  it('shows as many rows as chosen, and starts again from the first page on a change', async () => {
+    const many = Array.from({ length: 51 }, (_, index) =>
+      operation({
+        id: index + 1,
+        executed_at: `2026-05-01T00:${String(index).padStart(2, '0')}:00Z`,
+      }),
+    );
+    const { user } = openOperations({ operations: many });
+    await settledPage();
+    const pages = screen.getByRole('navigation', { name: 'Pages' });
+    const size = within(pages).getByLabelText('Rows per page');
+
+    expect(size).toHaveValue('50');
+    await user.selectOptions(size, '25');
+    await waitFor(() => {
+      expect(shown()).toBe('Showing 1–25 of 51');
+    });
+    expect(pages).toHaveTextContent('Page 1 of 3');
+
+    await user.click(within(pages).getByRole('button', { name: 'Older' }));
+    await waitFor(() => {
+      expect(shown()).toBe('Showing 26–50 of 51');
+    });
+
+    await user.selectOptions(size, '100');
+    await waitFor(() => {
+      expect(shown()).toBe('Showing 1–51 of 51');
+    });
+    expect(pages).toHaveTextContent('Page 1 of 1');
+
+    // A value the list does not offer, as only a tampered page could send, is the default.
+    fireEvent.change(size, { target: { value: '7' } });
+    await waitFor(() => {
+      expect(shown()).toBe('Showing 1–50 of 51');
+    });
+  });
+});
+
+describe('OperationsPage: a reward or a network fee by hand', () => {
+  function form(): HTMLElement {
+    return screen.getByRole('form', { name: 'Add an operation by hand' });
+  }
+
+  it('enters what a miner paid with no counterpart, and lists it as a reward', async () => {
+    const { user, fake } = openOperations();
+    await settledPage();
+    const fields = within(form());
+
+    await user.selectOptions(fields.getByLabelText('Kind'), 'reward');
+    expect(fields.queryByLabelText('Paid or received in')).not.toBeInTheDocument();
+    expect(fields.queryByLabelText('Amount paid or received')).not.toBeInTheDocument();
+    fireEvent.change(fields.getByLabelText('When'), { target: { value: '2026-02-09T12:00' } });
+    await user.clear(fields.getByLabelText('Where'));
+    await user.type(fields.getByLabelText('Where'), 'Miner');
+    await user.type(fields.getByLabelText('Asset'), 'KAS');
+    await user.type(fields.getByLabelText('Quantity'), '6.54');
+    await user.click(fields.getByRole('button', { name: 'Add' }));
+
+    expect(await fields.findByRole('status')).toHaveTextContent('Added.');
+    const body = fake.requests.find((request) => request.method === 'POST')?.body;
+    expect(body).toMatchObject({ venue: 'Miner', kind: 'reward', quantity: '6.54' });
+    expect(body).not.toHaveProperty('quote_currency');
+    expect(body).not.toHaveProperty('quote_amount');
+    expect(await screen.findByRole('table')).toBeInTheDocument();
+    expect(cellsOf('KAS').slice(1, 3)).toEqual(['Miner', 'Reward']);
+    expect(rowOf('KAS').slice(1, 3)).toEqual(['—', '—']);
+  });
+
+  it('enters a network fee a report left out, named as one in the table', async () => {
+    const { user } = openOperations();
+    await settledPage();
+    const fields = within(form());
+
+    await user.selectOptions(fields.getByLabelText('Kind'), 'fee');
+    fireEvent.change(fields.getByLabelText('When'), { target: { value: '2026-09-17T12:00' } });
+    await user.type(fields.getByLabelText('Asset'), 'KAS');
+    await user.type(fields.getByLabelText('Quantity'), '1.53');
+    await user.click(fields.getByRole('button', { name: 'Add' }));
+
+    await fields.findByRole('status');
+    expect(await screen.findByRole('table')).toBeInTheDocument();
+    expect(cellsOf('KAS')[2]).toBe('Network fee');
+  });
+
+  it('falls back to a buy for a kind it does not offer', async () => {
+    openOperations();
+    await settledPage();
+    const kind = within(form()).getByLabelText('Kind');
+
+    fireEvent.change(kind, { target: { value: 'reward' } });
+    expect(within(form()).queryByLabelText('Paid or received in')).not.toBeInTheDocument();
+    fireEvent.change(kind, { target: { value: 'deposit' } });
+
+    expect(kind).toHaveValue('buy');
+    expect(within(form()).getByLabelText('Paid or received in')).toBeInTheDocument();
   });
 });
