@@ -16,6 +16,10 @@
   --color-hairline: rgb(11 11 11 / 10%);
   --color-error: #a11b2b;
   --color-warning: #8a5a00;
+  /* A change's direction (spec 041), always beside its sign: text colours, so each clears
+     4.5:1 on the surface, unlike the status dots below. */
+  --color-gain: #17703a;
+  --color-loss: #a11b2b;
   /* Status dots: reserved for state, never a series. Always beside the words that say it. */
   --status-good: #0ca30c;
   --status-warning: #fab219;
@@ -68,6 +72,8 @@
     --color-hairline: rgb(255 255 255 / 10%);
     --color-error: #ff8b8b;
     --color-warning: #f0b429;
+    --color-gain: #5fd18a;
+    --color-loss: #ff8b8b;
     --shadow-card: none;
     --header-blur: rgb(13 13 13 / 82%);
 
@@ -1040,6 +1046,92 @@ tbody th {
   background-color: var(--color-text);
   color: var(--color-surface);
   font-weight: 600;
+}
+
+/* The series toggles (spec 041): the range buttons' look, each with its line's colour as a
+   swatch, so the row is the chart's legend as well. A pressed toggle is inked; the colour is
+   never the only thing that says which lines are drawn. */
+
+.series-selector {
+  margin-bottom: var(--space-3);
+}
+
+.series-selector button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.series-selector button:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.series-swatch {
+  display: inline-block;
+  flex: none;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px var(--color-surface);
+}
+
+.chart-tooltip-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* The change over 24 hours and 7 days (spec 041). Two figures side by side, each with its sign
+   in the text and its direction in colour: green for a rise, red for a fall, ink for none. A
+   change that could not be worked out is a dash and a sentence, in muted ink. */
+
+.changes-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: var(--space-4);
+}
+
+.change {
+  min-width: 0;
+}
+
+.change h3.kpi-label {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.change-value {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-xl);
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.change-arrow {
+  font-size: var(--text-sm);
+}
+
+.change-note {
+  margin: var(--space-1) 0 0;
+  color: var(--color-muted);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.change-up .change-value,
+.change-up .change-note {
+  color: var(--color-gain);
+}
+
+.change-down .change-value,
+.change-down .change-note {
+  color: var(--color-loss);
 }
 
 .history-wallet {

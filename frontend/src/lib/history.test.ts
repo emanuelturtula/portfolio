@@ -6,10 +6,13 @@ import {
   formatDay,
   GAPS_NOTE,
   PORTFOLIO_EMPTY_WORDS,
+  portfolioSeries,
   RANGE_LABELS,
   RANGE_PHRASES,
   summarize,
   toChartPoints,
+  TOTAL_COLOR,
+  TOTAL_SERIES,
   WALLET_EMPTY_WORDS,
 } from '@/lib/history';
 import { inTimeZone } from '@/test/timeZone';
@@ -140,5 +143,41 @@ describe('summarize', () => {
   it('is nothing at all when no day has a value, or there is no day', () => {
     expect(summarize(toChartPoints([{ day: '2026-09-24', value: null }]))).toBeUndefined();
     expect(summarize([])).toBeUndefined();
+  });
+});
+
+describe('portfolioSeries', () => {
+  const data = {
+    assets: ['BTC', 'KAS'],
+    points: [
+      { day: '2026-09-23', value: A, assets: { BTC: B, KAS: null } },
+      { day: '2026-09-24', value: C, assets: { BTC: C } },
+    ],
+  };
+  const colors = new Map([['BTC', 'var(--series-orange)']]);
+
+  it('offers the total first, then each asset, keeping only those chosen', () => {
+    const lines = portfolioSeries(data, ['KAS', 'total', 'BTC'], colors);
+
+    expect(lines.map((line) => [line.key, line.label, line.color])).toEqual([
+      [TOTAL_SERIES, 'Total', TOTAL_COLOR],
+      ['BTC', 'BTC', 'var(--series-orange)'],
+      ['KAS', 'KAS', 'var(--series-other)'],
+    ]);
+    expect(lines[0]?.points).toEqual([
+      { day: '2026-09-23', value: A },
+      { day: '2026-09-24', value: C },
+    ]);
+    // A day an asset is not served on is a gap, never a zero.
+    expect(lines[2]?.points).toEqual([
+      { day: '2026-09-23', value: null },
+      { day: '2026-09-24', value: null },
+    ]);
+  });
+
+  it('draws the total alone when that is all that is chosen', () => {
+    expect(portfolioSeries(data, [TOTAL_SERIES], colors).map((line) => line.key)).toEqual([
+      TOTAL_SERIES,
+    ]);
   });
 });

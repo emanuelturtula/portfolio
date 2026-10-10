@@ -104,6 +104,12 @@ EXPECTED_NAMES = {
         "ck_price_history_basis",
         "fk_price_history_asset_id_assets",
     },
+    "price_hourly": {
+        "pk_price_hourly",
+        "uq_price_hourly_asset_hour",
+        "ck_price_hourly_quote_currency",
+        "fk_price_hourly_asset_id_assets",
+    },
 }
 
 

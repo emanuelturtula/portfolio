@@ -201,6 +201,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/portfolio/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * How much the value in USDT changed over the last 24 hours and 7 days
+         * @description The value now, and its change since 24 hours and 7 days ago (spec 041).
+         *
+         *     The value now is the summary's total. The value then is each active wallet's balance at
+         *     that instant times the hourly close that priced it. **A change that cannot be worked out
+         *     is `null` with the reason in `unavailable`, never `"0"`.** Every amount is a JSON string.
+         */
+        get: operations["readPortfolioChanges"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/portfolio/history": {
         parameters: {
             query?: never;
@@ -487,6 +511,34 @@ export interface components {
             state: components["schemas"]["SectionState"];
         };
         /**
+         * ChangePeriod
+         * @description How far back a change looks (R8). The member is its wire form.
+         * @enum {string}
+         */
+        ChangePeriod: "24h" | "7d";
+        /**
+         * ChangeResponse
+         * @description The change over one period in USDT, or why there is none (spec 041).
+         *
+         *     `change` and `change_pct` are `null` exactly when `unavailable` names a reason, and never
+         *     `"0"` in its place; `change_pct` is also `null` when nothing was held at `since`.
+         */
+        ChangeResponse: {
+            /** Change */
+            change: string | null;
+            /** Change Pct */
+            change_pct: string | null;
+            period: components["schemas"]["ChangePeriod"];
+            /**
+             * Since
+             * Format: date-time
+             */
+            since: string;
+            unavailable: components["schemas"]["Unavailable"] | null;
+            /** Value Then */
+            value_then: string | null;
+        };
+        /**
          * CurrentBalancesResponse
          * @description What the portfolio holds now and what it is worth.
          *
@@ -622,10 +674,30 @@ export interface components {
             new_password: string;
         };
         /**
+         * PortfolioChangesResponse
+         * @description The value now in USDT, `null` when unknown, and the change over 24 hours and 7 days.
+         */
+        PortfolioChangesResponse: {
+            /**
+             * As Of
+             * Format: date-time
+             */
+            as_of: string;
+            /** Changes */
+            changes: components["schemas"]["ChangeResponse"][];
+            /** Value */
+            value: string | null;
+        };
+        /**
          * PortfolioHistoryResponse
          * @description Every active wallet together, one point per day of `range`, oldest first.
+         *
+         *     `assets` names the asset of every active wallet, sorted: the series a chart can draw
+         *     beside the total.
          */
         PortfolioHistoryResponse: {
+            /** Assets */
+            assets: string[];
             /** Points */
             points: components["schemas"]["PortfolioPointResponse"][];
             range: components["schemas"]["HistoryRange"];
@@ -633,8 +705,15 @@ export interface components {
         /**
          * PortfolioPointResponse
          * @description The wallets' value at the end of `day`, in USDT. `null` when it cannot be known.
+         *
+         *     `assets` is each asset's own value that day, keyed by the response's `assets`, and `null`
+         *     for an asset by the same rule (spec 041, R7).
          */
         PortfolioPointResponse: {
+            /** Assets */
+            assets: {
+                [key: string]: string | null;
+            };
             /**
              * Day
              * Format: date
@@ -966,6 +1045,16 @@ export interface components {
             /** Wallets Total */
             wallets_total: number;
         };
+        /**
+         * Unavailable
+         * @description Why a change could not be worked out. The member is its wire form.
+         *
+         *     * `value_unknown_now` -- the summary could not value everything held now (R5).
+         *     * `no_reading_then` -- a wallet's quantity at the instant is unknown (R3).
+         *     * `no_price_then` -- a wallet held something with no price at the instant (R2).
+         * @enum {string}
+         */
+        Unavailable: "value_unknown_now" | "no_reading_then" | "no_price_then";
         /**
          * UnpricedHoldingResponse
          * @description One asset the portfolio holds and could not value, with the reason.
@@ -1409,6 +1498,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthDetailResponse"];
+                };
+            };
+        };
+    };
+    readPortfolioChanges: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortfolioChangesResponse"];
                 };
             };
         };

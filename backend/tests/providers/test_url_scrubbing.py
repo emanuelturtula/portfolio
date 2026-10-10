@@ -24,6 +24,7 @@ from portfolio.providers.http import (
     ADDRESS_BALANCES,
     ADDRESS_HISTORY,
     ASSET_DAILY_CLOSES,
+    ASSET_HOURLY_CLOSES,
     ASSET_PRICE,
     ASSET_PRICES,
     BLOCK_TIP_HEIGHT,
@@ -394,12 +395,16 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     or the count the history is checked against. It comes in dozens for one wallet, so a log
     full of these is a rebuild running -- and one full of them every hour is a timer
     misbehaving, which a balance label could not show.
+
+    Nine at spec 041: `asset_hourly_closes` is one pair's hourly candles, read by the hourly
+    price timer. Its own label for `asset_daily_closes`'s reason: one per pair each hour.
     """
     assert sorted(ENDPOINT_LABELS) == [
         "address_balance",
         "address_balances",
         "address_history",
         "asset_daily_closes",
+        "asset_hourly_closes",
         "asset_price",
         "asset_prices",
         "block_tip_height",
@@ -409,6 +414,7 @@ def test_the_allowlist_names_the_labels_this_release_uses() -> None:
     assert ADDRESS_BALANCES == "address_balances"
     assert ADDRESS_HISTORY == "address_history"
     assert ASSET_DAILY_CLOSES == "asset_daily_closes"
+    assert ASSET_HOURLY_CLOSES == "asset_hourly_closes"
     assert ASSET_PRICE == "asset_price"
     assert ASSET_PRICES == "asset_prices"
     assert BLOCK_TIP_HEIGHT == "block_tip_height"

@@ -8,6 +8,7 @@ import {
   type PortfolioHistory,
   type WalletValueHistory,
 } from '@/api/history';
+import { PORTFOLIO_CHANGES_PATH, type PortfolioChanges } from '@/api/changes';
 import { PORTFOLIO_SUMMARY_PATH, type PortfolioSummary } from '@/api/portfolio';
 
 import {
@@ -24,6 +25,7 @@ import {
   type SyncTriggeredResponse,
   type WalletResponse,
 } from './fixtures';
+import { unknownChanges } from './changeFixtures';
 import { unreadWalletHistory, unvaluedPortfolioHistory } from './historyFixtures';
 import { problem, refuseNonJsonWrite, server, unauthorized } from './server';
 import { missing, portfolioSummary } from './summaryFixtures';
@@ -182,6 +184,12 @@ export interface FakePortfolioOptions {
    */
   readonly history?: PortfolioHistory | PortfolioHistoryView;
   /**
+   * What `GET /api/portfolio/changes` answers (spec 041). When omitted, both changes are
+   * unavailable because the value now is unknown: what the backend answers while a wallet is
+   * unread, and the only answer a fake that knows no prices can give honestly.
+   */
+  readonly changes?: PortfolioChanges;
+  /**
    * What `GET /api/wallets/{id}/value-history` answers for a registered wallet, archived ones
    * included. When omitted, or when this returns `undefined`, every day of the range is `null`
    * for the wallet's asset. A wallet that is not registered is a `404`, as on the backend.
@@ -210,6 +218,8 @@ export interface FakePortfolio {
   setSummary(summary: PortfolioSummary | undefined): void;
   history(range: HistoryRange): PortfolioHistory;
   setHistory(history: PortfolioHistory | PortfolioHistoryView | undefined): void;
+  changes(): PortfolioChanges;
+  setChanges(changes: PortfolioChanges | undefined): void;
   setCurrent(current: CurrentBalancesResponse | CurrentView | undefined): void;
   setRuns(runs: readonly SyncRunResponse[]): void;
   /** The next create of this address answers a 422 on `["body", "address"]`. */
@@ -248,6 +258,7 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
   let runs: SyncRunResponse[] = [...(options.runs ?? [])];
   let summary: PortfolioSummary | undefined = options.summary;
   let history: PortfolioHistory | PortfolioHistoryView | undefined = options.history;
+  let changes: PortfolioChanges | undefined = options.changes;
   const rejections = new Map<string, AddressRejectionType>();
   /** What each wallet created here was registered with, for the duplicate check. */
   const canonicalOf = new Map<number, string>();
@@ -312,6 +323,10 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     setHistory: (next) => {
       history = next;
     },
+    changes: () => changes ?? unknownChanges(),
+    setChanges: (next) => {
+      changes = next;
+    },
     current: () => {
       if (current === undefined) {
         return derivedCurrent();
@@ -366,6 +381,7 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     http.all('/api/balances/*', requireSession),
     http.all(PORTFOLIO_SUMMARY_PATH, requireSession),
     http.all(PORTFOLIO_HISTORY_PATH, requireSession),
+    http.all(PORTFOLIO_CHANGES_PATH, requireSession),
     http.all(WALLET_VALUE_HISTORY_PATH, requireSession),
     http.get(WALLETS_PATH, async ({ request }) => {
       await record(request);
@@ -514,6 +530,11 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     http.get(PORTFOLIO_SUMMARY_PATH, async ({ request }) => {
       await record(request);
       return HttpResponse.json(fake.summary());
+    }),
+
+    http.get(PORTFOLIO_CHANGES_PATH, async ({ request }) => {
+      await record(request);
+      return HttpResponse.json(fake.changes());
     }),
 
     http.get(PORTFOLIO_HISTORY_PATH, async ({ request }) => {

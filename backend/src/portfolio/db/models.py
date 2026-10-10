@@ -433,6 +433,32 @@ class PriceHistory(Base):
     recorded_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
+class PriceHourly(Base):
+    """One asset's closing price for one UTC hour, in one quote currency (spec 041).
+
+    The change over 24 hours and 7 days needs the price at an instant, and `price_history`
+    has one price per day. `hour` is the candle's open, on the hour, and `amount` its close:
+    the price at the end of that hour (R1). A committed candle is final, so a stored row is
+    never rewritten. `amount` is `NumericText(PRICE_SCALE)` with no `CHECK`, for the reason
+    `price_history.amount` has none.
+    """
+
+    __tablename__ = "price_hourly"
+    __table_args__ = (
+        UniqueConstraint("asset_id", "quote_currency", "hour", name="uq_price_hourly_asset_hour"),
+        CheckConstraint(_PRICE_QUOTE_CURRENCY_CHECK, name="quote_currency"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # No `ondelete`, for the reason `prices.asset_id` has none.
+    asset_id: Mapped[int] = mapped_column(Integer, ForeignKey("assets.id"), nullable=False)
+    quote_currency: Mapped[str] = mapped_column(Text, nullable=False)
+    hour: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(NumericText(PRICE_SCALE), nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
 class SyncRun(Base):
     """One attempt to read every active wallet's balance, whatever became of it.
 

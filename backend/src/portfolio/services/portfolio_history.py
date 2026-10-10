@@ -11,7 +11,7 @@ The prices are USD, read as USDT one for one, for the reason `services/portfolio
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC
 from typing import TYPE_CHECKING, Final
 
@@ -24,6 +24,7 @@ from portfolio.domain.portfolio_history import (
     HistoryRange,
     WalletDay,
     WalletReadings,
+    asset_days,
     days_of,
     portfolio_days,
     wallet_days,
@@ -37,7 +38,7 @@ from portfolio.services.prices import utc_now
 from portfolio.services.wallets import WalletNotFoundError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
     from datetime import date, datetime
     from decimal import Decimal
 
@@ -60,10 +61,15 @@ QUOTE: Final = QuoteCurrency.USD
 
 @dataclass(frozen=True, slots=True)
 class PortfolioHistory:
-    """Every active wallet together, one point per day of the range."""
+    """Every active wallet together, one point per day of the range.
+
+    `by_asset` holds each asset's own points over the same days, keyed by the asset of every
+    active wallet, sorted (spec 041, R7).
+    """
 
     history_range: HistoryRange
     points: tuple[DayValue, ...]
+    by_asset: Mapping[str, tuple[DayValue, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +114,9 @@ class PortfolioHistoryService:
         days = days_of(history_range, today=today, first_reading=_first_day(series))
         prices = await self._prices({reading.asset for reading in series}, days)
         return PortfolioHistory(
-            history_range=history_range, points=portfolio_days(days, series, prices)
+            history_range=history_range,
+            points=portfolio_days(days, series, prices),
+            by_asset=asset_days(days, series, prices),
         )
 
     async def wallet(

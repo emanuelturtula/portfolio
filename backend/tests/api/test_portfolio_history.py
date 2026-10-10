@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
 HISTORY: Final = "/api/portfolio/history"
-POINT_FIELDS: Final = {"day", "value"}
+POINT_FIELDS: Final = {"day", "value", "assets"}
 WALLET_POINT_FIELDS: Final = {"day", "quantity", "value"}
 
 
@@ -159,16 +159,38 @@ async def test_the_default_range_is_ninety_days_ending_today(api_environment: Pa
         await plant_two_days(app)
         body, _ = await get_json(client, HISTORY)
 
-    assert set(body) == {"range", "points"}
+    assert set(body) == {"range", "assets", "points"}
     assert body["range"] == "90d"
+    assert body["assets"] == ["BTC"]
     points = body["points"]
     assert len(points) == 90
     assert all(set(point) == POINT_FIELDS for point in points)
     assert points[-1]["day"] == today().isoformat()
     assert dec(points[-1]["value"]) == Decimal(24400)
     assert dec(points[-2]["value"]) == Decimal(24000)
+    assert dec(points[-1]["assets"]["BTC"]) == Decimal(24400)
     # Before the first reading the value is unknown, and says so with a null, never a zero.
     assert points[0]["value"] is None
+
+
+async def test_each_asset_has_its_own_value_beside_the_total(api_environment: Path) -> None:
+    """Spec 041, R7: KAS read today only is `null` yesterday, while BTC and the total are not."""
+    del api_environment
+    async with application() as (app, client):
+        await plant_two_days(app)
+        kas = await add_wallet(app, ChainKey.KASPA, KASPA_TESTNET_V0)
+        await plant_reading(app, kas, 1_000_000_000_000, datetime.now(UTC) - timedelta(seconds=5))
+        await plant_price(app, "KAS", today(), "0.05", OBSERVED)
+        body, raw = await get_json(client, f"{HISTORY}?range=30d")
+
+    assert body["assets"] == ["BTC", "KAS"]
+    yesterday, now = body["points"][-2:]
+    assert yesterday["assets"]["KAS"] is None
+    assert dec(yesterday["assets"]["BTC"]) == Decimal(24000)
+    assert dec(yesterday["value"]) == Decimal(24000)
+    assert dec(now["assets"]["KAS"]) == Decimal(500)
+    assert dec(now["value"]) == Decimal(24900)
+    assert not re.search(r'"(BTC|KAS)":-?\d', raw)
 
 
 async def test_all_starts_on_the_first_reading(api_environment: Path) -> None:

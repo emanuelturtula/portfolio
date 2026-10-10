@@ -2,9 +2,14 @@ import { useId, useState } from 'react';
 
 import type { WalletBalance } from '@/api/balances';
 import { DEFAULT_HISTORY_RANGE, useWalletValueHistory, type HistoryRange } from '@/api/history';
-import { assetColors } from '@/lib/assetColors';
+import { assetColors, colorOf } from '@/lib/assetColors';
 import { WALLET_EMPTY_WORDS } from '@/lib/history';
-import { HistoryTitle, HistoryView, RangeSelector } from '@/pages/dashboard/ValueHistory';
+import {
+  HistoryTitle,
+  HistoryView,
+  RangeSelector,
+  singleSeries,
+} from '@/pages/dashboard/ValueHistory';
 import { walletName } from '@/pages/dashboard/WalletValueChart';
 
 interface WalletHistoryChartProps {
@@ -21,7 +26,7 @@ function WalletHistoryChart({ wallet, range }: WalletHistoryChartProps) {
     <HistoryView
       query={history}
       subject={`${walletName(wallet)} value`}
-      color={assetColors([asset]).get(asset)}
+      series={singleSeries(`${walletName(wallet)} value`, colorOf(assetColors([asset]), asset))}
       asset={asset}
       emptyText={WALLET_EMPTY_WORDS}
     />

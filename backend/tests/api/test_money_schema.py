@@ -404,6 +404,9 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         # nothing can value a `null`.
         "/api/portfolio/history",
         "/api/wallets/{wallet_id}/value-history",
+        # The change over 24 hours and 7 days (spec 041): every amount and percentage a
+        # string, and a change nothing can work out a `null` with its reason.
+        "/api/portfolio/changes",
     }
 
 
@@ -419,6 +422,9 @@ MONEY_PROPERTIES: Final = frozenset(
         "amount",
         "confirmed",
         "pending",
+        "value_then",
+        "change",
+        "change_pct",
     }
 )
 
