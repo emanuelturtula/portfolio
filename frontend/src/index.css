@@ -1148,6 +1148,27 @@ tbody th {
   height: 240px;
 }
 
+/* On a touch screen the hover card is placed level with the top of the chart, and lifted its
+   own height plus a gap so it sits above it, over the controls the finger is not using, rather
+   than on the lines it is reading. */
+.history-chart-touch .chart-tooltip {
+  transform: translateY(calc(-100% - var(--space-2)));
+}
+
+/* Recharts makes some of a chart's layers focusable with `tabIndex={-1}`, so a tap focuses one
+   and the browser rings it: a white box around the plot that is not part of the chart. Nothing
+   in a chart is reachable by keyboard (`accessibilityLayer` is off and the chart is
+   `aria-hidden`), so there is no keyboard focus to lose by not drawing it. */
+.history-chart :focus,
+.donut-chart :focus {
+  outline: none;
+}
+
+.history-chart,
+.donut-chart {
+  -webkit-tap-highlight-color: transparent;
+}
+
 .history + .note {
   margin-top: 0.5rem;
 }

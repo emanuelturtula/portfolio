@@ -21,6 +21,7 @@ import {
   type HistorySummary,
 } from '@/lib/history';
 import { formatMoney, type Money } from '@/lib/money';
+import { useTouchScreen } from '@/lib/pointer';
 
 const HEIGHT = 240;
 const FIAT = { minimumFractionDigits: 2, maximumFractionDigits: 2 } as const;
@@ -28,6 +29,15 @@ const QUANTITY = { maximumFractionDigits: 8 } as const;
 const UNIT = 'USDT';
 
 const AXIS_TICK = { fill: 'var(--color-muted)', fontSize: 12 } as const;
+
+/**
+ * Where the hover card sits on a touch screen: level with the top of the chart, and lifted
+ * clear of it by `.history-chart-touch` in CSS, so it never covers the lines under the finger.
+ * Across, it still follows the finger.
+ */
+const ABOVE_THE_CHART = { y: 0 } as const;
+/** No fixed coordinate: the hover card follows the pointer both ways, as Recharts places it. */
+const BESIDE_THE_POINTER = {} as const;
 
 function amount(value: Money): string {
   return `${formatMoney(value, FIAT)} ${UNIT}`;
@@ -181,6 +191,9 @@ function toRows(
  * The chart itself is `aria-hidden` and nothing in it takes focus: the figure's caption names
  * it and a sentence beside it says where each line starts and ends, in exact figures. Its width
  * follows the card (`responsive`); in a test, which cannot measure, it draws at a fixed size.
+ *
+ * With a mouse the hover card follows the pointer. On a touch screen it sits above the chart
+ * instead, because a card beside a finger lands on the very lines the finger is reading.
  */
 export function ValueHistoryChart({
   series,
@@ -190,6 +203,7 @@ export function ValueHistoryChart({
   busy,
 }: ValueHistoryChartProps) {
   const captionId = useId();
+  const touch = useTouchScreen();
   const lines = series.map((line) => {
     const points = toChartPoints(line.points);
     return { ...line, points, summary: summarize(points) };
@@ -221,7 +235,10 @@ export function ValueHistoryChart({
         <figcaption id={captionId} className="visually-hidden">
           {caption}
         </figcaption>
-        <div className="history-chart" aria-hidden="true">
+        <div
+          className={touch ? 'history-chart history-chart-touch' : 'history-chart'}
+          aria-hidden="true"
+        >
           <AreaChart
             responsive
             width="100%"
@@ -250,6 +267,7 @@ export function ValueHistoryChart({
             <Tooltip
               content={<HistoryTooltip series={lines} asset={asset} />}
               filterNull={false}
+              position={touch ? ABOVE_THE_CHART : BESIDE_THE_POINTER}
               cursor={{ stroke: 'var(--color-faint)', strokeWidth: 1 }}
               isAnimationActive={false}
             />
