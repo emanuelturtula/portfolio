@@ -1,8 +1,9 @@
 import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { GAPS_NOTE, type ChartSeries, type HistoryPoint } from '@/lib/history';
 import { money } from '@/lib/money';
+import { TOUCH_QUERY } from '@/lib/pointer';
 import {
   HistoryTooltip,
   ValueHistoryChart,
@@ -278,6 +279,42 @@ describe('ValueHistoryChart with several lines (spec 041)', () => {
     );
 
     expect(screen.getByText(EMPTY)).toBeInTheDocument();
+  });
+
+  describe('on a touch screen', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    function renderOn(touch: boolean): HTMLElement {
+      vi.stubGlobal('matchMedia', (media: string) => ({
+        media,
+        matches: touch && media === TOUCH_QUERY,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+      }));
+      const { container } = render(
+        <ValueHistoryChart
+          series={line(WHOLE_HISTORY.points)}
+          caption="Portfolio value"
+          emptyText={EMPTY}
+          busy={false}
+        />,
+      );
+      const chart = container.querySelector('.history-chart');
+      if (chart === null) {
+        throw new Error('No chart was drawn.');
+      }
+      return chart as HTMLElement;
+    }
+
+    it('lifts the hover card above the chart, off the lines under the finger', () => {
+      expect(renderOn(true)).toHaveClass('history-chart-touch');
+    });
+
+    it('leaves the hover card beside a mouse pointer', () => {
+      expect(renderOn(false)).not.toHaveClass('history-chart-touch');
+    });
   });
 
   it('has no chart when there are no lines at all', () => {
