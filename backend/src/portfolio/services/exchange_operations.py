@@ -40,7 +40,11 @@ from portfolio.domain.exchange_exports import (
     Source,
     parse_export,
 )
-from portfolio.repositories.exchange_operations import ExchangeOperationRepository, NewOperation
+from portfolio.repositories.exchange_operations import (
+    ExchangeOperationRepository,
+    NewOperation,
+    OperationFilter,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -59,6 +63,7 @@ __all__ = [
     "FileReport",
     "ImportReport",
     "ManualOperation",
+    "OperationFilter",
     "OperationNotFoundError",
     "OperationNotManualError",
     "OperationPage",
@@ -164,23 +169,27 @@ class OperationView:
 
 @dataclass(frozen=True, slots=True)
 class OperationPage:
-    """One page of operations, newest first, and how many there are in all."""
+    """One page of operations, newest first, how many the filter keeps, and every asset and
+    venue stored, filtered or not."""
 
     total: int
     operations: tuple[OperationView, ...]
+    assets: tuple[str, ...]
+    venues: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class ManualOperation:
-    """A buy or sell the exports do not cover, such as a swap in a wallet app (R11)."""
+    """An operation the exports do not cover (R11): a buy or sell, such as a swap in a wallet
+    app, or a reward or network fee, which has no counterpart (spec 043)."""
 
     venue: str
     executed_at: datetime
     kind: OperationKind
     asset: str
     quantity: Decimal
-    quote_currency: str
-    quote_amount: Decimal
+    quote_currency: str | None
+    quote_amount: Decimal | None
     fee_asset: str | None
     fee_amount: Decimal | None
     description: str
@@ -292,11 +301,24 @@ class ExchangeOperationService:
             already_stored=total_already,
         )
 
-    async def list_operations(self, user_id: int, *, limit: int, offset: int) -> OperationPage:
-        """One page of the owner's operations, newest first."""
-        total = await self._operations.count(user_id)
-        rows = await self._operations.page(user_id, limit=limit, offset=offset)
-        return OperationPage(total=total, operations=tuple(view_of(row) for row in rows))
+    async def list_operations(
+        self,
+        user_id: int,
+        *,
+        limit: int,
+        offset: int,
+        filters: OperationFilter | None = None,
+    ) -> OperationPage:
+        """One page of the owner's operations that `filters` keeps, newest first, with every
+        asset and venue the owner has, for choosing the next filter."""
+        total = await self._operations.count(user_id, filters)
+        rows = await self._operations.page(user_id, limit=limit, offset=offset, filters=filters)
+        return OperationPage(
+            total=total,
+            operations=tuple(view_of(row) for row in rows),
+            assets=tuple(await self._operations.assets(user_id)),
+            venues=tuple(await self._operations.venues(user_id)),
+        )
 
     async def add_manual(self, user_id: int, entry: ManualOperation) -> OperationView:
         """Store a buy or a sell entered by hand, under an id of its own."""

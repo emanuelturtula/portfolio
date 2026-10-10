@@ -54,10 +54,23 @@ export function fakeOperations(options: FakeOperationsOptions = {}): FakeOperati
       const params = new URL(request.url).searchParams;
       const limit = Number.parseInt(params.get('limit') ?? '100', 10);
       const offset = Number.parseInt(params.get('offset') ?? '0', 10);
-      const newest = [...stored].sort((a, b) => b.executed_at.localeCompare(a.executed_at));
+      const asset = params.get('asset');
+      const venue = params.get('venue');
+      const since = params.get('since');
+      const until = params.get('until');
+      const kept = stored.filter(
+        (row) =>
+          (asset === null || row.asset === asset) &&
+          (venue === null || row.venue === venue) &&
+          (since === null || Date.parse(row.executed_at) >= Date.parse(since)) &&
+          (until === null || Date.parse(row.executed_at) < Date.parse(until)),
+      );
+      const newest = kept.sort((a, b) => b.executed_at.localeCompare(a.executed_at));
       return HttpResponse.json({
-        count: stored.length,
+        count: kept.length,
         operations: newest.slice(offset, offset + limit),
+        assets: [...new Set(stored.map((row) => row.asset))].sort(),
+        venues: [...new Set(stored.map((row) => row.venue))].sort(),
       });
     }),
 
@@ -90,8 +103,8 @@ export function fakeOperations(options: FakeOperationsOptions = {}): FakeOperati
         kind: body.kind,
         asset: body.asset.toUpperCase(),
         quantity: body.quantity,
-        quote_currency: body.quote_currency.toUpperCase(),
-        quote_amount: body.quote_amount,
+        quote_currency: body.quote_currency?.toUpperCase() ?? null,
+        quote_amount: body.quote_amount ?? null,
         fee_asset: null,
         fee_amount: null,
         description: body.description,

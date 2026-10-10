@@ -120,7 +120,8 @@ Confirmed facts the parsers rest on:
   assets up to the end of that UTC day. The series has one step for each day that changed it.
   It stops being known from the first day an unvalued trade happens.
 - **R11. Manual operations** have `source = manual` and a `venue` the owner names (`Tangem`).
-  Only `buy` and `sell` can be entered by hand. Only manual rows can be deleted.
+  Only `buy` and `sell` can be entered by hand (spec 043 adds `reward` and `fee`). Only manual
+  rows can be deleted.
 - **R12. Uploads travel as JSON** (`{"filename", "content_base64"}`). The write guard only lets
   JSON change state, and that stays the rule. The decoded file may be at most 5 MiB, and a zip
   may hold at most 100 files and 50 MiB uncompressed.

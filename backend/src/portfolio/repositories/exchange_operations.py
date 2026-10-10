@@ -12,7 +12,7 @@ sum of them is taken in Python by `domain.investment`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from sqlalchemy import func, select
 
@@ -23,9 +23,10 @@ if TYPE_CHECKING:
     from datetime import datetime
     from decimal import Decimal
 
+    from sqlalchemy import Select
     from sqlalchemy.ext.asyncio import AsyncSession
 
-__all__ = ["ExchangeOperationRepository", "NewOperation"]
+__all__ = ["ExchangeOperationRepository", "NewOperation", "OperationFilter"]
 
 _ID_BATCH: Final = 500
 """Ids per `IN (...)` when asking which are stored, well under SQLite's variable limit."""
@@ -47,6 +48,31 @@ class NewOperation:
     fee_asset: str | None
     fee_amount: Decimal | None
     description: str
+
+
+@dataclass(frozen=True, slots=True)
+class OperationFilter:
+    """Which operations a listing keeps. Each field narrows it; `None` keeps every value.
+
+    `since` is inclusive and `until` exclusive, so consecutive days never share an instant.
+    """
+
+    asset: str | None = None
+    venue: str | None = None
+    since: datetime | None = None
+    until: datetime | None = None
+
+    def apply(self, statement: Select[Any]) -> Select[Any]:
+        """`statement` with this filter's conditions added."""
+        if self.asset is not None:
+            statement = statement.where(ExchangeOperation.asset == self.asset)
+        if self.venue is not None:
+            statement = statement.where(ExchangeOperation.venue == self.venue)
+        if self.since is not None:
+            statement = statement.where(ExchangeOperation.executed_at >= self.since)
+        if self.until is not None:
+            statement = statement.where(ExchangeOperation.executed_at < self.until)
+        return statement
 
 
 class ExchangeOperationRepository:
@@ -132,23 +158,53 @@ class ExchangeOperationRepository:
         await self._session.flush()
         return rows
 
-    async def count(self, user_id: int) -> int:
-        """How many operations the owner has stored."""
-        total = await self._session.scalar(
+    async def count(self, user_id: int, filters: OperationFilter | None = None) -> int:
+        """How many of the owner's operations `filters` keeps; all of them without one."""
+        statement = (
             select(func.count())
             .select_from(ExchangeOperation)
             .where(ExchangeOperation.user_id == user_id)
         )
+        total = await self._session.scalar((filters or OperationFilter()).apply(statement))
         return int(total or 0)
 
-    async def page(self, user_id: int, *, limit: int, offset: int) -> list[ExchangeOperation]:
-        """One page of the owner's operations, newest first; ties by id, newest first."""
+    async def page(
+        self,
+        user_id: int,
+        *,
+        limit: int,
+        offset: int,
+        filters: OperationFilter | None = None,
+    ) -> list[ExchangeOperation]:
+        """One page of the owner's operations that `filters` keeps, newest first; ties by
+        id, newest first."""
+        statement = select(ExchangeOperation).where(ExchangeOperation.user_id == user_id)
         rows = await self._session.scalars(
-            select(ExchangeOperation)
-            .where(ExchangeOperation.user_id == user_id)
+            (filters or OperationFilter())
+            .apply(statement)
             .order_by(ExchangeOperation.executed_at.desc(), ExchangeOperation.id.desc())
             .limit(limit)
             .offset(offset)
+        )
+        return list(rows)
+
+    async def assets(self, user_id: int) -> list[str]:
+        """Every asset the owner has an operation in, alphabetically: a text column."""
+        rows = await self._session.scalars(
+            select(ExchangeOperation.asset)
+            .where(ExchangeOperation.user_id == user_id)
+            .distinct()
+            .order_by(ExchangeOperation.asset)
+        )
+        return list(rows)
+
+    async def venues(self, user_id: int) -> list[str]:
+        """Every venue the owner has an operation from, alphabetically."""
+        rows = await self._session.scalars(
+            select(ExchangeOperation.venue)
+            .where(ExchangeOperation.user_id == user_id)
+            .distinct()
+            .order_by(ExchangeOperation.venue)
         )
         return list(rows)
 

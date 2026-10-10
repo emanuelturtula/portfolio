@@ -32,27 +32,68 @@ export const OPERATIONS_PATH = '/api/exchange-operations';
 export const IMPORTS_PATH = '/api/exchange-operations/imports';
 export const INVESTMENT_PATH = '/api/investment';
 
-/** Rows per page of the operations table. */
-export const OPERATIONS_PAGE_SIZE = 50;
+/** The page sizes the table offers, and the one it starts on. */
+export const OPERATIONS_PAGE_SIZES = [25, 50, 100, 200] as const;
+export type OperationsPageSize = (typeof OPERATIONS_PAGE_SIZES)[number];
+export const DEFAULT_OPERATIONS_PAGE_SIZE: OperationsPageSize = 50;
 
 export const OPERATIONS_QUERY_KEY_ROOT = 'operations' as const;
 
 /** Under `['portfolio', ...]`, which a balance sync and a wallet change invalidate too. */
 export const investmentQueryKey = ['portfolio', 'investment'] as const;
 
-export function operationsQueryKey(page: number) {
-  return [OPERATIONS_QUERY_KEY_ROOT, { page }] as const;
+/**
+ * What the table asks for: a page of a size, and the filters. A day is a calendar date in this
+ * browser's zone, `YYYY-MM-DD` as a date input gives it, and `to` includes its whole day.
+ */
+export interface OperationsQuery {
+  readonly page: number;
+  readonly pageSize: OperationsPageSize;
+  readonly asset: string;
+  readonly venue: string;
+  readonly from: string;
+  readonly to: string;
+}
+
+export function operationsQueryKey(query: OperationsQuery) {
+  return [OPERATIONS_QUERY_KEY_ROOT, query] as const;
+}
+
+/** Local midnight at the start of `day`, `days` later, as an instant. */
+function startOfDay(day: string, days: number): string {
+  // A date-time with no offset is read in local time, unlike a bare date, which is UTC.
+  const start = new Date(`${day}T00:00`);
+  start.setDate(start.getDate() + days);
+  return start.toISOString();
+}
+
+/** The list's query string: an empty filter is left out rather than sent empty. */
+export function operationsSearch(query: OperationsQuery): string {
+  const params = new URLSearchParams({
+    limit: String(query.pageSize),
+    offset: String(query.page * query.pageSize),
+  });
+  if (query.asset !== '') {
+    params.set('asset', query.asset);
+  }
+  if (query.venue !== '') {
+    params.set('venue', query.venue);
+  }
+  if (query.from !== '') {
+    params.set('since', startOfDay(query.from, 0));
+  }
+  if (query.to !== '') {
+    params.set('until', startOfDay(query.to, 1));
+  }
+  return params.toString();
 }
 
 /** One page of the stored operations, newest first. The previous page stays while one loads. */
-export function useOperations(page: number): UseQueryResult<OperationList> {
+export function useOperations(query: OperationsQuery): UseQueryResult<OperationList> {
   return useQuery({
-    queryKey: operationsQueryKey(page),
+    queryKey: operationsQueryKey(query),
     queryFn: ({ signal }) =>
-      apiFetch<OperationList>(
-        `${OPERATIONS_PATH}?limit=${String(OPERATIONS_PAGE_SIZE)}&offset=${String(page * OPERATIONS_PAGE_SIZE)}`,
-        { signal },
-      ),
+      apiFetch<OperationList>(`${OPERATIONS_PATH}?${operationsSearch(query)}`, { signal }),
     placeholderData: keepPreviousData,
   });
 }

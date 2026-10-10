@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Final, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from portfolio.api.schemas.money import MoneyStr
 from portfolio.domain.exchange_exports import ExportFormat, OperationKind
@@ -136,13 +136,19 @@ class OperationResponse(BaseModel):
 
 
 class OperationListResponse(BaseModel):
-    """One page of operations, newest first, and how many there are in all.
+    """One page of operations, newest first, and how many the filter keeps.
 
     `count` rather than `total`, which is a money property everywhere else in the schema.
     """
 
     count: int
     operations: list[OperationResponse]
+    assets: list[str] = Field(
+        description="Every asset with a stored operation, alphabetically, whatever the filter."
+    )
+    venues: list[str] = Field(
+        description="Every venue with a stored operation, alphabetically, whatever the filter."
+    )
 
     @classmethod
     def of(cls, page: OperationPage) -> OperationListResponse:
@@ -150,28 +156,47 @@ class OperationListResponse(BaseModel):
         return cls(
             count=page.total,
             operations=[OperationResponse.of(view) for view in page.operations],
+            assets=list(page.assets),
+            venues=list(page.venues),
         )
 
 
 class ManualOperationRequest(BaseModel):
-    """A buy or a sell the exports do not cover, such as a swap in a wallet app (R11).
+    """An operation the exports do not cover (R11): a swap in a wallet app, a miner's payout,
+    or a network fee a withdrawal paid that the export did not list (spec 043).
 
-    `quantity` is what was bought or sold, and `quote_amount` what it cost or brought in, in
-    `quote_currency`, before any fee. A symbol is stored upper-cased.
+    A `buy` or `sell` says what it cost or brought in: `quantity` of `asset` for `quote_amount`
+    of `quote_currency`, before any fee. A `reward` or a `fee` is only `quantity` of `asset`,
+    and is refused with a counterpart or a fee of its own. A symbol is stored upper-cased.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     venue: str = Field(min_length=1, max_length=MAX_TEXT_LENGTH)
     executed_at: AwareDatetime
-    kind: Literal[OperationKind.BUY, OperationKind.SELL]
+    kind: Literal[OperationKind.BUY, OperationKind.SELL, OperationKind.REWARD, OperationKind.FEE]
     asset: str = Field(min_length=1, max_length=MAX_SYMBOL_LENGTH)
     quantity: MoneyStr = Field(gt=0)
-    quote_currency: str = Field(min_length=1, max_length=MAX_SYMBOL_LENGTH)
-    quote_amount: MoneyStr = Field(ge=0)
+    quote_currency: str | None = Field(default=None, min_length=1, max_length=MAX_SYMBOL_LENGTH)
+    quote_amount: MoneyStr | None = Field(default=None, ge=0)
     fee_asset: str | None = Field(default=None, min_length=1, max_length=MAX_SYMBOL_LENGTH)
     fee_amount: MoneyStr | None = Field(default=None, gt=0)
     description: str = Field(default="", max_length=MAX_TEXT_LENGTH)
+
+    @model_validator(mode="after")
+    def _counterpart_matches_kind(self) -> ManualOperationRequest:
+        trade = self.kind in {OperationKind.BUY, OperationKind.SELL}
+        quoted = (self.quote_currency, self.quote_amount)
+        if trade and None in quoted:
+            message = "a buy or a sell needs quote_currency and quote_amount"
+            raise ValueError(message)
+        if not trade and quoted != (None, None):
+            message = "a reward or a fee has no quote_currency or quote_amount"
+            raise ValueError(message)
+        if not trade and (self.fee_asset, self.fee_amount) != (None, None):
+            message = "a reward or a fee has no fee of its own"
+            raise ValueError(message)
+        return self
 
 
 class AssetInvestmentResponse(BaseModel):

@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Response, status
+from pydantic import AwareDatetime
 
 from portfolio.api.dependencies import (
     get_exchange_operation_service,
@@ -33,6 +34,7 @@ from portfolio.services.auth import Principal
 from portfolio.services.exchange_operations import (
     ExchangeOperationService,
     ManualOperation,
+    OperationFilter,
     OperationNotFoundError,
     OperationNotManualError,
     UploadRefusedError,
@@ -48,6 +50,16 @@ CurrentOperationService = Annotated[
 CurrentInvestmentService = Annotated[InvestmentService, Depends(get_investment_service)]
 
 MAX_PAGE: int = 500
+MAX_FILTER_LENGTH: int = 80
+
+Since = Annotated[
+    AwareDatetime | None,
+    Query(description="Only operations at or after this instant. Needs an offset."),
+]
+Until = Annotated[
+    AwareDatetime | None,
+    Query(description="Only operations before this instant. Needs an offset."),
+]
 
 router = APIRouter(tags=["exchange operations"])
 
@@ -88,16 +100,46 @@ async def list_operations(
     service: CurrentOperationService,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
+    asset: Annotated[
+        str | None,
+        Query(min_length=1, max_length=MAX_FILTER_LENGTH, description="Only this asset."),
+    ] = None,
+    venue: Annotated[
+        str | None,
+        Query(
+            min_length=1,
+            max_length=MAX_FILTER_LENGTH,
+            description="Only this venue, as `venues` lists it.",
+        ),
+    ] = None,
+    since: Since = None,
+    until: Until = None,
 ) -> OperationListResponse:
-    """One page of every stored operation, of every asset, with the total count."""
-    page = await service.list_operations(principal.user_id, limit=limit, offset=offset)
+    """One page of the stored operations, of every asset unless filtered, with how many the
+    filter keeps and every asset and venue there is to filter by.
+
+    A naive `since` or `until` is refused rather than assumed to be UTC, and so is a window
+    that ends at or before it starts.
+    """
+    if since is not None and until is not None and until <= since:
+        message = "`until` must be after `since`."
+        raise UnprocessableEntityError(message)
+    filters = OperationFilter(
+        asset=asset.strip().upper() if asset is not None else None,
+        venue=venue,
+        since=since,
+        until=until,
+    )
+    page = await service.list_operations(
+        principal.user_id, limit=limit, offset=offset, filters=filters
+    )
     return OperationListResponse.of(page)
 
 
 @router.post(
     "/exchange-operations",
     operation_id="createManualOperation",
-    summary="Record a buy or a sell no export covers",
+    summary="Record a buy, a sell, a reward or a network fee no export covers",
     status_code=status.HTTP_201_CREATED,
     response_model=OperationResponse,
 )
@@ -106,7 +148,8 @@ async def create_manual_operation(
     principal: CurrentPrincipal,
     service: CurrentOperationService,
 ) -> OperationResponse:
-    """Store a manual entry, such as a swap inside a wallet app. It can be deleted later."""
+    """Store a manual entry, such as a swap inside a wallet app, a miner's payout or a
+    withdrawal's unlisted network fee. It can be deleted later."""
     fee_asset = body.fee_asset.strip().upper() if body.fee_asset else None
     view = await service.add_manual(
         principal.user_id,
@@ -116,7 +159,9 @@ async def create_manual_operation(
             kind=body.kind,
             asset=body.asset.strip().upper(),
             quantity=body.quantity,
-            quote_currency=body.quote_currency.strip().upper(),
+            quote_currency=(
+                body.quote_currency.strip().upper() if body.quote_currency is not None else None
+            ),
             quote_amount=body.quote_amount,
             fee_asset=fee_asset if body.fee_amount is not None else None,
             fee_amount=body.fee_amount if fee_asset is not None else None,

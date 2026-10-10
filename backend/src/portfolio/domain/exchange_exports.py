@@ -69,6 +69,8 @@ class OperationKind(StrEnum):
     WITHDRAWAL = "withdrawal"
     TRANSFER = "transfer"
     OTHER = "other"
+    FEE = "fee"
+    """A network fee no export lists, entered by hand (spec 043). No parser produces one."""
 
 
 class Source(StrEnum):

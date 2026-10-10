@@ -1267,6 +1267,52 @@ def test_the_exchange_operation_checks_match_the_model(
     }
 
 
+def test_the_manual_rewards_migration_reverses_on_its_own(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Spec 043: one step down restores 0016's `CHECK`s, deleting the manual rewards and fees
+    they refuse and keeping every other row; the upgrade admits them again."""
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO users (id, username, password_hash, created_at) "
+                "VALUES (90, 'rewards', 'x', '2026-10-10 00:00:00.000000')"
+            )
+        )
+        for number, (source, kind) in enumerate(
+            [("manual", "buy"), ("manual", "reward"), ("manual", "fee"), ("bitget", "reward")]
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO exchange_operations (user_id, source, venue, external_id, "
+                    "executed_at, kind, asset, quantity, description, created_at) VALUES "
+                    "(90, :source, 'x', :id, '2026-10-10 00:00:00.000000', :kind, 'KAS', "
+                    "'1', '', '2026-10-10 00:00:00.000000')"
+                ),
+                {"source": source, "id": f"id-{number}", "kind": kind},
+            )
+
+    command.downgrade(build_alembic_config(database_url), "0016_exchange_operations")
+
+    with sync_engine.begin() as connection:
+        kept = connection.execute(
+            text("SELECT source, kind FROM exchange_operations WHERE user_id = 90 ORDER BY id")
+        ).all()
+    assert [tuple(row) for row in kept] == [("manual", "buy"), ("bitget", "reward")]
+    assert {
+        str(found["name"]): normalise_sql(str(found["sqltext"]))
+        for found in inspect(sync_engine).get_check_constraints("exchange_operations")
+    }["ck_exchange_operations_manual"] == normalise_sql(
+        "source != 'manual' OR kind IN ('buy', 'sell')"
+    )
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
 def test_the_exchange_operations_migration_reverses_on_its_own(
     database_url: str,
     sync_engine: Engine,
