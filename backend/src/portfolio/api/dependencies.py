@@ -33,12 +33,17 @@ from portfolio.services.auth import (
 )
 from portfolio.services.backup import BackupService
 from portfolio.services.balances import BalanceService, build_balance_service
+from portfolio.services.exchange_operations import (
+    ExchangeOperationService,
+    build_exchange_operation_service,
+)
 from portfolio.services.health import (
     HealthService,
     SchedulerName,
     TimerLike,
     build_health_service,
 )
+from portfolio.services.investment import InvestmentService, build_investment_service
 from portfolio.services.password_hasher import PasswordHasher
 from portfolio.services.portfolio import PortfolioService, build_portfolio_service
 from portfolio.services.portfolio_changes import (
@@ -195,6 +200,29 @@ async def get_portfolio_change_service(
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
     async with sessionmaker() as session:
         yield build_portfolio_change_service(session)
+
+
+async def get_exchange_operation_service(
+    request: Request,
+) -> AsyncIterator[ExchangeOperationService]:
+    """Open a session for this request and hand the router the operation service (spec 042).
+
+    The service commits what it writes; closing the session on the way out rolls back an
+    upload that was refused part way.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_exchange_operation_service(session)
+
+
+async def get_investment_service(request: Request) -> AsyncIterator[InvestmentService]:
+    """Open a session for this request and hand the router the investment service.
+
+    Read-only, like `get_portfolio_service`. The service's clock is the default one.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_investment_service(session)
 
 
 def get_backup_service(request: Request) -> BackupService:

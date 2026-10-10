@@ -8,6 +8,7 @@ import {
   usePortfolioHistory,
   type HistoryRange,
 } from '@/api/history';
+import { useInvestment } from '@/api/operations';
 import { ErrorState } from '@/components/ErrorState';
 import { Skeleton } from '@/components/Skeleton';
 import { assetColors, colorOf } from '@/lib/assetColors';
@@ -21,7 +22,11 @@ import {
   type ChartSeries,
   type HistoryPoint,
 } from '@/lib/history';
+import { investedPoints } from '@/lib/investment';
 import { ValueHistoryChart } from '@/pages/dashboard/ValueHistoryChart';
+
+/** The invested line's colour: the neutral grey, apart from the total's blue and every asset's. */
+export const INVESTED_COLOR = 'var(--series-other)';
 
 export const HISTORY_LOADING_LABEL = 'Loading the value history…';
 
@@ -198,11 +203,16 @@ export function SeriesSelector({ assets, colors, value, onChange }: SeriesSelect
  *
  * A chosen asset the history no longer carries (its last wallet archived) is dropped, and when
  * nothing chosen is left the total is drawn, so the chart is never empty by selection.
+ *
+ * Spec 042 adds what was invested, a step line over the same days, shown by default once any
+ * operation has been uploaded and toggled beside the series.
  */
 export function PortfolioHistory() {
   const [range, setRange] = useState<HistoryRange>(DEFAULT_HISTORY_RANGE);
   const [chosen, setChosen] = useState<readonly string[]>([TOTAL_SERIES]);
+  const [showInvested, setShowInvested] = useState(true);
   const history = usePortfolioHistory(range);
+  const steps = useInvestment().data?.invested_by_day ?? [];
   const assets = history.data?.assets ?? [];
   const colors = assetColors(assets);
   const kept = chosen.filter((key) => key === TOTAL_SERIES || assets.includes(key));
@@ -217,10 +227,43 @@ export function PortfolioHistory() {
       {assets.length > 0 && (
         <SeriesSelector assets={assets} colors={colors} value={selected} onChange={setChosen} />
       )}
+      {steps.length > 0 && (
+        <div className="range-selector series-selector" role="group" aria-label="Compare">
+          <button
+            type="button"
+            aria-pressed={showInvested}
+            onClick={() => {
+              setShowInvested(!showInvested);
+            }}
+          >
+            <span
+              className="series-swatch"
+              style={{ backgroundColor: INVESTED_COLOR }}
+              aria-hidden="true"
+            />
+            Invested
+          </button>
+        </div>
+      )}
       <HistoryView
         query={history}
         subject="Portfolio value"
-        series={(data) => portfolioSeries(data, selected, colors)}
+        series={(data) => [
+          ...portfolioSeries(data, selected, colors),
+          ...(showInvested && steps.length > 0
+            ? [
+                {
+                  key: 'invested',
+                  label: 'Invested',
+                  color: INVESTED_COLOR,
+                  points: investedPoints(
+                    data.points.map((point) => point.day),
+                    steps,
+                  ),
+                },
+              ]
+            : []),
+        ]}
         emptyText={PORTFOLIO_EMPTY_WORDS}
       />
     </section>

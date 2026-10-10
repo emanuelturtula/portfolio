@@ -9,6 +9,7 @@ import {
   type WalletValueHistory,
 } from '@/api/history';
 import { PORTFOLIO_CHANGES_PATH, type PortfolioChanges } from '@/api/changes';
+import { INVESTMENT_PATH, type Investment } from '@/api/operations';
 import { PORTFOLIO_SUMMARY_PATH, type PortfolioSummary } from '@/api/portfolio';
 
 import {
@@ -26,6 +27,7 @@ import {
   type WalletResponse,
 } from './fixtures';
 import { unknownChanges } from './changeFixtures';
+import { emptyInvestment } from './investmentFixtures';
 import { unreadWalletHistory, unvaluedPortfolioHistory } from './historyFixtures';
 import { problem, refuseNonJsonWrite, server, unauthorized } from './server';
 import { missing, portfolioSummary } from './summaryFixtures';
@@ -189,6 +191,11 @@ export interface FakePortfolioOptions {
    * unread, and the only answer a fake that knows no prices can give honestly.
    */
   readonly changes?: PortfolioChanges;
+  /**
+   * What `GET /api/investment` answers (spec 042). When omitted, nothing is tracked or
+   * uploaded: what the backend answers on a new install.
+   */
+  readonly investment?: Investment;
   /**
    * What `GET /api/wallets/{id}/value-history` answers for a registered wallet, archived ones
    * included. When omitted, or when this returns `undefined`, every day of the range is `null`
@@ -382,6 +389,7 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     http.all(PORTFOLIO_SUMMARY_PATH, requireSession),
     http.all(PORTFOLIO_HISTORY_PATH, requireSession),
     http.all(PORTFOLIO_CHANGES_PATH, requireSession),
+    http.all(INVESTMENT_PATH, requireSession),
     http.all(WALLET_VALUE_HISTORY_PATH, requireSession),
     http.get(WALLETS_PATH, async ({ request }) => {
       await record(request);
@@ -535,6 +543,11 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     http.get(PORTFOLIO_CHANGES_PATH, async ({ request }) => {
       await record(request);
       return HttpResponse.json(fake.changes());
+    }),
+
+    http.get(INVESTMENT_PATH, async ({ request }) => {
+      await record(request);
+      return HttpResponse.json(options.investment ?? emptyInvestment());
     }),
 
     http.get(PORTFOLIO_HISTORY_PATH, async ({ request }) => {

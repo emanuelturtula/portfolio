@@ -10,6 +10,7 @@ import { describeMissing } from '@/lib/portfolio';
 import { BackupNotice } from '@/pages/dashboard/BackupNotice';
 import { ChangeSummary } from '@/pages/dashboard/ChangeSummary';
 import { Holdings } from '@/pages/dashboard/Holdings';
+import { InvestmentSummary } from '@/pages/dashboard/InvestmentSummary';
 import { TotalHero } from '@/pages/dashboard/TotalHero';
 import { PortfolioHistory } from '@/pages/dashboard/ValueHistory';
 
@@ -35,6 +36,9 @@ function isEmpty(summary: PortfolioSummary): boolean {
  * The change over 24 hours and 7 days (spec 041) and the chart of the value over time (spec
  * 037) each have a query and four states of their own, inside their cards: one that fails to
  * load never takes the figures above it down with it.
+ *
+ * What was invested and the gain or loss (spec 042) is a card of its own with its own query, after
+ * the change.
  *
  * Above everything, a warning when the scheduled backups failed or stopped (spec 029): it is
  * about the data underneath, not about any one figure.
@@ -137,6 +141,7 @@ function Overview({ summary, sync }: OverviewProps) {
         )}
       </TotalHero>
       <ChangeSummary />
+      <InvestmentSummary />
       <PortfolioHistory />
       {data.holdings.length > 0 && <Holdings summary={data} />}
     </div>

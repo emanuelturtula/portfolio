@@ -8,6 +8,7 @@ import { DashboardPage } from '@/pages/DashboardPage';
 import { HealthPage } from '@/pages/HealthPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { NotFoundPage } from '@/pages/NotFoundPage';
+import { OperationsPage } from '@/pages/OperationsPage';
 import { WalletsPage } from '@/pages/WalletsPage';
 
 /**
@@ -52,6 +53,14 @@ export function App() {
             }
           />
           <Route
+            path="/operations"
+            element={
+              <RequireSession>
+                <OperationsPage />
+              </RequireSession>
+            }
+          />
+          <Route
             path="/health"
             element={
               <RequireSession>
@@ -74,7 +83,8 @@ export function App() {
 }
 
 /**
- * The two pages (spec 039): the dashboard, and the wallets behind its figures. Health is not
+ * The pages (spec 039): the dashboard, and the wallets behind its figures; spec 042 adds the
+ * exchange operations the invested figures are built from. Health is not
  * here; the dashboard's backup notice links to it when there is something to see. Renders only
  * when a session exists, like {@link AccountControls} - a signed-out visitor never reaches
  * either destination, so showing the links to them would be navigation to nowhere.
@@ -92,6 +102,7 @@ function MainNav() {
         Dashboard
       </NavLink>
       <NavLink to="/wallets">Wallets</NavLink>
+      <NavLink to="/operations">Operations</NavLink>
     </nav>
   );
 }

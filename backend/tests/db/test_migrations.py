@@ -45,6 +45,8 @@ from portfolio.db.base import NAMING_CONVENTION
 from portfolio.db.models import (
     _ASSET_KIND_CHECK,
     _BALANCE_SNAPSHOT_CONFIRMED_CHECK,
+    _EXCHANGE_OPERATION_KIND_CHECK,
+    _EXCHANGE_OPERATION_MANUAL_CHECK,
     _PRICE_HISTORY_BASIS_CHECK,
     _PRICE_QUOTE_CURRENCY_CHECK,
     _RECONSTRUCTED_BALANCE_CONFIRMED_CHECK,
@@ -86,6 +88,9 @@ APPLICATION_TABLES = frozenset(
         "reconstructed_balances",
         # Spec 041. One closing price per asset, quote currency and UTC hour.
         "price_hourly",
+        # Spec 042. Every operation of the uploaded exchange exports, and the uploads.
+        "exchange_imports",
+        "exchange_operations",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -159,6 +164,10 @@ RECONSTRUCTED_TABLES = frozenset({"reconstructed_balances"})
 #: Spec 041's one. Its revision sits on top of `0014`, so every single-step reversal below
 #: `0015_price_hourly` takes it down as well, and each test subtracts it.
 HOURLY_TABLES = frozenset({"price_hourly"})
+
+#: Spec 042's two. Its revision sits on top of `0015`, so every single-step reversal below
+#: `0016_exchange_operations` takes them down as well, and each test subtracts them.
+OPERATION_TABLES = frozenset({"exchange_imports", "exchange_operations"})
 
 #: Spec 036's revision, and the one below it: the last schema that has the tables it drops.
 DROP_REVISION = "0012_drop_exchanges_accounting"
@@ -257,6 +266,17 @@ EXPECTED_CONSTRAINT_NAMES = {
         "uq_price_hourly_asset_hour",
         "ck_price_hourly_quote_currency",
         "fk_price_hourly_asset_id_assets",
+    },
+    # Spec 042. Two CHECKs, compared with their constants by
+    # `test_the_exchange_operation_checks_match_the_model`.
+    "exchange_imports": {"pk_exchange_imports", "fk_exchange_imports_user_id_users"},
+    "exchange_operations": {
+        "pk_exchange_operations",
+        "uq_exchange_operations_source_id",
+        "ck_exchange_operations_kind",
+        "ck_exchange_operations_manual",
+        "fk_exchange_operations_user_id_users",
+        "fk_exchange_operations_import_id_exchange_imports",
     },
     "derived_addresses": {
         "pk_derived_addresses",
@@ -541,6 +561,7 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
         - PRICE_HISTORY_TABLES
         - RECONSTRUCTED_TABLES
         - HOURLY_TABLES
+        - OPERATION_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -578,6 +599,7 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
         - PRICE_HISTORY_TABLES
         - RECONSTRUCTED_TABLES
         - HOURLY_TABLES
+        - OPERATION_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -652,6 +674,7 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
         - PRICE_HISTORY_TABLES
         - RECONSTRUCTED_TABLES
         - HOURLY_TABLES
+        - OPERATION_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:
@@ -891,7 +914,13 @@ def test_the_dropped_tables_carry_the_convention_names_below_the_drop(
 
     assert set(PRE_DROP_CONSTRAINT_NAMES) == DROPPED_TABLES
     assert table_names(sync_engine) == (
-        (APPLICATION_TABLES - PRICE_HISTORY_TABLES - RECONSTRUCTED_TABLES - HOURLY_TABLES)
+        (
+            APPLICATION_TABLES
+            - PRICE_HISTORY_TABLES
+            - RECONSTRUCTED_TABLES
+            - HOURLY_TABLES
+            - OPERATION_TABLES
+        )
         | DROPPED_TABLES
         | {STAMP_TABLE}
     )
@@ -1118,7 +1147,11 @@ def test_the_price_history_migration_reverses_on_its_own(
     command.downgrade(build_alembic_config(database_url), DROP_REVISION)
 
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - PRICE_HISTORY_TABLES - RECONSTRUCTED_TABLES - HOURLY_TABLES
+        APPLICATION_TABLES
+        - PRICE_HISTORY_TABLES
+        - RECONSTRUCTED_TABLES
+        - HOURLY_TABLES
+        - OPERATION_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -1166,7 +1199,7 @@ def test_the_reconstructed_balances_migration_reverses_on_its_own(
     command.downgrade(build_alembic_config(database_url), "0013_price_history")
 
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - RECONSTRUCTED_TABLES - HOURLY_TABLES
+        APPLICATION_TABLES - RECONSTRUCTED_TABLES - HOURLY_TABLES - OPERATION_TABLES
     ) | {STAMP_TABLE}
 
     upgrade_to_head(database_url)
@@ -1206,7 +1239,48 @@ def test_the_price_hourly_migration_reverses_on_its_own(
 
     command.downgrade(build_alembic_config(database_url), "0014_reconstructed_balances")
 
-    assert table_names(sync_engine) == (APPLICATION_TABLES - HOURLY_TABLES) | {STAMP_TABLE}
+    assert table_names(sync_engine) == (APPLICATION_TABLES - HOURLY_TABLES - OPERATION_TABLES) | {
+        STAMP_TABLE
+    }
+    assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
+def test_the_exchange_operation_checks_match_the_model(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Spec 042's two `CHECK`s: R1's kinds, and R11's buy or sell for a manual entry."""
+    upgrade_to_head(database_url)
+
+    reflected = {
+        str(found["name"]): normalise_sql(str(found["sqltext"]))
+        for found in inspect(sync_engine).get_check_constraints("exchange_operations")
+    }
+
+    assert reflected == {
+        "ck_exchange_operations_kind": normalise_sql(_EXCHANGE_OPERATION_KIND_CHECK),
+        "ck_exchange_operations_manual": normalise_sql(_EXCHANGE_OPERATION_MANUAL_CHECK),
+    }
+
+
+def test_the_exchange_operations_migration_reverses_on_its_own(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """One step down drops the two tables and nothing else; the upgrade restores them."""
+    upgrade_to_head(database_url)
+    revisions = [
+        script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+    ]
+    assert revisions.index("0016_exchange_operations") == (revisions.index("0015_price_hourly") - 1)
+
+    command.downgrade(build_alembic_config(database_url), "0015_price_hourly")
+
+    assert table_names(sync_engine) == (APPLICATION_TABLES - OPERATION_TABLES) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
     upgrade_to_head(database_url)

@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import { App } from '@/App';
 import { fakePortfolio } from '@/test/fakePortfolio';
+import { fakeOperations } from '@/test/fakeOperations';
 import { healthyPortfolio } from '@/test/fixtures';
 import { renderApp } from '@/test/render';
 import { fakeSession, server, TEST_USERNAME } from '@/test/server';
@@ -142,6 +143,13 @@ const ROUTE_CASES: readonly RouteCase[] = [
     passwordInputs: 0,
   },
   {
+    route: '/operations',
+    visit: '/operations',
+    signedIn: true,
+    ready: () => screen.findByRole('form', { name: 'Add an operation by hand' }),
+    passwordInputs: 0,
+  },
+  {
     route: '/health',
     visit: '/health',
     signedIn: true,
@@ -163,6 +171,7 @@ function serve(signedIn: boolean): void {
   server.use(
     ...session.handlers,
     ...fakePortfolio({ ...scenario, summary: VALUED_SUMMARY, session }).handlers,
+    ...fakeOperations().handlers,
   );
 }
 

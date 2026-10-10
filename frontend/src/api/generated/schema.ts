@@ -161,6 +161,75 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/exchange-operations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The stored operations, newest first
+         * @description One page of every stored operation, of every asset, with the total count.
+         */
+        get: operations["listExchangeOperations"];
+        put?: never;
+        /**
+         * Record a buy or a sell no export covers
+         * @description Store a manual entry, such as a swap inside a wallet app. It can be deleted later.
+         */
+        post: operations["createManualOperation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/exchange-operations/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upload an exchange's export, a CSV or a zip of them
+         * @description Store every operation of the upload not already stored, and say what each file held.
+         *
+         *     A file is recognised by its header row. One this importer does not read is reported as
+         *     skipped, with its row count. A row that cannot be read refuses the whole upload with a
+         *     422 naming the file and the line, and nothing is stored.
+         */
+        post: operations["importExchangeOperations"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/exchange-operations/{operation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a manual entry
+         * @description Delete one manual entry. An imported operation is a 409: re-uploading would bring it
+         *     back, so deleting it would only hide it until then.
+         */
+        delete: operations["deleteManualOperation"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/health": {
         parameters: {
             query?: never;
@@ -193,6 +262,30 @@ export interface paths {
          * @description Return each source's state as its last recorded attempt left it. Calls no vendor.
          */
         get: operations["getHealthDetail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/investment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Invested, value, profit and loss, and the quantities the operations explain
+         * @description The figures for the assets of the active wallets, from the stored operations.
+         *
+         *     **A figure that cannot be known is `null` with the reason in `unavailable`, never `"0"`**:
+         *     a trade not priced in a stablecoin, or an asset with no value now. Every amount is a JSON
+         *     string.
+         */
+        get: operations["readInvestment"];
         put?: never;
         post?: never;
         delete?: never;
@@ -408,6 +501,37 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * AssetInvestmentResponse
+         * @description One tracked asset's figures. A figure that cannot be known is `null`, never `"0"`, and
+         *     `unavailable` says why the profit or its percentage is missing.
+         */
+        AssetInvestmentResponse: {
+            /** Asset */
+            asset: string;
+            /** Difference */
+            difference: string | null;
+            /**
+             * Explained
+             * @example 1234.56789012
+             */
+            explained: string;
+            /** Held */
+            held: string | null;
+            /** Invested */
+            invested: string | null;
+            /** Pnl */
+            pnl: string | null;
+            /** Pnl Pct */
+            pnl_pct: string | null;
+            /** Trades */
+            trades: number;
+            unavailable: components["schemas"]["InvestmentUnavailable"] | null;
+            /** Unvalued Trades */
+            unvalued_trades: number;
+            /** Value */
+            value: string | null;
+        };
+        /**
          * BackupErrorKind
          * @description Why an attempt to take a copy of the database failed.
          *
@@ -566,6 +690,12 @@ export interface components {
             /** Wallets */
             wallets: components["schemas"]["WalletBalanceResponse"][];
         };
+        /**
+         * ExportFormat
+         * @description A format this module reads. The member is the name an upload's report gives.
+         * @enum {string}
+         */
+        ExportFormat: "bitget_spot_order_details" | "bitget_spot_transactions" | "bingx_spot_order_history" | "bingx_futures_order_history" | "bingx_fund_account" | "binance_transaction_history" | "nexo_transactions" | "buenbit_history";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -631,6 +761,89 @@ export interface components {
             value: string | null;
         };
         /**
+         * ImportFileResponse
+         * @description One file of an upload: its format, its data rows, and what of it was new.
+         *
+         *     `format` is `null` exactly when the file was skipped, and `skipped_reason` says why.
+         */
+        ImportFileResponse: {
+            /** Already Stored */
+            already_stored: number;
+            format: components["schemas"]["ExportFormat"] | null;
+            /** Name */
+            name: string;
+            /** Rows */
+            rows: number;
+            /** Skipped Reason */
+            skipped_reason: string | null;
+            /** Stored */
+            stored: number;
+        };
+        /**
+         * ImportRequest
+         * @description One file as the exchange served it, a CSV or a zip of them, in base64 (R12).
+         */
+        ImportRequest: {
+            /**
+             * Content Base64
+             * @description The file's bytes, base64-encoded; at most 5 MiB.
+             */
+            content_base64: string;
+            /** Filename */
+            filename: string;
+        };
+        /**
+         * ImportResponse
+         * @description What an upload stored, file by file, and in all.
+         */
+        ImportResponse: {
+            /** Already Stored */
+            already_stored: number;
+            /** Filename */
+            filename: string;
+            /** Files */
+            files: components["schemas"]["ImportFileResponse"][];
+            /** Stored */
+            stored: number;
+        };
+        /**
+         * InvestedOnDayResponse
+         * @description The total invested at the end of a UTC day a trade changed it; `null` once unknown.
+         */
+        InvestedOnDayResponse: {
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Invested */
+            invested: string | null;
+        };
+        /**
+         * InvestmentResponse
+         * @description What went in, what it is worth now, and whether the exchanges explain the wallets.
+         *
+         *     `overall` rather than `total`, which is a money property everywhere else in the schema.
+         */
+        InvestmentResponse: {
+            /** Assets */
+            assets: components["schemas"]["AssetInvestmentResponse"][];
+            /** Invested By Day */
+            invested_by_day: components["schemas"]["InvestedOnDayResponse"][];
+            overall: components["schemas"]["TotalInvestmentResponse"];
+        };
+        /**
+         * InvestmentUnavailable
+         * @description Why a profit, or its percentage, is not a number. The member is its own wire form.
+         *
+         *     * `unvalued_trades` -- a trade was not priced in a stablecoin, so nothing invested is known.
+         *     * `value_unknown` -- the coin has no value now: unpriced, or a wallet never read.
+         *     * `nothing_invested` -- the profit is known, but there is nothing above zero to divide it
+         *       by, so it has no percentage.
+         * @enum {string}
+         */
+        InvestmentUnavailable: "unvalued_trades" | "value_unknown" | "nothing_invested";
+        /**
          * LoginRequest
          * @description Credentials submitted by the login form.
          */
@@ -639,6 +852,50 @@ export interface components {
             password: string;
             /** Username */
             username: string;
+        };
+        /**
+         * ManualOperationRequest
+         * @description A buy or a sell the exports do not cover, such as a swap in a wallet app (R11).
+         *
+         *     `quantity` is what was bought or sold, and `quote_amount` what it cost or brought in, in
+         *     `quote_currency`, before any fee. A symbol is stored upper-cased.
+         */
+        ManualOperationRequest: {
+            /** Asset */
+            asset: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Executed At
+             * Format: date-time
+             */
+            executed_at: string;
+            /** Fee Amount */
+            fee_amount?: string | null;
+            /** Fee Asset */
+            fee_asset?: string | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "buy" | "sell";
+            /**
+             * Quantity
+             * @example 1234.56789012
+             */
+            quantity: string;
+            /**
+             * Quote Amount
+             * @example 1234.56789012
+             */
+            quote_amount: string;
+            /** Quote Currency */
+            quote_currency: string;
+            /** Venue */
+            venue: string;
         };
         /**
          * MissingKind
@@ -662,6 +919,63 @@ export interface components {
             kind: components["schemas"]["MissingKind"];
             /** Subject */
             subject: string;
+        };
+        /**
+         * OperationKind
+         * @description What an operation did. The member is its own stored and wire form.
+         * @enum {string}
+         */
+        OperationKind: "buy" | "sell" | "reward" | "deposit" | "withdrawal" | "transfer" | "other";
+        /**
+         * OperationListResponse
+         * @description One page of operations, newest first, and how many there are in all.
+         *
+         *     `count` rather than `total`, which is a money property everywhere else in the schema.
+         */
+        OperationListResponse: {
+            /** Count */
+            count: number;
+            /** Operations */
+            operations: components["schemas"]["OperationResponse"][];
+        };
+        /**
+         * OperationResponse
+         * @description One stored operation. `manual` says whether it can be deleted.
+         */
+        OperationResponse: {
+            /** Asset */
+            asset: string;
+            /** Description */
+            description: string;
+            /**
+             * Executed At
+             * Format: date-time
+             */
+            executed_at: string;
+            /** External Id */
+            external_id: string;
+            /** Fee Amount */
+            fee_amount: string | null;
+            /** Fee Asset */
+            fee_asset: string | null;
+            /** Id */
+            id: number;
+            kind: components["schemas"]["OperationKind"];
+            /** Manual */
+            manual: boolean;
+            /**
+             * Quantity
+             * @example 1234.56789012
+             */
+            quantity: string;
+            /** Quote Amount */
+            quote_amount: string | null;
+            /** Quote Currency */
+            quote_currency: string | null;
+            /** Source */
+            source: string;
+            /** Venue */
+            venue: string;
         };
         /**
          * PasswordChangeRequest
@@ -1044,6 +1358,21 @@ export interface components {
             wallets_succeeded: number;
             /** Wallets Total */
             wallets_total: number;
+        };
+        /**
+         * TotalInvestmentResponse
+         * @description The tracked assets together, unknown where any of them is.
+         */
+        TotalInvestmentResponse: {
+            /** Invested */
+            invested: string | null;
+            /** Pnl */
+            pnl: string | null;
+            /** Pnl Pct */
+            pnl_pct: string | null;
+            unavailable: components["schemas"]["InvestmentUnavailable"] | null;
+            /** Value */
+            value: string | null;
         };
         /**
          * Unavailable
@@ -1462,6 +1791,133 @@ export interface operations {
             };
         };
     };
+    listExchangeOperations: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OperationListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    createManualOperation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManualOperationRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OperationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    importExchangeOperations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImportRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    deleteManualOperation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                operation_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     getHealth: {
         parameters: {
             query?: never;
@@ -1498,6 +1954,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthDetailResponse"];
+                };
+            };
+        };
+    };
+    readInvestment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InvestmentResponse"];
                 };
             };
         };

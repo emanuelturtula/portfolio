@@ -480,6 +480,32 @@ instant (`BalanceRepository.latest_at_or_before`), or its rebuilt balance before
 `domain/portfolio_change.py` does the arithmetic. A change it cannot value is `null` with a
 reason, never `"0"`.
 
+### Exchange operations and what was invested (spec 042)
+
+The exchanges' own CSV exports, uploaded by hand, are stored one row per operation in
+`exchange_operations` (migration `0016_exchange_operations`), `UNIQUE (user_id, source,
+external_id)`, with each upload recorded in `exchange_imports`. Every operation is stored,
+whatever its asset; only the figures keep to the assets of the owner's active wallets.
+
+| Endpoint | Answers |
+|---|---|
+| `POST /api/exchange-operations/imports` | one file, a CSV or a zip of them, as `{filename, content_base64}`: 201 with what each file held, stored and skipped; 422 naming the file and line it could not read, with nothing stored |
+| `GET /api/exchange-operations?limit=…&offset=…` | `count` and one page of `operations`, newest first |
+| `POST /api/exchange-operations` | a buy or a sell no export covers, entered by hand; 201 with the stored row |
+| `DELETE /api/exchange-operations/{operation_id}` | 204; 404 for none of the owner's; 409 for a row that came from an upload |
+| `GET /api/investment` | per tracked asset and `overall`: invested, value, profit and its percentage, or the reason it is unknown; held, explained and their difference; and `invested_by_day` |
+
+The upload is JSON because the write guard lets nothing else change state.
+
+| Module | Layer | What it does |
+|---|---|---|
+| `domain/exchange_exports.py` | `domain` | `parse_export`, pure: recognises a format by its header and reads it into operations in UTC. A named zone is resolved by the caller's function |
+| `domain/investment.py` | `domain` | `summarize_investment`, pure: invested, explained, profit and the cumulative invested per day. An unknown is `None` with its reason, never zero |
+| `repositories/exchange_operations.py` | `repositories` | the stored ids, the inserts, a page, every row for the figures. Orders by time and id, never by an amount |
+| `services/exchange_operations.py` | `services` | decodes and unpacks the upload within its size limits, parses each file, skips what is stored, and commits once |
+| `services/investment.py` | `services` | reads the operations and the dashboard summary, so the value is the dashboard's own |
+| `api/routers/exchange_operations.py` | `api` | the five routes above, handed built services |
+
 ### Past balances, rebuilt (spec 038)
 
 A snapshot exists only from the day a wallet was added. Before that, each wallet's closing

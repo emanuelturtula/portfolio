@@ -110,6 +110,17 @@ EXPECTED_NAMES = {
         "ck_price_hourly_quote_currency",
         "fk_price_hourly_asset_id_assets",
     },
+    # Spec 042. The listing reads one owner's operations newest first, through the index.
+    "exchange_imports": {"pk_exchange_imports", "fk_exchange_imports_user_id_users"},
+    "exchange_operations": {
+        "pk_exchange_operations",
+        "uq_exchange_operations_source_id",
+        "ck_exchange_operations_kind",
+        "ck_exchange_operations_manual",
+        "fk_exchange_operations_user_id_users",
+        "fk_exchange_operations_import_id_exchange_imports",
+        "ix_exchange_operations_user_executed",
+    },
 }
 
 
