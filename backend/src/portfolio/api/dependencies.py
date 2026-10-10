@@ -41,6 +41,10 @@ from portfolio.services.health import (
 )
 from portfolio.services.password_hasher import PasswordHasher
 from portfolio.services.portfolio import PortfolioService, build_portfolio_service
+from portfolio.services.portfolio_changes import (
+    PortfolioChangeService,
+    build_portfolio_change_service,
+)
 from portfolio.services.portfolio_history import (
     PortfolioHistoryService,
     build_portfolio_history_service,
@@ -179,6 +183,18 @@ async def get_portfolio_history_service(
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
     async with sessionmaker() as session:
         yield build_portfolio_history_service(session)
+
+
+async def get_portfolio_change_service(
+    request: Request,
+) -> AsyncIterator[PortfolioChangeService]:
+    """Open a session for this request and hand the router the change service (spec 041).
+
+    Read-only, like `get_portfolio_service`. The service's clock is the default one.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_portfolio_change_service(session)
 
 
 def get_backup_service(request: Request) -> BackupService:

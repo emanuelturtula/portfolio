@@ -17,7 +17,7 @@ import {
   summarize,
   toChartPoints,
   type ChartPoint,
-  type HistoryPoint,
+  type ChartSeries,
   type HistorySummary,
 } from '@/lib/history';
 import { formatMoney, type Money } from '@/lib/money';
@@ -26,14 +26,25 @@ const HEIGHT = 240;
 const FIAT = { minimumFractionDigits: 2, maximumFractionDigits: 2 } as const;
 const QUANTITY = { maximumFractionDigits: 8 } as const;
 const UNIT = 'USDT';
-/** The line of an entity with no colour of its own. */
-const OTHER = 'var(--series-other)';
 
 const AXIS_TICK = { fill: 'var(--color-muted)', fontSize: 12 } as const;
 
 function amount(value: Money): string {
   return `${formatMoney(value, FIAT)} ${UNIT}`;
 }
+
+/**
+ * One day as the chart holds it: the day, the quantity of the first line (a wallet's, when the
+ * chart is one wallet), and each line's point by its key.
+ */
+export interface ChartRow {
+  readonly day: string;
+  readonly quantity: ChartPoint['quantity'];
+  readonly lines: Readonly<Record<string, ChartPoint | undefined>>;
+}
+
+/** What the hover card needs of a line: its key, its name and its colour. */
+export type SeriesLabel = Pick<ChartSeries, 'key' | 'label' | 'color'>;
 
 /**
  * The part of Recharts' tooltip props the hover card reads: whether the crosshair is on a day,
@@ -43,29 +54,55 @@ function amount(value: Money): string {
 export interface HistoryTooltipProps {
   readonly active?: boolean | undefined;
   readonly payload?: readonly { readonly payload?: unknown }[] | undefined;
+  /** The lines drawn, in order. With one, the card shows its value alone, as before spec 041. */
+  readonly series: readonly SeriesLabel[];
   /** The wallet's asset, for the quantity line. A portfolio has no single asset, and no line. */
   readonly asset?: string | undefined;
 }
 
 /**
- * The hover card: the day's exact value, formatted from its string, then the day. A gap says it
- * could not be valued rather than showing nothing, so a reader whose crosshair lands in one
- * learns why the line is missing there.
+ * The hover card: the day's exact value, formatted from its string, then the day. With several
+ * lines it names each one beside its value, in the line's colour. A gap says it could not be
+ * valued rather than showing nothing, so a reader whose crosshair lands in one learns why the
+ * line is missing there.
  */
-export function HistoryTooltip({ active, payload, asset }: HistoryTooltipProps) {
-  const point = payload?.[0]?.payload as ChartPoint | undefined;
-  if (!active || point === undefined) {
+export function HistoryTooltip({ active, payload, series, asset }: HistoryTooltipProps) {
+  const row = payload?.[0]?.payload as ChartRow | undefined;
+  if (!active || row === undefined) {
     return null;
   }
+  const valueOf = (key: string) => {
+    const value = row.lines[key]?.value ?? null;
+    return value === null ? 'Not valued' : amount(value);
+  };
+  const [only] = series;
   return (
     <div className="chart-tooltip">
-      <strong>{point.value === null ? 'Not valued' : amount(point.value)}</strong>
-      <span>{formatDay(point.day)}</span>
+      {series.length === 1 && only !== undefined ? (
+        <>
+          <strong>{valueOf(only.key)}</strong>
+          <span>{formatDay(row.day)}</span>
+        </>
+      ) : (
+        <>
+          <strong>{formatDay(row.day)}</strong>
+          {series.map((line) => (
+            <span key={line.key} className="chart-tooltip-line">
+              <span
+                className="series-swatch"
+                style={{ backgroundColor: line.color }}
+                aria-hidden="true"
+              />
+              {line.label}: {valueOf(line.key)}
+            </span>
+          ))}
+        </>
+      )}
       {asset !== undefined && (
         <span>
-          {point.quantity === null
+          {row.quantity === null
             ? 'Not read yet'
-            : `${formatMoney(point.quantity, QUANTITY)} ${asset}`}
+            : `${formatMoney(row.quantity, QUANTITY)} ${asset}`}
         </span>
       )}
     </div>
@@ -77,9 +114,9 @@ export function HistoryTooltip({ active, payload, asset }: HistoryTooltipProps) 
  * around it: where the line ends, and any valued day between two gaps, which a line alone
  * could not draw.
  */
-function markedDot(color: string) {
+function markedDot(key: string, color: string) {
   return function MarkedDot({ cx, cy, payload }: DotItemDotProps) {
-    if (!(payload as ChartPoint).marked) {
+    if ((payload as ChartRow).lines[key]?.marked !== true) {
       return null;
     }
     return (
@@ -96,7 +133,7 @@ function markedDot(color: string) {
   };
 }
 
-/** The chart in one sentence, for a screen reader: it is all the chart says without hovering. */
+/** One line in one sentence, for a screen reader: it is all the chart says without hovering. */
 function describe({ first, last }: HistorySummary): string {
   if (first.day === last.day) {
     return `Valued on one day only: ${amount(last.value)} on ${formatDay(last.day)}.`;
@@ -108,11 +145,10 @@ function describe({ first, last }: HistorySummary): string {
 }
 
 interface ValueHistoryChartProps {
-  readonly points: readonly HistoryPoint[];
+  /** The lines to draw, each with its own points over the same days. One for a wallet. */
+  readonly series: readonly ChartSeries[];
   /** The figure's accessible name: what is drawn and over which range. */
   readonly caption: string;
-  /** The line's colour, a CSS colour such as `var(--series-blue)`. Grey without one. */
-  readonly color?: string | undefined;
   /** The wallet's asset, when the points carry its quantity. */
   readonly asset?: string | undefined;
   /** What stands in the chart's place when no day of the range has a value. */
@@ -121,35 +157,63 @@ interface ValueHistoryChartProps {
   readonly busy: boolean;
 }
 
+/** The lines' points side by side, one row per day: the days of `first`, which every line shares. */
+function toRows(
+  first: readonly ChartPoint[],
+  lines: readonly { key: string; points: readonly ChartPoint[] }[],
+): ChartRow[] {
+  return first.map((point, index) => ({
+    day: point.day,
+    quantity: point.quantity,
+    lines: Object.fromEntries(lines.map((line) => [line.key, line.points[index]])),
+  }));
+}
+
 /**
- * Value over time, one point per day, as an area from zero.
+ * Value over time, one point per day, as an area from zero, one line per series.
  *
  * A day with no value is a gap: the area stops before it and starts again after it
- * (`connectNulls={false}`), and nothing is drawn at zero. With no valued day at all there is
- * no chart, only a sentence that says when the line will start - which is not an error, and
+ * (`connectNulls={false}`), and nothing is drawn at zero. With no valued day in any line there
+ * is no chart, only a sentence that says when the line will start - which is not an error, and
  * does not look like one. With some days missing, a note under the chart says what a gap is.
+ * Several lines are drawn without their wash, so one does not hide another (spec 041).
  *
  * The chart itself is `aria-hidden` and nothing in it takes focus: the figure's caption names
- * it and a sentence beside it says where the line starts and ends, in exact figures. Its width
+ * it and a sentence beside it says where each line starts and ends, in exact figures. Its width
  * follows the card (`responsive`); in a test, which cannot measure, it draws at a fixed size.
  */
 export function ValueHistoryChart({
-  points,
+  series,
   caption,
-  color,
   asset,
   emptyText,
   busy,
 }: ValueHistoryChartProps) {
   const captionId = useId();
-  const data = toChartPoints(points);
-  const summary = summarize(data);
+  const lines = series.map((line) => {
+    const points = toChartPoints(line.points);
+    return { ...line, points, summary: summarize(points) };
+  });
+  const valued = lines.flatMap((line) =>
+    line.summary === undefined ? [] : [{ ...line, summary: line.summary }],
+  );
 
-  if (summary === undefined) {
+  const [firstValued] = valued;
+  if (firstValued === undefined) {
     return <p className="history-empty">{emptyText}</p>;
   }
 
-  const line = color ?? OTHER;
+  const data = toRows(firstValued.points, lines);
+  const single = lines.length === 1;
+  const sentence = single
+    ? describe(firstValued.summary)
+    : lines
+        .map((line) =>
+          line.summary === undefined
+            ? `${line.label}: not valued on any day of this range.`
+            : `${line.label}: ${describe(line.summary)}`,
+        )
+        .join(' ');
 
   return (
     <>
@@ -184,28 +248,37 @@ export function ValueHistoryChart({
               tick={AXIS_TICK}
             />
             <Tooltip
-              content={<HistoryTooltip asset={asset} />}
+              content={<HistoryTooltip series={lines} asset={asset} />}
               filterNull={false}
               cursor={{ stroke: 'var(--color-faint)', strokeWidth: 1 }}
               isAnimationActive={false}
             />
-            <Area
-              type="linear"
-              dataKey="y"
-              connectNulls={false}
-              stroke={line}
-              strokeWidth={2}
-              fill={line}
-              fillOpacity={0.1}
-              dot={markedDot(line)}
-              activeDot={{ r: 4, fill: line, stroke: 'var(--color-surface)', strokeWidth: 2 }}
-              isAnimationActive={false}
-            />
+            {lines.map((line) => (
+              <Area
+                key={line.key}
+                type="linear"
+                dataKey={(row: ChartRow) => row.lines[line.key]?.y ?? null}
+                name={line.label}
+                connectNulls={false}
+                stroke={line.color}
+                strokeWidth={2}
+                fill={line.color}
+                fillOpacity={single ? 0.1 : 0}
+                dot={markedDot(line.key, line.color)}
+                activeDot={{
+                  r: 4,
+                  fill: line.color,
+                  stroke: 'var(--color-surface)',
+                  strokeWidth: 2,
+                }}
+                isAnimationActive={false}
+              />
+            ))}
           </AreaChart>
         </div>
-        <p className="visually-hidden">{describe(summary)}</p>
+        <p className="visually-hidden">{sentence}</p>
       </figure>
-      {summary.gaps > 0 && <p className="note">{GAPS_NOTE}</p>}
+      {valued.some((line) => line.summary.gaps > 0) && <p className="note">{GAPS_NOTE}</p>}
     </>
   );
 }

@@ -7,6 +7,7 @@
  * was missing is a crash that never happened, and it would be believed.
  */
 import type { HistoryRange } from '@/api/history';
+import { colorOf } from '@/lib/assetColors';
 import { money, toChartNumber, type Money } from '@/lib/money';
 
 /** One day as either endpoint serves it. A portfolio day carries no quantity. */
@@ -14,6 +15,57 @@ export interface HistoryPoint {
   readonly day: string;
   readonly value: string | null;
   readonly quantity?: string | null;
+}
+
+/** One line on a chart: what it is called, its colour, and its points, oldest first. */
+export interface ChartSeries {
+  /** Unique among the lines of one chart. */
+  readonly key: string;
+  /** What the line is, for the hover card and the sentence beside the chart: "BTC". */
+  readonly label: string;
+  /** A CSS colour such as `var(--series-blue)`. */
+  readonly color: string;
+  readonly points: readonly HistoryPoint[];
+}
+
+/** The portfolio history as the chart reads it: the total per day, and each asset's. */
+export interface PortfolioSeriesData {
+  readonly assets: readonly string[];
+  readonly points: readonly {
+    readonly day: string;
+    readonly value: string | null;
+    readonly assets: Readonly<Record<string, string | null | undefined>>;
+  }[];
+}
+
+/** The key of the portfolio's total among its lines (spec 041). Never an asset's symbol. */
+export const TOTAL_SERIES = 'total';
+
+/** The total's line colour: the colour the chart had when it drew the total alone. */
+export const TOTAL_COLOR = 'var(--series-blue)';
+
+/**
+ * The lines the portfolio chart draws: the total and each asset, in the order offered, keeping
+ * only those `selected` names. An asset's day is its own value that day, `null` as served.
+ */
+export function portfolioSeries(
+  data: PortfolioSeriesData,
+  selected: readonly string[],
+  colors: ReadonlyMap<string, string>,
+): ChartSeries[] {
+  const total: ChartSeries = {
+    key: TOTAL_SERIES,
+    label: 'Total',
+    color: TOTAL_COLOR,
+    points: data.points.map(({ day, value }) => ({ day, value })),
+  };
+  const assets = data.assets.map((asset): ChartSeries => ({
+    key: asset,
+    label: asset,
+    color: colorOf(colors, asset),
+    points: data.points.map(({ day, assets: values }) => ({ day, value: values[asset] ?? null })),
+  }));
+  return [total, ...assets].filter((series) => selected.includes(series.key));
 }
 
 /** One day as the chart holds it. */

@@ -13,6 +13,7 @@ import {
   portfolioHistory,
   RANGE_DAYS,
   VALUE_A,
+  VALUE_B,
   VALUE_TODAY,
   WHOLE_HISTORY,
 } from '@/test/historyFixtures';
@@ -261,5 +262,100 @@ describe('DashboardPage: the value over time', () => {
       'Valued on one day only: 30,770.00 USDT on Sep 24, 2026.',
     );
     expect(historyReads(fake)).toBeGreaterThan(before);
+  });
+
+  describe('each asset as a line of its own (spec 041)', () => {
+    /** Three days of the total, BTC and KAS, KAS unvalued on the first. */
+    const BY_ASSET = portfolioHistory([VALUE_A, VALUE_B, VALUE_TODAY], '90d', {
+      BTC: ['20000.000000000000000000', '20500.000000000000000000', '21000.000000000000000000'],
+      KAS: [null, '9000.000000000000000000', '9770.000000000000000000'],
+    });
+
+    function series(card: HTMLElement): HTMLElement {
+      return within(card).getByRole('group', { name: 'Series' });
+    }
+
+    function seriesPressed(card: HTMLElement): string[] {
+      return within(series(card))
+        .getAllByRole('button', { pressed: true })
+        .map((button) => button.textContent);
+    }
+
+    it('offers the total and each asset, drawing the total alone to begin with', async () => {
+      openDashboard({ history: BY_ASSET });
+
+      const card = await historySettled(CARD);
+
+      expect(
+        within(series(card))
+          .getAllByRole('button')
+          .map((button) => button.textContent),
+      ).toEqual(['Total', 'BTC', 'KAS']);
+      expect(seriesPressed(card)).toEqual(['Total']);
+      // The only line drawn cannot be released, so the chart is never empty by choice.
+      expect(within(series(card)).getByRole('button', { name: 'Total' })).toBeDisabled();
+      expect(chart(card, 'the last 90 days')).toHaveTextContent(
+        'From 29,000.00 USDT on Sep 22, 2026 to 30,770.00 USDT on Sep 24, 2026.',
+      );
+    });
+
+    it('draws every line pressed, in the order offered, and lets any but the last go', async () => {
+      const { user } = openDashboard({ history: BY_ASSET });
+      const card = await historySettled(CARD);
+
+      await user.click(within(series(card)).getByRole('button', { name: 'KAS' }));
+      await user.click(within(series(card)).getByRole('button', { name: 'BTC' }));
+
+      expect(seriesPressed(card)).toEqual(['Total', 'BTC', 'KAS']);
+      expect(within(series(card)).getByRole('button', { name: 'Total' })).toBeEnabled();
+      const figure = chart(card, 'the last 90 days');
+      expect(figure.querySelectorAll('.recharts-area-curve')).toHaveLength(3);
+      expect(figure).toHaveTextContent(
+        'Total: From 29,000.00 USDT on Sep 22, 2026 to 30,770.00 USDT on Sep 24, 2026. ' +
+          'BTC: From 20,000.00 USDT on Sep 22, 2026 to 21,000.00 USDT on Sep 24, 2026. ' +
+          'KAS: From 9,000.00 USDT on Sep 23, 2026 to 9,770.00 USDT on Sep 24, 2026.',
+      );
+
+      await user.click(within(series(card)).getByRole('button', { name: 'Total' }));
+      await user.click(within(series(card)).getByRole('button', { name: 'KAS' }));
+
+      expect(seriesPressed(card)).toEqual(['BTC']);
+      expect(within(series(card)).getByRole('button', { name: 'BTC' })).toBeDisabled();
+      expect(chart(card, 'the last 90 days')).toHaveTextContent(
+        'From 20,000.00 USDT on Sep 22, 2026 to 21,000.00 USDT on Sep 24, 2026.',
+      );
+    });
+
+    it('falls back to the total when the asset chosen is no longer in the history', async () => {
+      const { user, fake, queryClient } = openDashboard({ history: BY_ASSET });
+      const card = await historySettled(CARD);
+      await user.click(within(series(card)).getByRole('button', { name: 'KAS' }));
+      await user.click(within(series(card)).getByRole('button', { name: 'Total' }));
+      expect(seriesPressed(card)).toEqual(['KAS']);
+
+      fake.setHistory(
+        portfolioHistory([VALUE_A, VALUE_B, VALUE_TODAY], '90d', {
+          BTC: [VALUE_A, VALUE_B, VALUE_TODAY],
+        }),
+      );
+      await queryClient.refetchQueries({ queryKey: ['portfolio', 'history'] });
+
+      await waitFor(() => {
+        expect(seriesPressed(card)).toEqual(['Total']);
+      });
+      expect(
+        within(series(card))
+          .getAllByRole('button')
+          .map((button) => button.textContent),
+      ).toEqual(['Total', 'BTC']);
+    });
+
+    it('offers no choice when the history carries no asset', async () => {
+      openDashboard({ history: WHOLE_HISTORY });
+
+      const card = await historySettled(CARD);
+
+      expect(within(card).queryByRole('group', { name: 'Series' })).not.toBeInTheDocument();
+    });
   });
 });

@@ -696,7 +696,7 @@ async def test_every_operation_is_logged_under_its_prefixed_template(
             assert response.status_code == seen[f"{method} {template}"][1], response.text
     entries = lines(capsys)
 
-    assert len(documented) == 17
+    assert len(documented) == 18
     assert sum(1 for _id, status in seen.values() if status == 422) == 7
     for name, (request_id, _status) in seen.items():
         template = name.split(" ", 1)[1]

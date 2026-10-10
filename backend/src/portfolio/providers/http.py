@@ -99,6 +99,7 @@ __all__ = [
     "ADDRESS_BALANCES",
     "ADDRESS_HISTORY",
     "ASSET_DAILY_CLOSES",
+    "ASSET_HOURLY_CLOSES",
     "ASSET_PRICE",
     "ASSET_PRICES",
     "BLOCK_TIP_HEIGHT",
@@ -284,12 +285,21 @@ log showing these more often than daily is a timer misbehaving. The label does n
 pair, for the reason `ASSET_PRICE` does not.
 """
 
+ASSET_HOURLY_CLOSES: Final = "asset_hourly_closes"
+"""A read of one pair's hourly candles: Kraken's OHLC at a one-hour interval (spec 041).
+
+Separate from `ASSET_DAILY_CLOSES` because it is on the hourly price timer's schedule: one
+per pair each hour. A log showing these more often than hourly is a timer misbehaving. The
+label does not carry the pair, for the reason `ASSET_PRICE` does not.
+"""
+
 ENDPOINT_LABELS: Final[frozenset[str]] = frozenset(
     {
         ADDRESS_BALANCE,
         ADDRESS_BALANCES,
         ADDRESS_HISTORY,
         ASSET_DAILY_CLOSES,
+        ASSET_HOURLY_CLOSES,
         ASSET_PRICE,
         ASSET_PRICES,
         BLOCK_TIP_HEIGHT,

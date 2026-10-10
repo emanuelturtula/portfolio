@@ -36,10 +36,13 @@ from portfolio.domain.chains import ChainKey
 from portfolio.main import create_app, drain_coordinators, latest_price_backfill
 from portfolio.providers.errors import ProviderUnavailableError
 from portfolio.providers.prices.base import (
+    BTC,
     SUPPORTED_PAIRS,
+    USD,
     DailyClose,
     DailyCloseSource,
     HistoricalCloseSource,
+    HourlyClose,
     PriceQuote,
     PriceSource,
 )
@@ -576,18 +579,40 @@ def priced_lifespan(
         get_settings.cache_clear()
 
 
-def stub_price_sources(monkeypatch: pytest.MonkeyPatch, source: FakePriceSource) -> None:
+class FakeHourlyCloses:
+    """An `HourlyCloseSource` with no network: one close for one hour, for every pair asked."""
+
+    name = "fake-hourly"
+    pairs = frozenset({(BTC, USD)})
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def hourly_closes(self, pair: PricePair) -> tuple[HourlyClose, ...]:
+        del pair
+        self.calls += 1
+        return (HourlyClose(hour=datetime(2026, 10, 9, 22, tzinfo=UTC), close=Decimal("60000")),)
+
+
+def stub_price_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    source: FakePriceSource,
+    hourly: FakeHourlyCloses | None = None,
+) -> None:
     """Replace the vendors the lifespan builds, at the composition root that builds them.
 
     `price_scheduler_for` calls `price_sources(client, settings=...)`, so patching the name
     where `main` imported it intercepts every path into a vendor without this test knowing
     anything about Kraken's document shape -- the same argument `stub_chain_providers` makes
-    about `ChainProviderRegistry.create`.
+    about `ChainProviderRegistry.create`. The hourly closes the same timer stores after each
+    refresh (spec 041) are replaced the same way.
     """
     monkeypatch.setattr(
         "portfolio.main.price_sources",
         lambda client, **keywords: (source,),
     )
+    fake_hourly = hourly if hourly is not None else FakeHourlyCloses()
+    monkeypatch.setattr("portfolio.main.KrakenHourlyCloses", lambda client: fake_hourly)
 
 
 PRICES_SQL: Final = "SELECT asset_id, quote_currency, amount, source FROM prices ORDER BY id"
@@ -658,6 +683,32 @@ async def test_the_price_refresh_is_scheduled_and_actually_fills_the_cache(
     assert {row["source"] for row in rows} == {source.name}
     assert source.calls == 1, "one refresh, not one per pair"
     assert await prices_in(priced_lifespan) == rows, "and the rows survived the shutdown"
+
+
+async def test_each_price_tick_also_stores_the_new_hourly_closes(
+    priced_lifespan: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec 041: after the refresh, the same tick stores the hourly closes, committed."""
+    await bring_the_schema_up(priced_lifespan)
+    hourly = FakeHourlyCloses()
+    stub_price_sources(monkeypatch, FakePriceSource(), hourly)
+    app = create_app()
+    rows: list[dict[str, object]] = []
+
+    with capture_logs() as logs:
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(until(lambda: hourly.calls > 0), timeout=5)
+            async with own_session(priced_lifespan) as session:
+                for _ in range(POLL_TURNS):
+                    rows = await rows_of(session, "SELECT amount, source FROM price_hourly")
+                    if rows:
+                        break
+                    await session.rollback()
+                    await asyncio.sleep(0)
+
+    assert rows == [{"amount": "60000.000000000000", "source": "fake-hourly"}]
+    assert any(log["event"] == "price_hourly_finished" and log["hours"] == 1 for log in logs)
 
 
 async def test_the_price_scheduler_is_not_started_when_disabled(

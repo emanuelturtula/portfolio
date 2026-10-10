@@ -150,6 +150,37 @@ class BalanceRepository:
             found.setdefault(row.wallet_id, []).append(row)
         return found
 
+    async def latest_at_or_before(
+        self, wallet_ids: Sequence[int], at: datetime
+    ) -> dict[int, BalanceSnapshot]:
+        """Each wallet's last snapshot observed at or before `at`, keyed by `wallet_id`.
+
+        What a wallet held at a past instant (spec 041, R3). "Last" is the latest
+        `observed_at`, ties broken by the higher `id`, as in `daily_closing`. A wallet with no
+        snapshot by then is absent, never a zero.
+        """
+        if not wallet_ids:
+            return {}
+        ranked = (
+            select(
+                BalanceSnapshot.id.label("snapshot_id"),
+                func.row_number()
+                .over(
+                    partition_by=BalanceSnapshot.wallet_id,
+                    order_by=(BalanceSnapshot.observed_at.desc(), BalanceSnapshot.id.desc()),
+                )
+                .label("rank"),
+            )
+            .where(BalanceSnapshot.wallet_id.in_(wallet_ids), BalanceSnapshot.observed_at <= at)
+            .subquery()
+        )
+        rows = await self._session.scalars(
+            select(BalanceSnapshot).where(
+                BalanceSnapshot.id.in_(select(ranked.c.snapshot_id).where(ranked.c.rank == 1))
+            )
+        )
+        return {row.wallet_id: row for row in rows}
+
     async def latest_for_wallets(self, wallet_ids: Sequence[int]) -> dict[int, BalanceSnapshot]:
         """The newest snapshot for each of these wallets, keyed by `wallet_id`.
 

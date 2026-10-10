@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { assetColors } from '@/lib/assetColors';
+import { assetColors, colorOf } from '@/lib/assetColors';
 
 describe('assetColors', () => {
   it('gives each tracked asset its own slot', () => {
@@ -36,5 +36,12 @@ describe('assetColors', () => {
     expect(colors.get('ETH')).toBe('var(--series-blue)');
     expect(colors.get('SOL')).toBe('var(--series-other)');
     expect(colors.size).toBe(2);
+  });
+
+  it('reads an asset its colour, and grey for one the map was not built over', () => {
+    const colors = assetColors(['BTC']);
+
+    expect(colorOf(colors, 'BTC')).toBe('var(--series-orange)');
+    expect(colorOf(colors, 'KAS')).toBe('var(--series-other)');
   });
 });

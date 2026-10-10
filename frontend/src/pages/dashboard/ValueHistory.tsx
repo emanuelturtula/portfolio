@@ -10,10 +10,15 @@ import {
 } from '@/api/history';
 import { ErrorState } from '@/components/ErrorState';
 import { Skeleton } from '@/components/Skeleton';
+import { assetColors, colorOf } from '@/lib/assetColors';
 import {
   PORTFOLIO_EMPTY_WORDS,
+  portfolioSeries,
   RANGE_LABELS,
   RANGE_PHRASES,
+  TOTAL_COLOR,
+  TOTAL_SERIES,
+  type ChartSeries,
   type HistoryPoint,
 } from '@/lib/history';
 import { ValueHistoryChart } from '@/pages/dashboard/ValueHistoryChart';
@@ -66,11 +71,17 @@ interface HistoryData {
   readonly points: readonly HistoryPoint[];
 }
 
-interface HistoryViewProps {
-  readonly query: UseQueryResult<HistoryData>;
+/** One line over the answer's own points, for a chart of one thing: a wallet. */
+export function singleSeries(label: string, color: string): (data: HistoryData) => ChartSeries[] {
+  return (data) => [{ key: 'value', label, color, points: data.points }];
+}
+
+interface HistoryViewProps<T extends HistoryData> {
+  readonly query: UseQueryResult<T>;
   /** What is drawn, for the chart's accessible name: "Portfolio value". */
   readonly subject: string;
-  readonly color?: string | undefined;
+  /** The lines to draw from what the endpoint answered. */
+  readonly series: (data: T) => readonly ChartSeries[];
   readonly asset?: string | undefined;
   readonly emptyText: string;
 }
@@ -83,7 +94,13 @@ interface HistoryViewProps {
  * figures. While a newly chosen range loads, the previous one stays on screen, dimmed and
  * `aria-busy`, and the accessible name keeps saying which range is drawn.
  */
-export function HistoryView({ query, subject, color, asset, emptyText }: HistoryViewProps) {
+export function HistoryView<T extends HistoryData>({
+  query,
+  subject,
+  series,
+  asset,
+  emptyText,
+}: HistoryViewProps<T>) {
   if (query.isPending) {
     return <Skeleton label={HISTORY_LOADING_LABEL} />;
   }
@@ -112,9 +129,8 @@ export function HistoryView({ query, subject, color, asset, emptyText }: History
         </p>
       )}
       <ValueHistoryChart
-        points={data.points}
+        series={series(data)}
         caption={`${subject}, ${RANGE_PHRASES[data.range]}`}
-        color={color}
         asset={asset}
         emptyText={emptyText}
         busy={query.isPlaceholderData}
@@ -123,13 +139,74 @@ export function HistoryView({ query, subject, color, asset, emptyText }: History
   );
 }
 
+interface SeriesSelectorProps {
+  /** Every asset the history carries, in the order served. */
+  readonly assets: readonly string[];
+  readonly colors: ReadonlyMap<string, string>;
+  readonly value: readonly string[];
+  readonly onChange: (selected: readonly string[]) => void;
+}
+
+/**
+ * Which lines the chart draws (spec 041): the total and each asset, as toggle buttons, any
+ * number of them pressed. The last one pressed cannot be released, so the chart always draws
+ * something; it is disabled rather than silently ignoring the click. Each button carries its
+ * line's colour as a swatch, so the row is the chart's legend too.
+ */
+export function SeriesSelector({ assets, colors, value, onChange }: SeriesSelectorProps) {
+  const options = [
+    { key: TOTAL_SERIES, label: 'Total', color: TOTAL_COLOR },
+    ...assets.map((asset) => ({ key: asset, label: asset, color: colorOf(colors, asset) })),
+  ];
+  return (
+    <div className="range-selector series-selector" role="group" aria-label="Series">
+      {options.map((option) => {
+        const on = value.includes(option.key);
+        return (
+          <button
+            key={option.key}
+            type="button"
+            aria-pressed={on}
+            disabled={on && value.length === 1}
+            onClick={() => {
+              onChange(
+                on
+                  ? value.filter((key) => key !== option.key)
+                  : options
+                      .map(({ key }) => key)
+                      .filter((key) => key === option.key || value.includes(key)),
+              );
+            }}
+          >
+            <span
+              className="series-swatch"
+              style={{ backgroundColor: option.color }}
+              aria-hidden="true"
+            />
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 /**
  * The dashboard's chart (spec 037): what every active wallet together was worth on each day of
- * the chosen range, 90 days to begin with.
+ * the chosen range, 90 days to begin with. Spec 041 adds each asset as a line of its own,
+ * chosen beside the total; the total alone is the default.
+ *
+ * A chosen asset the history no longer carries (its last wallet archived) is dropped, and when
+ * nothing chosen is left the total is drawn, so the chart is never empty by selection.
  */
 export function PortfolioHistory() {
   const [range, setRange] = useState<HistoryRange>(DEFAULT_HISTORY_RANGE);
+  const [chosen, setChosen] = useState<readonly string[]>([TOTAL_SERIES]);
   const history = usePortfolioHistory(range);
+  const assets = history.data?.assets ?? [];
+  const colors = assetColors(assets);
+  const kept = chosen.filter((key) => key === TOTAL_SERIES || assets.includes(key));
+  const selected = kept.length > 0 ? kept : [TOTAL_SERIES];
 
   return (
     <section className="card history-card" aria-labelledby="portfolio-history-heading">
@@ -137,10 +214,13 @@ export function PortfolioHistory() {
         <HistoryTitle id="portfolio-history-heading">Value over time</HistoryTitle>
         <RangeSelector value={range} onChange={setRange} />
       </div>
+      {assets.length > 0 && (
+        <SeriesSelector assets={assets} colors={colors} value={selected} onChange={setChosen} />
+      )}
       <HistoryView
         query={history}
         subject="Portfolio value"
-        color="var(--series-blue)"
+        series={(data) => portfolioSeries(data, selected, colors)}
         emptyText={PORTFOLIO_EMPTY_WORDS}
       />
     </section>

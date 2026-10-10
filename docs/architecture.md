@@ -363,6 +363,7 @@ that is handed its providers rather than building them:
 |---|---|---|---|
 | the `balance-sync` timer; `POST /api/balances/sync` | `BalanceSyncService` | `provider_for`, which calls `get_chain_provider` over the shared client | `balance_snapshots`, `derived_addresses`, `sync_runs` |
 | the `price-refresh` timer; `python -m portfolio refresh-prices` | `PriceRefreshService` | the sources `price_sources` built | `prices`, and today's `observed` row in `price_history` |
+| the `price-refresh` timer, after each refresh | `HourlyPriceService`, in `services/price_hourly.py` | a `KrakenHourlyCloses` over the shared client | `price_hourly`, every new committed hourly close (spec 041) |
 | the `price-backfill` timer; `python -m portfolio backfill-prices` | `PriceBackfillService`, in `services/price_backfill.py` | a `KrakenDailyCloses` and a `CoinbaseDailyCloses` over the shared client | `price_history`, every committed daily close as `close` |
 | the `balance-rebuild` timer; `python -m portfolio rebuild-balances` | `BalanceRebuildService`, in `services/balance_rebuild.py` | `provider_for`, as the balance sync | `reconstructed_balances`, each complete wallet's rows replaced |
 
@@ -386,8 +387,9 @@ that is handed its providers rather than building them:
 - **Nothing in a request path reaches a price source or a chain's history.** Neither price
   timer nor the rebuild has an endpoint, and `services/prices.py` and
   `services/portfolio_history.py`, through which the dashboard reads prices and the value
-  over time, import no provider. A request renders from the `prices`, `price_history` and
-  `reconstructed_balances` tables.
+  over time, import no provider, and neither does `services/portfolio_changes.py`. A request
+  renders from the `prices`, `price_history`, `price_hourly` and `reconstructed_balances`
+  tables.
 - **`GET /api/health/detail` calls no vendor.** It reports each source's last recorded
   outcome. `ChainProvider.health()` is part of the protocol, and no production code calls
   it.
@@ -441,7 +443,7 @@ numeric-affinity comparison.
 
 | Endpoint | Answers |
 |---|---|
-| `GET /api/portfolio/history?range=30d\|90d\|1y\|all` | `range` and `points`, one `{day, value}` per day of the range, oldest first, ending today (UTC) |
+| `GET /api/portfolio/history?range=30d\|90d\|1y\|all` | `range`, `assets` and `points`, one `{day, value, assets}` per day of the range, oldest first, ending today (UTC). `assets` holds each asset's own value that day (spec 041) |
 | `GET /api/wallets/{wallet_id}/value-history?range=…` | `wallet_id`, `asset`, `range` and one `{day, quantity, value}` per day; 404 for a wallet that is not the owner's |
 
 Both are under `/api` and not in `PUBLIC_API_PATHS`, so the middleware requires a session for
@@ -465,6 +467,18 @@ ordering on `observed_at` and `id`, never on a money column** (`BalanceRepositor
 one window function), and every sum is `Decimal` arithmetic in `domain`, rounded once per
 holding. **A partial sum is never served as a value**: a day with a holding that has no price
 that day is `null`, because a total that quietly omits a holding would be believed.
+
+### The change over 24 hours and 7 days (spec 041)
+
+`GET /api/portfolio/changes` answers the value now (the summary's total) and, for `24h` and
+`7d`, the value at that instant, the change and its percentage, or the reason it cannot be
+worked out. The value at an instant needs a price at that instant, which `price_hourly`
+(migration `0015_price_hourly`) holds: one row per asset, quote currency and UTC hour, the
+close of Kraken's hourly candle, stored by the price timer after each refresh and never
+rewritten. `services/portfolio_changes.py` reads each wallet's last snapshot at or before the
+instant (`BalanceRepository.latest_at_or_before`), or its rebuilt balance before it, and
+`domain/portfolio_change.py` does the arithmetic. A change it cannot value is `null` with a
+reason, never `"0"`.
 
 ### Past balances, rebuilt (spec 038)
 

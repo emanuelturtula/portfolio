@@ -6,17 +6,30 @@ gives. The client sums nothing: every figure the dashboard shows is here.
 
 from __future__ import annotations
 
+from datetime import datetime
+from typing import TYPE_CHECKING
+
 from pydantic import BaseModel
 
 from portfolio.api.schemas.money import MoneyStr
 from portfolio.domain.portfolio import HoldingSummary  # noqa: TC001
+from portfolio.domain.portfolio_change import Change, ChangePeriod, Unavailable
 from portfolio.services.portfolio import (
     Missing,
     MissingKind,
     PortfolioSummaryView,
 )
 
-__all__ = ["HoldingResponse", "MissingResponse", "PortfolioSummaryResponse"]
+if TYPE_CHECKING:
+    from portfolio.services.portfolio_changes import PortfolioChanges
+
+__all__ = [
+    "ChangeResponse",
+    "HoldingResponse",
+    "MissingResponse",
+    "PortfolioChangesResponse",
+    "PortfolioSummaryResponse",
+]
 
 
 class HoldingResponse(BaseModel):
@@ -77,4 +90,48 @@ class PortfolioSummaryResponse(BaseModel):
             total_value=summary.total_value,
             holdings=[HoldingResponse.of(holding) for holding in summary.holdings],
             missing=[MissingResponse.of(entry) for entry in view.missing],
+        )
+
+
+class ChangeResponse(BaseModel):
+    """The change over one period in USDT, or why there is none (spec 041).
+
+    `change` and `change_pct` are `null` exactly when `unavailable` names a reason, and never
+    `"0"` in its place; `change_pct` is also `null` when nothing was held at `since`.
+    """
+
+    period: ChangePeriod
+    since: datetime
+    value_then: MoneyStr | None
+    change: MoneyStr | None
+    change_pct: MoneyStr | None
+    unavailable: Unavailable | None
+
+    @classmethod
+    def of(cls, change: Change) -> ChangeResponse:
+        """Render one period."""
+        return cls(
+            period=change.period,
+            since=change.since,
+            value_then=change.value_then,
+            change=change.change,
+            change_pct=change.change_pct,
+            unavailable=change.unavailable,
+        )
+
+
+class PortfolioChangesResponse(BaseModel):
+    """The value now in USDT, `null` when unknown, and the change over 24 hours and 7 days."""
+
+    as_of: datetime
+    value: MoneyStr | None
+    changes: list[ChangeResponse]
+
+    @classmethod
+    def of(cls, changes: PortfolioChanges) -> PortfolioChangesResponse:
+        """Render the service's changes."""
+        return cls(
+            as_of=changes.as_of,
+            value=changes.value,
+            changes=[ChangeResponse.of(change) for change in changes.changes],
         )
