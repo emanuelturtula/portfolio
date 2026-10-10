@@ -1,4 +1,4 @@
-import { useEffect, useState, type SubmitEvent } from 'react';
+import { useState, type SubmitEvent } from 'react';
 
 import { describeApiError } from '@/api/client';
 import {
@@ -483,14 +483,6 @@ function OperationsTable() {
   const [page, setPage] = useState(0);
   const operations = useOperations({ page, pageSize, ...filters });
   const remove = useDeleteOperation();
-  const stored = operations.data?.count;
-
-  // A deletion can empty the last page: step back to the page that is now the last.
-  useEffect(() => {
-    if (stored !== undefined && page > 0 && page * pageSize >= stored) {
-      setPage(Math.max(0, Math.ceil(stored / pageSize) - 1));
-    }
-  }, [stored, page, pageSize]);
 
   if (operations.isPending) {
     return <Skeleton label={OPERATIONS_LOADING_LABEL} />;
@@ -583,7 +575,14 @@ function OperationsTable() {
                   operation={operation}
                   deleting={remove.isPending}
                   onDelete={(id) => {
-                    remove.mutate(id);
+                    remove.mutate(id, {
+                      // Deleting the only row of the last page empties it: step back a page.
+                      onSuccess: () => {
+                        if (rows.length === 1 && page > 0) {
+                          setPage(page - 1);
+                        }
+                      },
+                    });
                   }}
                 />
               ))}
