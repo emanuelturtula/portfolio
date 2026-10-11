@@ -17,6 +17,7 @@ import {
 
 import { apiFetch, apiSend } from '@/api/client';
 import type { components } from '@/api/generated/schema';
+import { usePortfolioScope, withPortfolio } from '@/lib/portfolioScope';
 
 export type Operation = components['schemas']['OperationResponse'];
 export type OperationList = components['schemas']['OperationListResponse'];
@@ -40,13 +41,19 @@ export const DEFAULT_OPERATIONS_PAGE_SIZE: OperationsPageSize = 50;
 export const OPERATIONS_QUERY_KEY_ROOT = 'operations' as const;
 
 /** Under `['portfolio', ...]`, which a balance sync and a wallet change invalidate too. */
-export const investmentQueryKey = ['portfolio', 'investment'] as const;
+export const INVESTMENT_QUERY_KEY_ROOT = ['portfolio', 'investment'] as const;
+
+export function investmentQueryKey(scope: number | null) {
+  return [...INVESTMENT_QUERY_KEY_ROOT, scope] as const;
+}
 
 /**
  * What the table asks for: a page of a size, and the filters. A day is a calendar date in this
  * browser's zone, `YYYY-MM-DD` as a date input gives it, and `to` includes its whole day.
  */
 export interface OperationsQuery {
+  /** The portfolio the table is narrowed to, or `null` for all of them (spec 044). */
+  readonly portfolio: number | null;
   readonly page: number;
   readonly pageSize: OperationsPageSize;
   readonly asset: string;
@@ -60,7 +67,7 @@ export function operationsQueryKey(query: OperationsQuery) {
 }
 
 /** Local midnight at the start of `day`, `days` later, as an instant. */
-function startOfDay(day: string, days: number): string {
+export function startOfDay(day: string, days: number): string {
   // A date-time with no offset is read in local time, unlike a bare date, which is UTC.
   const start = new Date(`${day}T00:00`);
   start.setDate(start.getDate() + days);
@@ -73,6 +80,9 @@ export function operationsSearch(query: OperationsQuery): string {
     limit: String(query.pageSize),
     offset: String(query.page * query.pageSize),
   });
+  if (query.portfolio !== null) {
+    params.set('portfolio', String(query.portfolio));
+  }
   if (query.asset !== '') {
     params.set('asset', query.asset);
   }
@@ -99,9 +109,11 @@ export function useOperations(query: OperationsQuery): UseQueryResult<OperationL
 }
 
 export function useInvestment(): UseQueryResult<Investment> {
+  const { scope } = usePortfolioScope();
   return useQuery({
-    queryKey: investmentQueryKey,
-    queryFn: ({ signal }) => apiFetch<Investment>(INVESTMENT_PATH, { signal }),
+    queryKey: investmentQueryKey(scope),
+    queryFn: ({ signal }) =>
+      apiFetch<Investment>(withPortfolio(INVESTMENT_PATH, scope), { signal }),
   });
 }
 
@@ -109,7 +121,9 @@ export function useInvestment(): UseQueryResult<Investment> {
 async function invalidateOperations(queryClient: QueryClient): Promise<void> {
   await Promise.all([
     queryClient.invalidateQueries({ queryKey: [OPERATIONS_QUERY_KEY_ROOT] }),
-    queryClient.invalidateQueries({ queryKey: investmentQueryKey }),
+    queryClient.invalidateQueries({ queryKey: INVESTMENT_QUERY_KEY_ROOT }),
+    // A portfolio's count of operations changes with every upload and manual entry.
+    queryClient.invalidateQueries({ queryKey: ['portfolios'] }),
   ]);
 }
 
@@ -124,13 +138,23 @@ export async function fileToBase64(file: Blob): Promise<string> {
   return btoa(binary);
 }
 
-export function useImportOperations(): UseMutationResult<ImportReport, unknown, File> {
+/** One file to upload, and the portfolio to store it in when there is a choice (spec 044). */
+export interface ImportInput {
+  readonly file: File;
+  readonly portfolio_id?: number;
+}
+
+export function useImportOperations(): UseMutationResult<ImportReport, unknown, ImportInput> {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (file: File) =>
+    mutationFn: async ({ file, portfolio_id }: ImportInput) =>
       apiFetch<ImportReport>(IMPORTS_PATH, {
         method: 'POST',
-        body: { filename: file.name, content_base64: await fileToBase64(file) },
+        body: {
+          filename: file.name,
+          content_base64: await fileToBase64(file),
+          ...(portfolio_id === undefined ? {} : { portfolio_id }),
+        },
       }),
     onSuccess: () => invalidateOperations(queryClient),
   });

@@ -16,6 +16,7 @@ import {
 import { apiFetch } from '@/api/client';
 import type { components } from '@/api/generated/schema';
 import { VALUATION_CURRENCY } from '@/lib/currency';
+import { usePortfolioScope, withPortfolio } from '@/lib/portfolioScope';
 
 export type CurrentBalances = components['schemas']['CurrentBalancesResponse'];
 export type WalletBalance = components['schemas']['WalletBalanceResponse'];
@@ -38,7 +39,10 @@ const RUNS_LIMIT = 2;
  */
 const REFETCH_INTERVAL_MS = 60_000;
 
-export const currentBalancesQueryKey = ['balances', 'current'] as const;
+/** One entry per portfolio scope (spec 044). */
+export function currentBalancesQueryKey(scope: number | null) {
+  return ['balances', 'current', scope] as const;
+}
 export const runsQueryKey = ['balances', 'runs'] as const;
 
 /**
@@ -46,12 +50,14 @@ export const runsQueryKey = ['balances', 'runs'] as const;
  * is EUR, and every other figure in the app is in USDT.
  */
 export function useCurrentBalances(): UseQueryResult<CurrentBalances> {
+  const { scope } = usePortfolioScope();
   return useQuery({
-    queryKey: currentBalancesQueryKey,
+    queryKey: currentBalancesQueryKey(scope),
     queryFn: ({ signal }) =>
-      apiFetch<CurrentBalances>(`${CURRENT_BALANCES_PATH}?quote_currency=${VALUATION_CURRENCY}`, {
-        signal,
-      }),
+      apiFetch<CurrentBalances>(
+        withPortfolio(`${CURRENT_BALANCES_PATH}?quote_currency=${VALUATION_CURRENCY}`, scope),
+        { signal },
+      ),
     refetchInterval: REFETCH_INTERVAL_MS,
   });
 }

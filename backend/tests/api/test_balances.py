@@ -65,6 +65,7 @@ from tests.balance_harness import (
     stub_chain_providers,
     sync_runs,
 )
+from tests.portfolio_harness import main_portfolio
 
 if TYPE_CHECKING:
     from httpx import AsyncClient
@@ -904,14 +905,16 @@ async def insert_another_users_wallet(
                 {"username": username, "created_at": sqlite_timestamp(THIRD_SEEN)},
             )
             user_id = result.scalar_one()
+        portfolio_id = await main_portfolio(session, user_id)
         result = await session.execute(
             text(
                 "INSERT INTO wallets (user_id, chain_key, address_canonical, address_display, "
-                "label, archived_at, created_at, updated_at) "
-                "VALUES (:user_id, :chain_key, :address, :address, NULL, NULL, :now, :now) "
-                "RETURNING id"
+                "label, archived_at, created_at, updated_at, portfolio_id) "
+                "VALUES (:user_id, :chain_key, :address, :address, NULL, NULL, :now, :now, "
+                ":portfolio_id) RETURNING id"
             ),
             {
+                "portfolio_id": portfolio_id,
                 "user_id": user_id,
                 "chain_key": chain_key,
                 "address": address,
@@ -942,14 +945,16 @@ async def test_another_users_wallet_is_a_404(
             {"created_at": sqlite_timestamp(THIRD_SEEN)},
         )
         other_user: int = result.scalar_one()
+        portfolio_id = await main_portfolio(session, other_user)
         result = await session.execute(
             text(
                 "INSERT INTO wallets (user_id, chain_key, address_canonical, address_display, "
-                "label, archived_at, created_at, updated_at) "
-                "VALUES (:user_id, 'bitcoin', :address, :address, NULL, NULL, :now, :now) "
-                "RETURNING id"
+                "label, archived_at, created_at, updated_at, portfolio_id) "
+                "VALUES (:user_id, 'bitcoin', :address, :address, NULL, NULL, :now, :now, "
+                ":portfolio_id) RETURNING id"
             ),
             {
+                "portfolio_id": portfolio_id,
                 "user_id": other_user,
                 "address": CORE_REGTEST_P2WPKH,
                 "now": sqlite_timestamp(THIRD_SEEN),

@@ -106,10 +106,13 @@ class PortfolioHistoryService:
         self._assets = assets
         self._clock = clock
 
-    async def portfolio(self, user_id: int, history_range: HistoryRange) -> PortfolioHistory:
-        """The owner's active wallets together, over `history_range` (R6, R7)."""
+    async def portfolio(
+        self, user_id: int, history_range: HistoryRange, portfolio_id: int | None = None
+    ) -> PortfolioHistory:
+        """The owner's active wallets together, over `history_range` (R6, R7); only one
+        portfolio's when it is named (spec 044)."""
         today = self._clock().astimezone(UTC).date()
-        wallets = await self._wallets.list_for_user(user_id)
+        wallets = await self._wallets.list_for_user(user_id, portfolio_id=portfolio_id)
         series = await self._readings(wallets)
         days = days_of(history_range, today=today, first_reading=_first_day(series))
         prices = await self._prices({reading.asset for reading in series}, days)

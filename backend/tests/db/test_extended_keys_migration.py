@@ -35,7 +35,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
-from portfolio.db.alembic_config import MIGRATIONS_DIR, build_alembic_config, upgrade_to_head
+from portfolio.db.alembic_config import MIGRATIONS_DIR, build_alembic_config
 from portfolio.db.migration_guards import MigrationIntegrityError
 from portfolio.db.migrations.versions import v0011_extended_keys
 from portfolio.db.models import (
@@ -114,6 +114,16 @@ INSERT_DERIVED: Final = text(
     "INSERT INTO derived_addresses (wallet_id, branch, child_index, address_canonical, used, "
     "created_at) VALUES (:wallet, :branch, :child_index, :address, :used, :at)"
 )
+
+
+def at_this_revision(database_url: str) -> None:
+    """Migrate to this revision and no further.
+
+    These tests are about this one step. Head has moved on: `0012_drop_exchanges_accounting`
+    rebuilds tables this revision has nothing to do with, and `0018_portfolios` gives every
+    wallet a required `portfolio_id` that no revision before it knows about.
+    """
+    command.upgrade(build_alembic_config(database_url), REVISION)
 
 
 def normalise_sql(expression: str) -> str:
@@ -317,7 +327,7 @@ def test_the_kind_check_admits_exactly_the_domains_kinds() -> None:
 
 
 def test_the_wallet_gains_kind_and_keeps_the_rest(database_url: str, sync_engine: Engine) -> None:
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
 
     assert column_shapes(sync_engine, "wallets") == WALLET_COLUMNS_AFTER
     (kind,) = [
@@ -330,7 +340,7 @@ def test_the_rebuild_keeps_every_constraint_and_the_index(
     database_url: str, sync_engine: Engine
 ) -> None:
     """`ix_wallets_user_id` is in the `copy_from` table; a rebuild without it drops it."""
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     inspector = inspect(sync_engine)
 
     assert check_names(sync_engine, "wallets") == WALLET_CHECKS_AFTER
@@ -347,7 +357,7 @@ def test_the_rebuild_keeps_every_constraint_and_the_index(
 
 
 def test_the_wallet_checks_match_the_model(database_url: str, sync_engine: Engine) -> None:
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     reflected = {
         str(found["name"]): normalise_sql(str(found["sqltext"]))
         for found in inspect(sync_engine).get_check_constraints("wallets")
@@ -361,7 +371,7 @@ def test_a_wallet_written_without_a_kind_is_an_address(
     database_url: str, sync_engine: Engine
 ) -> None:
     """The server default: every writer before spec 031 wrote no `kind`, and meant this."""
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     with sync_engine.begin() as connection:
         insert_wallet(connection, insert_user(connection))
 
@@ -370,7 +380,7 @@ def test_a_wallet_written_without_a_kind_is_an_address(
 
 
 def test_an_extended_key_on_bitcoin_is_stored(database_url: str, sync_engine: Engine) -> None:
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     with sync_engine.begin() as connection:
         insert_wallet_of_kind(connection, insert_user(connection), kind="extended_key")
 
@@ -380,7 +390,7 @@ def test_an_extended_key_on_bitcoin_is_stored(database_url: str, sync_engine: En
 
 
 def test_an_unknown_kind_is_refused_by_the_table(database_url: str, sync_engine: Engine) -> None:
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     with sync_engine.begin() as connection:
         user = insert_user(connection)
 
@@ -398,7 +408,7 @@ def test_an_extended_key_on_kaspa_is_refused_by_the_table(
     database_url: str, sync_engine: Engine
 ) -> None:
     """The domain refuses it first (R2a); this is what holds if the domain ever did not."""
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     with sync_engine.begin() as connection:
         user = insert_user(connection)
 
@@ -419,7 +429,7 @@ def test_an_extended_key_on_kaspa_is_refused_by_the_table(
 
 
 def test_a_null_kind_is_refused(database_url: str, sync_engine: Engine) -> None:
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     with sync_engine.begin() as connection:
         user = insert_user(connection)
 
@@ -446,7 +456,7 @@ def test_a_null_kind_is_refused(database_url: str, sync_engine: Engine) -> None:
 
 
 def test_the_table_has_the_specs_columns(database_url: str, sync_engine: Engine) -> None:
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
 
     assert column_shapes(sync_engine, TABLE) == EXPECTED_COLUMNS
 
@@ -454,7 +464,7 @@ def test_the_table_has_the_specs_columns(database_url: str, sync_engine: Engine)
 def test_the_keys_and_the_absent_index_are_the_specs(
     database_url: str, sync_engine: Engine
 ) -> None:
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     inspector = inspect(sync_engine)
 
     assert {
@@ -470,7 +480,7 @@ def test_the_keys_and_the_absent_index_are_the_specs(
 
 
 def test_the_table_checks_match_the_model(database_url: str, sync_engine: Engine) -> None:
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     reflected = {
         str(found["name"]): normalise_sql(str(found["sqltext"]))
         for found in inspect(sync_engine).get_check_constraints(TABLE)
@@ -486,7 +496,7 @@ def test_the_table_checks_match_the_model(database_url: str, sync_engine: Engine
 @pytest.fixture
 def key_wallet(database_url: str, sync_engine: Engine) -> int:
     """A migrated database with one extended-key wallet in it."""
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     with sync_engine.begin() as connection:
         return insert_wallet_of_kind(connection, insert_user(connection), kind="extended_key")
 
@@ -643,7 +653,7 @@ def test_the_upgrade_keeps_every_wallet_as_an_address_and_what_references_it(
     snapshots_before = all_rows(sync_engine, "balance_snapshots")
     assert "kind" not in wallets_before[0]
 
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
 
     wallets_after = all_rows(sync_engine, "wallets")
     assert wallets_after == [{**row, "kind": "address"} for row in wallets_before]
@@ -688,7 +698,7 @@ def test_the_migrations_copy_of_the_table_is_the_table_the_parent_left(
 def test_the_downgrades_copy_of_the_table_is_the_table_this_revision_leaves(
     database_url: str, sync_engine: Engine
 ) -> None:
-    upgrade_to_head(database_url)
+    at_this_revision(database_url)
     inspector = inspect(sync_engine)
     declared = v0011_extended_keys._wallets_after()
 
@@ -705,15 +715,6 @@ def test_the_downgrades_copy_of_the_table_is_the_table_this_revision_leaves(
         )
     }
     assert {str(constraint.name) for constraint in declared.constraints} == on_disk
-
-
-def at_this_revision(database_url: str) -> None:
-    """Migrate to this revision and no further.
-
-    A downgrade from head would first run `0012_drop_exchanges_accounting`'s, which rebuilds
-    tables this revision has nothing to do with; the tests below are about this one step.
-    """
-    command.upgrade(build_alembic_config(database_url), REVISION)
 
 
 # --------------------------------------------------------------------------------------

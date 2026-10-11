@@ -188,12 +188,28 @@ async function readJsonBody(request: Request): Promise<unknown> {
  * `fakeSession({ initialUser: ... }).handlers`, so no test can drift into
  * asserting authenticated behaviour without having said so.
  *
+ * `GET /api/portfolios` answers one portfolio (spec 044).
+ *
  * The backup detail (spec 029) answers `ok`, the state that renders nothing on the
  * dashboard: every dashboard and Health page test reads it, and a test about the backups
  * replaces it with `serveBackup(...)` from `backupFixtures.ts`.
  */
+export const PORTFOLIOS_PATH = '/api/portfolios';
+
+/** The one portfolio every account has after the migration (spec 044). */
+export const mainPortfolio = {
+  id: 1,
+  name: 'Main',
+  wallets: 0,
+  operations: 0,
+  created_at: '2026-01-01T00:00:00Z',
+};
+
 export const handlers: HttpHandler[] = [
   http.get(HEALTH_PATH, () => HttpResponse.json(healthFixture)),
+  // One portfolio, so the switcher and every form's portfolio field stay hidden and every
+  // read is for all portfolios, as before spec 044. A test about portfolios replaces it.
+  http.get(PORTFOLIOS_PATH, () => HttpResponse.json({ portfolios: [mainPortfolio] })),
   http.get(HEALTH_DETAIL_PATH, () => HttpResponse.json(healthDetail())),
   http.get(SESSION_PATH, () => unauthorized()),
 ];

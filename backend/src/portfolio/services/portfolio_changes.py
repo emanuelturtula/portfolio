@@ -107,14 +107,15 @@ class PortfolioChangeService:
         self._assets = assets
         self._clock = clock
 
-    async def changes(self, user_id: int) -> PortfolioChanges:
-        """The owner's change over 24 hours and over 7 days, each by R6."""
+    async def changes(self, user_id: int, portfolio_id: int | None = None) -> PortfolioChanges:
+        """The owner's change over 24 hours and over 7 days, each by R6: of every portfolio,
+        or of the one named (spec 044)."""
         now = self._clock()
-        view = await self._summary.summary(user_id)
+        view = await self._summary.summary(user_id, portfolio_id)
         unknown_now = any(missing.kind in _UNKNOWN_NOW for missing in view.missing)
         value_now = None if unknown_now else view.summary.total_value
 
-        wallets = await self._wallets.list_for_user(user_id)
+        wallets = await self._wallets.list_for_user(user_id, portfolio_id=portfolio_id)
         rebuilt = await self._rebuilt.for_wallets([wallet.id for wallet in wallets])
         readings = {
             wallet_id: [

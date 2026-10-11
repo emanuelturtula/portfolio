@@ -87,6 +87,7 @@ function report(overrides: Partial<ImportReport> = {}): ImportReport {
     stored: 2,
     already_stored: 0,
     files: [BITGET_FILE],
+    portfolio_id: 1,
     ...overrides,
   };
 }

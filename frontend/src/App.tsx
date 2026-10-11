@@ -3,12 +3,15 @@ import { Navigate, NavLink, Route, Routes } from 'react-router-dom';
 
 import { describeApiError } from '@/api/client';
 import { logout, sessionQueryKey, useSession } from '@/api/session';
+import { PortfolioSwitcher } from '@/components/PortfolioSwitcher';
 import { RequireSession } from '@/components/RequireSession';
+import { PortfolioScopeGate, PortfolioScopeProvider } from '@/lib/portfolioScope';
 import { DashboardPage } from '@/pages/DashboardPage';
 import { HealthPage } from '@/pages/HealthPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { NotFoundPage } from '@/pages/NotFoundPage';
 import { OperationsPage } from '@/pages/OperationsPage';
+import { PortfoliosPage } from '@/pages/PortfoliosPage';
 import { WalletsPage } from '@/pages/WalletsPage';
 
 /**
@@ -19,6 +22,9 @@ import { WalletsPage } from '@/pages/WalletsPage';
  * catch-all - is wrapped in `RequireSession`, per the route table in
  * docs/specs/004-login-page-and-app-shell.md, extended by #11 for `/wallets`.
  *
+ * Spec 044 wraps every page in the portfolio scope: the switcher at the top of the main area
+ * chooses the portfolio every figure is narrowed to, once there are two or more.
+ *
  * `/details` was a page of its own from #154 until spec 039 folded it into `/wallets`. It now
  * redirects there, replacing the history entry, so a bookmark still lands on the same figures
  * and the back button does not bounce through it. The redirect needs no session of its own:
@@ -26,59 +32,72 @@ import { WalletsPage } from '@/pages/WalletsPage';
  */
 export function App() {
   return (
-    <div className="app">
-      <header className="app-header">
-        <h1>Portfolio</h1>
-        <MainNav />
-        <AccountControls />
-      </header>
-      <main className="app-main">
-        <Routes>
-          <Route path="/login" element={<LoginPage />} />
-          <Route
-            path="/"
-            element={
-              <RequireSession>
-                <DashboardPage />
-              </RequireSession>
-            }
-          />
-          <Route path="/details" element={<Navigate to="/wallets" replace />} />
-          <Route
-            path="/wallets"
-            element={
-              <RequireSession>
-                <WalletsPage />
-              </RequireSession>
-            }
-          />
-          <Route
-            path="/operations"
-            element={
-              <RequireSession>
-                <OperationsPage />
-              </RequireSession>
-            }
-          />
-          <Route
-            path="/health"
-            element={
-              <RequireSession>
-                <HealthPage />
-              </RequireSession>
-            }
-          />
-          <Route
-            path="*"
-            element={
-              <RequireSession>
-                <NotFoundPage />
-              </RequireSession>
-            }
-          />
-        </Routes>
-      </main>
-    </div>
+    <PortfolioScopeProvider>
+      <div className="app">
+        <header className="app-header">
+          <h1>Portfolio</h1>
+          <MainNav />
+          <AccountControls />
+        </header>
+        <main className="app-main">
+          <PortfolioSwitcher />
+          <PortfolioScopeGate>
+            <Routes>
+              <Route path="/login" element={<LoginPage />} />
+              <Route
+                path="/"
+                element={
+                  <RequireSession>
+                    <DashboardPage />
+                  </RequireSession>
+                }
+              />
+              <Route path="/details" element={<Navigate to="/wallets" replace />} />
+              <Route
+                path="/wallets"
+                element={
+                  <RequireSession>
+                    <WalletsPage />
+                  </RequireSession>
+                }
+              />
+              <Route
+                path="/operations"
+                element={
+                  <RequireSession>
+                    <OperationsPage />
+                  </RequireSession>
+                }
+              />
+              <Route
+                path="/portfolios"
+                element={
+                  <RequireSession>
+                    <PortfoliosPage />
+                  </RequireSession>
+                }
+              />
+              <Route
+                path="/health"
+                element={
+                  <RequireSession>
+                    <HealthPage />
+                  </RequireSession>
+                }
+              />
+              <Route
+                path="*"
+                element={
+                  <RequireSession>
+                    <NotFoundPage />
+                  </RequireSession>
+                }
+              />
+            </Routes>
+          </PortfolioScopeGate>
+        </main>
+      </div>
+    </PortfolioScopeProvider>
   );
 }
 
@@ -103,6 +122,7 @@ function MainNav() {
       </NavLink>
       <NavLink to="/wallets">Wallets</NavLink>
       <NavLink to="/operations">Operations</NavLink>
+      <NavLink to="/portfolios">Portfolios</NavLink>
     </nav>
   );
 }

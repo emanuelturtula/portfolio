@@ -2,13 +2,20 @@ import { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 
 import { describeApiError } from '@/api/client';
-import { useArchiveWallet, useRestoreWallet, useWallets, type Wallet } from '@/api/wallets';
+import {
+  useArchiveWallet,
+  useMoveWallet,
+  useRestoreWallet,
+  useWallets,
+  type Wallet,
+} from '@/api/wallets';
 import { Address } from '@/components/Address';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
 import { Skeleton } from '@/components/Skeleton';
 import { truncateAddress } from '@/lib/addresses';
 import { chainDisplayName } from '@/lib/chains';
+import { usePortfolioScope } from '@/lib/portfolioScope';
 
 const ARCHIVE_CONSEQUENCE =
   'This wallet will stop being read and will leave the total. Archiving can be undone with Restore.';
@@ -21,6 +28,48 @@ const ARCHIVE_CONSEQUENCE =
  */
 function rowName(wallet: Wallet): string {
   return wallet.label ?? `${chainDisplayName(wallet.chain_key)} ${truncateAddress(wallet.address)}`;
+}
+
+/**
+ * Which portfolio the wallet is in, and the control that moves it, with its whole history, to
+ * another (spec 044, R6). Only with two or more portfolios: with one there is nowhere to go.
+ */
+function WalletPortfolio({ wallet, name }: { readonly wallet: Wallet; readonly name: string }) {
+  const { portfolios } = usePortfolioScope();
+  const move = useMoveWallet();
+
+  if (portfolios.length < 2) {
+    return null;
+  }
+
+  return (
+    <>
+      <label className="wallet-portfolio">
+        <span className="visually-hidden">Portfolio of {name}</span>
+        <select
+          value={String(wallet.portfolio_id)}
+          disabled={move.isPending}
+          onChange={(event) => {
+            const found = portfolios.find(
+              (portfolio) => String(portfolio.id) === event.target.value,
+            );
+            if (found !== undefined) {
+              move.mutate({ walletId: wallet.id, portfolioId: found.id });
+            }
+          }}
+        >
+          {portfolios.map((portfolio) => (
+            <option key={portfolio.id} value={String(portfolio.id)}>
+              {portfolio.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      {move.isError && (
+        <p role="alert">{describeApiError(move.error, 'Could not move the wallet. Try again.')}</p>
+      )}
+    </>
+  );
 }
 
 interface WalletRowProps {
@@ -202,6 +251,7 @@ function WalletRow({ wallet, isShowingArchived, focusListHeading }: WalletRowPro
       </div>
 
       <div className="wallet-row-actions">
+        <WalletPortfolio wallet={wallet} name={name} />
         {wallet.archived ? (
           <button
             type="button"

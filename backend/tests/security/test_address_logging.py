@@ -313,6 +313,7 @@ async def test_a_constraint_refusal_that_is_not_a_duplicate_logs_no_address(
         address_display: str,
         label: str | None,
         created_at: datetime,
+        portfolio_id: int,
         kind: str = "address",
     ) -> Wallet:
         # `kind` mirrors `WalletRepository.add` (spec 031). Without it the service's call
@@ -327,6 +328,7 @@ async def test_a_constraint_refusal_that_is_not_a_duplicate_logs_no_address(
             address_display=address_display,
             label=label,
             created_at=created_at,
+            portfolio_id=portfolio_id,
             kind=kind,
         )
 

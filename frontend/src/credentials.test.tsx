@@ -150,6 +150,13 @@ const ROUTE_CASES: readonly RouteCase[] = [
     passwordInputs: 0,
   },
   {
+    route: '/portfolios',
+    visit: '/portfolios',
+    signedIn: true,
+    ready: () => screen.findByRole('form', { name: 'New portfolio' }),
+    passwordInputs: 0,
+  },
+  {
     route: '/health',
     visit: '/health',
     signedIn: true,

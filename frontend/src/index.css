@@ -1545,3 +1545,46 @@ tbody th {
 .operations-pages {
   align-items: center;
 }
+
+/* Spec 044: the portfolio every page shows, at the top of the main area. */
+.portfolio-switcher {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+.operations-move {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.operations-move .field,
+.portfolio-rename .field {
+  margin: 0;
+}
+
+.operations-move .note {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.portfolio-rename {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-3);
+}
+
+.wallet-portfolio select {
+  font: inherit;
+  font-size: var(--text-sm);
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background-color: var(--color-page);
+  color: var(--color-text);
+}

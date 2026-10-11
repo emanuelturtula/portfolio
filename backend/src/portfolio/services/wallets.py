@@ -36,7 +36,9 @@ from enum import Enum
 from typing import TYPE_CHECKING, Final
 
 from portfolio.domain.chains import WalletKind, classify_wallet_key
+from portfolio.repositories.portfolios import PortfolioRepository
 from portfolio.repositories.wallets import WalletConstraintError, WalletRepository
+from portfolio.services.portfolios import resolve_portfolio
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -154,6 +156,7 @@ class WalletView:
     archived: bool
     created_at: datetime
     updated_at: datetime
+    portfolio_id: int
 
 
 def mask_extended_key(key: str) -> str:
@@ -187,6 +190,7 @@ def view_of(wallet: Wallet) -> WalletView:
         archived=wallet.archived_at is not None,
         created_at=wallet.created_at,
         updated_at=wallet.updated_at,
+        portfolio_id=wallet.portfolio_id,
     )
 
 
@@ -222,10 +226,12 @@ class WalletService:
         *,
         session: AsyncSession,
         wallets: WalletRepository,
+        portfolios: PortfolioRepository,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._session = session
         self._wallets = wallets
+        self._portfolios = portfolios
         self._clock = clock
 
     async def list_wallets(
@@ -233,11 +239,14 @@ class WalletService:
         principal: Principal,
         *,
         include_archived: bool = False,
+        portfolio_id: int | None = None,
     ) -> list[WalletView]:
-        """Every wallet the caller holds. Archived ones are hidden unless asked for."""
+        """Every wallet the caller holds, or one portfolio's. Archived ones are hidden unless
+        asked for."""
         rows = await self._wallets.list_for_user(
             principal.user_id,
             include_archived=include_archived,
+            portfolio_id=portfolio_id,
         )
         return [view_of(row) for row in rows]
 
@@ -248,6 +257,7 @@ class WalletService:
         chain_key: str,
         address: str,
         label: str | None = None,
+        portfolio_id: int | None = None,
     ) -> WalletView:
         """Register an address or an extended public key, after proving offline that it is one.
 
@@ -261,13 +271,20 @@ class WalletService:
         as an address, exactly as before. The network is not checked here (R3): it is the
         provider's, at read time, as it is for an address.
 
+        The wallet is filed in `portfolio_id`, or in the owner's first portfolio when none is
+        named (spec 044, R8). An address another portfolio holds is the same conflict as
+        any other (R2).
+
         Raises:
             AddressInvalidError: the chain key, the address or the key did not validate.
             WalletAlreadyExistsError: the slot is taken, by an active or an archived row.
+            PortfolioNotFoundError: `portfolio_id` is not one of the caller's.
             ValueError: the label is too long.
         """
         validated = classify_wallet_key(chain_key, address)
         clean_label = normalise_label(label)
+        now = self._clock()
+        target = await resolve_portfolio(self._portfolios, principal.user_id, portfolio_id, now=now)
 
         existing = await self._wallets.find_by_canonical(
             user_id=principal.user_id,
@@ -286,7 +303,8 @@ class WalletService:
                 address_canonical=validated.canonical,
                 address_display=validated.display,
                 label=clean_label,
-                created_at=self._clock(),
+                created_at=now,
+                portfolio_id=target,
                 kind=validated.kind.value,
             )
         except WalletConstraintError:
@@ -326,20 +344,31 @@ class WalletService:
         *,
         label: str | Unset | None = UNSET,
         archived: bool | Unset = UNSET,
+        portfolio_id: int | Unset = UNSET,
     ) -> WalletView:
-        """Rename a wallet, archive it, or bring it back.
+        """Rename a wallet, archive it, bring it back, or move it to another portfolio.
 
         Both fields are optional and `UNSET` is not `None`: a request that sends only
         `archived` leaves the label exactly as it was, and one that sends `"label": null`
         clears it. A request that sends neither is a no-op that still returns the wallet,
         which is what makes a retried `PATCH` safe.
 
+        A move takes the wallet's whole history with it (spec 044, R6). Moving it into the
+        portfolio it is in writes nothing.
+
         Raises:
             WalletNotFoundError: no wallet with that id belongs to the caller.
+            PortfolioNotFoundError: `portfolio_id` is not one of the caller's.
             ValueError: the label is too long.
         """
         wallet = await self._require_wallet(principal, wallet_id)
         now = self._clock()
+
+        if not isinstance(portfolio_id, Unset) and portfolio_id != wallet.portfolio_id:
+            target = await resolve_portfolio(
+                self._portfolios, principal.user_id, portfolio_id, now=now
+            )
+            await self._wallets.set_portfolio(wallet, target, now)
 
         if not isinstance(label, Unset):
             await self._wallets.set_label(wallet, normalise_label(label), now)
@@ -414,4 +443,9 @@ def build_wallet_service(
     The repository is built here rather than injected because there is exactly one
     implementation of it; the clock is injectable so that a test can name the instant.
     """
-    return WalletService(session=session, wallets=WalletRepository(session), clock=clock)
+    return WalletService(
+        session=session,
+        wallets=WalletRepository(session),
+        portfolios=PortfolioRepository(session),
+        clock=clock,
+    )

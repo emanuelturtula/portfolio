@@ -52,11 +52,13 @@ class InvestmentService:
         self._wallets = wallets
         self._portfolio = portfolio
 
-    async def investment(self, user_id: int) -> Investment:
-        """Every tracked asset's invested, value, profit, held and explained quantities."""
-        wallets = await self._wallets.list_for_user(user_id)
+    async def investment(self, user_id: int, portfolio_id: int | None = None) -> Investment:
+        """Every tracked asset's invested, value, profit, held and explained quantities: of
+        every portfolio, or of the one named, from its own wallets and operations (spec 044,
+        R5)."""
+        wallets = await self._wallets.list_for_user(user_id, portfolio_id=portfolio_id)
         tracked = sorted({ChainKey(wallet.chain_key).asset_symbol for wallet in wallets})
-        view = await self._portfolio.summary(user_id)
+        view = await self._portfolio.summary(user_id, portfolio_id)
         unread = {
             ChainKey(missing.subject).asset_symbol
             for missing in view.missing
@@ -75,7 +77,7 @@ class InvestmentService:
             else:
                 holdings.append(Holding(asset, holding.quantity, holding.value))
 
-        rows = await self._operations.all_for(user_id)
+        rows = await self._operations.all_for(user_id, portfolio_id=portfolio_id)
         movements = [
             Movement(
                 executed_at=row.executed_at,
