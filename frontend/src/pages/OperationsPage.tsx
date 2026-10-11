@@ -495,18 +495,20 @@ interface MoveBarProps {
   readonly count: number;
   readonly scope: number | null;
   readonly filters: Filters;
-  readonly portfolios: readonly Portfolio[];
+  /** Every portfolio but the one shown, which is where they can go. */
+  readonly choices: readonly Portfolio[];
+  /** The first of `choices`, the default. */
+  readonly first: Portfolio;
 }
 
 /**
  * Moves every operation the filters keep, on every page, to another portfolio (spec 044, R7).
  * It names how many before it runs, and moving them back is the same action.
  */
-function MoveBar({ count, scope, filters, portfolios }: MoveBarProps) {
+function MoveBar({ count, scope, filters, choices, first }: MoveBarProps) {
   const move = useMoveOperations();
-  const choices = portfolios.filter((portfolio) => portfolio.id !== scope);
   const [picked, setPicked] = useState<number | undefined>(undefined);
-  const target = choices.some((portfolio) => portfolio.id === picked) ? picked : choices[0]?.id;
+  const target = choices.find((portfolio) => portfolio.id === picked) ?? first;
   const noun = count === 1 ? 'operation' : 'operations';
 
   return (
@@ -515,7 +517,7 @@ function MoveBar({ count, scope, filters, portfolios }: MoveBarProps) {
         id="operations-move-target"
         label={`Move these ${String(count)} ${noun} to`}
         portfolios={choices}
-        value={target}
+        value={target.id}
         onChange={(portfolio) => {
           setPicked(portfolio);
           move.reset();
@@ -524,13 +526,10 @@ function MoveBar({ count, scope, filters, portfolios }: MoveBarProps) {
       />
       <button
         type="button"
-        disabled={target === undefined || move.isPending}
+        disabled={move.isPending}
         onClick={() => {
-          if (target === undefined) {
-            return;
-          }
           move.mutate({
-            portfolio_id: target,
+            portfolio_id: target.id,
             from_portfolio: scope,
             asset: filters.asset === '' ? null : filters.asset,
             venue: filters.venue === '' ? null : filters.venue,
@@ -569,6 +568,9 @@ function OperationsTable() {
   const operations = useOperations({ portfolio: scope, page, pageSize, ...filters });
   const remove = useDeleteOperation();
   const several = portfolios.length > 1;
+  // Where the move bar can send them: every portfolio but the one shown.
+  const choices = portfolios.filter((portfolio) => portfolio.id !== scope);
+  const [first] = choices;
   // Which portfolio each row is in, when the table shows them all.
   const named = several && scope === null ? portfolios : undefined;
 
@@ -622,8 +624,8 @@ function OperationsTable() {
           setPage(0);
         }}
       />
-      {several && count > 0 && (
-        <MoveBar count={count} scope={scope} filters={filters} portfolios={portfolios} />
+      {several && count > 0 && first !== undefined && (
+        <MoveBar count={count} scope={scope} filters={filters} choices={choices} first={first} />
       )}
       {remove.isError && (
         <p className="note note-error" role="alert">

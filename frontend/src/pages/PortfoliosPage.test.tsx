@@ -1,13 +1,14 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http } from 'msw';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { IMPORTS_PATH, type ImportReport } from '@/api/operations';
 import { PORTFOLIO_SUMMARY_PATH } from '@/api/portfolio';
-import { SELECTED_PORTFOLIO_KEY } from '@/lib/portfolioScope';
+import { PORTFOLIO_SCOPE_LOADING_LABEL, SELECTED_PORTFOLIO_KEY } from '@/lib/portfolioScope';
 import { deleteBlocker, describeContents, PORTFOLIOS_LOADING_LABEL } from '@/pages/PortfoliosPage';
 import { fakeOperations } from '@/test/fakeOperations';
-import { fakePortfolio, WALLETS_PATH } from '@/test/fakePortfolio';
+import { fakePortfolio, WALLET_PATH, WALLETS_PATH } from '@/test/fakePortfolio';
 import {
   fakePortfolios,
   NAME_TAKEN_DETAIL,
@@ -26,6 +27,7 @@ import { fakeSession, PORTFOLIOS_PATH, problem, server, TEST_USERNAME } from '@/
 
 const MAIN = portfolio({ id: 1, name: 'Main', wallets: 2, operations: 3 });
 const TRADING = portfolio({ id: 2, name: 'Trading' });
+const RETIREMENT = portfolio({ id: 3, name: 'Retirement' });
 
 function clearStored(): void {
   window.localStorage.removeItem(SELECTED_PORTFOLIO_KEY);
@@ -115,6 +117,72 @@ describe('the Portfolios page', () => {
     });
   });
 
+  it('retries a failed read from the error state', async () => {
+    const user = userEvent.setup();
+    const registry = fakePortfolios([MAIN]);
+    signIn(registry);
+    server.use(
+      http.get(
+        PORTFOLIOS_PATH,
+        () => problem(500, 'Internal Server Error', 'Database is locked.'),
+        {
+          once: true,
+        },
+      ),
+    );
+    renderApp(['/portfolios']);
+
+    await user.click(await screen.findByRole('button', { name: /try again|retry/i }));
+
+    expect(await screen.findByText('2 wallets, 3 operations')).toBeInTheDocument();
+  });
+
+  it('says there are none yet when the account has no portfolio', async () => {
+    signIn(fakePortfolios([]));
+    renderApp(['/portfolios']);
+
+    expect(await screen.findByRole('heading', { name: 'No portfolios yet' })).toBeInTheDocument();
+  });
+
+  it('cancels a rename without sending it', async () => {
+    const user = userEvent.setup();
+    const registry = fakePortfolios([MAIN]);
+    signIn(registry);
+    renderApp(['/portfolios']);
+
+    await user.click(await screen.findByRole('button', { name: 'Rename Main' }));
+    await user.type(screen.getByLabelText('New name for Main'), ' fund');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    await user.click(screen.getByRole('button', { name: 'Rename Main' }));
+
+    expect(screen.getByLabelText('New name for Main')).toHaveValue('Main');
+    expect(registry.requests.filter((request) => request.method === 'PATCH')).toEqual([]);
+  });
+
+  it('shows why a rename or a delete was refused', async () => {
+    const user = userEvent.setup();
+    signIn(fakePortfolios([MAIN, TRADING]));
+    server.use(
+      http.delete(`${PORTFOLIOS_PATH}/:id`, () =>
+        problem(409, 'Conflict', 'This portfolio still holds wallets or operations.'),
+      ),
+    );
+    renderApp(['/portfolios']);
+
+    await user.click(await screen.findByRole('button', { name: 'Rename Trading' }));
+    const field = screen.getByLabelText('New name for Trading');
+    await user.clear(field);
+    await user.type(field, 'Main');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(`Not renamed: ${NAME_TAKEN_DETAIL}`);
+
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    await user.click(screen.getByRole('button', { name: 'Delete Trading' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Not deleted: This portfolio still holds wallets or operations.',
+    );
+  });
+
   it('shows the refusal of a name already taken', async () => {
     const user = userEvent.setup();
     signIn(fakePortfolios([MAIN]));
@@ -172,6 +240,62 @@ describe('the selector', () => {
     expect(window.localStorage.getItem(SELECTED_PORTFOLIO_KEY)).toBe('2');
   });
 
+  it('goes back to all of them and forgets the choice', async () => {
+    const user = userEvent.setup();
+    const fake = fakePortfolio(healthyPortfolio());
+    window.localStorage.setItem(SELECTED_PORTFOLIO_KEY, '2');
+    signIn(fakePortfolios([MAIN, TRADING]));
+    server.use(...fake.handlers);
+    renderApp(['/']);
+
+    await waitFor(() => {
+      expect(switcher()).toHaveValue('2');
+    });
+    await user.selectOptions(switcher(), 'All portfolios');
+
+    expect(switcher()).toHaveValue('all');
+    expect(window.localStorage.getItem(SELECTED_PORTFOLIO_KEY)).toBeNull();
+  });
+
+  it('still switches when the browser blocks storage, for as long as the page is open', async () => {
+    const user = userEvent.setup();
+    const blocked = () => {
+      throw new DOMException('Blocked', 'SecurityError');
+    };
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(blocked);
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(blocked);
+    vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(blocked);
+    const fake = fakePortfolio(healthyPortfolio());
+    signIn(fakePortfolios([MAIN, TRADING]));
+    server.use(...fake.handlers);
+    renderApp(['/']);
+
+    await waitFor(() => {
+      expect(switcher()).toHaveValue('all');
+    });
+    await user.selectOptions(switcher(), 'Trading');
+    expect(switcher()).toHaveValue('2');
+    await user.selectOptions(switcher(), 'All portfolios');
+    expect(switcher()).toHaveValue('all');
+    vi.restoreAllMocks();
+  });
+
+  it('reads nothing for all of them while a remembered choice is being checked', async () => {
+    const fake = fakePortfolio(healthyPortfolio());
+    window.localStorage.setItem(SELECTED_PORTFOLIO_KEY, '2');
+    signIn(fakePortfolios([MAIN, TRADING]));
+    server.use(...fake.handlers);
+    renderApp(['/']);
+
+    expect(await screen.findByText(PORTFOLIO_SCOPE_LOADING_LABEL)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(fake.writes('GET', PORTFOLIO_SUMMARY_PATH).length).toBeGreaterThan(0);
+    });
+    expect(fake.writes('GET', PORTFOLIO_SUMMARY_PATH).map((r) => new URL(r.url).search)).toEqual(
+      fake.writes('GET', PORTFOLIO_SUMMARY_PATH).map(() => '?portfolio=2'),
+    );
+  });
+
   it('falls back to all when the remembered portfolio no longer exists', async () => {
     const fake = fakePortfolio(healthyPortfolio());
     window.localStorage.setItem(SELECTED_PORTFOLIO_KEY, '9');
@@ -202,6 +326,25 @@ describe('wallets', () => {
     // It follows the selection at the top until the owner picks another.
     expect(field).toHaveValue('2');
     await user.selectOptions(field, 'Main');
+    await user.type(within(form).getByLabelText('Address'), ADDRESSES.btcSegwit);
+    await user.click(within(form).getByRole('button', { name: 'Add wallet' }));
+
+    await waitFor(() => {
+      expect(fake.writes('POST', WALLETS_PATH)).toHaveLength(1);
+    });
+    expect(fake.writes('POST', WALLETS_PATH)[0]?.body).toMatchObject({ portfolio_id: 1 });
+  });
+
+  it('ignores a choice that is not one of the portfolios', async () => {
+    const user = userEvent.setup();
+    const fake = fakePortfolio({ wallets: [] });
+    signIn(fakePortfolios([MAIN, TRADING]));
+    server.use(...fake.handlers);
+    renderApp(['/wallets']);
+
+    const form = await screen.findByRole('form', { name: 'Add a wallet' });
+    const field = await within(form).findByRole('combobox', { name: 'Portfolio' });
+    fireEvent.change(field, { target: { value: 'not-a-portfolio' } });
     await user.type(within(form).getByLabelText('Address'), ADDRESSES.btcSegwit);
     await user.click(within(form).getByRole('button', { name: 'Add wallet' }));
 
@@ -246,6 +389,25 @@ describe('wallets', () => {
       expect(fake.wallets()[0]?.portfolio_id).toBe(2);
     });
     expect(fake.writes('PATCH', `${WALLETS_PATH}/7`)[0]?.body).toEqual({ portfolio_id: 2 });
+  });
+  it('says so when a wallet could not be moved, and ignores a choice that is no portfolio', async () => {
+    const user = userEvent.setup();
+    const fake = fakePortfolio({
+      wallets: [wallet({ id: 7, address: ADDRESSES.btcSegwit, label: 'Cold storage' })],
+    });
+    signIn(fakePortfolios([MAIN, TRADING]));
+    server.use(...fake.handlers);
+    server.use(
+      http.patch(WALLET_PATH, () => problem(404, 'Not Found', 'No portfolio with that id.')),
+    );
+    renderApp(['/wallets']);
+
+    const select = await screen.findByRole('combobox', { name: 'Portfolio of Cold storage' });
+    fireEvent.change(select, { target: { value: 'not-a-portfolio' } });
+    expect(fake.writes('PATCH', `${WALLETS_PATH}/7`)).toEqual([]);
+    await user.selectOptions(select, 'Trading');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('No portfolio with that id.');
   });
 });
 
@@ -298,5 +460,93 @@ describe('operations', () => {
     expect(within(table).getByRole('columnheader', { name: 'Portfolio' })).toBeInTheDocument();
     expect(within(table).getByRole('cell', { name: 'Trading' })).toBeInTheDocument();
     expect(within(table).getByRole('cell', { name: 'Main' })).toBeInTheDocument();
+  });
+  it('moves them to the portfolio picked, not only the first one offered', async () => {
+    const user = userEvent.setup();
+    window.localStorage.setItem(SELECTED_PORTFOLIO_KEY, '1');
+    const operations = fakeOperations({ operations: [operation({ id: 1 })] });
+    signIn(fakePortfolios([MAIN, TRADING, RETIREMENT]));
+    server.use(...operations.handlers, ...fakePortfolio(healthyPortfolio()).handlers);
+    renderApp(['/operations']);
+
+    const group = await screen.findByRole('group', { name: 'Move to another portfolio' });
+    await user.selectOptions(
+      within(group).getByRole('combobox', { name: 'Move these 1 operation to' }),
+      'Retirement',
+    );
+    await user.click(within(group).getByRole('button', { name: 'Move' }));
+
+    expect(await within(group).findByRole('status')).toHaveTextContent('Moved 1 operation.');
+    const sent = operations.requests.find((request) => request.url.endsWith('/move'));
+    expect(sent?.body).toMatchObject({ portfolio_id: 3, from_portfolio: 1 });
+  });
+
+  it('uploads a report into the portfolio picked in the form', async () => {
+    const user = userEvent.setup();
+    const report: ImportReport = {
+      filename: 'bitget.csv',
+      stored: 0,
+      already_stored: 0,
+      files: [],
+      portfolio_id: 2,
+    };
+    const operations = fakeOperations({ uploads: [report] });
+    signIn(fakePortfolios([MAIN, TRADING]));
+    server.use(...operations.handlers, ...fakePortfolio(healthyPortfolio()).handlers);
+    renderApp(['/operations']);
+
+    const form = await screen.findByRole('form', { name: 'Upload exchange reports' });
+    await user.selectOptions(
+      await within(form).findByRole('combobox', { name: 'Portfolio' }),
+      'Trading',
+    );
+    await user.upload(
+      within(form).getByLabelText('Files'),
+      new File(['a,b\n1,2\n'], 'bitget.csv', { type: 'text/csv' }),
+    );
+    await user.click(within(form).getByRole('button', { name: 'Upload' }));
+
+    await waitFor(() => {
+      expect(operations.requests.some((request) => request.url.endsWith(IMPORTS_PATH))).toBe(true);
+    });
+    const sent = operations.requests.find((request) => request.url.endsWith(IMPORTS_PATH));
+    expect(sent?.body).toMatchObject({ filename: 'bitget.csv', portfolio_id: 2 });
+  });
+  it('moves only what the filters keep, and says so when the move is refused', async () => {
+    const user = userEvent.setup();
+    const operations = fakeOperations({
+      operations: [operation({ id: 1 }), operation({ id: 2, asset: 'KAS', external_id: 'b' })],
+    });
+    signIn(fakePortfolios([MAIN, TRADING]));
+    server.use(...operations.handlers, ...fakePortfolio(healthyPortfolio()).handlers);
+    let sent: unknown;
+    server.use(
+      http.post('/api/exchange-operations/move', async ({ request }) => {
+        sent = await request.json();
+        return problem(404, 'Not Found', 'No portfolio with that id.');
+      }),
+    );
+    renderApp(['/operations']);
+
+    const filters = await screen.findByRole('group', { name: 'Filters' });
+    await user.selectOptions(within(filters).getByLabelText('Asset'), 'BTC');
+    await user.selectOptions(within(filters).getByLabelText('Where'), 'Bitget');
+    fireEvent.change(within(filters).getByLabelText('From'), { target: { value: '2026-05-01' } });
+    fireEvent.change(within(filters).getByLabelText('To'), { target: { value: '2026-05-31' } });
+    const group = await screen.findByRole('group', { name: 'Move to another portfolio' });
+    await user.click(within(group).getByRole('button', { name: 'Move' }));
+
+    expect(await within(group).findByRole('alert')).toHaveTextContent(
+      'Not moved: No portfolio with that id.',
+    );
+    // All portfolios are shown, so every one is a destination and the first is the default.
+    expect(sent).toMatchObject({
+      portfolio_id: 1,
+      from_portfolio: null,
+      asset: 'BTC',
+      venue: 'Bitget',
+    });
+    expect(sent).toHaveProperty('since', expect.stringMatching(/^2026-0[45]-/));
+    expect(sent).toHaveProperty('until', expect.stringMatching(/^2026-0[56]-/));
   });
 });

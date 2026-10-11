@@ -16,6 +16,7 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from 'react';
 
 import { usePortfolios, type Portfolio } from '@/api/portfolios';
+import { Skeleton } from '@/components/Skeleton';
 
 export const SELECTED_PORTFOLIO_KEY = 'portfolio.selected';
 
@@ -25,9 +26,20 @@ export interface PortfolioScope {
   /** Every portfolio, oldest first; empty until loaded or outside the provider. */
   readonly portfolios: readonly Portfolio[];
   readonly choose: (portfolio: number | null) => void;
+  /**
+   * A portfolio was chosen earlier and the list that says whether it still exists is being
+   * read. Until it is, the scope cannot be known, and a page that read *all* in the
+   * meantime would show the wrong figures without a selector to say whose they are.
+   */
+  readonly resolving: boolean;
 }
 
-const ALL: PortfolioScope = { scope: null, portfolios: [], choose: () => undefined };
+const ALL: PortfolioScope = {
+  scope: null,
+  portfolios: [],
+  choose: () => undefined,
+  resolving: false,
+};
 
 const PortfolioScopeContext = createContext<PortfolioScope>(ALL);
 
@@ -66,14 +78,26 @@ export function PortfolioScopeProvider({ children }: { readonly children: ReactN
         setChosen(portfolio === null ? null : String(portfolio));
         writeStored(portfolio);
       },
+      resolving: chosen !== null && portfolios.isLoading,
     };
-  }, [portfolios.data, chosen]);
+  }, [portfolios.data, portfolios.isLoading, chosen]);
 
   return <PortfolioScopeContext value={value}>{children}</PortfolioScopeContext>;
 }
 
 export function usePortfolioScope(): PortfolioScope {
   return useContext(PortfolioScopeContext);
+}
+
+export const PORTFOLIO_SCOPE_LOADING_LABEL = 'Loading your portfolio…';
+
+/** Holds the pages back while a remembered choice is {@link PortfolioScope.resolving}. */
+export function PortfolioScopeGate({ children }: { readonly children: ReactNode }) {
+  const { resolving } = usePortfolioScope();
+  if (resolving) {
+    return <Skeleton label={PORTFOLIO_SCOPE_LOADING_LABEL} />;
+  }
+  return children;
 }
 
 /** `path` narrowed to `scope`: unchanged for all portfolios. */

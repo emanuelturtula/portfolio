@@ -3,15 +3,19 @@ import { useState } from 'react';
 import type { Portfolio } from '@/api/portfolios';
 import { defaultTarget, usePortfolioScope } from '@/lib/portfolioScope';
 
-/** The portfolio a form writes to, and whether there is a choice to show (spec 044, R12). */
-export interface PortfolioTarget {
-  /** Whether there are two or more portfolios, and so a select to show. */
-  readonly shown: boolean;
-  /** The portfolio picked, or the default: the selected one, else the first. */
-  readonly value: number | undefined;
-  readonly portfolios: readonly Portfolio[];
-  readonly pick: (portfolio: number) => void;
-}
+/**
+ * The portfolio a form writes to, and whether there is a choice to show (spec 044, R12): with
+ * two or more portfolios there is, and a portfolio to show as picked.
+ */
+export type PortfolioTarget =
+  | {
+      readonly shown: true;
+      /** The portfolio picked, or the default: the selected one, else the first. */
+      readonly value: number;
+      readonly portfolios: readonly Portfolio[];
+      readonly pick: (portfolio: number) => void;
+    }
+  | { readonly shown: false };
 
 /**
  * The portfolio a form writes to. It follows the selection at the top of the page until the
@@ -21,24 +25,23 @@ export function usePortfolioTarget(): PortfolioTarget {
   const scope = usePortfolioScope();
   const [picked, setPicked] = useState<number | undefined>(undefined);
   const valid = scope.portfolios.some((portfolio) => portfolio.id === picked);
-  return {
-    shown: scope.portfolios.length > 1,
-    value: valid ? picked : defaultTarget(scope),
-    portfolios: scope.portfolios,
-    pick: setPicked,
-  };
+  const value = valid ? picked : defaultTarget(scope);
+  if (scope.portfolios.length > 1 && value !== undefined) {
+    return { shown: true, value, portfolios: scope.portfolios, pick: setPicked };
+  }
+  return { shown: false };
 }
 
 /** `{ portfolio_id }` for a request body when there is a choice, and nothing otherwise. */
 export function portfolioBody(target: PortfolioTarget): { portfolio_id?: number } {
-  return target.shown && target.value !== undefined ? { portfolio_id: target.value } : {};
+  return target.shown ? { portfolio_id: target.value } : {};
 }
 
 interface PortfolioSelectProps {
   readonly id: string;
   readonly label: string;
   readonly portfolios: readonly Portfolio[];
-  readonly value: number | undefined;
+  readonly value: number;
   readonly onChange: (portfolio: number) => void;
   readonly disabled?: boolean;
 }
@@ -57,7 +60,7 @@ export function PortfolioSelect({
       <label htmlFor={id}>{label}</label>
       <select
         id={id}
-        value={value === undefined ? '' : String(value)}
+        value={String(value)}
         disabled={disabled}
         onChange={(event) => {
           const found = portfolios.find((portfolio) => String(portfolio.id) === event.target.value);

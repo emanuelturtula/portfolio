@@ -5,7 +5,7 @@ import { describeApiError } from '@/api/client';
 import { logout, sessionQueryKey, useSession } from '@/api/session';
 import { PortfolioSwitcher } from '@/components/PortfolioSwitcher';
 import { RequireSession } from '@/components/RequireSession';
-import { PortfolioScopeProvider } from '@/lib/portfolioScope';
+import { PortfolioScopeGate, PortfolioScopeProvider } from '@/lib/portfolioScope';
 import { DashboardPage } from '@/pages/DashboardPage';
 import { HealthPage } from '@/pages/HealthPage';
 import { LoginPage } from '@/pages/LoginPage';
@@ -41,58 +41,60 @@ export function App() {
         </header>
         <main className="app-main">
           <PortfolioSwitcher />
-          <Routes>
-            <Route path="/login" element={<LoginPage />} />
-            <Route
-              path="/"
-              element={
-                <RequireSession>
-                  <DashboardPage />
-                </RequireSession>
-              }
-            />
-            <Route path="/details" element={<Navigate to="/wallets" replace />} />
-            <Route
-              path="/wallets"
-              element={
-                <RequireSession>
-                  <WalletsPage />
-                </RequireSession>
-              }
-            />
-            <Route
-              path="/operations"
-              element={
-                <RequireSession>
-                  <OperationsPage />
-                </RequireSession>
-              }
-            />
-            <Route
-              path="/portfolios"
-              element={
-                <RequireSession>
-                  <PortfoliosPage />
-                </RequireSession>
-              }
-            />
-            <Route
-              path="/health"
-              element={
-                <RequireSession>
-                  <HealthPage />
-                </RequireSession>
-              }
-            />
-            <Route
-              path="*"
-              element={
-                <RequireSession>
-                  <NotFoundPage />
-                </RequireSession>
-              }
-            />
-          </Routes>
+          <PortfolioScopeGate>
+            <Routes>
+              <Route path="/login" element={<LoginPage />} />
+              <Route
+                path="/"
+                element={
+                  <RequireSession>
+                    <DashboardPage />
+                  </RequireSession>
+                }
+              />
+              <Route path="/details" element={<Navigate to="/wallets" replace />} />
+              <Route
+                path="/wallets"
+                element={
+                  <RequireSession>
+                    <WalletsPage />
+                  </RequireSession>
+                }
+              />
+              <Route
+                path="/operations"
+                element={
+                  <RequireSession>
+                    <OperationsPage />
+                  </RequireSession>
+                }
+              />
+              <Route
+                path="/portfolios"
+                element={
+                  <RequireSession>
+                    <PortfoliosPage />
+                  </RequireSession>
+                }
+              />
+              <Route
+                path="/health"
+                element={
+                  <RequireSession>
+                    <HealthPage />
+                  </RequireSession>
+                }
+              />
+              <Route
+                path="*"
+                element={
+                  <RequireSession>
+                    <NotFoundPage />
+                  </RequireSession>
+                }
+              />
+            </Routes>
+          </PortfolioScopeGate>
         </main>
       </div>
     </PortfolioScopeProvider>
