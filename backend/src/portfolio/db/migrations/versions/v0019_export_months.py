@@ -1,8 +1,8 @@
 """Export months: the months whose manual exchange exports are done (spec 040).
 
-Revision ID: 0015_export_months
-Revises: 0014_reconstructed_balances
-Create Date: 2026-10-09
+Revision ID: 0019_export_months
+Revises: 0018_portfolios
+Create Date: 2026-10-11
 
 One new table and no alteration of an existing one, so the downgrade drops what this revision
 created and nothing else. What it loses is which months were marked done; after a re-upgrade
@@ -16,8 +16,8 @@ from alembic import op
 
 from portfolio.db.types import UtcDateTime
 
-revision: str = "0015_export_months"
-down_revision: str | None = "0014_reconstructed_balances"
+revision: str = "0019_export_months"
+down_revision: str | None = "0018_portfolios"
 branch_labels: str | tuple[str, ...] | None = None
 depends_on: str | tuple[str, ...] | None = None
 

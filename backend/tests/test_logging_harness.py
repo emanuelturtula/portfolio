@@ -44,7 +44,6 @@ from tests.cli import test_backup_commands
 from tests.db import conftest as db_conftest
 from tests.logging_harness import logging_state, preserved_logging
 from tests.security import conftest as security_conftest
-from tests.security.conftest import PRODUCTION_ORIGIN
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -72,7 +71,6 @@ def production_settings() -> Settings:
     """The settings the Raspberry Pi logs with, clear of the production cost floor."""
     return Settings(
         environment="prod",
-        allowed_origin=PRODUCTION_ORIGIN,
         argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
         argon2_time_cost=OWASP_MINIMUM_TIME_COST,
     )
@@ -80,7 +78,7 @@ def production_settings() -> Settings:
 
 def development_settings() -> Settings:
     """The settings a developer's machine logs with, and the renderer that hid the hazard."""
-    return Settings(environment="dev", allowed_origin=PRODUCTION_ORIGIN)
+    return Settings(environment="dev")
 
 
 def structlog_defaults() -> dict[str, object]:

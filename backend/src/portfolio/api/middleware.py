@@ -7,12 +7,16 @@ covered, and that an endpoint added tomorrow is protected by default rather than
 someone remembers.
 
 **Write guard.** For any method outside `GET`, `HEAD` and `OPTIONS` the request must
-carry an `Origin` equal to the configured one, and a `Content-Type` of `application/json`.
-The content-type rule is the one that does the work: a form-encoded POST is the shape an
-HTML form on any site can send cross-origin with no preflight, so refusing anything but
-JSON is what makes a cross-site write impossible rather than merely unlikely. A missing
-`Origin` is refused too -- every browser sends one on a non-GET request, so its absence
-identifies a non-browser client, which this API does not serve.
+carry a `Content-Type` of `application/json`. A form-encoded POST is the shape an HTML form
+on any site can send cross-origin with no preflight; a JSON one needs a CORS preflight that
+this application never answers, so refusing anything but JSON is what makes a cross-site
+write impossible rather than merely unlikely. `SameSite=Lax` on the session cookie is a
+second, independent reason a cross-site POST arrives unauthenticated.
+
+There is no `Origin` check. It used to require one configured origin, and the deployment
+is reached at two -- through a tunnel over HTTPS, and at the host's address on the home
+network -- so it refused every sign-in on the second. The content-type rule was already
+the one doing the work.
 
 **Authentication.** Every path under `/api` that is not in `PUBLIC_API_PATHS` requires a
 valid session. Everything outside `/api` is the static SPA bundle, which carries no data
@@ -37,6 +41,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from portfolio.api.dependencies import auth_service_for
 from portfolio.api.errors import ForbiddenError, UnauthorizedError, problem_response
+from portfolio.api.session_cookie import read_session_token
 from portfolio.services.auth import SESSION_REQUIRED_DETAIL, SessionInvalidError
 
 if TYPE_CHECKING:
@@ -45,10 +50,8 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
     from starlette.requests import Request
     from starlette.responses import Response
-    from starlette.types import ASGIApp
 
     from portfolio.api.errors import AppError
-    from portfolio.config import Settings
 
 API_PREFIX: Final = "/api"
 
@@ -63,7 +66,6 @@ these two, so widening it is a visible decision in a diff rather than a quiet on
 SAFE_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD", "OPTIONS"})
 JSON_MEDIA_TYPE: Final = "application/json"
 
-ORIGIN_REJECTED_DETAIL: Final = "The request origin is missing or not allowed."
 CONTENT_TYPE_REJECTED_DETAIL: Final = "Requests that change state must be JSON."
 
 LOGGED_PATH_LIMIT: Final = 256
@@ -125,11 +127,7 @@ def logged_path(path: str) -> dict[str, str | int | bool]:
 
 
 class RequestGuardMiddleware(BaseHTTPMiddleware):
-    """Origin and content-type enforcement, then deny-by-default authentication."""
-
-    def __init__(self, app: ASGIApp, *, settings: Settings) -> None:
-        super().__init__(app)
-        self._settings = settings
+    """Content-type enforcement, then deny-by-default authentication."""
 
     async def dispatch(
         self,
@@ -153,13 +151,6 @@ class RequestGuardMiddleware(BaseHTTPMiddleware):
         if request.method in SAFE_METHODS:
             return None
 
-        # A missing header reads as `None`, which is never equal to the configured origin,
-        # so absence and mismatch are one comparison and one answer. They are deliberately
-        # not told apart: a missing `Origin` on a non-GET request identifies a non-browser
-        # client, and this API serves exactly one browser.
-        if request.headers.get("origin") != self._settings.allowed_origin:
-            return self._refuse(request, ForbiddenError(ORIGIN_REJECTED_DETAIL), "origin")
-
         if media_type_of(request.headers.get("content-type", "")) != JSON_MEDIA_TYPE:
             return self._refuse(
                 request,
@@ -170,7 +161,7 @@ class RequestGuardMiddleware(BaseHTTPMiddleware):
 
     async def _authenticate(self, request: Request) -> Response | None:
         """Attach the principal to the request, or return the 401 that replaces it."""
-        token = request.cookies.get(self._settings.session_cookie_name)
+        token = read_session_token(request)
         if not token:
             # Answered without opening a database session: an unauthenticated scan must
             # not be able to make the server do work.

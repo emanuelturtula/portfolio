@@ -108,11 +108,11 @@ describe('DashboardPage: the figure', () => {
     );
   });
 
-  it('shows no invested figure and no profit or loss', async () => {
+  it('keeps what was invested out of the figure, in a section of its own', async () => {
     openDashboard(VALUED_SUMMARY);
     await loaded();
 
-    expect(screen.queryByRole('region', { name: 'Invested' })).not.toBeInTheDocument();
+    expect(await screen.findByRole('region', { name: 'Invested' })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'Profit / loss' })).not.toBeInTheDocument();
   });
 });

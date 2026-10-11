@@ -43,6 +43,7 @@ __all__ = [
     "HistoryRange",
     "WalletDay",
     "WalletReadings",
+    "asset_days",
     "days_of",
     "portfolio_days",
     "wallet_days",
@@ -151,6 +152,23 @@ def portfolio_days(
                 total = add(total, value)
         points.append(DayValue(day=day, value=total if known and priced else None))
     return tuple(points)
+
+
+def asset_days(
+    days: Sequence[date],
+    wallets: Sequence[WalletReadings],
+    prices: Mapping[str, Mapping[date, Decimal]],
+) -> dict[str, tuple[DayValue, ...]]:
+    """Each asset's value at the end of each day, keyed by asset (spec 041, R7).
+
+    An asset's value is `portfolio_days` over its own wallets alone, so R3 and R4 hold for it
+    as they hold for the total: `None` before any of its wallets was read, and `None` on a
+    day one of them held something with no price.
+    """
+    by_asset: dict[str, list[WalletReadings]] = {}
+    for wallet in wallets:
+        by_asset.setdefault(wallet.asset, []).append(wallet)
+    return {asset: portfolio_days(days, by_asset[asset], prices) for asset in sorted(by_asset)}
 
 
 def wallet_days(

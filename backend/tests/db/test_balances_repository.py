@@ -868,3 +868,36 @@ async def test_a_real_database_failure_is_left_as_itself(
 
     assert not isinstance(caught.value, SnapshotConstraintError)
     assert "balance_snapshots" in str(caught.value.orig)
+
+
+# --------------------------------------------------------------------------------------
+# What a wallet held at a past instant (spec 041, R3)
+# --------------------------------------------------------------------------------------
+
+
+async def test_at_or_before_is_the_latest_snapshot_up_to_the_instant_inclusive(
+    session: AsyncSession,
+    repository: BalanceRepository,
+    wallet_id: int,
+    run_id: int,
+) -> None:
+    """Three readings an hour apart: an instant on the second is the second, inclusive."""
+    for hours, confirmed in ((0, NINE_COINS), (1, ELEVEN_COINS), (2, NINE_COINS)):
+        run = run_id if hours == 0 else await insert_run(session, started_at=NOON)
+        await repository.record(
+            wallet_id=wallet_id,
+            sync_run_id=run,
+            confirmed=confirmed,
+            pending=None,
+            decimals=BITCOIN_DECIMALS,
+            observed_at=NOON + timedelta(hours=hours),
+        )
+    await session.commit()
+
+    at_second = await repository.latest_at_or_before([wallet_id], NOON + timedelta(hours=1))
+    before_first = await repository.latest_at_or_before([wallet_id], NOON - timedelta(seconds=1))
+
+    assert at_second[wallet_id].confirmed == ELEVEN_COINS
+    assert at_second[wallet_id].observed_at == NOON + timedelta(hours=1)
+    assert before_first == {}
+    assert await repository.latest_at_or_before([], NOON) == {}

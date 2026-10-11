@@ -9,6 +9,7 @@ import { keepPreviousData, useQuery, type UseQueryResult } from '@tanstack/react
 
 import { apiFetch } from '@/api/client';
 import type { components } from '@/api/generated/schema';
+import { usePortfolioScope, withPortfolio } from '@/lib/portfolioScope';
 
 export type HistoryRange = components['schemas']['HistoryRange'];
 export type PortfolioHistory = components['schemas']['PortfolioHistoryResponse'];
@@ -41,8 +42,8 @@ const REFETCH_INTERVAL_MS = 60_000;
  * Under `['portfolio', ...]`, the prefix a balance sync and a wallet change invalidate: both
  * change what a day is worth.
  */
-export function portfolioHistoryQueryKey(range: HistoryRange) {
-  return ['portfolio', 'history', range] as const;
+export function portfolioHistoryQueryKey(range: HistoryRange, scope: number | null = null) {
+  return ['portfolio', 'history', range, scope] as const;
 }
 
 export function walletValueHistoryQueryKey(walletId: number, range: HistoryRange) {
@@ -56,10 +57,13 @@ export function walletValueHistoryQueryKey(walletId: number, range: HistoryRange
  * chart does not collapse to a loading line and back each time the owner changes the range.
  */
 export function usePortfolioHistory(range: HistoryRange): UseQueryResult<PortfolioHistory> {
+  const { scope } = usePortfolioScope();
   return useQuery({
-    queryKey: portfolioHistoryQueryKey(range),
+    queryKey: portfolioHistoryQueryKey(range, scope),
     queryFn: ({ signal }) =>
-      apiFetch<PortfolioHistory>(`${PORTFOLIO_HISTORY_PATH}?range=${range}`, { signal }),
+      apiFetch<PortfolioHistory>(withPortfolio(`${PORTFOLIO_HISTORY_PATH}?range=${range}`, scope), {
+        signal,
+      }),
     placeholderData: keepPreviousData,
     refetchInterval: REFETCH_INTERVAL_MS,
   });

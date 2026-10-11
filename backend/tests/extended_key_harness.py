@@ -44,6 +44,7 @@ from tests.extended_key_vectors import (
     SCAN_USED_CHANGE,
     SCAN_USED_RECEIVE,
 )
+from tests.portfolio_harness import main_portfolio
 from tests.providers.chains.harness import esplora_settings
 
 if TYPE_CHECKING:
@@ -245,14 +246,16 @@ async def insert_key_wallet(
     `tests/balance_harness.py`'s `insert_wallet` leaves `kind` to the column's default,
     which is `address`; this is the one place a test writes the other kind.
     """
+    portfolio_id = await main_portfolio(session, user_id)
     result = await session.execute(
         text(
             "INSERT INTO wallets (user_id, chain_key, address_canonical, address_display, "
-            "label, archived_at, created_at, updated_at, kind) "
+            "label, archived_at, created_at, updated_at, kind, portfolio_id) "
             "VALUES (:user_id, 'bitcoin', :key, :key, NULL, :archived_at, :now, :now, "
-            "'extended_key') RETURNING id"
+            "'extended_key', :portfolio_id) RETURNING id"
         ),
         {
+            "portfolio_id": portfolio_id,
             "user_id": user_id,
             "key": key,
             "archived_at": sqlite_timestamp(created_at) if archived else None,

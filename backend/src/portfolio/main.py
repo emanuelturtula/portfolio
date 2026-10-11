@@ -18,7 +18,17 @@ from portfolio.api.dependencies import auth_service_for, install_auth_runtime
 from portfolio.api.errors import register_exception_handlers
 from portfolio.api.middleware import API_PREFIX, RequestGuardMiddleware, is_api_path
 from portfolio.api.request_context import RequestContextMiddleware, documentation_paths
-from portfolio.api.routers import auth, balances, exports, health, history, portfolio, wallets
+from portfolio.api.routers import (
+    auth,
+    balances,
+    exchange_operations,
+    exports,
+    health,
+    history,
+    portfolio,
+    portfolios,
+    wallets,
+)
 from portfolio.config import get_settings
 from portfolio.db.alembic_config import upgrade_to_head
 from portfolio.db.engine import (
@@ -35,7 +45,7 @@ from portfolio.logging import configure_logging
 from portfolio.providers import chains as _registered_chain_providers  # noqa: F401
 from portfolio.providers.http import build_http_client
 from portfolio.providers.prices.coinbase import CoinbaseDailyCloses
-from portfolio.providers.prices.kraken import KrakenDailyCloses
+from portfolio.providers.prices.kraken import KrakenDailyCloses, KrakenHourlyCloses
 from portfolio.providers.prices.registry import price_sources
 from portfolio.providers.registry import get_chain_provider
 from portfolio.repositories.price_history import PriceHistoryRepository
@@ -46,6 +56,7 @@ from portfolio.services.backup import BackupService, build_backup_service
 from portfolio.services.balance_rebuild import RebuildOutcome, build_balance_rebuild_service
 from portfolio.services.balance_sync import build_balance_sync_service
 from portfolio.services.price_backfill import build_price_backfill_service
+from portfolio.services.price_hourly import build_hourly_price_service
 from portfolio.services.price_refresh import build_price_refresh_service
 from portfolio.services.scheduler import IntervalScheduler
 from portfolio.services.sync_coordinator import SyncCoordinator, SyncTrigger
@@ -63,6 +74,7 @@ if TYPE_CHECKING:
     from portfolio.services.balance_rebuild import RebuildReport
     from portfolio.services.password_hasher import PasswordHasher
     from portfolio.services.price_backfill import BackfillReport
+    from portfolio.services.price_hourly import HourlyReport
     from portfolio.services.price_refresh import RefreshReport
     from portfolio.services.sync_coordinator import SyncRunner
 
@@ -366,11 +378,17 @@ def price_scheduler_for(
     Its own switch and its own interval rather than sharing the balance pair: the two answer
     to different vendors, and an operator waiting out a chain outage should not also stop
     valuing the balances they already have.
+
+    After the refresh, each tick stores the hourly closes that are new (spec 041): an hour's
+    close appears once an hour, which is this timer's cadence, and the change over 24 hours
+    needs the hour that ended a day ago. Its own session, so a failure in one leaves the
+    other's commit standing.
     """
     if not settings.price_refresh_enabled:
         _logger.info("scheduler_disabled", scheduler="price-refresh")
         return None
     sources = price_sources(client, settings=settings)
+    hourly = KrakenHourlyCloses(client)
 
     async def run(at_startup: bool) -> None:
         del at_startup  # A refresh is the same work whenever it happens; nothing records it.
@@ -379,6 +397,9 @@ def price_scheduler_for(
             service = build_price_refresh_service(session, sources=sources)
             report = await service.refresh_prices()
         _report_price_refresh(report)
+        async with sessionmaker() as session:
+            hours = await build_hourly_price_service(session, source=hourly).record()
+        _report_hourly_prices(hours)
 
     return IntervalScheduler(
         name="price-refresh",
@@ -411,6 +432,18 @@ def _report_price_refresh(report: RefreshReport) -> None:
         )
         return
     _logger.info("price_refresh_finished", refreshed=len(report.refreshed))
+
+
+def _report_hourly_prices(report: HourlyReport) -> None:
+    """Log what one hourly-close run did: counts and pairs, never a price."""
+    failed = tuple(
+        f"{entry.asset_symbol}/{entry.quote_currency} via {entry.source}" for entry in report.failed
+    )
+    hours = sum(entry.hours for entry in report.stored)
+    if failed:
+        _logger.warning("price_hourly_incomplete", hours=hours, failed=failed)
+        return
+    _logger.info("price_hourly_finished", hours=hours)
 
 
 def price_backfill_scheduler_for(
@@ -682,7 +715,7 @@ def create_app() -> FastAPI:
 
     # Middleware runs before routing, which is the whole point: a check that ran after
     # routing would see an API request only when a route happened to exist for it.
-    app.add_middleware(RequestGuardMiddleware, settings=settings)
+    app.add_middleware(RequestGuardMiddleware)
     # Added last, so it is the outermost of the application's own middleware: the request id
     # it binds reaches the guard above, every route, and the 500 handler outside them all
     # (#23). A pure ASGI middleware, for the reason `api/request_context.py` gives. It labels
@@ -705,6 +738,12 @@ def create_app() -> FastAPI:
     # Full paths, like the balance router's: `/portfolio/history` beside `/portfolio/summary`,
     # and `/wallets/{wallet_id}/value-history` beside the wallet routes, none colliding.
     app.include_router(history.router, prefix=API_PREFIX)
+    # Spec 042: the uploaded exchange operations, and the invested figures built on them.
+    app.include_router(exchange_operations.router, prefix=API_PREFIX)
+    # Spec 044: the named groups every wallet and operation is filed in. `/portfolios` beside
+    # the dashboard's `/portfolio/...`, none colliding.
+    app.include_router(portfolios.router, prefix=API_PREFIX)
+    # Spec 040: the monthly reminder to export each exchange's transactions by hand.
     app.include_router(exports.router, prefix=API_PREFIX)
 
     # Mounted last and at the root: it matches every path outside `/api`, so a route

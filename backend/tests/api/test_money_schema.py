@@ -404,6 +404,19 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         # nothing can value a `null`.
         "/api/portfolio/history",
         "/api/wallets/{wallet_id}/value-history",
+        # The change over 24 hours and 7 days (spec 041): every amount and percentage a
+        # string, and a change nothing can work out a `null` with its reason.
+        "/api/portfolio/changes",
+        # Exchange operations and what was invested (spec 042): every quantity, amount and
+        # profit a string, and a figure nothing can work out a `null` with its reason.
+        "/api/exchange-operations",
+        "/api/exchange-operations/imports",
+        "/api/exchange-operations/{operation_id}",
+        "/api/investment",
+        # Portfolios (spec 044): names and counts, no money; moving operations answers a count.
+        "/api/portfolios",
+        "/api/portfolios/{portfolio_id}",
+        "/api/exchange-operations/move",
         # The monthly export reminder (spec 040): months as `YYYY-MM` and exchange names. No
         # money crosses it.
         "/api/exports/reminder",
@@ -423,6 +436,18 @@ MONEY_PROPERTIES: Final = frozenset(
         "amount",
         "confirmed",
         "pending",
+        "value_then",
+        "change",
+        "change_pct",
+        # Spec 042.
+        "quote_amount",
+        "fee_amount",
+        "invested",
+        "pnl",
+        "pnl_pct",
+        "held",
+        "explained",
+        "difference",
     }
 )
 

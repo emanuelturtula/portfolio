@@ -32,13 +32,26 @@ export function daysEnding(count: number, end: string = HISTORY_TODAY): string[]
   );
 }
 
-/** A portfolio history with one point per value, ending today. */
+/**
+ * A portfolio history with one point per value, ending today. `byAsset` gives each asset's own
+ * value per day (spec 041), aligned with `values`; without it the history carries no asset.
+ */
 export function portfolioHistory(
   values: readonly (string | null)[],
   range: HistoryRange = '90d',
+  byAsset: Readonly<Record<string, readonly (string | null)[]>> = {},
 ): PortfolioHistory {
   const days = daysEnding(values.length);
-  return { range, points: days.map((day, index) => ({ day, value: values[index] ?? null })) };
+  const assets = Object.keys(byAsset).sort();
+  return {
+    range,
+    assets,
+    points: days.map((day, index) => ({
+      day,
+      value: values[index] ?? null,
+      assets: Object.fromEntries(assets.map((asset) => [asset, byAsset[asset]?.[index] ?? null])),
+    })),
+  };
 }
 
 /** What the backend answers before anything could be valued: every day of the range `null`. */

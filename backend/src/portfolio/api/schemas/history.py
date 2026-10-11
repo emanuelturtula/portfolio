@@ -6,6 +6,7 @@ a day nothing can value is `null`, never `"0"`.
 
 from __future__ import annotations
 
+from collections.abc import Mapping  # noqa: TC003
 from datetime import date
 
 from pydantic import BaseModel
@@ -27,29 +28,50 @@ __all__ = [
 
 
 class PortfolioPointResponse(BaseModel):
-    """The wallets' value at the end of `day`, in USDT. `null` when it cannot be known."""
+    """The wallets' value at the end of `day`, in USDT. `null` when it cannot be known.
+
+    `assets` is each asset's own value that day, keyed by the response's `assets`, and `null`
+    for an asset by the same rule (spec 041, R7).
+    """
 
     day: date
     value: MoneyStr | None
+    assets: dict[str, MoneyStr | None]
 
     @classmethod
-    def of(cls, point: DayValue) -> PortfolioPointResponse:
-        """Render one day."""
-        return cls(day=point.day, value=point.value)
+    def of(cls, point: DayValue, assets: Mapping[str, DayValue]) -> PortfolioPointResponse:
+        """Render one day, with each asset's point of the same day."""
+        return cls(
+            day=point.day,
+            value=point.value,
+            assets={asset: day.value for asset, day in assets.items()},
+        )
 
 
 class PortfolioHistoryResponse(BaseModel):
-    """Every active wallet together, one point per day of `range`, oldest first."""
+    """Every active wallet together, one point per day of `range`, oldest first.
+
+    `assets` names the asset of every active wallet, sorted: the series a chart can draw
+    beside the total.
+    """
 
     range: HistoryRange
+    assets: list[str]
     points: list[PortfolioPointResponse]
 
     @classmethod
     def of(cls, history: PortfolioHistory) -> PortfolioHistoryResponse:
         """Render the service's history."""
+        assets = sorted(history.by_asset)
         return cls(
             range=history.history_range,
-            points=[PortfolioPointResponse.of(point) for point in history.points],
+            assets=assets,
+            points=[
+                PortfolioPointResponse.of(
+                    point, {asset: history.by_asset[asset][index] for asset in assets}
+                )
+                for index, point in enumerate(history.points)
+            ],
         )
 
 

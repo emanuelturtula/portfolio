@@ -1018,9 +1018,11 @@ numbers:
 
 The endpoints are read from the four modules under `providers/prices/`. The refresh asks each
 source for the current price only, so none of the four tables below has a retention window to
-record. **History is asked of one vendor, Kraken, and only by the price backfill** (spec 037):
-its endpoint, its window and what was confirmed about it are in the second Kraken table and in
-*Kraken's daily candles, confirmed and measured on 2026-10-08*, below.
+record. **History is asked of Kraken by the price backfill** (spec 037): its endpoint, its window
+and what was confirmed about it are in the second Kraken table and in *Kraken's daily candles,
+confirmed and measured on 2026-10-08*, below. **The hourly price timer also asks Kraken for
+hourly candles** (spec 041), in the third Kraken table. Coinbase's daily candles reach further
+back for BTC (spec 038).
 
 #### Kraken, the primary
 
@@ -1052,6 +1054,22 @@ detail beneath each status is in *Kraken's daily candles, confirmed and measured
 | retention window | the 720 most recent entries, and nothing older, whatever `since` says | **confirmed** 2026-10-08, quoted below; **measured** 2026-10-08 |
 | a close, once committed | assumed never to change | **unverified**: nothing documents it either way. The backfill rewrites every day it receives, every day, so a correction inside the window would be picked up |
 | rate limit | per-API-key call counters are documented; a public, unauthenticated call is not addressed | **confirmed** 2026-10-08, Kraken's Spot REST rate-limit guide. **Not measured**. Two calls a day, at the shared one-request-a-second floor |
+
+#### Kraken's hourly candles, for the change over 24 hours and 7 days
+
+Read by `KrakenHourlyCloses` in `providers/prices/kraken.py`, by the hourly price timer after
+each refresh (spec 041). The same endpoint as the daily candles, at another documented
+interval, so every row of the table above holds for it except these.
+
+| | What the code uses or assumes | Status |
+|---|---|---|
+| endpoint | `GET https://api.kraken.com/0/public/OHLC?pair=<code>&interval=60`, one pair per call, labelled `asset_hourly_closes` | **confirmed** 2026-10-10, Kraken's API reference; **measured** 2026-10-10 |
+| `interval` | `60` minutes, one of the documented options listed above | **confirmed** 2026-10-10 |
+| a candle's hour | `time`, the candle's open. Every `time` measured is on the hour; any other is refused | **measured** 2026-10-10: 721 entries for `XXBTZUSD` and for `KASUSD`, none missing; the refusal is spec 041, R1 |
+| the last entry | the current hour, still trading. Never stored | **confirmed** 2026-10-10, the same wording as for the daily candles; **measured** 2026-10-10, `last` was the hour before the final entry |
+| retention window | the 720 most recent entries: 30 days of hours | **confirmed** 2026-10-10; **measured** 2026-10-10 |
+| a close, once committed | assumed never to change, so a stored hour is never rewritten | **unverified**, as for the daily candles |
+| rate limit | as for the daily candles. Two calls an hour | **Not measured** |
 
 #### Coinbase Exchange's daily candles, for BTC before Kraken's window
 
@@ -1149,6 +1167,12 @@ counts successes when deciding whether to run at startup (the newest `close` row
 `recorded_at`), so while both pairs fail a crash loop costs two calls per restart; one pair
 answering is enough to stop that. Nothing falls back from Kraken for the backfill: a pair it
 cannot read is reported and retried by the next day's run.
+
+**The hourly candles (spec 041) ride on the refresh's timer.** One request per pair per tick,
+two pairs, 24 ticks a day: 48 a day and 48 × 30 = 1,440 a month. With the refresh and the
+backfill that is 2,220 Kraken requests in a 30-day month, about three an hour, still far under
+the one-a-second floor. Nothing falls back from Kraken for them either: a pair it cannot read
+is a warning, and the change widget says the price is missing until a later tick stores it.
 
 **The issue's premise about the budget turned out not to hold, and the conclusion still
 does.** #9 was written around CoinGecko's Demo quota — roughly 10,000 calls a month, about 13

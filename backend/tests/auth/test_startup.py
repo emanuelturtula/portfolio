@@ -1,4 +1,4 @@
-"""Criterion 12, and the two other configurations the application refuses to start on.
+"""Criterion 12, and the other configurations the application refuses to start on.
 
 Refusing at settings construction rather than at first use is the point. A container that
 starts and then behaves badly passes its health check, stays up, and is discovered by a
@@ -14,12 +14,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from portfolio.config import (
-    DEV_ALLOWED_ORIGIN,
-    INSECURE_SESSION_COOKIE_NAME,
-    Settings,
-    get_settings,
-)
+from portfolio.config import Settings, get_settings
 from portfolio.db.models import User
 from portfolio.domain.passwords import OWASP_MINIMUM_MEMORY_COST, OWASP_MINIMUM_TIME_COST
 from portfolio.main import create_app
@@ -27,10 +22,6 @@ from tests.auth.conftest import OWNER_PHRASE, OWNER_USERNAME, apply_auth_environ
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-# Fictional, and never a real hostname: rule 3 keeps infrastructure out of the repository.
-PRODUCTION_ORIGIN = "https://portfolio.example"
-PLAIN_HTTP_ORIGIN = "http://portfolio.example:8083"
 
 
 def build_settings(monkeypatch: pytest.MonkeyPatch, value: str) -> Settings:
@@ -90,72 +81,6 @@ def test_no_bootstrap_password_is_a_valid_configuration(monkeypatch: pytest.Monk
     assert Settings().bootstrap_password is None
 
 
-def test_prod_refuses_an_insecure_session_cookie() -> None:
-    """Criterion 5's interpretation: an HTTPS deployment cannot drop `Secure`.
-
-    On an `https://` origin the flag costs nothing and the `__Host-` prefix guarantees no
-    other host on the domain set the cookie, so turning it off there is a mistake and is
-    refused. The one origin that is exempt is `http://`, below.
-    """
-    with pytest.raises(ValidationError, match="PORTFOLIO_SESSION_COOKIE_SECURE"):
-        Settings(
-            environment="prod",
-            session_cookie_secure=False,
-            allowed_origin=PRODUCTION_ORIGIN,
-        )
-
-
-def test_prod_accepts_an_insecure_session_cookie_on_a_plain_http_origin() -> None:
-    """A deployment reached over plain HTTP on the LAN has no working `Secure` cookie.
-
-    A browser drops a `Secure` cookie that arrives over `http://` from any host but
-    `localhost`, so the flag would make sign-in impossible rather than safe. The operator
-    who serves that way says so twice, in the origin and in the flag, and the cookie name
-    degrades with it because `__Host-` is invalid without `Secure`.
-    """
-    settings = Settings(
-        environment="prod",
-        session_cookie_secure=False,
-        allowed_origin=PLAIN_HTTP_ORIGIN,
-    )
-
-    assert settings.session_cookie_secure is False
-    assert settings.session_cookie_name == INSECURE_SESSION_COOKIE_NAME
-
-
-@pytest.mark.parametrize(
-    "origin",
-    [
-        "ftp://portfolio.example",
-        "portfolio.example",
-        "",
-        # Forms a URL parser would read as `http` but that a browser never sends as an
-        # `Origin`, so they cannot be a working plain-HTTP deployment.
-        "HTTP://portfolio.example",
-        "http:portfolio.example",
-    ],
-)
-def test_prod_refuses_an_insecure_cookie_on_an_origin_that_is_not_http(origin: str) -> None:
-    """Only an origin that starts with the literal `http://` earns the exemption.
-
-    A scheme-less or mistyped origin can never equal what a browser sends, so it must not
-    be able to switch the cookie's protection off on the way to being wrong.
-    """
-    with pytest.raises(ValidationError, match="PORTFOLIO_SESSION_COOKIE_SECURE"):
-        Settings(environment="prod", session_cookie_secure=False, allowed_origin=origin)
-
-
-def test_prod_refuses_the_development_allowed_origin() -> None:
-    """An unset origin in production rejects every write with a 403 and says why nowhere.
-
-    The symptom -- "login works, nothing else does" -- does not name its cause, so the
-    configuration is refused at startup instead of being discovered from a browser
-    console.
-    """
-    with pytest.raises(ValidationError, match="PORTFOLIO_ALLOWED_ORIGIN"):
-        Settings(environment="prod", allowed_origin=DEV_ALLOWED_ORIGIN)
-
-
 def test_prod_refuses_argon2_parameters_below_the_owasp_floor() -> None:
     """The floor is enforced, not merely documented and asserted against the defaults.
 
@@ -170,14 +95,12 @@ def test_prod_refuses_argon2_parameters_below_the_owasp_floor() -> None:
     with pytest.raises(ValidationError, match="PORTFOLIO_ARGON2_MEMORY_COST"):
         Settings(
             environment="prod",
-            allowed_origin=PRODUCTION_ORIGIN,
             argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST - 1,
         )
 
     with pytest.raises(ValidationError, match="PORTFOLIO_ARGON2_TIME_COST"):
         Settings(
             environment="prod",
-            allowed_origin=PRODUCTION_ORIGIN,
             argon2_time_cost=OWASP_MINIMUM_TIME_COST - 1,
         )
 
@@ -186,7 +109,6 @@ def test_prod_accepts_parameters_exactly_at_the_floor() -> None:
     """The boundary, in the direction a `>` typo would break: at the floor is acceptable."""
     settings = Settings(
         environment="prod",
-        allowed_origin=PRODUCTION_ORIGIN,
         argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
         argon2_time_cost=OWASP_MINIMUM_TIME_COST,
     )
@@ -207,12 +129,15 @@ def test_dev_may_run_below_the_floor() -> None:
     assert settings.argon2_memory_cost == 64
 
 
-def test_prod_accepts_a_deployed_origin_and_a_secure_cookie() -> None:
-    """The configuration production is meant to run: both refusals stay quiet."""
-    settings = Settings(environment="prod", allowed_origin=PRODUCTION_ORIGIN)
+def test_prod_needs_no_origin_and_no_cookie_flag() -> None:
+    """The deployment is reached at more than one origin, so neither is configured.
 
-    assert settings.session_cookie_secure is True
-    assert settings.session_cookie_name.startswith("__Host-")
+    Both used to be required, and a `secrets.env` that still sets them must not stop the
+    container: unknown `PORTFOLIO_*` variables are ignored.
+    """
+    settings = Settings(_env_file=None, environment="prod")
+
+    assert settings.environment == "prod"
 
 
 async def test_bootstrap_creates_the_user_only_when_none_exists(

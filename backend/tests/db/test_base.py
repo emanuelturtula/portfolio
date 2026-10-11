@@ -35,6 +35,9 @@ EXPECTED_NAMES = {
         "ck_wallets_kind_chain",
         "fk_wallets_user_id_users",
         "ix_wallets_user_id",
+        # Spec 044. Every wallet is in one portfolio, and a portfolio's reads go through it.
+        "fk_wallets_portfolio_id_portfolios",
+        "ix_wallets_portfolio_id",
     },
     # #9. `uq_prices_asset_currency` is named explicitly for the same reason
     # `uq_wallets_user_chain_address` is: the convention would render
@@ -108,6 +111,33 @@ EXPECTED_NAMES = {
         "ck_price_history_quote_currency",
         "ck_price_history_basis",
         "fk_price_history_asset_id_assets",
+    },
+    "price_hourly": {
+        "pk_price_hourly",
+        "uq_price_hourly_asset_hour",
+        "ck_price_hourly_quote_currency",
+        "fk_price_hourly_asset_id_assets",
+    },
+    # Spec 042. The listing reads one owner's operations newest first, through the index.
+    "exchange_imports": {"pk_exchange_imports", "fk_exchange_imports_user_id_users"},
+    "exchange_operations": {
+        "pk_exchange_operations",
+        "uq_exchange_operations_source_id",
+        "ck_exchange_operations_kind",
+        "ck_exchange_operations_manual",
+        "fk_exchange_operations_user_id_users",
+        "fk_exchange_operations_import_id_exchange_imports",
+        "ix_exchange_operations_user_executed",
+        # Spec 044.
+        "fk_exchange_operations_portfolio_id_portfolios",
+        "ix_exchange_operations_portfolio_id",
+    },
+    # Spec 044. A name is unique per owner; the owner's portfolios are read through the
+    # unique constraint, which leads with `user_id`, so there is no separate index.
+    "portfolios": {
+        "pk_portfolios",
+        "uq_portfolios_user_name",
+        "fk_portfolios_user_id_users",
     },
 }
 

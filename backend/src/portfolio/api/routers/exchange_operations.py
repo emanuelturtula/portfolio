@@ -1,0 +1,258 @@
+"""The exchange-operation endpoints: upload an export, list, enter by hand, delete (spec 042),
+and the invested figures built on them.
+
+Thin on purpose: each route parses, calls a service and serializes. Recognising a format,
+deduplicating and every sum are the service's and the domain's.
+
+No path here is in `PUBLIC_API_PATHS`, so every one requires a session: the deny-by-default
+middleware's doing, not this module's. The upload is JSON, base64 inside, because the write
+guard lets only JSON change state (R12).
+"""
+
+from __future__ import annotations
+
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query, Response, status
+from pydantic import AwareDatetime
+
+from portfolio.api.dependencies import (
+    get_exchange_operation_service,
+    get_investment_service,
+    get_portfolio_scope,
+    get_principal,
+)
+from portfolio.api.errors import ConflictError, NotFoundError, UnprocessableEntityError
+from portfolio.api.schemas.exchange_operations import (
+    ImportRequest,
+    ImportResponse,
+    InvestmentResponse,
+    ManualOperationRequest,
+    MoveOperationsRequest,
+    MoveOperationsResponse,
+    OperationListResponse,
+    OperationResponse,
+)
+from portfolio.services.auth import Principal
+from portfolio.services.exchange_operations import (
+    ExchangeOperationService,
+    ManualOperation,
+    OperationFilter,
+    OperationNotFoundError,
+    OperationNotManualError,
+    PortfolioNotFoundError,
+    UploadRefusedError,
+)
+from portfolio.services.investment import InvestmentService
+
+# Declared here rather than imported from `api.dependencies`, for the reason the balance
+# router gives: FastAPI resolves these annotations at import time.
+CurrentPrincipal = Annotated[Principal, Depends(get_principal)]
+CurrentOperationService = Annotated[
+    ExchangeOperationService, Depends(get_exchange_operation_service)
+]
+CurrentInvestmentService = Annotated[InvestmentService, Depends(get_investment_service)]
+PortfolioScope = Annotated[int | None, Depends(get_portfolio_scope)]
+
+MAX_PAGE: int = 500
+MAX_FILTER_LENGTH: int = 80
+
+Since = Annotated[
+    AwareDatetime | None,
+    Query(description="Only operations at or after this instant. Needs an offset."),
+]
+Until = Annotated[
+    AwareDatetime | None,
+    Query(description="Only operations before this instant. Needs an offset."),
+]
+
+router = APIRouter(tags=["exchange operations"])
+
+
+@router.post(
+    "/exchange-operations/imports",
+    operation_id="importExchangeOperations",
+    summary="Upload an exchange's export, a CSV or a zip of them",
+    status_code=status.HTTP_201_CREATED,
+    response_model=ImportResponse,
+)
+async def import_operations(
+    body: ImportRequest,
+    principal: CurrentPrincipal,
+    service: CurrentOperationService,
+) -> ImportResponse:
+    """Store every operation of the upload not already stored, and say what each file held.
+
+    A file is recognised by its header row. One this importer does not read is reported as
+    skipped, with its row count. A row that cannot be read refuses the whole upload with a
+    422 naming the file and the line, and nothing is stored.
+    """
+    try:
+        report = await service.import_upload(
+            principal.user_id, body.filename, body.content_base64, body.portfolio_id
+        )
+    except UploadRefusedError as exc:
+        raise UnprocessableEntityError(str(exc)) from exc
+    except PortfolioNotFoundError as exc:
+        raise NotFoundError(str(exc)) from exc
+    return ImportResponse.of(report)
+
+
+@router.get(
+    "/exchange-operations",
+    operation_id="listExchangeOperations",
+    summary="The stored operations, newest first",
+    response_model=OperationListResponse,
+)
+async def list_operations(
+    principal: CurrentPrincipal,
+    service: CurrentOperationService,
+    scope: PortfolioScope,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    asset: Annotated[
+        str | None,
+        Query(min_length=1, max_length=MAX_FILTER_LENGTH, description="Only this asset."),
+    ] = None,
+    venue: Annotated[
+        str | None,
+        Query(
+            min_length=1,
+            max_length=MAX_FILTER_LENGTH,
+            description="Only this venue, as `venues` lists it.",
+        ),
+    ] = None,
+    since: Since = None,
+    until: Until = None,
+) -> OperationListResponse:
+    """One page of the stored operations, of every asset unless filtered, with how many the
+    filter keeps and every asset and venue there is to filter by.
+
+    A naive `since` or `until` is refused rather than assumed to be UTC, and so is a window
+    that ends at or before it starts.
+    """
+    if since is not None and until is not None and until <= since:
+        message = "`until` must be after `since`."
+        raise UnprocessableEntityError(message)
+    filters = OperationFilter(
+        portfolio_id=scope,
+        asset=asset.strip().upper() if asset is not None else None,
+        venue=venue,
+        since=since,
+        until=until,
+    )
+    page = await service.list_operations(
+        principal.user_id, limit=limit, offset=offset, filters=filters
+    )
+    return OperationListResponse.of(page)
+
+
+@router.post(
+    "/exchange-operations",
+    operation_id="createManualOperation",
+    summary="Record a buy, a sell, a reward or a network fee no export covers",
+    status_code=status.HTTP_201_CREATED,
+    response_model=OperationResponse,
+)
+async def create_manual_operation(
+    body: ManualOperationRequest,
+    principal: CurrentPrincipal,
+    service: CurrentOperationService,
+) -> OperationResponse:
+    """Store a manual entry, such as a swap inside a wallet app, a miner's payout or a
+    withdrawal's unlisted network fee. It can be deleted later."""
+    fee_asset = body.fee_asset.strip().upper() if body.fee_asset else None
+    try:
+        view = await service.add_manual(
+            principal.user_id,
+            ManualOperation(
+                venue=body.venue.strip(),
+                executed_at=body.executed_at,
+                kind=body.kind,
+                asset=body.asset.strip().upper(),
+                quantity=body.quantity,
+                quote_currency=(
+                    body.quote_currency.strip().upper() if body.quote_currency is not None else None
+                ),
+                quote_amount=body.quote_amount,
+                fee_asset=fee_asset if body.fee_amount is not None else None,
+                fee_amount=body.fee_amount if fee_asset is not None else None,
+                description=body.description.strip(),
+            ),
+            body.portfolio_id,
+        )
+    except PortfolioNotFoundError as exc:
+        raise NotFoundError(str(exc)) from exc
+    return OperationResponse.of(view)
+
+
+@router.delete(
+    "/exchange-operations/{operation_id}",
+    operation_id="deleteManualOperation",
+    summary="Delete a manual entry",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+async def delete_manual_operation(
+    operation_id: int,
+    principal: CurrentPrincipal,
+    service: CurrentOperationService,
+) -> Response:
+    """Delete one manual entry. An imported operation is a 409: re-uploading would bring it
+    back, so deleting it would only hide it until then."""
+    try:
+        await service.delete_manual(principal.user_id, operation_id)
+    except OperationNotFoundError as exc:
+        raise NotFoundError("No such operation.") from exc
+    except OperationNotManualError as exc:
+        raise ConflictError("Only a manual entry can be deleted.") from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/exchange-operations/move",
+    operation_id="moveExchangeOperations",
+    summary="Move every operation a filter keeps to another portfolio",
+    response_model=MoveOperationsResponse,
+)
+async def move_operations(
+    body: MoveOperationsRequest,
+    principal: CurrentPrincipal,
+    service: CurrentOperationService,
+) -> MoveOperationsResponse:
+    """File every operation the filters keep in `portfolio_id`, imported and manual alike
+    (spec 044, R7). The filters mean what they mean in the listing. Either portfolio not
+    being the caller's is a 404."""
+    filters = OperationFilter(
+        portfolio_id=body.from_portfolio,
+        asset=body.asset.strip().upper() if body.asset is not None else None,
+        venue=body.venue,
+        since=body.since,
+        until=body.until,
+    )
+    try:
+        moved = await service.move(principal.user_id, filters, body.portfolio_id)
+    except PortfolioNotFoundError as exc:
+        raise NotFoundError(str(exc)) from exc
+    return MoveOperationsResponse(moved=moved)
+
+
+@router.get(
+    "/investment",
+    operation_id="readInvestment",
+    summary="Invested, value, profit and loss, and the quantities the operations explain",
+    response_model=InvestmentResponse,
+)
+async def read_investment(
+    principal: CurrentPrincipal,
+    service: CurrentInvestmentService,
+    scope: PortfolioScope,
+) -> InvestmentResponse:
+    """The figures for the assets of the active wallets, from the stored operations.
+
+    **A figure that cannot be known is `null` with the reason in `unavailable`, never `"0"`**:
+    a trade not priced in a stablecoin, or an asset with no value now. Every amount is a JSON
+    string.
+    """
+    investment = await service.investment(principal.user_id, scope)
+    return InvestmentResponse.of(investment)

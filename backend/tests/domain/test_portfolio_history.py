@@ -17,6 +17,7 @@ from portfolio.domain.portfolio_history import (
     HistoryRange,
     WalletDay,
     WalletReadings,
+    asset_days,
     days_of,
     portfolio_days,
     wallet_days,
@@ -200,3 +201,39 @@ def test_a_reading_after_the_range_is_not_carried_backwards() -> None:
     points = wallet_days((D1, D2), readings("BTC", (D4, "1")), {D1: Decimal(1), D2: Decimal(1)})
 
     assert points == (WalletDay(D1, None, None), WalletDay(D2, None, None))
+
+
+# --------------------------------------------------------------------------------------
+# Each asset on its own (spec 041, R7)
+# --------------------------------------------------------------------------------------
+
+
+def test_each_asset_is_the_sum_of_its_own_wallets_by_the_same_rules() -> None:
+    """Two BTC wallets add up; KAS, read from D3 on, is `None` before and unpriced on D4."""
+    first = readings("BTC", (D1, "0.1"))
+    second = readings("BTC", (D2, "0.2"))
+    kas = readings("KAS", (D3, "1000"))
+    prices = {
+        "BTC": {D1: Decimal(60000), D2: Decimal(60000), D3: Decimal(61000), D4: Decimal(62000)},
+        "KAS": {D3: Decimal("0.05")},
+    }
+
+    by_asset = asset_days(DAYS, [kas, first, second], prices)
+
+    assert list(by_asset) == ["BTC", "KAS"]
+    assert by_asset["BTC"] == (
+        DayValue(D1, Decimal(6000)),
+        DayValue(D2, Decimal(18000)),
+        DayValue(D3, Decimal(18300)),
+        DayValue(D4, Decimal(18600)),
+    )
+    assert by_asset["KAS"] == (
+        DayValue(D1, None),
+        DayValue(D2, None),
+        DayValue(D3, Decimal(50)),
+        DayValue(D4, None),
+    )
+
+
+def test_no_wallets_is_no_assets() -> None:
+    assert asset_days(DAYS, [], {}) == {}

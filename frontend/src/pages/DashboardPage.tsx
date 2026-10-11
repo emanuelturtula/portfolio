@@ -8,8 +8,10 @@ import { ErrorState } from '@/components/ErrorState';
 import { Skeleton } from '@/components/Skeleton';
 import { describeMissing } from '@/lib/portfolio';
 import { BackupNotice } from '@/pages/dashboard/BackupNotice';
+import { ChangeSummary } from '@/pages/dashboard/ChangeSummary';
 import { ExportReminder } from '@/pages/dashboard/ExportReminder';
 import { Holdings } from '@/pages/dashboard/Holdings';
+import { InvestmentSummary } from '@/pages/dashboard/InvestmentSummary';
 import { TotalHero } from '@/pages/dashboard/TotalHero';
 import { PortfolioHistory } from '@/pages/dashboard/ValueHistory';
 
@@ -32,8 +34,12 @@ function isEmpty(summary: PortfolioSummary): boolean {
  * linked from that line and from the header. The Refresh that re-reads every balance sits in
  * the hero, beside the figure it refreshes, and says there how it went.
  *
- * The chart of the value over time (spec 037) has a query and four states of its own, inside
- * its card: a history that fails to load never takes the figures above it down with it.
+ * The change over 24 hours and 7 days (spec 041) and the chart of the value over time (spec
+ * 037) each have a query and four states of their own, inside their cards: one that fails to
+ * load never takes the figures above it down with it.
+ *
+ * What was invested and the gain or loss (spec 042) is a card of its own with its own query, after
+ * the change.
  *
  * Above everything, a warning when the scheduled backups failed or stopped (spec 029): it is
  * about the data underneath, not about any one figure. Below it, the monthly reminder to export
@@ -137,6 +143,8 @@ function Overview({ summary, sync }: OverviewProps) {
           </p>
         )}
       </TotalHero>
+      <ChangeSummary />
+      <InvestmentSummary />
       <PortfolioHistory />
       {data.holdings.length > 0 && <Holdings summary={data} />}
     </div>

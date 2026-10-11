@@ -457,10 +457,8 @@ world-readable. Changing it requires recreating the container, not restarting it
 ~/portfolio-app/prod/compose.sh up -d --force-recreate app
 ```
 
-Two of the variables in this file are authentication's. The application refuses to start in
-production without `PORTFOLIO_ALLOWED_ORIGIN`, so a deployment to a host whose file lacks it
-fails its health check and rolls back. `PORTFOLIO_BOOTSTRAP_PASSWORD` is optional. See
-[Operations](operations.md), section 1.
+One of the variables in this file is authentication's: `PORTFOLIO_BOOTSTRAP_PASSWORD`, which
+is optional. See [Operations](operations.md), section 1.
 
 ### 6. Enable deployment
 
@@ -599,7 +597,7 @@ not.
 | "Deployment failed; rollback=healthy; database=restored" | the same, but the candidate had migrated the database before it failed. The snapshot from before it was restored, and the previous version runs on it. Anything written since the snapshot is only in the safety copy `database_safety_copy` names, in the backups volume ([Rolling back](#rolling-back)). A `database_error` here says `restore-backup` failed after it had finished the restore, which stands |
 | "Deployment failed; rollback=healthy; database=not_restored" | the candidate failed, the attempt had no snapshot of its own with a revision to compare with, and the previous version started on the database as the candidate left it, so the candidate had not migrated it. Nothing to do about the database |
 | "Deployment failed; rollback=healthy; database=unread" | the candidate failed, and stopping it or reading the database's revision failed too, so nothing was compared or restored. The previous version started anyway, so the database is at a revision it knows. `database_error` in `failed/result.json` says what failed: a compose file compose rejects fails here, for one |
-| "Deployment failed; rollback=no_previous_deployment" | the first deployment on this host failed, for example on a `secrets.env` without `PORTFOLIO_ALLOWED_ORIGIN`. The candidate was taken down and the data volume kept |
+| "Deployment failed; rollback=no_previous_deployment" | the first deployment on this host failed, for example on a bootstrap password the policy refuses. The candidate was taken down and the data volume kept |
 | "Deployment failed; rollback=failed; database=restore_failed" | production is down. The candidate migrated the database, and putting the snapshot back failed, so the previous image was not started on a database it cannot read. `failed/result.json` has `rollback_error`, with what `restore-backup` refused or failed on. The snapshot is `failed/database.sqlite3`, and in the backups volume as well when `database_restored_from` names it. If the restore got as far as its safety copy, `database_safety_copy` names the copy holding the migrated database. Fix the cause and restore by hand, Operations, section 17, then start the application ([Rolling back](#rolling-back)) |
 | "Deployment failed; rollback=failed; database=not_restored" | production is down. The candidate most likely migrated the database, and the attempt had no snapshot of its own with a revision to put back, so the previous image cannot start on it. The newest copy from before it may be the one in `failed/database.sqlite3`, or a scheduled copy (`list-backups`): choose, and restore it by hand ([Rolling back](#rolling-back)) |
 | "Deployment failed; rollback=failed; database=unread" | production is down. Stopping the candidate or reading the database's revision failed (`database_error`), so nothing was restored, and the previous image did not come up either (`rollback_error`). If its log says `Can't locate revision identified by ...`, the candidate migrated the database: restore a copy from before it by hand, such as `failed/database.sqlite3` when there is one ([Rolling back](#rolling-back)) |

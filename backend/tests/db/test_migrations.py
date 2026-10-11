@@ -45,6 +45,8 @@ from portfolio.db.base import NAMING_CONVENTION
 from portfolio.db.models import (
     _ASSET_KIND_CHECK,
     _BALANCE_SNAPSHOT_CONFIRMED_CHECK,
+    _EXCHANGE_OPERATION_KIND_CHECK,
+    _EXCHANGE_OPERATION_MANUAL_CHECK,
     _PRICE_HISTORY_BASIS_CHECK,
     _PRICE_QUOTE_CURRENCY_CHECK,
     _RECONSTRUCTED_BALANCE_CONFIRMED_CHECK,
@@ -84,6 +86,13 @@ APPLICATION_TABLES = frozenset(
         "price_history",
         # Spec 038. Each wallet's closing balance per day, rebuilt from its transactions.
         "reconstructed_balances",
+        # Spec 041. One closing price per asset, quote currency and UTC hour.
+        "price_hourly",
+        # Spec 042. Every operation of the uploaded exchange exports, and the uploads.
+        "exchange_imports",
+        "exchange_operations",
+        # Spec 044. The named groups every wallet and operation is filed in.
+        "portfolios",
         # Spec 040. The months whose manual exchange exports the owner marked done.
         "export_months",
     }
@@ -156,8 +165,17 @@ PRICE_HISTORY_TABLES = frozenset({"price_history"})
 #: `0014_reconstructed_balances` takes it down as well, and each test subtracts it.
 RECONSTRUCTED_TABLES = frozenset({"reconstructed_balances"})
 
-#: Spec 040's one. Its revision sits on top of `0014`, so every single-step reversal below
-#: `0015_export_months` takes it down as well, and each test subtracts it.
+#: Spec 041's one. Its revision sits on top of `0014`, so every single-step reversal below
+#: `0015_price_hourly` takes it down as well, and each test subtracts it.
+HOURLY_TABLES = frozenset({"price_hourly"})
+
+#: Spec 042's two. Its revision sits on top of `0015`, so every single-step reversal below
+#: `0016_exchange_operations` takes them down as well, and each test subtracts them.
+OPERATION_TABLES = frozenset({"exchange_imports", "exchange_operations"})
+#: Spec 044's table, which every revision below `0018_portfolios` lacks.
+PORTFOLIO_TABLES = frozenset({"portfolios"})
+#: Spec 040's one. Its revision sits on top of `0018_portfolios`, so every single-step reversal
+#: below `0019_export_months` takes it down as well, and each test subtracts it.
 EXPORT_MONTH_TABLES = frozenset({"export_months"})
 
 #: Spec 036's revision, and the one below it: the last schema that has the tables it drops.
@@ -193,6 +211,8 @@ EXPECTED_CONSTRAINT_NAMES = {
         "ck_wallets_kind",
         "ck_wallets_kind_chain",
         "fk_wallets_user_id_users",
+        # Spec 044: the portfolio every wallet is filed in, with no cascade.
+        "fk_wallets_portfolio_id_portfolios",
     },
     # #9. `uq_prices_asset_currency` is what makes this the *current* price rather than a
     # history: the refresh upserts onto it. `ck_prices_quote_currency` is the only thing
@@ -249,6 +269,32 @@ EXPECTED_CONSTRAINT_NAMES = {
         "uq_reconstructed_balances_wallet_day",
         "ck_reconstructed_balances_confirmed",
         "fk_reconstructed_balances_wallet_id_wallets",
+    },
+    # Spec 041. One CHECK, the quote currency, compared with its constant by
+    # `test_the_price_hourly_check_matches_the_model`.
+    "price_hourly": {
+        "pk_price_hourly",
+        "uq_price_hourly_asset_hour",
+        "ck_price_hourly_quote_currency",
+        "fk_price_hourly_asset_id_assets",
+    },
+    # Spec 042. Two CHECKs, compared with their constants by
+    # `test_the_exchange_operation_checks_match_the_model`.
+    "exchange_imports": {"pk_exchange_imports", "fk_exchange_imports_user_id_users"},
+    "exchange_operations": {
+        "pk_exchange_operations",
+        "uq_exchange_operations_source_id",
+        "ck_exchange_operations_kind",
+        "ck_exchange_operations_manual",
+        "fk_exchange_operations_user_id_users",
+        "fk_exchange_operations_import_id_exchange_imports",
+        "fk_exchange_operations_portfolio_id_portfolios",
+    },
+    # Spec 044. A name is unique per owner (R9).
+    "portfolios": {
+        "pk_portfolios",
+        "uq_portfolios_user_name",
+        "fk_portfolios_user_id_users",
     },
     # Spec 040. No CHECK: the domain decides what a month is. The unique key leads with
     # `user_id`, so it is also the index every read uses.
@@ -539,6 +585,9 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
         - DERIVED_ADDRESS_TABLES
         - PRICE_HISTORY_TABLES
         - RECONSTRUCTED_TABLES
+        - HOURLY_TABLES
+        - OPERATION_TABLES
+        - PORTFOLIO_TABLES
         - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
@@ -576,6 +625,9 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
         - DERIVED_ADDRESS_TABLES
         - PRICE_HISTORY_TABLES
         - RECONSTRUCTED_TABLES
+        - HOURLY_TABLES
+        - OPERATION_TABLES
+        - PORTFOLIO_TABLES
         - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
@@ -650,6 +702,9 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
         - DERIVED_ADDRESS_TABLES
         - PRICE_HISTORY_TABLES
         - RECONSTRUCTED_TABLES
+        - HOURLY_TABLES
+        - OPERATION_TABLES
+        - PORTFOLIO_TABLES
         - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
@@ -716,7 +771,16 @@ def test_the_migrated_schema_carries_the_convention_names(
         assert found == expected, table
 
     assert {index["name"] for index in inspector.get_indexes("sessions")} == {"ix_sessions_user_id"}
-    assert {index["name"] for index in inspector.get_indexes("wallets")} == {"ix_wallets_user_id"}
+    assert {index["name"] for index in inspector.get_indexes("wallets")} == {
+        "ix_wallets_user_id",
+        "ix_wallets_portfolio_id",
+    }
+    # Spec 044: every per-portfolio read filters on these.
+    assert {index["name"] for index in inspector.get_indexes("exchange_operations")} == {
+        "ix_exchange_operations_user_executed",
+        "ix_exchange_operations_portfolio_id",
+    }
+    assert inspector.get_indexes("portfolios") == []
     # #10's two, named exactly as the spec's DDL writes them. An index the model declares
     # and the migration forgets is invisible to the drift check on SQLite and shows up only
     # as a table scan per chart render, on the slowest hardware this runs on.
@@ -890,7 +954,15 @@ def test_the_dropped_tables_carry_the_convention_names_below_the_drop(
 
     assert set(PRE_DROP_CONSTRAINT_NAMES) == DROPPED_TABLES
     assert table_names(sync_engine) == (
-        (APPLICATION_TABLES - PRICE_HISTORY_TABLES - RECONSTRUCTED_TABLES - EXPORT_MONTH_TABLES)
+        (
+            APPLICATION_TABLES
+            - PRICE_HISTORY_TABLES
+            - RECONSTRUCTED_TABLES
+            - HOURLY_TABLES
+            - OPERATION_TABLES
+            - PORTFOLIO_TABLES
+            - EXPORT_MONTH_TABLES
+        )
         | DROPPED_TABLES
         | {STAMP_TABLE}
     )
@@ -1117,7 +1189,13 @@ def test_the_price_history_migration_reverses_on_its_own(
     command.downgrade(build_alembic_config(database_url), DROP_REVISION)
 
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - PRICE_HISTORY_TABLES - RECONSTRUCTED_TABLES - EXPORT_MONTH_TABLES
+        APPLICATION_TABLES
+        - PRICE_HISTORY_TABLES
+        - RECONSTRUCTED_TABLES
+        - HOURLY_TABLES
+        - OPERATION_TABLES
+        - PORTFOLIO_TABLES
+        - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -1165,8 +1243,154 @@ def test_the_reconstructed_balances_migration_reverses_on_its_own(
     command.downgrade(build_alembic_config(database_url), "0013_price_history")
 
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - RECONSTRUCTED_TABLES - EXPORT_MONTH_TABLES
+        APPLICATION_TABLES
+        - RECONSTRUCTED_TABLES
+        - HOURLY_TABLES
+        - OPERATION_TABLES
+        - PORTFOLIO_TABLES
+        - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
+def test_the_price_hourly_check_matches_the_model(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Spec 041's one `CHECK`: the quote currencies the current prices admit, no more."""
+    upgrade_to_head(database_url)
+
+    reflected = {
+        str(found["name"]): normalise_sql(str(found["sqltext"]))
+        for found in inspect(sync_engine).get_check_constraints("price_hourly")
+    }
+
+    assert reflected == {
+        "ck_price_hourly_quote_currency": normalise_sql(_PRICE_QUOTE_CURRENCY_CHECK),
+    }
+
+
+def test_the_price_hourly_migration_reverses_on_its_own(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """One step down drops `price_hourly` and nothing else; the upgrade restores it."""
+    upgrade_to_head(database_url)
+    revisions = [
+        script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+    ]
+    assert revisions.index("0015_price_hourly") == (
+        revisions.index("0014_reconstructed_balances") - 1
+    )
+
+    command.downgrade(build_alembic_config(database_url), "0014_reconstructed_balances")
+
+    assert table_names(sync_engine) == (
+        APPLICATION_TABLES
+        - HOURLY_TABLES
+        - OPERATION_TABLES
+        - PORTFOLIO_TABLES
+        - EXPORT_MONTH_TABLES
+    ) | {STAMP_TABLE}
+    assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
+def test_the_exchange_operation_checks_match_the_model(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Spec 042's two `CHECK`s: R1's kinds, and R11's buy or sell for a manual entry."""
+    upgrade_to_head(database_url)
+
+    reflected = {
+        str(found["name"]): normalise_sql(str(found["sqltext"]))
+        for found in inspect(sync_engine).get_check_constraints("exchange_operations")
+    }
+
+    assert reflected == {
+        "ck_exchange_operations_kind": normalise_sql(_EXCHANGE_OPERATION_KIND_CHECK),
+        "ck_exchange_operations_manual": normalise_sql(_EXCHANGE_OPERATION_MANUAL_CHECK),
+    }
+
+
+def test_the_manual_rewards_migration_reverses_on_its_own(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """Spec 043: one step down restores 0016's `CHECK`s, deleting the manual rewards and fees
+    they refuse and keeping every other row; the upgrade admits them again."""
+    upgrade_to_head(database_url)
+    with sync_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO users (id, username, password_hash, created_at) "
+                "VALUES (90, 'rewards', 'x', '2026-10-10 00:00:00.000000')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO portfolios (id, user_id, name, created_at, updated_at) "
+                "VALUES (90, 90, 'Main', '2026-10-10 00:00:00.000000', "
+                "'2026-10-10 00:00:00.000000')"
+            )
+        )
+        for number, (source, kind) in enumerate(
+            [("manual", "buy"), ("manual", "reward"), ("manual", "fee"), ("bitget", "reward")]
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO exchange_operations (user_id, source, venue, external_id, "
+                    "executed_at, kind, asset, quantity, description, created_at, "
+                    "portfolio_id) VALUES "
+                    "(90, :source, 'x', :id, '2026-10-10 00:00:00.000000', :kind, 'KAS', "
+                    "'1', '', '2026-10-10 00:00:00.000000', 90)"
+                ),
+                {"source": source, "id": f"id-{number}", "kind": kind},
+            )
+
+    command.downgrade(build_alembic_config(database_url), "0016_exchange_operations")
+
+    with sync_engine.begin() as connection:
+        kept = connection.execute(
+            text("SELECT source, kind FROM exchange_operations WHERE user_id = 90 ORDER BY id")
+        ).all()
+    assert [tuple(row) for row in kept] == [("manual", "buy"), ("bitget", "reward")]
+    assert {
+        str(found["name"]): normalise_sql(str(found["sqltext"]))
+        for found in inspect(sync_engine).get_check_constraints("exchange_operations")
+    }["ck_exchange_operations_manual"] == normalise_sql(
+        "source != 'manual' OR kind IN ('buy', 'sell')"
+    )
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
+def test_the_exchange_operations_migration_reverses_on_its_own(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """One step down drops the two tables and nothing else; the upgrade restores them."""
+    upgrade_to_head(database_url)
+    revisions = [
+        script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+    ]
+    assert revisions.index("0016_exchange_operations") == (revisions.index("0015_price_hourly") - 1)
+
+    command.downgrade(build_alembic_config(database_url), "0015_price_hourly")
+
+    assert table_names(sync_engine) == (
+        APPLICATION_TABLES - OPERATION_TABLES - PORTFOLIO_TABLES - EXPORT_MONTH_TABLES
+    ) | {STAMP_TABLE}
+    assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
     upgrade_to_head(database_url)
 
@@ -1182,11 +1406,9 @@ def test_the_export_months_migration_reverses_on_its_own(
     revisions = [
         script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
     ]
-    assert revisions.index("0015_export_months") == (
-        revisions.index("0014_reconstructed_balances") - 1
-    )
+    assert revisions.index("0019_export_months") == revisions.index("0018_portfolios") - 1
 
-    command.downgrade(build_alembic_config(database_url), "0014_reconstructed_balances")
+    command.downgrade(build_alembic_config(database_url), "0018_portfolios")
 
     assert table_names(sync_engine) == (APPLICATION_TABLES - EXPORT_MONTH_TABLES) | {STAMP_TABLE}
 

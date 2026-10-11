@@ -61,12 +61,18 @@ INSERT_USER: Final = text(
 
 # Bound parameters, and deliberately not built through the ORM: this is the statement that
 # has to reach SQLite with nothing of ours in between.
+# Each account's portfolio has the account's id (spec 044), so a wallet is filed by its owner.
+INSERT_PORTFOLIO: Final = text(
+    "INSERT INTO portfolios (id, user_id, name, created_at, updated_at) "
+    "VALUES (:id, :id, 'Main', '2026-09-21 00:00:00', '2026-09-21 00:00:00')"
+)
+
 INSERT_WALLET: Final = text(
     "INSERT INTO wallets "
     "(user_id, chain_key, address_canonical, address_display, label, "
-    " archived_at, created_at, updated_at) "
+    " archived_at, created_at, updated_at, portfolio_id) "
     "VALUES (:user_id, :chain_key, :canonical, :display, :label, "
-    " :archived_at, '2026-09-21 12:00:00', '2026-09-21 12:00:00')"
+    " :archived_at, '2026-09-21 12:00:00', '2026-09-21 12:00:00', :user_id)"
 )
 
 
@@ -80,6 +86,8 @@ async def wallets_engine(migrated_engine: AsyncEngine) -> AsyncEngine:
     async with migrated_engine.begin() as connection:
         await connection.execute(INSERT_USER, {"id": OWNER_ID, "username": "owner"})
         await connection.execute(INSERT_USER, {"id": SECOND_OWNER_ID, "username": "second"})
+        await connection.execute(INSERT_PORTFOLIO, {"id": OWNER_ID})
+        await connection.execute(INSERT_PORTFOLIO, {"id": SECOND_OWNER_ID})
     return migrated_engine
 
 
@@ -113,6 +121,7 @@ async def add_wallet(
         address_display=display,
         label=label,
         created_at=CREATED_AT,
+        portfolio_id=user_id,
     )
 
 
@@ -561,9 +570,12 @@ def test_the_foreign_key_cascades_from_users(
     """
     del migrated_database_url
 
-    foreign_keys = inspect(sync_engine).get_foreign_keys("wallets")
+    foreign_keys = [
+        found
+        for found in inspect(sync_engine).get_foreign_keys("wallets")
+        if found["referred_table"] == "users"
+    ]
 
     assert len(foreign_keys) == 1
-    assert foreign_keys[0]["referred_table"] == "users"
     assert foreign_keys[0]["constrained_columns"] == ["user_id"]
     assert foreign_keys[0]["options"].get("ondelete") == "CASCADE"

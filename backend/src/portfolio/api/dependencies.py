@@ -13,16 +13,16 @@ nothing, and the hasher because its dummy hash is computed once and reused.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Annotated, Final
 
 # A runtime import, deliberately. FastAPI resolves a dependency's annotations when the
 # application is built, and `request: Request` is how it knows to pass the request object
 # rather than to treat the parameter as a query string value. Moved into a type-checking
 # block -- which is what TC002 asks for -- the name would be missing at that moment and
 # the server would fail to start, while mypy stayed green.
-from fastapi import Request  # noqa: TC002
+from fastapi import Depends, Query, Request
 
-from portfolio.api.errors import UnauthorizedError
+from portfolio.api.errors import NotFoundError, UnauthorizedError
 from portfolio.domain.auth import SessionLifetime
 from portfolio.services.auth import (
     SESSION_REQUIRED_DETAIL,
@@ -33,6 +33,10 @@ from portfolio.services.auth import (
 )
 from portfolio.services.backup import BackupService
 from portfolio.services.balances import BalanceService, build_balance_service
+from portfolio.services.exchange_operations import (
+    ExchangeOperationService,
+    build_exchange_operation_service,
+)
 from portfolio.services.export_reminders import (
     ExportReminderService,
     build_export_reminder_service,
@@ -43,11 +47,21 @@ from portfolio.services.health import (
     TimerLike,
     build_health_service,
 )
+from portfolio.services.investment import InvestmentService, build_investment_service
 from portfolio.services.password_hasher import PasswordHasher
 from portfolio.services.portfolio import PortfolioService, build_portfolio_service
+from portfolio.services.portfolio_changes import (
+    PortfolioChangeService,
+    build_portfolio_change_service,
+)
 from portfolio.services.portfolio_history import (
     PortfolioHistoryService,
     build_portfolio_history_service,
+)
+from portfolio.services.portfolios import (
+    PortfolioNotFoundError,
+    PortfolioRegistryService,
+    build_portfolio_registry_service,
 )
 from portfolio.services.sync_coordinator import SyncCoordinator
 from portfolio.services.wallets import WalletService, build_wallet_service
@@ -183,6 +197,75 @@ async def get_portfolio_history_service(
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
     async with sessionmaker() as session:
         yield build_portfolio_history_service(session)
+
+
+async def get_portfolio_change_service(
+    request: Request,
+) -> AsyncIterator[PortfolioChangeService]:
+    """Open a session for this request and hand the router the change service (spec 041).
+
+    Read-only, like `get_portfolio_service`. The service's clock is the default one.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_portfolio_change_service(session)
+
+
+async def get_exchange_operation_service(
+    request: Request,
+) -> AsyncIterator[ExchangeOperationService]:
+    """Open a session for this request and hand the router the operation service (spec 042).
+
+    The service commits what it writes; closing the session on the way out rolls back an
+    upload that was refused part way.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_exchange_operation_service(session)
+
+
+async def get_investment_service(request: Request) -> AsyncIterator[InvestmentService]:
+    """Open a session for this request and hand the router the investment service.
+
+    Read-only, like `get_portfolio_service`. The service's clock is the default one.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_investment_service(session)
+
+
+async def get_portfolio_registry_service(
+    request: Request,
+) -> AsyncIterator[PortfolioRegistryService]:
+    """Open a session for this request and hand the router the portfolio registry (spec 044).
+
+    The service commits what it writes.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_portfolio_registry_service(session)
+
+
+async def get_portfolio_scope(
+    request: Request,
+    registry: Annotated[PortfolioRegistryService, Depends(get_portfolio_registry_service)],
+    portfolio: Annotated[
+        int | None,
+        Query(description="Only this portfolio. Every portfolio together when omitted."),
+    ] = None,
+) -> int | None:
+    """The portfolio a read is narrowed to, or `None` for all of them (spec 044, R4).
+
+    One dependency for every scoped read, so that "is this one of the caller's portfolios" is
+    decided in one place. An id that is not is a 404, the answer an id that does not exist
+    gets, because any other status would confirm it.
+    """
+    if portfolio is None:
+        return None
+    principal = get_principal(request)
+    if not await registry.exists(principal.user_id, portfolio):
+        raise NotFoundError(str(PortfolioNotFoundError()))
+    return portfolio
 
 
 async def get_export_reminder_service(request: Request) -> AsyncIterator[ExportReminderService]:

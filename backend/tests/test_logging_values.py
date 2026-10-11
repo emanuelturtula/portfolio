@@ -100,8 +100,6 @@ SECRET_FIELDS: Final = frozenset(
     }
 )
 
-PRODUCTION_ORIGIN: Final = "https://portfolio.example"
-
 
 def redacted(text: str, *secrets: str) -> str:
     return ValueRedactor(secrets).redact_text(text)

@@ -142,6 +142,7 @@ export function wallet(overrides: Partial<WalletResponse> = {}): WalletResponse 
     archived: false,
     created_at: CREATED_AT,
     updated_at: CREATED_AT,
+    portfolio_id: 1,
     ...overrides,
   };
 }

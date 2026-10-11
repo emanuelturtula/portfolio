@@ -71,7 +71,6 @@ BOOM: Final = "/api/test/boom"
 CONCURRENT_REQUESTS: Final = 40
 FORGED: Final = "forged-request-id-4f1c"
 QUERY_SENTINEL: Final = "query-sentinel-8a2d"
-PRODUCTION_ORIGIN: Final = "https://portfolio.example"
 HYPHENATED_UUID: Final = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 )
@@ -110,7 +109,6 @@ def production(log_level: str = "DEBUG") -> Settings:
     return Settings(
         _env_file=None,
         environment="prod",
-        allowed_origin=PRODUCTION_ORIGIN,
         log_level=log_level,
         argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
         argon2_time_cost=OWASP_MINIMUM_TIME_COST,
@@ -500,7 +498,7 @@ REFUSED_LINE_MAX_BYTES: Final = 1024
 
 
 async def anonymous_call(app: FastAPI, method: str, path: str) -> tuple[int, dict[str, str]]:
-    """`method path` with no cookie, no `Origin` and no body, as a raw ASGI call: the status
+    """`method path` with no cookie, no `Content-Type` and no body, as a raw ASGI call: the status
     and the headers.
 
     Not through `httpx`, which refuses a URL over 64 KB before sending it. A server does not:
@@ -536,8 +534,8 @@ async def anonymous_call(app: FastAPI, method: str, path: str) -> tuple[int, dic
 
 @pytest.mark.parametrize(
     ("method", "status", "reason"),
-    [("GET", 401, "no_session"), ("POST", 403, "origin")],
-    ids=["no session", "no origin"],
+    [("GET", 401, "no_session"), ("POST", 403, "content_type")],
+    ids=["no session", "not json"],
 )
 @pytest.mark.parametrize("unit", ["a.", "a://", "tb1", "kaspatest:"])
 async def test_an_anonymous_200_kb_path_is_answered_quickly_and_logged_in_a_bounded_line(
@@ -674,7 +672,7 @@ async def test_every_operation_is_logged_under_its_prefixed_template(
     """Read from `scope["fastapi"]["effective_route_context"]`, measured on FastAPI 0.141.1.
 
     An upgrade that drops that entry falls back to the template without `/api`, and this
-    fails on all nineteen. A body is sent malformed and a path parameter unparsable, so the
+    fails on all seventeen. A body is sent malformed and a path parameter unparsable, so the
     route is matched and no endpoint with a side effect runs; the bodiless ones that remain
     are reads, the manual balance sync with no wallet, and `logout`, sent last.
     """
@@ -698,8 +696,8 @@ async def test_every_operation_is_logged_under_its_prefixed_template(
             assert response.status_code == seen[f"{method} {template}"][1], response.text
     entries = lines(capsys)
 
-    assert len(documented) == 19
-    assert sum(1 for _id, status in seen.values() if status == 422) == 8
+    assert len(documented) == 30
+    assert sum(1 for _id, status in seen.values() if status == 422) == 15
     for name, (request_id, _status) in seen.items():
         template = name.split(" ", 1)[1]
         assert template.startswith("/api/")

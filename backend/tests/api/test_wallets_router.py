@@ -63,6 +63,8 @@ WALLET_FIELDS: Final = {
     "archived",
     "created_at",
     "updated_at",
+    # Spec 044: the portfolio it is filed in.
+    "portfolio_id",
 }
 
 

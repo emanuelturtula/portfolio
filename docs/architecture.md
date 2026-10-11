@@ -363,6 +363,7 @@ that is handed its providers rather than building them:
 |---|---|---|---|
 | the `balance-sync` timer; `POST /api/balances/sync` | `BalanceSyncService` | `provider_for`, which calls `get_chain_provider` over the shared client | `balance_snapshots`, `derived_addresses`, `sync_runs` |
 | the `price-refresh` timer; `python -m portfolio refresh-prices` | `PriceRefreshService` | the sources `price_sources` built | `prices`, and today's `observed` row in `price_history` |
+| the `price-refresh` timer, after each refresh | `HourlyPriceService`, in `services/price_hourly.py` | a `KrakenHourlyCloses` over the shared client | `price_hourly`, every new committed hourly close (spec 041) |
 | the `price-backfill` timer; `python -m portfolio backfill-prices` | `PriceBackfillService`, in `services/price_backfill.py` | a `KrakenDailyCloses` and a `CoinbaseDailyCloses` over the shared client | `price_history`, every committed daily close as `close` |
 | the `balance-rebuild` timer; `python -m portfolio rebuild-balances` | `BalanceRebuildService`, in `services/balance_rebuild.py` | `provider_for`, as the balance sync | `reconstructed_balances`, each complete wallet's rows replaced |
 
@@ -386,8 +387,9 @@ that is handed its providers rather than building them:
 - **Nothing in a request path reaches a price source or a chain's history.** Neither price
   timer nor the rebuild has an endpoint, and `services/prices.py` and
   `services/portfolio_history.py`, through which the dashboard reads prices and the value
-  over time, import no provider. A request renders from the `prices`, `price_history` and
-  `reconstructed_balances` tables.
+  over time, import no provider, and neither does `services/portfolio_changes.py`. A request
+  renders from the `prices`, `price_history`, `price_hourly` and `reconstructed_balances`
+  tables.
 - **`GET /api/health/detail` calls no vendor.** It reports each source's last recorded
   outcome. `ChainProvider.health()` is part of the protocol, and no production code calls
   it.
@@ -441,7 +443,7 @@ numeric-affinity comparison.
 
 | Endpoint | Answers |
 |---|---|
-| `GET /api/portfolio/history?range=30d\|90d\|1y\|all` | `range` and `points`, one `{day, value}` per day of the range, oldest first, ending today (UTC) |
+| `GET /api/portfolio/history?range=30d\|90d\|1y\|all` | `range`, `assets` and `points`, one `{day, value, assets}` per day of the range, oldest first, ending today (UTC). `assets` holds each asset's own value that day (spec 041) |
 | `GET /api/wallets/{wallet_id}/value-history?range=…` | `wallet_id`, `asset`, `range` and one `{day, quantity, value}` per day; 404 for a wallet that is not the owner's |
 
 Both are under `/api` and not in `PUBLIC_API_PATHS`, so the middleware requires a session for
@@ -465,6 +467,72 @@ ordering on `observed_at` and `id`, never on a money column** (`BalanceRepositor
 one window function), and every sum is `Decimal` arithmetic in `domain`, rounded once per
 holding. **A partial sum is never served as a value**: a day with a holding that has no price
 that day is `null`, because a total that quietly omits a holding would be believed.
+
+### The change over 24 hours and 7 days (spec 041)
+
+`GET /api/portfolio/changes` answers the value now (the summary's total) and, for `24h` and
+`7d`, the value at that instant, the change and its percentage, or the reason it cannot be
+worked out. The value at an instant needs a price at that instant, which `price_hourly`
+(migration `0015_price_hourly`) holds: one row per asset, quote currency and UTC hour, the
+close of Kraken's hourly candle, stored by the price timer after each refresh and never
+rewritten. `services/portfolio_changes.py` reads each wallet's last snapshot at or before the
+instant (`BalanceRepository.latest_at_or_before`), or its rebuilt balance before it, and
+`domain/portfolio_change.py` does the arithmetic. A change it cannot value is `null` with a
+reason, never `"0"`.
+
+### Exchange operations and what was invested (spec 042)
+
+The exchanges' own CSV exports, uploaded by hand, are stored one row per operation in
+`exchange_operations` (migration `0016_exchange_operations`), `UNIQUE (user_id, source,
+external_id)`, with each upload recorded in `exchange_imports`. Every operation is stored,
+whatever its asset; only the figures keep to the assets of the owner's active wallets.
+Migration `0017_manual_rewards_and_fees` lets a manual entry be a reward or a network fee
+(spec 043).
+
+| Endpoint | Answers |
+|---|---|
+| `POST /api/exchange-operations/imports` | one file, a CSV or a zip of them, as `{filename, content_base64}`: 201 with what each file held, stored and skipped; 422 naming the file and line it could not read, with nothing stored |
+| `GET /api/exchange-operations?limit=…&offset=…&asset=…&venue=…&since=…&until=…` | `count` and one page of `operations`, newest first, kept by the filters; `assets` and `venues`, every value stored (spec 043) |
+| `POST /api/exchange-operations` | a buy or a sell no export covers, or a reward or network fee with no counterpart (spec 043), entered by hand; 201 with the stored row |
+| `DELETE /api/exchange-operations/{operation_id}` | 204; 404 for none of the owner's; 409 for a row that came from an upload |
+| `GET /api/investment` | per tracked asset and `overall`: invested, value, profit and its percentage, or the reason it is unknown; held, explained and their difference; and `invested_by_day` |
+
+The upload is JSON because the write guard lets nothing else change state.
+
+| Module | Layer | What it does |
+|---|---|---|
+| `domain/exchange_exports.py` | `domain` | `parse_export`, pure: recognises a format by its header and reads it into operations in UTC. A named zone is resolved by the caller's function |
+| `domain/investment.py` | `domain` | `summarize_investment`, pure: invested, explained, profit and the cumulative invested per day. An unknown is `None` with its reason, never zero |
+| `repositories/exchange_operations.py` | `repositories` | the stored ids, the inserts, a page, every row for the figures. Orders by time and id, never by an amount |
+| `services/exchange_operations.py` | `services` | decodes and unpacks the upload within its size limits, parses each file, skips what is stored, and commits once |
+| `services/investment.py` | `services` | reads the operations and the dashboard summary, so the value is the dashboard's own |
+| `api/routers/exchange_operations.py` | `api` | the five routes above, handed built services |
+
+### Portfolios (spec 044)
+
+The owner's wallets and operations are grouped into named portfolios, such as one for
+retirement and one for trading. Migration `0018_portfolios` adds `portfolios` (`UNIQUE
+(user_id, name)`), creates a `Main` for every account, and files every existing wallet and
+operation in it through a required, indexed `portfolio_id` on `wallets` and
+`exchange_operations`. Each wallet and each operation is in exactly one portfolio, so *All
+portfolios* is their sum and nothing is counted twice. Address uniqueness and the dedup of
+uploaded operations stay per owner, across portfolios.
+
+| Endpoint | Answers |
+|---|---|
+| `GET /api/portfolios` | every portfolio, oldest first, with how many wallets (archived included) and operations it holds |
+| `POST /api/portfolios` | 201 with the new portfolio; 409 for a name the owner already uses; 422 for a blank or overlong one |
+| `PATCH /api/portfolios/{portfolio_id}` | rename: 200; 404, 409 and 422 as above |
+| `DELETE /api/portfolios/{portfolio_id}` | 204; 409 for the owner's only portfolio or one that still holds anything |
+| `POST /api/exchange-operations/move` | moves every operation a filter keeps (from a portfolio, asset, venue, days) to another; answers how many moved |
+
+The summary, changes, history, investment, wallet list, current balances and operations list
+take an optional `?portfolio=<id>`: without it they answer for all portfolios, as before, and
+with an id that is not the caller's they answer 404. A write that names no portfolio goes to
+the owner's oldest, and creates `Main` if there is none, so the CLI and older clients need
+nothing. Moving a wallet is `PATCH /api/wallets/{id}` with `portfolio_id`, and its whole
+history moves with it, because history is read through the wallet. Sync, backups and health
+stay global.
 
 ### Past balances, rebuilt (spec 038)
 
@@ -523,12 +591,18 @@ endpoint is the exact failure mode, and a rule that can be forgotten is a rule t
 eventually is. A contract test walks every registered route and asserts `401` without a
 cookie, and a second pins the allowlist's contents.
 
-The same middleware, `RequestGuardMiddleware` in `api/middleware.py`, enforces a matching
-`Origin` and a `Content-Type` of `application/json` on every request whose method is not
-`GET`, `HEAD` or `OPTIONS`. A missing `Origin` is refused like a wrong one. The
-content-type rule is the one that does the work: a form-encoded POST is the shape an HTML
-form can send cross-site without a preflight, so refusing it closes CSRF without a token
-round-trip. `SameSite=Lax` on the cookie is the belt to that pair of braces.
+The same middleware, `RequestGuardMiddleware` in `api/middleware.py`, enforces a
+`Content-Type` of `application/json` on every request whose method is not `GET`, `HEAD` or
+`OPTIONS`. A form-encoded POST is the shape an HTML form can send cross-site without a
+preflight, so refusing it closes CSRF without a token round-trip. `SameSite=Lax` on the
+cookie is the belt to those braces.
+
+There is no `Origin` check. It used to require one configured origin, and the deployment is
+reached at two -- through the tunnel over HTTPS and at the Pi's address on the home network
+-- so it refused every sign-in on the second. For the same reason the session cookie follows
+the scheme the browser used, read from `Origin` (`api/session_cookie.py`): `__Host-psid`,
+`Secure`, over HTTPS, and `psid` without `Secure` over plain HTTP, where a browser would drop
+a `Secure` cookie.
 
 See `docs/specs/003-single-user-password-login.md` for the decisions and what they cost.
 

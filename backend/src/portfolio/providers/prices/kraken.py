@@ -35,18 +35,19 @@ failover on to the next source.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from portfolio.providers.base import require_json_object
 from portfolio.providers.endpoints import PRIMARY, EndpointSet
 from portfolio.providers.errors import ProviderResponseError
-from portfolio.providers.http import ASSET_DAILY_CLOSES, ASSET_PRICES
+from portfolio.providers.http import ASSET_DAILY_CLOSES, ASSET_HOURLY_CLOSES, ASSET_PRICES
 from portfolio.providers.prices.base import (
     BTC,
     EUR,
     KAS,
     USD,
     DailyClose,
+    HourlyClose,
     PriceQuote,
     require_price,
 )
@@ -63,14 +64,18 @@ if TYPE_CHECKING:
 __all__ = [
     "BACKFILL_PAIRS",
     "DAILY_INTERVAL_MINUTES",
+    "HOURLY_INTERVAL_MINUTES",
+    "HOURLY_PAIRS",
     "KRAKEN",
     "KRAKEN_API_URL",
     "OHLC_PATH",
     "PAIR_CODES",
     "TICKER_PATH",
     "KrakenDailyCloses",
+    "KrakenHourlyCloses",
     "KrakenPriceSource",
     "parse_daily_closes",
+    "parse_hourly_closes",
     "parse_ticker",
 ]
 
@@ -357,6 +362,30 @@ def parse_daily_closes(body: str | bytes, code: str) -> tuple[DailyClose, ...]:
     Raises:
         ProviderResponseError: any of the above.
     """
+    entries, last = _ohlc_entries(body, code)
+
+    closes: list[DailyClose] = []
+    for entry in entries:
+        opened = _candle_time(entry, code)
+        if opened > last:
+            continue
+        day = datetime.fromtimestamp(opened, UTC).date()
+        if closes and day <= closes[-1].day:
+            message = f"The {VENDOR} OHLC candles for {code} are not one per day, oldest first."
+            raise ProviderResponseError(message)
+        closes.append(DailyClose(day=day, close=require_price(entry[CLOSE_INDEX], source=VENDOR)))
+    return tuple(closes)
+
+
+def _ohlc_entries(body: str | bytes, code: str) -> tuple[list[Any], int]:
+    """One OHLC response's candles for `code` and its `last`, or a refusal.
+
+    The checks every OHLC parser shares, whatever its interval: the envelope, the pair, the
+    list and the integer `last`.
+
+    Raises:
+        ProviderResponseError: the first four refusals `parse_daily_closes` lists.
+    """
     result = _result_of(body)
     unexpected = len(set(result) - {code, LAST_COMMITTED_FIELD})
     if unexpected:
@@ -376,33 +405,28 @@ def parse_daily_closes(body: str | bytes, code: str) -> tuple[DailyClose, ...]:
             "candle still trading cannot be told from the committed ones."
         )
         raise ProviderResponseError(message)
-
-    closes: list[DailyClose] = []
-    for entry in entries:
-        opened = _candle_time(entry, code)
-        if opened > last:
-            continue
-        day = datetime.fromtimestamp(opened, UTC).date()
-        if closes and day <= closes[-1].day:
-            message = f"The {VENDOR} OHLC candles for {code} are not one per day, oldest first."
-            raise ProviderResponseError(message)
-        closes.append(DailyClose(day=day, close=require_price(entry[CLOSE_INDEX], source=VENDOR)))
-    return tuple(closes)
+    return entries, last
 
 
-def _candle_time(entry: object, code: str) -> int:
-    """A candle's open time, refusing every candle that is not a daily one.
+def _candle_time(
+    entry: object,
+    code: str,
+    *,
+    period: int = SECONDS_PER_DAY,
+    boundary: str = "a UTC midnight",
+) -> int:
+    """A candle's open time, refusing every candle that does not open on a `period` boundary.
 
     Raises:
         ProviderResponseError: not a list of at least five, or its time is not an integer
-            at a UTC midnight.
+            on the boundary (`boundary` says which, in words).
     """
     if not isinstance(entry, list) or len(entry) <= CLOSE_INDEX:
         message = f"A {VENDOR} OHLC candle for {code} is not the documented array."
         raise ProviderResponseError(message)
     opened = entry[0]
-    if not isinstance(opened, int) or isinstance(opened, bool) or opened % SECONDS_PER_DAY:
-        message = f"A {VENDOR} OHLC candle for {code} does not open at a UTC midnight."
+    if not isinstance(opened, int) or isinstance(opened, bool) or opened % period:
+        message = f"A {VENDOR} OHLC candle for {code} does not open at {boundary}."
         raise ProviderResponseError(message)
     return opened
 
@@ -447,3 +471,82 @@ class KrakenDailyCloses:
         path = f"{OHLC_PATH}?pair={code}&interval={DAILY_INTERVAL_MINUTES}"
         body, _index = await self._endpoint.read(path, ASSET_DAILY_CLOSES)
         return parse_daily_closes(body, code)
+
+
+# --------------------------------------------------------------------------------------
+# Hourly closes, for the change over 24 hours and 7 days (spec 041)
+# --------------------------------------------------------------------------------------
+
+HOURLY_INTERVAL_MINUTES: Final = 60
+"""One candle per hour, another of the documented intervals. Measured on 2026-10-10: 721
+entries, 30 days of hours, each opening on the hour, none missing."""
+
+SECONDS_PER_HOUR: Final = 3_600
+
+HOURLY_PAIRS: Final[frozenset[PricePair]] = BACKFILL_PAIRS
+"""The pairs the hourly closes are read for: the backfill's, for the backfill's reason."""
+
+
+def parse_hourly_closes(body: str | bytes, code: str) -> tuple[HourlyClose, ...]:
+    """Every committed hourly close in one OHLC response, oldest first, or a refusal.
+
+    `parse_daily_closes` at another interval, with every rule it states, except that a
+    candle must open on the hour rather than at midnight (spec 041, R1).
+
+    Raises:
+        ProviderResponseError: any refusal `parse_daily_closes` lists, or a candle that does
+            not open on the hour.
+    """
+    entries, last = _ohlc_entries(body, code)
+
+    closes: list[HourlyClose] = []
+    for entry in entries:
+        opened = _candle_time(entry, code, period=SECONDS_PER_HOUR, boundary="the hour")
+        if opened > last:
+            continue
+        hour = datetime.fromtimestamp(opened, UTC)
+        if closes and hour <= closes[-1].hour:
+            message = f"The {VENDOR} OHLC candles for {code} are not one per hour, oldest first."
+            raise ProviderResponseError(message)
+        closes.append(
+            HourlyClose(hour=hour, close=require_price(entry[CLOSE_INDEX], source=VENDOR))
+        )
+    return tuple(closes)
+
+
+class KrakenHourlyCloses:
+    """Reads one pair's hourly closes from Kraken's public OHLC endpoint, one call per pair.
+
+    Satisfies `HourlyCloseSource` structurally, as `KrakenDailyCloses` satisfies its own.
+    """
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        """Bind to the shared client. No key and no configuration."""
+        self._endpoint = EndpointSet.configured(client, ((PRIMARY, KRAKEN_API_URL),), vendor=VENDOR)
+
+    @property
+    def name(self) -> str:
+        """`kraken`, the string written to `price_hourly.source`."""
+        return KRAKEN
+
+    @property
+    def pairs(self) -> frozenset[PricePair]:
+        """`HOURLY_PAIRS`: BTC and KAS in USD."""
+        return HOURLY_PAIRS
+
+    async def hourly_closes(self, pair: PricePair) -> tuple[HourlyClose, ...]:
+        """The committed hourly closes Kraken still serves for `pair`, oldest first.
+
+        Raises:
+            ProviderRateLimitedError: a 429 that survived the transport's retries.
+            ProviderUnavailableError: the vendor did not answer, or failed with a 5xx.
+            ProviderResponseError: the pair is not one this source reads, or the answer
+                cannot be trusted.
+        """
+        if pair not in HOURLY_PAIRS:
+            message = f"{pair[0]}/{pair[1]} is not a pair the {VENDOR} hourly closes read."
+            raise ProviderResponseError(message)
+        code = PAIR_CODES[pair]
+        path = f"{OHLC_PATH}?pair={code}&interval={HOURLY_INTERVAL_MINUTES}"
+        body, _index = await self._endpoint.read(path, ASSET_HOURLY_CLOSES)
+        return parse_hourly_closes(body, code)

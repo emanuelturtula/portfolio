@@ -39,6 +39,7 @@ from tests.cli.conftest import (
     read_sessions,
     read_users,
 )
+from tests.portfolio_harness import main_portfolio_sync
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -175,14 +176,20 @@ def give_the_owner_a_portfolio(engine: Engine, owner_id: int) -> None:
     """
     now = sqlite_timestamp(OBSERVED_AT)
     with engine.begin() as connection:
+        portfolio_id = main_portfolio_sync(connection, owner_id)
         wallet_id: int = connection.execute(
             text(
                 "INSERT INTO wallets (user_id, chain_key, address_canonical, address_display, "
-                "label, archived_at, created_at, updated_at) "
+                "label, archived_at, created_at, updated_at, portfolio_id) "
                 "VALUES (:user_id, 'bitcoin', :address, :address, 'cold storage', NULL, "
-                ":now, :now) RETURNING id"
+                ":now, :now, :portfolio_id) RETURNING id"
             ),
-            {"user_id": owner_id, "address": BIP173_TESTNET_P2WPKH, "now": now},
+            {
+                "portfolio_id": portfolio_id,
+                "user_id": owner_id,
+                "address": BIP173_TESTNET_P2WPKH,
+                "now": now,
+            },
         ).scalar_one()
         run_id: int = connection.execute(
             text(

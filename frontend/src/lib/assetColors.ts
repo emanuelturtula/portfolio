@@ -30,6 +30,14 @@ const SPARE: readonly string[] = ['var(--series-blue)'];
 const OTHER = 'var(--series-other)';
 
 /**
+ * One asset's colour from a map `assetColors` built, and the neutral grey for an asset the map
+ * was not built over, so a caller never has to handle a missing colour.
+ */
+export function colorOf(colors: ReadonlyMap<string, string>, asset: string): string {
+  return colors.get(asset) ?? OTHER;
+}
+
+/**
  * The colour of each asset in `assets`, keyed by asset. Pass every asset the chart shows, so
  * that the spare slots are handed out over the same set each time.
  */

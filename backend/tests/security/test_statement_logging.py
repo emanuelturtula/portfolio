@@ -52,7 +52,7 @@ import structlog
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
-from portfolio.config import SECURE_SESSION_COOKIE_NAME
+from portfolio.api.session_cookie import SECURE_SESSION_COOKIE_NAME
 from portfolio.logging import (
     SILENCED_VENDOR_LOGGERS,
     STATEMENT_LOGGING_LIBRARIES,

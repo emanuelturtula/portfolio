@@ -86,7 +86,6 @@ SECTION_19: Final = "## 19. The health detail: every source, and what to do abou
 REDACTED_HEADING: Final = "### What is redacted"
 NOT_REDACTED_HEADING: Final = "### What is not redacted"
 UNAVAILABLE_HEADING: Final = "### `unavailable`: a section that could not be read"
-PRODUCTION_ORIGIN: Final = "https://portfolio.example"
 
 #: How many of each credential the document counts: "the bootstrap password and the CoinGecko
 #: key".
@@ -189,7 +188,6 @@ def test_the_keys_table_is_the_keys_a_record_carries(
         Settings(
             _env_file=None,
             environment="prod",
-            allowed_origin=PRODUCTION_ORIGIN,
             argon2_memory_cost=OWASP_MINIMUM_MEMORY_COST,
             argon2_time_cost=OWASP_MINIMUM_TIME_COST,
         )

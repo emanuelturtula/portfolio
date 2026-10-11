@@ -22,34 +22,27 @@ Every command against the running container goes through
 deployed. It passes its arguments to docker compose along with the image, port, environment
 and secrets file that compose refuses to run without, so there is nothing to export first.
 
-## 1. Required before the first deployment carrying authentication
+## 1. The account, and the two ways in
 
-**This is the one manual step the authentication change needs, and skipping it makes the
-deployment fail.** The application now refuses to start in `prod` when
-`PORTFOLIO_ALLOWED_ORIGIN` is still the development default, so the container never becomes
-healthy and `deploy.py` rolls back.
-
-Add both variables to the host-local secrets file — the same file every credential goes in,
-at mode 0600, never through GitHub:
+Authentication needs no host-specific configuration. To create the account on first start,
+add the bootstrap password to the host-local secrets file — the same file every credential
+goes in, at mode 0600, never through GitHub:
 
 ```bash
 $EDITOR ~/portfolio-app/prod/secrets.env
 ```
 
 ```
-PORTFOLIO_ALLOWED_ORIGIN=https://portfolio.example
 PORTFOLIO_BOOTSTRAP_PASSWORD=<a long random password from a password manager>
 ```
-
-`PORTFOLIO_ALLOWED_ORIGIN` must match the origin the browser sends: scheme and host, no
-trailing slash, no path. A mismatch is not a startup failure — it is a `403` on every write
-while reads keep working, which is a confusing symptom, so check it against the address bar
-rather than against memory.
 
 `PORTFOLIO_BOOTSTRAP_PASSWORD` is used once, to create the account on first start, and is
 ignored on every later start. It must be at least 12 characters and must not be one of the
 obvious defaults, or the application refuses to start. Delete the line once the account
 exists.
+
+`PORTFOLIO_ALLOWED_ORIGIN` and `PORTFOLIO_SESSION_COOKIE_SECURE` are no longer read. A
+`secrets.env` that still sets them starts normally; the lines can be deleted.
 
 `env_file` is read at container **creation**, so after editing this file:
 
@@ -60,23 +53,19 @@ exists.
 A plain restart silently keeps the old values. That is already the last row of the
 troubleshooting table in `docs/deployment.md`, and it catches people here too.
 
-### Serving over plain HTTP on the local network
+### Over HTTPS, and over plain HTTP on the local network
 
-The application is built to sit behind HTTPS, and its defaults assume it. If you would rather
-open it at the address the Raspberry Pi has on your own network, with no TLS in front, `prod`
-accepts that when you say so twice — in the origin and in the cookie flag:
+The same container answers at its HTTPS address through the tunnel and at the address the
+Raspberry Pi has on your own network, with nothing to configure for either. Writes are not
+tied to an origin; the session cookie follows the scheme the browser used, read from the
+`Origin` header of the sign-in request:
 
-```
-PORTFOLIO_ALLOWED_ORIGIN=http://<host-address>:<port>
-PORTFOLIO_SESSION_COOKIE_SECURE=false
-```
+| Reached over | Cookie |
+|---|---|
+| HTTPS | `__Host-psid`, `Secure` |
+| plain HTTP | `psid`, not `Secure` — a browser drops a `Secure` cookie that arrives over plain HTTP from any host but `localhost` |
 
-Both lines are required. A browser drops a `Secure` cookie that arrives over plain HTTP from
-any host but `localhost`, so with only the origin set, login returns `204` and the page stays
-on the sign-in form. The flag on its own is refused unless the origin starts with `http://`:
-on an `https://` origin `Secure` stays mandatory.
-
-**What this costs.** The password and the session cookie cross the network unencrypted, so
+**What plain HTTP costs.** The password and the session cookie cross the network unencrypted, so
 anyone who can capture traffic on that network can sign in as you. That is a reasonable trade
 on a home network you control and not on a shared one, and the port must never be forwarded
 to the internet.
@@ -210,7 +199,7 @@ rather than guessing which one you mean.
 
 | | |
 |---|---|
-| Cookie | `__Host-psid` — `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain`. Named `psid` and not `Secure` on a plain-HTTP deployment — section 1 |
+| Cookie | `__Host-psid` — `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain`. Named `psid` and not `Secure` when reached over plain HTTP — section 1 |
 | Idle expiry | 7 days since the last request (`PORTFOLIO_SESSION_IDLE_DAYS`) |
 | Absolute expiry | 30 days since login, never extended (`PORTFOLIO_SESSION_ABSOLUTE_DAYS`) |
 | Stored as | a SHA-256 hash of the token, so a leaked database file yields no usable session |
@@ -822,7 +811,7 @@ names the address**, so you match it against your wallet list rather than agains
 ### Triggering one by hand
 
 ```bash
-curl -X POST -H 'Content-Type: application/json' -H "Origin: https://<host>" \
+curl -X POST -H 'Content-Type: application/json' \
      -b "$COOKIE" https://<host>/api/balances/sync
 ```
 
@@ -1461,7 +1450,7 @@ At `WARNING`, written before the request's `request_completed` line, with the sa
 | Field | Meaning |
 |---|---|
 | `status` | `401` or `403`. |
-| `reason` | `no_session`: no session cookie. `session_invalid`: a cookie that names no live session. `origin`: a request that changes state without the configured `Origin`. `content_type`: one that changes state and is not JSON. |
+| `reason` | `no_session`: no session cookie. `session_invalid`: a cookie that names no live session. `content_type`: a request that changes state and is not JSON. |
 | `method` | `GET`, `POST`, ... |
 | `path` | The path asked for, never the query string, and **at most 256 characters of it**. A longer path is cut back to the last `/` within its first 256, so no part of a segment is written. |
 | `path_truncated` | `true`, only on a path that was cut. |
@@ -1636,11 +1625,8 @@ A lasting one is a defect to report, with the `error_type` and the `request_id`.
 
 | Symptom | Likely cause |
 |---|---|
-| Container never becomes healthy after the auth deployment, deployment rolls back | `PORTFOLIO_ALLOWED_ORIGIN` not set in `secrets.env` — section 1 |
 | Container refuses to start, log names the bootstrap password | It is blank, under 12 characters, or a deny-listed default |
-| Container refuses to start, log names `PORTFOLIO_SESSION_COOKIE_SECURE` | The flag is `false` but `PORTFOLIO_ALLOWED_ORIGIN` does not start with `http://` — section 1 |
-| Login returns 204 but the app still shows the login page | The cookie was dropped. `__Host-` requires `Secure`, which requires HTTPS. On a plain `http://` origin, also set `PORTFOLIO_SESSION_COOKIE_SECURE=false` — section 1 |
-| Reads work, every write returns 403 | `PORTFOLIO_ALLOWED_ORIGIN` does not match the address bar exactly |
+| Login returns 204 but the app still shows the login page | The cookie was dropped. A proxy in front that rewrites or strips `Origin` can make the server choose the wrong cookie for the scheme — section 1 |
 | `/api/docs` returns 401 in the browser | Working as intended — sign in first, section 6 |
 | Login returns 429 | Throttled — section 7 |
 | Logged out roughly weekly | Working as intended: the 7-day idle window |

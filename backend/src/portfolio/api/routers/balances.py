@@ -35,7 +35,12 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query
 from fastapi.exceptions import RequestValidationError
 
-from portfolio.api.dependencies import get_balance_service, get_principal, get_sync_coordinator
+from portfolio.api.dependencies import (
+    get_balance_service,
+    get_portfolio_scope,
+    get_principal,
+    get_sync_coordinator,
+)
 from portfolio.api.errors import NotFoundError
 from portfolio.api.schemas.balances import (
     DEFAULT_QUOTE_CURRENCY,
@@ -192,15 +197,18 @@ async def sync_balances(
 async def read_current_balances(
     principal: CurrentPrincipal,
     service: CurrentBalanceService,
+    scope: Annotated[int | None, Depends(get_portfolio_scope)],
     quote_currency: ValuationCurrency = DEFAULT_QUOTE_CURRENCY,
 ) -> CurrentBalancesResponse:
-    """Return every active wallet's latest balance and what it is worth.
+    """Return every active wallet's latest balance and what it is worth, or one portfolio's.
 
     **Reads the snapshot table; asks no chain anything.** A wallet the sync has never
     covered comes back with nulls rather than zeros, and a holding with no price is named in
     `unpriced` rather than valued at nothing.
     """
-    view = await service.current_balances(principal, quote_currency=quote_currency)
+    view = await service.current_balances(
+        principal, quote_currency=quote_currency, portfolio_id=scope
+    )
     return CurrentBalancesResponse.of(view)
 
 

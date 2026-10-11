@@ -55,14 +55,23 @@ class WalletRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def list_for_user(self, user_id: int, *, include_archived: bool = False) -> list[Wallet]:
-        """Every wallet an account holds, oldest first.
+    async def list_for_user(
+        self,
+        user_id: int,
+        *,
+        include_archived: bool = False,
+        portfolio_id: int | None = None,
+    ) -> list[Wallet]:
+        """Every wallet an account holds, oldest first; only one portfolio's when it is named
+        (spec 044).
 
         Ordered by the primary key, which is an `INTEGER` column: ordering by a `TEXT`
         money column would coerce it to a float, but there is no money here and an id is
         exactly the insertion order the owner added the wallets in.
         """
         statement = select(Wallet).where(Wallet.user_id == user_id)
+        if portfolio_id is not None:
+            statement = statement.where(Wallet.portfolio_id == portfolio_id)
         if not include_archived:
             statement = statement.where(Wallet.archived_at.is_(None))
         result = await self._session.scalars(statement.order_by(Wallet.id))
@@ -132,6 +141,7 @@ class WalletRepository:
         address_display: str,
         label: str | None,
         created_at: datetime,
+        portfolio_id: int,
         kind: str = "address",
     ) -> Wallet:
         """Insert a wallet. The caller has already validated the address or the key.
@@ -159,6 +169,7 @@ class WalletRepository:
             created_at=created_at,
             updated_at=created_at,
             kind=kind,
+            portfolio_id=portfolio_id,
         )
         self._session.add(wallet)
         try:
@@ -174,6 +185,12 @@ class WalletRepository:
     async def set_label(self, wallet: Wallet, label: str | None, updated_at: datetime) -> None:
         """Replace the label in place. `None` clears it."""
         wallet.label = label
+        wallet.updated_at = updated_at
+        await self._session.flush()
+
+    async def set_portfolio(self, wallet: Wallet, portfolio_id: int, updated_at: datetime) -> None:
+        """File the wallet in another portfolio. Its history follows it (spec 044, R6)."""
+        wallet.portfolio_id = portfolio_id
         wallet.updated_at = updated_at
         await self._session.flush()
 
