@@ -12,7 +12,11 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 
-from portfolio.api.dependencies import get_portfolio_history_service, get_principal
+from portfolio.api.dependencies import (
+    get_portfolio_history_service,
+    get_portfolio_scope,
+    get_principal,
+)
 from portfolio.api.errors import NotFoundError
 from portfolio.api.schemas.history import PortfolioHistoryResponse, WalletValueHistoryResponse
 from portfolio.services.auth import Principal
@@ -40,6 +44,7 @@ router = APIRouter(tags=["history"])
 async def read_portfolio_history(
     principal: CurrentPrincipal,
     service: CurrentHistoryService,
+    scope: Annotated[int | None, Depends(get_portfolio_scope)],
     history_range: Range = HistoryRange.DAYS_90,
 ) -> PortfolioHistoryResponse:
     """One point per day, oldest first, ending today (UTC).
@@ -48,7 +53,7 @@ async def read_portfolio_history(
     nothing can value is `null`, never `"0"`**: no wallet read yet, or a holding with no
     price that day. Every amount is a JSON string.
     """
-    history = await service.portfolio(principal.user_id, history_range)
+    history = await service.portfolio(principal.user_id, history_range, scope)
     return PortfolioHistoryResponse.of(history)
 
 

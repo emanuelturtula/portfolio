@@ -45,6 +45,8 @@ from portfolio.repositories.exchange_operations import (
     NewOperation,
     OperationFilter,
 )
+from portfolio.repositories.portfolios import PortfolioRepository
+from portfolio.services.portfolios import PortfolioNotFoundError, resolve_portfolio
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -68,6 +70,7 @@ __all__ = [
     "OperationNotManualError",
     "OperationPage",
     "OperationView",
+    "PortfolioNotFoundError",
     "UploadRefusedError",
     "build_exchange_operation_service",
     "utc_now",
@@ -135,12 +138,13 @@ class FileReport:
 
 @dataclass(frozen=True, slots=True)
 class ImportReport:
-    """What an upload stored, file by file."""
+    """What an upload stored, file by file, and the portfolio it stored it in."""
 
     filename: str
     files: tuple[FileReport, ...]
     stored: int
     already_stored: int
+    portfolio_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +164,7 @@ class OperationView:
     fee_asset: str | None
     fee_amount: Decimal | None
     description: str
+    portfolio_id: int
 
     @property
     def manual(self) -> bool:
@@ -210,6 +215,7 @@ def view_of(row: ExchangeOperation) -> OperationView:
         fee_asset=row.fee_asset,
         fee_amount=row.fee_amount,
         description=row.description,
+        portfolio_id=row.portfolio_id,
     )
 
 
@@ -230,16 +236,29 @@ class ExchangeOperationService:
         *,
         session: AsyncSession,
         operations: ExchangeOperationRepository,
+        portfolios: PortfolioRepository,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._session = session
         self._operations = operations
+        self._portfolios = portfolios
         self._clock = clock
 
-    async def import_upload(self, user_id: int, filename: str, content_base64: str) -> ImportReport:
-        """Store every operation of the upload that is not stored yet.
+    async def import_upload(
+        self,
+        user_id: int,
+        filename: str,
+        content_base64: str,
+        portfolio_id: int | None = None,
+    ) -> ImportReport:
+        """Store every operation of the upload that is not stored yet, in `portfolio_id` or
+        the owner's first portfolio (spec 044, R8).
+
+        An operation already stored is skipped whatever portfolio holds it (R3): one
+        operation is never in two.
 
         Raises:
+            PortfolioNotFoundError: `portfolio_id` is not one of the caller's.
             UploadRefusedError: the upload is not base64, is too large, is a broken zip, or has
                 a row that cannot be read. Nothing is stored.
         """
@@ -247,6 +266,7 @@ class ExchangeOperationService:
         parsed = [_parse(name, data) for name, data in _files(filename, content)]
 
         now = self._clock()
+        target = await resolve_portfolio(self._portfolios, user_id, portfolio_id, now=now)
         seen: dict[str, set[str]] = {}
         new: list[NewOperation] = []
         reports = []
@@ -291,7 +311,11 @@ class ExchangeOperationService:
             imported_at=now,
         )
         await self._operations.add(
-            user_id=user_id, operations=new, import_id=import_id, created_at=now
+            user_id=user_id,
+            portfolio_id=target,
+            operations=new,
+            import_id=import_id,
+            created_at=now,
         )
         await self._session.commit()
         return ImportReport(
@@ -299,6 +323,7 @@ class ExchangeOperationService:
             files=tuple(reports),
             stored=total_stored,
             already_stored=total_already,
+            portfolio_id=target,
         )
 
     async def list_operations(
@@ -310,19 +335,43 @@ class ExchangeOperationService:
         filters: OperationFilter | None = None,
     ) -> OperationPage:
         """One page of the owner's operations that `filters` keeps, newest first, with every
-        asset and venue the owner has, for choosing the next filter."""
+        asset and venue the owner has -- in the filter's portfolio, when it names one -- for
+        choosing the next filter."""
         total = await self._operations.count(user_id, filters)
         rows = await self._operations.page(user_id, limit=limit, offset=offset, filters=filters)
+        portfolio_id = filters.portfolio_id if filters is not None else None
         return OperationPage(
             total=total,
             operations=tuple(view_of(row) for row in rows),
-            assets=tuple(await self._operations.assets(user_id)),
-            venues=tuple(await self._operations.venues(user_id)),
+            assets=tuple(await self._operations.assets(user_id, portfolio_id)),
+            venues=tuple(await self._operations.venues(user_id, portfolio_id)),
         )
 
-    async def add_manual(self, user_id: int, entry: ManualOperation) -> OperationView:
-        """Store a buy or a sell entered by hand, under an id of its own."""
+    async def move(self, user_id: int, filters: OperationFilter, portfolio_id: int) -> int:
+        """File every operation `filters` keeps in `portfolio_id`, imported and manual alike,
+        and say how many moved (spec 044, R7).
+
+        Raises:
+            PortfolioNotFoundError: the target, or the filter's portfolio, is not the caller's.
+        """
+        for named in (portfolio_id, filters.portfolio_id):
+            if named is not None and await self._portfolios.get_for_user(user_id, named) is None:
+                raise PortfolioNotFoundError
+        moved = await self._operations.move(user_id, filters, portfolio_id)
+        await self._session.commit()
+        return moved
+
+    async def add_manual(
+        self, user_id: int, entry: ManualOperation, portfolio_id: int | None = None
+    ) -> OperationView:
+        """Store a buy or a sell entered by hand, under an id of its own, in `portfolio_id` or
+        the owner's first portfolio (spec 044, R8).
+
+        Raises:
+            PortfolioNotFoundError: `portfolio_id` is not one of the caller's.
+        """
         now = self._clock()
+        target = await resolve_portfolio(self._portfolios, user_id, portfolio_id, now=now)
         operation = NewOperation(
             source=Source.MANUAL,
             venue=entry.venue,
@@ -338,7 +387,11 @@ class ExchangeOperationService:
             description=entry.description,
         )
         (row,) = await self._operations.add(
-            user_id=user_id, operations=[operation], import_id=None, created_at=now
+            user_id=user_id,
+            portfolio_id=target,
+            operations=[operation],
+            import_id=None,
+            created_at=now,
         )
         await self._session.commit()
         return view_of(row)
@@ -455,5 +508,8 @@ def build_exchange_operation_service(
 ) -> ExchangeOperationService:
     """Assemble the service over one database session."""
     return ExchangeOperationService(
-        session=session, operations=ExchangeOperationRepository(session), clock=clock
+        session=session,
+        operations=ExchangeOperationRepository(session),
+        portfolios=PortfolioRepository(session),
+        clock=clock,
     )

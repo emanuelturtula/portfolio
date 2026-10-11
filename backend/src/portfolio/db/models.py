@@ -236,6 +236,29 @@ class Asset(Base):
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
+class Portfolio(Base):
+    """A named group of wallets and exchange operations (spec 044).
+
+    Every wallet and every operation belongs to exactly one portfolio (R1), so the portfolios
+    together add up to everything the owner holds and nothing is counted twice. The name is
+    unique per owner exactly as typed (R9).
+
+    Rows that still point at a portfolio keep it from being deleted: the two foreign keys to it
+    have no cascade, so the database refuses what the service already refuses (R10).
+    """
+
+    __tablename__ = "portfolios"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_portfolios_user_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+
 class Wallet(Base):
     """One on-chain address the owner wants balances read from.
 
@@ -300,6 +323,10 @@ class Wallet(Base):
     # Last, because `0011_extended_keys` adds it to an existing table. The server default is
     # what every row written before it becomes.
     kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'address'"))
+    # Last, because `0018_portfolios` adds it to an existing table (spec 044).
+    portfolio_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("portfolios.id"), nullable=False, index=True
+    )
 
 
 class DerivedAddress(Base):
@@ -737,6 +764,10 @@ class ExchangeOperation(Base):
         Integer, ForeignKey("exchange_imports.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    # Last, because `0018_portfolios` adds it to an existing table (spec 044).
+    portfolio_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("portfolios.id"), nullable=False, index=True
+    )
 
 
 # Re-exported so that anything needing the schema -- Alembic's `env.py`, the drift check --

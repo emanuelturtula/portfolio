@@ -19,6 +19,7 @@ from pydantic import AwareDatetime
 from portfolio.api.dependencies import (
     get_exchange_operation_service,
     get_investment_service,
+    get_portfolio_scope,
     get_principal,
 )
 from portfolio.api.errors import ConflictError, NotFoundError, UnprocessableEntityError
@@ -27,6 +28,8 @@ from portfolio.api.schemas.exchange_operations import (
     ImportResponse,
     InvestmentResponse,
     ManualOperationRequest,
+    MoveOperationsRequest,
+    MoveOperationsResponse,
     OperationListResponse,
     OperationResponse,
 )
@@ -37,6 +40,7 @@ from portfolio.services.exchange_operations import (
     OperationFilter,
     OperationNotFoundError,
     OperationNotManualError,
+    PortfolioNotFoundError,
     UploadRefusedError,
 )
 from portfolio.services.investment import InvestmentService
@@ -48,6 +52,7 @@ CurrentOperationService = Annotated[
     ExchangeOperationService, Depends(get_exchange_operation_service)
 ]
 CurrentInvestmentService = Annotated[InvestmentService, Depends(get_investment_service)]
+PortfolioScope = Annotated[int | None, Depends(get_portfolio_scope)]
 
 MAX_PAGE: int = 500
 MAX_FILTER_LENGTH: int = 80
@@ -83,9 +88,13 @@ async def import_operations(
     422 naming the file and the line, and nothing is stored.
     """
     try:
-        report = await service.import_upload(principal.user_id, body.filename, body.content_base64)
+        report = await service.import_upload(
+            principal.user_id, body.filename, body.content_base64, body.portfolio_id
+        )
     except UploadRefusedError as exc:
         raise UnprocessableEntityError(str(exc)) from exc
+    except PortfolioNotFoundError as exc:
+        raise NotFoundError(str(exc)) from exc
     return ImportResponse.of(report)
 
 
@@ -98,6 +107,7 @@ async def import_operations(
 async def list_operations(
     principal: CurrentPrincipal,
     service: CurrentOperationService,
+    scope: PortfolioScope,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
     asset: Annotated[
@@ -125,6 +135,7 @@ async def list_operations(
         message = "`until` must be after `since`."
         raise UnprocessableEntityError(message)
     filters = OperationFilter(
+        portfolio_id=scope,
         asset=asset.strip().upper() if asset is not None else None,
         venue=venue,
         since=since,
@@ -151,23 +162,27 @@ async def create_manual_operation(
     """Store a manual entry, such as a swap inside a wallet app, a miner's payout or a
     withdrawal's unlisted network fee. It can be deleted later."""
     fee_asset = body.fee_asset.strip().upper() if body.fee_asset else None
-    view = await service.add_manual(
-        principal.user_id,
-        ManualOperation(
-            venue=body.venue.strip(),
-            executed_at=body.executed_at,
-            kind=body.kind,
-            asset=body.asset.strip().upper(),
-            quantity=body.quantity,
-            quote_currency=(
-                body.quote_currency.strip().upper() if body.quote_currency is not None else None
+    try:
+        view = await service.add_manual(
+            principal.user_id,
+            ManualOperation(
+                venue=body.venue.strip(),
+                executed_at=body.executed_at,
+                kind=body.kind,
+                asset=body.asset.strip().upper(),
+                quantity=body.quantity,
+                quote_currency=(
+                    body.quote_currency.strip().upper() if body.quote_currency is not None else None
+                ),
+                quote_amount=body.quote_amount,
+                fee_asset=fee_asset if body.fee_amount is not None else None,
+                fee_amount=body.fee_amount if fee_asset is not None else None,
+                description=body.description.strip(),
             ),
-            quote_amount=body.quote_amount,
-            fee_asset=fee_asset if body.fee_amount is not None else None,
-            fee_amount=body.fee_amount if fee_asset is not None else None,
-            description=body.description.strip(),
-        ),
-    )
+            body.portfolio_id,
+        )
+    except PortfolioNotFoundError as exc:
+        raise NotFoundError(str(exc)) from exc
     return OperationResponse.of(view)
 
 
@@ -194,6 +209,34 @@ async def delete_manual_operation(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.post(
+    "/exchange-operations/move",
+    operation_id="moveExchangeOperations",
+    summary="Move every operation a filter keeps to another portfolio",
+    response_model=MoveOperationsResponse,
+)
+async def move_operations(
+    body: MoveOperationsRequest,
+    principal: CurrentPrincipal,
+    service: CurrentOperationService,
+) -> MoveOperationsResponse:
+    """File every operation the filters keep in `portfolio_id`, imported and manual alike
+    (spec 044, R7). The filters mean what they mean in the listing. Either portfolio not
+    being the caller's is a 404."""
+    filters = OperationFilter(
+        portfolio_id=body.from_portfolio,
+        asset=body.asset.strip().upper() if body.asset is not None else None,
+        venue=body.venue,
+        since=body.since,
+        until=body.until,
+    )
+    try:
+        moved = await service.move(principal.user_id, filters, body.portfolio_id)
+    except PortfolioNotFoundError as exc:
+        raise NotFoundError(str(exc)) from exc
+    return MoveOperationsResponse(moved=moved)
+
+
 @router.get(
     "/investment",
     operation_id="readInvestment",
@@ -203,6 +246,7 @@ async def delete_manual_operation(
 async def read_investment(
     principal: CurrentPrincipal,
     service: CurrentInvestmentService,
+    scope: PortfolioScope,
 ) -> InvestmentResponse:
     """The figures for the assets of the active wallets, from the stored operations.
 
@@ -210,5 +254,5 @@ async def read_investment(
     a trade not priced in a stablecoin, or an asset with no value now. Every amount is a JSON
     string.
     """
-    investment = await service.investment(principal.user_id)
+    investment = await service.investment(principal.user_id, scope)
     return InvestmentResponse.of(investment)

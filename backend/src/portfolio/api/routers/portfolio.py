@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends
 
 from portfolio.api.dependencies import (
     get_portfolio_change_service,
+    get_portfolio_scope,
     get_portfolio_service,
     get_principal,
 )
@@ -29,6 +30,7 @@ from portfolio.services.portfolio_changes import PortfolioChangeService
 CurrentPrincipal = Annotated[Principal, Depends(get_principal)]
 CurrentPortfolioService = Annotated[PortfolioService, Depends(get_portfolio_service)]
 CurrentChangeService = Annotated[PortfolioChangeService, Depends(get_portfolio_change_service)]
+PortfolioScope = Annotated[int | None, Depends(get_portfolio_scope)]
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
@@ -42,6 +44,7 @@ router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 async def read_portfolio_summary(
     principal: CurrentPrincipal,
     service: CurrentPortfolioService,
+    scope: PortfolioScope,
 ) -> PortfolioSummaryResponse:
     """Return what the wallets hold and what it is worth.
 
@@ -49,7 +52,7 @@ async def read_portfolio_summary(
     include something -- an unread wallet, an unpriced asset -- names it in `missing` rather
     than counting it as zero. Every amount is a JSON string.
     """
-    view = await service.summary(principal.user_id)
+    view = await service.summary(principal.user_id, scope)
     return PortfolioSummaryResponse.of(view)
 
 
@@ -62,6 +65,7 @@ async def read_portfolio_summary(
 async def read_portfolio_changes(
     principal: CurrentPrincipal,
     service: CurrentChangeService,
+    scope: PortfolioScope,
 ) -> PortfolioChangesResponse:
     """The value now, and its change since 24 hours and 7 days ago (spec 041).
 
@@ -69,5 +73,5 @@ async def read_portfolio_changes(
     that instant times the hourly close that priced it. **A change that cannot be worked out
     is `null` with the reason in `unavailable`, never `"0"`.** Every amount is a JSON string.
     """
-    changes = await service.changes(principal.user_id)
+    changes = await service.changes(principal.user_id, scope)
     return PortfolioChangesResponse.of(changes)

@@ -26,7 +26,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Response, status
 from fastapi.exceptions import RequestValidationError
 
-from portfolio.api.dependencies import get_principal, get_wallet_service
+from portfolio.api.dependencies import get_portfolio_scope, get_principal, get_wallet_service
 from portfolio.api.errors import ConflictError, NotFoundError
 from portfolio.api.schemas.wallets import (
     LABEL_FIELD_NAME,
@@ -37,6 +37,7 @@ from portfolio.api.schemas.wallets import (
 )
 from portfolio.domain.addresses import AddressInvalidError
 from portfolio.services.auth import Principal
+from portfolio.services.portfolios import PortfolioNotFoundError
 from portfolio.services.wallets import (
     UNSET,
     WalletAlreadyExistsError,
@@ -49,6 +50,7 @@ from portfolio.services.wallets import (
 # dependency graph, so the names inside them are runtime values wearing a type's clothes.
 CurrentPrincipal = Annotated[Principal, Depends(get_principal)]
 CurrentWalletService = Annotated[WalletService, Depends(get_wallet_service)]
+PortfolioScope = Annotated[int | None, Depends(get_portfolio_scope)]
 IncludeArchived = Annotated[
     bool,
     Query(description="Include wallets that have been archived."),
@@ -88,10 +90,14 @@ def _address_rejected(exc: AddressInvalidError) -> RequestValidationError:
 async def list_wallets(
     principal: CurrentPrincipal,
     service: CurrentWalletService,
+    scope: PortfolioScope,
     include_archived: IncludeArchived = False,
 ) -> WalletListResponse:
-    """Return the caller's wallets, oldest first, archived ones hidden by default."""
-    views = await service.list_wallets(principal, include_archived=include_archived)
+    """Return the caller's wallets, or one portfolio's, oldest first, archived ones hidden by
+    default."""
+    views = await service.list_wallets(
+        principal, include_archived=include_archived, portfolio_id=scope
+    )
     return WalletListResponse(wallets=[WalletResponse.of(view) for view in views])
 
 
@@ -123,18 +129,21 @@ async def create_wallet(
             chain_key=body.chain_key.value,
             address=body.address,
             label=body.label,
+            portfolio_id=body.portfolio_id,
         )
     except AddressInvalidError as exc:
         raise _address_rejected(exc) from exc
     except WalletAlreadyExistsError as exc:
         raise ConflictError(str(exc)) from exc
+    except PortfolioNotFoundError as exc:
+        raise NotFoundError(str(exc)) from exc
     return WalletResponse.of(view)
 
 
 @router.patch(
     "/{wallet_id}",
     operation_id="updateWallet",
-    summary="Rename a wallet, archive it, or restore it",
+    summary="Rename a wallet, archive it, restore it, or move it to another portfolio",
     response_model=WalletResponse,
 )
 async def update_wallet(
@@ -151,9 +160,12 @@ async def update_wallet(
     """
     label = body.label if LABEL_FIELD_NAME in body.model_fields_set else UNSET
     archived = body.archived if body.archived is not None else UNSET
+    portfolio_id = body.portfolio_id if body.portfolio_id is not None else UNSET
     try:
-        view = await service.update_wallet(principal, wallet_id, label=label, archived=archived)
-    except WalletNotFoundError as exc:
+        view = await service.update_wallet(
+            principal, wallet_id, label=label, archived=archived, portfolio_id=portfolio_id
+        )
+    except (WalletNotFoundError, PortfolioNotFoundError) as exc:
         raise NotFoundError(str(exc)) from exc
     return WalletResponse.of(view)
 

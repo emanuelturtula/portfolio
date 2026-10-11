@@ -305,8 +305,10 @@ class BalanceService:
         principal: Principal,
         *,
         quote_currency: QuoteCurrency,
+        portfolio_id: int | None = None,
     ) -> CurrentBalances:
-        """Every active wallet's latest reading, valued in one currency.
+        """Every active wallet's latest reading, valued in one currency; only one portfolio's
+        wallets when it is named (spec 044).
 
         Archived wallets are excluded, because an archived wallet is one the owner asked us
         to stop reading and its last balance is not part of what they hold today. Its history
@@ -320,7 +322,7 @@ class BalanceService:
         holding with only a USD price is unpriced rather than translated, which is #9's
         contract and is re-asserted here rather than re-decided.
         """
-        wallets = await self._wallets.list_for_user(principal.user_id)
+        wallets = await self._wallets.list_for_user(principal.user_id, portfolio_id=portfolio_id)
         latest = await self._balances.latest_for_wallets([wallet.id for wallet in wallets])
         portfolio = await self._prices.value_portfolio(
             _holdings_of(wallets, latest),

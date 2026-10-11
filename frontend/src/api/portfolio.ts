@@ -8,6 +8,7 @@ import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 
 import { apiFetch } from '@/api/client';
 import type { components } from '@/api/generated/schema';
+import { usePortfolioScope, withPortfolio } from '@/lib/portfolioScope';
 
 export type PortfolioSummary = components['schemas']['PortfolioSummaryResponse'];
 export type Holding = components['schemas']['HoldingResponse'];
@@ -24,14 +25,18 @@ const REFETCH_INTERVAL_MS = 60_000;
 
 /**
  * `['portfolio', ...]` is the prefix a balance sync and a wallet change invalidate, since each
- * changes what the summary reads.
+ * changes what the summary reads. One entry per portfolio scope (spec 044).
  */
-export const portfolioSummaryQueryKey = ['portfolio', 'summary'] as const;
+export function portfolioSummaryQueryKey(scope: number | null) {
+  return ['portfolio', 'summary', scope] as const;
+}
 
 export function usePortfolioSummary(): UseQueryResult<PortfolioSummary> {
+  const { scope } = usePortfolioScope();
   return useQuery({
-    queryKey: portfolioSummaryQueryKey,
-    queryFn: ({ signal }) => apiFetch<PortfolioSummary>(PORTFOLIO_SUMMARY_PATH, { signal }),
+    queryKey: portfolioSummaryQueryKey(scope),
+    queryFn: ({ signal }) =>
+      apiFetch<PortfolioSummary>(withPortfolio(PORTFOLIO_SUMMARY_PATH, scope), { signal }),
     refetchInterval: REFETCH_INTERVAL_MS,
   });
 }

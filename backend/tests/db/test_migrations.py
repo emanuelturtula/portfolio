@@ -91,6 +91,8 @@ APPLICATION_TABLES = frozenset(
         # Spec 042. Every operation of the uploaded exchange exports, and the uploads.
         "exchange_imports",
         "exchange_operations",
+        # Spec 044. The named groups every wallet and operation is filed in.
+        "portfolios",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -168,6 +170,8 @@ HOURLY_TABLES = frozenset({"price_hourly"})
 #: Spec 042's two. Its revision sits on top of `0015`, so every single-step reversal below
 #: `0016_exchange_operations` takes them down as well, and each test subtracts them.
 OPERATION_TABLES = frozenset({"exchange_imports", "exchange_operations"})
+#: Spec 044's table, which every revision below `0018_portfolios` lacks.
+PORTFOLIO_TABLES = frozenset({"portfolios"})
 
 #: Spec 036's revision, and the one below it: the last schema that has the tables it drops.
 DROP_REVISION = "0012_drop_exchanges_accounting"
@@ -202,6 +206,8 @@ EXPECTED_CONSTRAINT_NAMES = {
         "ck_wallets_kind",
         "ck_wallets_kind_chain",
         "fk_wallets_user_id_users",
+        # Spec 044: the portfolio every wallet is filed in, with no cascade.
+        "fk_wallets_portfolio_id_portfolios",
     },
     # #9. `uq_prices_asset_currency` is what makes this the *current* price rather than a
     # history: the refresh upserts onto it. `ck_prices_quote_currency` is the only thing
@@ -277,6 +283,13 @@ EXPECTED_CONSTRAINT_NAMES = {
         "ck_exchange_operations_manual",
         "fk_exchange_operations_user_id_users",
         "fk_exchange_operations_import_id_exchange_imports",
+        "fk_exchange_operations_portfolio_id_portfolios",
+    },
+    # Spec 044. A name is unique per owner (R9).
+    "portfolios": {
+        "pk_portfolios",
+        "uq_portfolios_user_name",
+        "fk_portfolios_user_id_users",
     },
     "derived_addresses": {
         "pk_derived_addresses",
@@ -562,6 +575,7 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
         - RECONSTRUCTED_TABLES
         - HOURLY_TABLES
         - OPERATION_TABLES
+        - PORTFOLIO_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -600,6 +614,7 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
         - RECONSTRUCTED_TABLES
         - HOURLY_TABLES
         - OPERATION_TABLES
+        - PORTFOLIO_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -675,6 +690,7 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
         - RECONSTRUCTED_TABLES
         - HOURLY_TABLES
         - OPERATION_TABLES
+        - PORTFOLIO_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:
@@ -740,7 +756,16 @@ def test_the_migrated_schema_carries_the_convention_names(
         assert found == expected, table
 
     assert {index["name"] for index in inspector.get_indexes("sessions")} == {"ix_sessions_user_id"}
-    assert {index["name"] for index in inspector.get_indexes("wallets")} == {"ix_wallets_user_id"}
+    assert {index["name"] for index in inspector.get_indexes("wallets")} == {
+        "ix_wallets_user_id",
+        "ix_wallets_portfolio_id",
+    }
+    # Spec 044: every per-portfolio read filters on these.
+    assert {index["name"] for index in inspector.get_indexes("exchange_operations")} == {
+        "ix_exchange_operations_user_executed",
+        "ix_exchange_operations_portfolio_id",
+    }
+    assert inspector.get_indexes("portfolios") == []
     # #10's two, named exactly as the spec's DDL writes them. An index the model declares
     # and the migration forgets is invisible to the drift check on SQLite and shows up only
     # as a table scan per chart render, on the slowest hardware this runs on.
@@ -920,6 +945,7 @@ def test_the_dropped_tables_carry_the_convention_names_below_the_drop(
             - RECONSTRUCTED_TABLES
             - HOURLY_TABLES
             - OPERATION_TABLES
+            - PORTFOLIO_TABLES
         )
         | DROPPED_TABLES
         | {STAMP_TABLE}
@@ -1152,6 +1178,7 @@ def test_the_price_history_migration_reverses_on_its_own(
         - RECONSTRUCTED_TABLES
         - HOURLY_TABLES
         - OPERATION_TABLES
+        - PORTFOLIO_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -1199,7 +1226,11 @@ def test_the_reconstructed_balances_migration_reverses_on_its_own(
     command.downgrade(build_alembic_config(database_url), "0013_price_history")
 
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - RECONSTRUCTED_TABLES - HOURLY_TABLES - OPERATION_TABLES
+        APPLICATION_TABLES
+        - RECONSTRUCTED_TABLES
+        - HOURLY_TABLES
+        - OPERATION_TABLES
+        - PORTFOLIO_TABLES
     ) | {STAMP_TABLE}
 
     upgrade_to_head(database_url)
@@ -1239,9 +1270,9 @@ def test_the_price_hourly_migration_reverses_on_its_own(
 
     command.downgrade(build_alembic_config(database_url), "0014_reconstructed_balances")
 
-    assert table_names(sync_engine) == (APPLICATION_TABLES - HOURLY_TABLES - OPERATION_TABLES) | {
-        STAMP_TABLE
-    }
+    assert table_names(sync_engine) == (
+        APPLICATION_TABLES - HOURLY_TABLES - OPERATION_TABLES - PORTFOLIO_TABLES
+    ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
     upgrade_to_head(database_url)
@@ -1281,15 +1312,23 @@ def test_the_manual_rewards_migration_reverses_on_its_own(
                 "VALUES (90, 'rewards', 'x', '2026-10-10 00:00:00.000000')"
             )
         )
+        connection.execute(
+            text(
+                "INSERT INTO portfolios (id, user_id, name, created_at, updated_at) "
+                "VALUES (90, 90, 'Main', '2026-10-10 00:00:00.000000', "
+                "'2026-10-10 00:00:00.000000')"
+            )
+        )
         for number, (source, kind) in enumerate(
             [("manual", "buy"), ("manual", "reward"), ("manual", "fee"), ("bitget", "reward")]
         ):
             connection.execute(
                 text(
                     "INSERT INTO exchange_operations (user_id, source, venue, external_id, "
-                    "executed_at, kind, asset, quantity, description, created_at) VALUES "
+                    "executed_at, kind, asset, quantity, description, created_at, "
+                    "portfolio_id) VALUES "
                     "(90, :source, 'x', :id, '2026-10-10 00:00:00.000000', :kind, 'KAS', "
-                    "'1', '', '2026-10-10 00:00:00.000000')"
+                    "'1', '', '2026-10-10 00:00:00.000000', 90)"
                 ),
                 {"source": source, "id": f"id-{number}", "kind": kind},
             )
@@ -1326,7 +1365,9 @@ def test_the_exchange_operations_migration_reverses_on_its_own(
 
     command.downgrade(build_alembic_config(database_url), "0015_price_hourly")
 
-    assert table_names(sync_engine) == (APPLICATION_TABLES - OPERATION_TABLES) | {STAMP_TABLE}
+    assert table_names(sync_engine) == (
+        APPLICATION_TABLES - OPERATION_TABLES - PORTFOLIO_TABLES
+    ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
     upgrade_to_head(database_url)

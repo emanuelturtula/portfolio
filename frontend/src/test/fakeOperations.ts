@@ -15,6 +15,8 @@ import {
   type Operation,
 } from '@/api/operations';
 
+import { MOVE_OPERATIONS_PATH, type MoveOperationsRequest } from '@/api/portfolios';
+
 import { operation } from './investmentFixtures';
 import { problem, refuseNonJsonWrite } from './server';
 
@@ -58,8 +60,10 @@ export function fakeOperations(options: FakeOperationsOptions = {}): FakeOperati
       const venue = params.get('venue');
       const since = params.get('since');
       const until = params.get('until');
+      const portfolio = params.get('portfolio');
       const kept = stored.filter(
         (row) =>
+          (portfolio === null || String(row.portfolio_id) === portfolio) &&
           (asset === null || row.asset === asset) &&
           (venue === null || row.venue === venue) &&
           (since === null || Date.parse(row.executed_at) >= Date.parse(since)) &&
@@ -112,6 +116,29 @@ export function fakeOperations(options: FakeOperationsOptions = {}): FakeOperati
       });
       stored = [...stored, created];
       return HttpResponse.json(created, { status: 201 });
+    }),
+
+    // Spec 044, R7: every operation the filters keep goes to `portfolio_id`.
+    http.post(MOVE_OPERATIONS_PATH, async ({ request }) => {
+      const body = (await record(request)) as MoveOperationsRequest;
+      const refusal = refuseNonJsonWrite(request);
+      if (refusal !== undefined) {
+        return refusal;
+      }
+      let moved = 0;
+      stored = stored.map((row) => {
+        const kept =
+          row.portfolio_id !== body.portfolio_id &&
+          ((body.from_portfolio ?? null) === null || row.portfolio_id === body.from_portfolio) &&
+          ((body.asset ?? null) === null || row.asset === body.asset) &&
+          ((body.venue ?? null) === null || row.venue === body.venue);
+        if (!kept) {
+          return row;
+        }
+        moved += 1;
+        return { ...row, portfolio_id: body.portfolio_id };
+      });
+      return HttpResponse.json({ moved });
     }),
 
     http.delete(`${OPERATIONS_PATH}/:id`, async ({ request, params }) => {

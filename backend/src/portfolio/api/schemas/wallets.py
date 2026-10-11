@@ -67,6 +67,10 @@ class WalletCreateRequest(BaseModel):
         ),
     )
     label: str | None = Field(default=None, max_length=MAX_LABEL_LENGTH)
+    portfolio_id: int | None = Field(
+        default=None,
+        description="The portfolio to file the wallet in. The first one when omitted.",
+    )
 
     @field_validator("address", mode="before")
     @classmethod
@@ -92,13 +96,18 @@ class WalletUpdateRequest(BaseModel):
     simply a nullable field with a default.
 
     `archived` is the simpler case: omitted and null both mean "leave it as it is", because
-    a three-valued boolean has no third meaning worth having.
+    a three-valued boolean has no third meaning worth having. `portfolio_id` is the same:
+    a wallet is always in a portfolio, so null has nothing to clear.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     label: str | None = Field(default=None, max_length=MAX_LABEL_LENGTH)
     archived: bool | None = None
+    portfolio_id: int | None = Field(
+        default=None,
+        description="Move the wallet, with its history, to this portfolio.",
+    )
 
 
 class WalletResponse(BaseModel):
@@ -119,6 +128,7 @@ class WalletResponse(BaseModel):
     archived: bool
     created_at: datetime
     updated_at: datetime
+    portfolio_id: int = Field(description="The portfolio the wallet is filed in.")
 
     @classmethod
     def of(cls, view: WalletView) -> WalletResponse:
@@ -132,6 +142,7 @@ class WalletResponse(BaseModel):
             archived=view.archived,
             created_at=view.created_at,
             updated_at=view.updated_at,
+            portfolio_id=view.portfolio_id,
         )
 
 

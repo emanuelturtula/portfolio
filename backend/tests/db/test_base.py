@@ -35,6 +35,9 @@ EXPECTED_NAMES = {
         "ck_wallets_kind_chain",
         "fk_wallets_user_id_users",
         "ix_wallets_user_id",
+        # Spec 044. Every wallet is in one portfolio, and a portfolio's reads go through it.
+        "fk_wallets_portfolio_id_portfolios",
+        "ix_wallets_portfolio_id",
     },
     # #9. `uq_prices_asset_currency` is named explicitly for the same reason
     # `uq_wallets_user_chain_address` is: the convention would render
@@ -120,6 +123,16 @@ EXPECTED_NAMES = {
         "fk_exchange_operations_user_id_users",
         "fk_exchange_operations_import_id_exchange_imports",
         "ix_exchange_operations_user_executed",
+        # Spec 044.
+        "fk_exchange_operations_portfolio_id_portfolios",
+        "ix_exchange_operations_portfolio_id",
+    },
+    # Spec 044. A name is unique per owner; the owner's portfolios are read through the
+    # unique constraint, which leads with `user_id`, so there is no separate index.
+    "portfolios": {
+        "pk_portfolios",
+        "uq_portfolios_user_name",
+        "fk_portfolios_user_id_users",
     },
 }
 

@@ -32,6 +32,8 @@ __all__ = [
     "InvestedOnDayResponse",
     "InvestmentResponse",
     "ManualOperationRequest",
+    "MoveOperationsRequest",
+    "MoveOperationsResponse",
     "OperationListResponse",
     "OperationResponse",
     "TotalInvestmentResponse",
@@ -49,6 +51,10 @@ class ImportRequest(BaseModel):
 
     filename: str = Field(min_length=1, max_length=MAX_FILENAME_LENGTH)
     content_base64: str = Field(description="The file's bytes, base64-encoded; at most 5 MiB.")
+    portfolio_id: int | None = Field(
+        default=None,
+        description="The portfolio to store it in. The first one when omitted (spec 044).",
+    )
 
 
 class ImportFileResponse(BaseModel):
@@ -78,12 +84,13 @@ class ImportFileResponse(BaseModel):
 
 
 class ImportResponse(BaseModel):
-    """What an upload stored, file by file, and in all."""
+    """What an upload stored, file by file, and in all, and the portfolio it went to."""
 
     filename: str
     files: list[ImportFileResponse]
     stored: int
     already_stored: int
+    portfolio_id: int
 
     @classmethod
     def of(cls, report: ImportReport) -> ImportResponse:
@@ -93,6 +100,7 @@ class ImportResponse(BaseModel):
             files=[ImportFileResponse.of(file) for file in report.files],
             stored=report.stored,
             already_stored=report.already_stored,
+            portfolio_id=report.portfolio_id,
         )
 
 
@@ -113,6 +121,7 @@ class OperationResponse(BaseModel):
     fee_amount: MoneyStr | None
     description: str
     manual: bool
+    portfolio_id: int
 
     @classmethod
     def of(cls, view: OperationView) -> OperationResponse:
@@ -132,6 +141,7 @@ class OperationResponse(BaseModel):
             fee_amount=view.fee_amount,
             description=view.description,
             manual=view.manual,
+            portfolio_id=view.portfolio_id,
         )
 
 
@@ -144,10 +154,16 @@ class OperationListResponse(BaseModel):
     count: int
     operations: list[OperationResponse]
     assets: list[str] = Field(
-        description="Every asset with a stored operation, alphabetically, whatever the filter."
+        description=(
+            "Every asset with a stored operation, alphabetically, whatever the filter: in the "
+            "portfolio asked for, when one is."
+        )
     )
     venues: list[str] = Field(
-        description="Every venue with a stored operation, alphabetically, whatever the filter."
+        description=(
+            "Every venue with a stored operation, alphabetically, whatever the filter: in the "
+            "portfolio asked for, when one is."
+        )
     )
 
     @classmethod
@@ -182,6 +198,10 @@ class ManualOperationRequest(BaseModel):
     fee_asset: str | None = Field(default=None, min_length=1, max_length=MAX_SYMBOL_LENGTH)
     fee_amount: MoneyStr | None = Field(default=None, gt=0)
     description: str = Field(default="", max_length=MAX_TEXT_LENGTH)
+    portfolio_id: int | None = Field(
+        default=None,
+        description="The portfolio to store it in. The first one when omitted (spec 044).",
+    )
 
     @model_validator(mode="after")
     def _counterpart_matches_kind(self) -> ManualOperationRequest:
@@ -197,6 +217,36 @@ class ManualOperationRequest(BaseModel):
             message = "a reward or a fee has no fee of its own"
             raise ValueError(message)
         return self
+
+
+class MoveOperationsRequest(BaseModel):
+    """Which operations to move, by the listing's own filters, and where (spec 044, R7).
+
+    Every filter is optional, and one left out keeps every value. `from_portfolio` is the
+    listing's `portfolio`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    portfolio_id: int = Field(description="The portfolio to move them to.")
+    from_portfolio: int | None = None
+    asset: str | None = Field(default=None, min_length=1, max_length=MAX_SYMBOL_LENGTH)
+    venue: str | None = Field(default=None, min_length=1, max_length=MAX_TEXT_LENGTH)
+    since: AwareDatetime | None = None
+    until: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def _window_is_forward(self) -> MoveOperationsRequest:
+        if self.since is not None and self.until is not None and self.until <= self.since:
+            message = "`until` must be after `since`."
+            raise ValueError(message)
+        return self
+
+
+class MoveOperationsResponse(BaseModel):
+    """How many operations moved. Those already in the target are not counted."""
+
+    moved: int
 
 
 class AssetInvestmentResponse(BaseModel):

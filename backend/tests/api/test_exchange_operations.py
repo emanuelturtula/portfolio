@@ -155,7 +155,10 @@ async def test_an_upload_stores_its_operations_once(api_environment: Path) -> No
         ],
         "stored": 2,
         "already_stored": 0,
+        # Spec 044: named none, so filed in the owner's first portfolio.
+        "portfolio_id": first["portfolio_id"],
     }
+    assert isinstance(first["portfolio_id"], int)
     assert (again["stored"], again["already_stored"]) == (0, 2)
     assert body["count"] == 2
     newest, oldest = body["operations"]

@@ -58,6 +58,7 @@ from portfolio.providers.base import (
 from portfolio.providers.errors import UnknownChainError
 from portfolio.providers.registry import CHAIN_PROVIDERS
 from tests.address_vectors import BIP173_TESTNET_P2WPKH, KASPA_TESTNET_V0
+from tests.portfolio_harness import main_portfolio
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -331,14 +332,16 @@ async def insert_wallet(
     vector where they differ -- the uppercase bech32 rendering -- is `tests/api/`'s
     business rather than the sync service's.
     """
+    portfolio_id = await main_portfolio(session, user_id)
     result = await session.execute(
         text(
             "INSERT INTO wallets (user_id, chain_key, address_canonical, address_display, "
-            "label, archived_at, created_at, updated_at) "
+            "label, archived_at, created_at, updated_at, portfolio_id) "
             "VALUES (:user_id, :chain_key, :address, :address, :label, :archived_at, "
-            ":now, :now) RETURNING id"
+            ":now, :now, :portfolio_id) RETURNING id"
         ),
         {
+            "portfolio_id": portfolio_id,
             "user_id": user_id,
             "chain_key": chain_key.value,
             "address": address,

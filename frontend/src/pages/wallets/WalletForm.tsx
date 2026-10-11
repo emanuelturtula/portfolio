@@ -3,6 +3,7 @@ import { flushSync } from 'react-dom';
 
 import { ApiError, describeApiError } from '@/api/client';
 import { useCreateWallet, type ChainKey } from '@/api/wallets';
+import { PortfolioField, portfolioBody, usePortfolioTarget } from '@/components/PortfolioField';
 import {
   addressHint,
   CHAIN_KEYS,
@@ -119,6 +120,7 @@ export function WalletForm() {
   const labelErrorRef = useRef<HTMLParagraphElement | null>(null);
 
   const mutation = useCreateWallet();
+  const target = usePortfolioTarget();
 
   const hint = addressHint(chainKey, address);
   const switchTarget = hint?.switchTo;
@@ -145,7 +147,12 @@ export function WalletForm() {
     // value reaches it, and it refuses one before storing it. A second check on this line
     // would be a branch that can never run.
     mutation.mutate(
-      { chain_key: chainKey, address, label: label.trim() === '' ? null : label },
+      {
+        chain_key: chainKey,
+        address,
+        label: label.trim() === '' ? null : label,
+        ...portfolioBody(target),
+      },
       {
         onSuccess: () => {
           setAddress('');
@@ -283,6 +290,8 @@ export function WalletForm() {
           </p>
         )}
       </div>
+
+      <PortfolioField id="wallet-portfolio" target={target} />
 
       {formErrors?.map((message, index) => (
         // Keyed by position, not by `message`: two distinct 422 entries can carry the

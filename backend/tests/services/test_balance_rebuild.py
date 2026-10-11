@@ -44,6 +44,7 @@ from tests.address_vectors import (
 )
 from tests.balance_harness import insert_user, insert_wallet, sqlite_timestamp
 from tests.extended_key_vectors import BIP84_ACCOUNT_VPUB
+from tests.portfolio_harness import main_portfolio
 from tests.providers.fakes import FakeChainProvider
 from tests.sqlite_harness import migrated_sessionmaker
 
@@ -132,14 +133,21 @@ async def key_wallet(
 ) -> int:
     """An extended-key wallet and the addresses it has derived, each used or not."""
     async with factory() as session:
+        portfolio_id = await main_portfolio(session, user_id)
         wallet_id = int(
             await session.scalar(
                 text(
                     "INSERT INTO wallets (user_id, chain_key, address_canonical, "
-                    "address_display, kind, created_at, updated_at) VALUES (:user, 'bitcoin', "
-                    ":key, :key, 'extended_key', :at, :at) RETURNING id"
+                    "address_display, kind, created_at, updated_at, portfolio_id) VALUES "
+                    "(:user, 'bitcoin', :key, :key, 'extended_key', :at, :at, "
+                    ":portfolio_id) RETURNING id"
                 ),
-                {"user": user_id, "key": BIP84_ACCOUNT_VPUB, "at": sqlite_timestamp(NOW)},
+                {
+                    "portfolio_id": portfolio_id,
+                    "user": user_id,
+                    "key": BIP84_ACCOUNT_VPUB,
+                    "at": sqlite_timestamp(NOW),
+                },
             )
         )
         for index, (address, used) in enumerate(derived.items()):

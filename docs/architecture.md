@@ -508,6 +508,32 @@ The upload is JSON because the write guard lets nothing else change state.
 | `services/investment.py` | `services` | reads the operations and the dashboard summary, so the value is the dashboard's own |
 | `api/routers/exchange_operations.py` | `api` | the five routes above, handed built services |
 
+### Portfolios (spec 044)
+
+The owner's wallets and operations are grouped into named portfolios, such as one for
+retirement and one for trading. Migration `0018_portfolios` adds `portfolios` (`UNIQUE
+(user_id, name)`), creates a `Main` for every account, and files every existing wallet and
+operation in it through a required, indexed `portfolio_id` on `wallets` and
+`exchange_operations`. Each wallet and each operation is in exactly one portfolio, so *All
+portfolios* is their sum and nothing is counted twice. Address uniqueness and the dedup of
+uploaded operations stay per owner, across portfolios.
+
+| Endpoint | Answers |
+|---|---|
+| `GET /api/portfolios` | every portfolio, oldest first, with how many wallets (archived included) and operations it holds |
+| `POST /api/portfolios` | 201 with the new portfolio; 409 for a name the owner already uses; 422 for a blank or overlong one |
+| `PATCH /api/portfolios/{portfolio_id}` | rename: 200; 404, 409 and 422 as above |
+| `DELETE /api/portfolios/{portfolio_id}` | 204; 409 for the owner's only portfolio or one that still holds anything |
+| `POST /api/exchange-operations/move` | moves every operation a filter keeps (from a portfolio, asset, venue, days) to another; answers how many moved |
+
+The summary, changes, history, investment, wallet list, current balances and operations list
+take an optional `?portfolio=<id>`: without it they answer for all portfolios, as before, and
+with an id that is not the caller's they answer 404. A write that names no portfolio goes to
+the owner's oldest, and creates `Main` if there is none, so the CLI and older clients need
+nothing. Moving a wallet is `PATCH /api/wallets/{id}` with `portfolio_id`, and its whole
+history moves with it, because history is read through the wallet. Sync, backups and health
+stay global.
+
 ### Past balances, rebuilt (spec 038)
 
 A snapshot exists only from the day a wallet was added. Before that, each wallet's closing

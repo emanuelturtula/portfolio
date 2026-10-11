@@ -89,6 +89,7 @@ export function operation(overrides: Partial<Operation> = {}): Operation {
     fee_amount: '0.000500000000000000',
     description: 'Spot Buy',
     manual: false,
+    portfolio_id: 1,
     ...overrides,
   };
 }

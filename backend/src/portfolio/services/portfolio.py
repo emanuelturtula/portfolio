@@ -123,8 +123,9 @@ class PortfolioService:
         self._prices = prices
         self._clock = clock
 
-    async def summary(self, user_id: int) -> PortfolioSummaryView:
-        """The owner's total value, and every holding's share of it.
+    async def summary(self, user_id: int, portfolio_id: int | None = None) -> PortfolioSummaryView:
+        """The owner's total value, and every holding's share of it: of every portfolio, or
+        of the one named (spec 044).
 
         The clock is read once, so every reading is held to the same instant. The latest
         finished balance run is read before the snapshots: a reading committed between the two
@@ -134,7 +135,7 @@ class PortfolioService:
         missing: set[Missing] = set()
         quantities: dict[str, Decimal] = {}
 
-        wallets = await self._wallets.list_for_user(user_id)
+        wallets = await self._wallets.list_for_user(user_id, portfolio_id=portfolio_id)
         latest_run = await self._sync_runs.latest_finished()
         readings = await self._balances.latest_for_wallets([wallet.id for wallet in wallets])
         for wallet in wallets:

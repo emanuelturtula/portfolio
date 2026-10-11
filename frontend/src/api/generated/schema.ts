@@ -93,7 +93,7 @@ export interface paths {
         };
         /**
          * The latest reading of every active wallet, valued
-         * @description Return every active wallet's latest balance and what it is worth.
+         * @description Return every active wallet's latest balance and what it is worth, or one portfolio's.
          *
          *     **Reads the snapshot table; asks no chain anything.** A wallet the sync has never
          *     covered comes back with nulls rather than zeros, and a holding with no price is named in
@@ -208,6 +208,28 @@ export interface paths {
          *     422 naming the file and the line, and nothing is stored.
          */
         post: operations["importExchangeOperations"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/exchange-operations/move": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Move every operation a filter keeps to another portfolio
+         * @description File every operation the filters keep in `portfolio_id`, imported and manual alike
+         *     (spec 044, R7). The filters mean what they mean in the listing. Either portfolio not
+         *     being the caller's is a 404.
+         */
+        post: operations["moveExchangeOperations"];
         delete?: never;
         options?: never;
         head?: never;
@@ -371,6 +393,56 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/portfolios": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Every portfolio, with how many wallets and operations each holds
+         * @description Oldest first. The first is where a wallet, an upload or a manual entry that names no
+         *     portfolio goes.
+         */
+        get: operations["listPortfolios"];
+        put?: never;
+        /**
+         * Create a portfolio
+         * @description A name already in use is a 409.
+         */
+        post: operations["createPortfolio"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/portfolios/{portfolio_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete an empty portfolio
+         * @description Only a portfolio that holds no wallet and no operation, and is not the last one, can be
+         *     deleted; otherwise a 409 says which. Nothing is ever deleted along with it.
+         */
+        delete: operations["deletePortfolio"];
+        options?: never;
+        head?: never;
+        /**
+         * Rename a portfolio
+         * @description A name another portfolio has is a 409; its own name again is not.
+         */
+        patch: operations["renamePortfolio"];
+        trace?: never;
+    };
     "/api/wallets": {
         parameters: {
             query?: never;
@@ -380,7 +452,8 @@ export interface paths {
         };
         /**
          * List the wallets balances are read from
-         * @description Return the caller's wallets, oldest first, archived ones hidden by default.
+         * @description Return the caller's wallets, or one portfolio's, oldest first, archived ones hidden by
+         *     default.
          */
         get: operations["listWallets"];
         put?: never;
@@ -426,7 +499,7 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * Rename a wallet, archive it, or restore it
+         * Rename a wallet, archive it, restore it, or move it to another portfolio
          * @description Apply only the fields the request actually sent.
          *
          *     `model_fields_set` is what separates "the label was omitted" from `"label": null`; the
@@ -796,10 +869,15 @@ export interface components {
             content_base64: string;
             /** Filename */
             filename: string;
+            /**
+             * Portfolio Id
+             * @description The portfolio to store it in. The first one when omitted (spec 044).
+             */
+            portfolio_id?: number | null;
         };
         /**
          * ImportResponse
-         * @description What an upload stored, file by file, and in all.
+         * @description What an upload stored, file by file, and in all, and the portfolio it went to.
          */
         ImportResponse: {
             /** Already Stored */
@@ -808,6 +886,8 @@ export interface components {
             filename: string;
             /** Files */
             files: components["schemas"]["ImportFileResponse"][];
+            /** Portfolio Id */
+            portfolio_id: number;
             /** Stored */
             stored: number;
         };
@@ -890,6 +970,11 @@ export interface components {
              */
             kind: "buy" | "sell" | "reward" | "fee";
             /**
+             * Portfolio Id
+             * @description The portfolio to store it in. The first one when omitted (spec 044).
+             */
+            portfolio_id?: number | null;
+            /**
              * Quantity
              * @example 1234.56789012
              */
@@ -925,6 +1010,38 @@ export interface components {
             subject: string;
         };
         /**
+         * MoveOperationsRequest
+         * @description Which operations to move, by the listing's own filters, and where (spec 044, R7).
+         *
+         *     Every filter is optional, and one left out keeps every value. `from_portfolio` is the
+         *     listing's `portfolio`.
+         */
+        MoveOperationsRequest: {
+            /** Asset */
+            asset?: string | null;
+            /** From Portfolio */
+            from_portfolio?: number | null;
+            /**
+             * Portfolio Id
+             * @description The portfolio to move them to.
+             */
+            portfolio_id: number;
+            /** Since */
+            since?: string | null;
+            /** Until */
+            until?: string | null;
+            /** Venue */
+            venue?: string | null;
+        };
+        /**
+         * MoveOperationsResponse
+         * @description How many operations moved. Those already in the target are not counted.
+         */
+        MoveOperationsResponse: {
+            /** Moved */
+            moved: number;
+        };
+        /**
          * OperationKind
          * @description What an operation did. The member is its own stored and wire form.
          * @enum {string}
@@ -939,7 +1056,7 @@ export interface components {
         OperationListResponse: {
             /**
              * Assets
-             * @description Every asset with a stored operation, alphabetically, whatever the filter.
+             * @description Every asset with a stored operation, alphabetically, whatever the filter: in the portfolio asked for, when one is.
              */
             assets: string[];
             /** Count */
@@ -948,7 +1065,7 @@ export interface components {
             operations: components["schemas"]["OperationResponse"][];
             /**
              * Venues
-             * @description Every venue with a stored operation, alphabetically, whatever the filter.
+             * @description Every venue with a stored operation, alphabetically, whatever the filter: in the portfolio asked for, when one is.
              */
             venues: string[];
         };
@@ -977,6 +1094,8 @@ export interface components {
             kind: components["schemas"]["OperationKind"];
             /** Manual */
             manual: boolean;
+            /** Portfolio Id */
+            portfolio_id: number;
             /**
              * Quantity
              * @example 1234.56789012
@@ -1031,6 +1150,14 @@ export interface components {
             range: components["schemas"]["HistoryRange"];
         };
         /**
+         * PortfolioListResponse
+         * @description Every portfolio, oldest first: the first is where a write that names none goes.
+         */
+        PortfolioListResponse: {
+            /** Portfolios */
+            portfolios: components["schemas"]["PortfolioResponse"][];
+        };
+        /**
          * PortfolioPointResponse
          * @description The wallets' value at the end of `day`, in USDT. `null` when it cannot be known.
          *
@@ -1049,6 +1176,34 @@ export interface components {
             day: string;
             /** Value */
             value: string | null;
+        };
+        /**
+         * PortfolioRequest
+         * @description A portfolio's name, to create one or to rename one. Trimmed, and unique per owner.
+         */
+        PortfolioRequest: {
+            /** Name */
+            name: string;
+        };
+        /**
+         * PortfolioResponse
+         * @description One portfolio, with how many wallets (archived ones included) and operations it holds:
+         *     it can be deleted only when both are zero and it is not the last one.
+         */
+        PortfolioResponse: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Id */
+            id: number;
+            /** Name */
+            name: string;
+            /** Operations */
+            operations: number;
+            /** Wallets */
+            wallets: number;
         };
         /**
          * PortfolioSummaryResponse
@@ -1489,6 +1644,11 @@ export interface components {
             chain_key: components["schemas"]["ChainKey"];
             /** Label */
             label?: string | null;
+            /**
+             * Portfolio Id
+             * @description The portfolio to file the wallet in. The first one when omitted.
+             */
+            portfolio_id?: number | null;
         };
         /**
          * WalletHistoryResponse
@@ -1577,6 +1737,11 @@ export interface components {
             /** Label */
             label: string | null;
             /**
+             * Portfolio Id
+             * @description The portfolio the wallet is filed in.
+             */
+            portfolio_id: number;
+            /**
              * Updated At
              * Format: date-time
              */
@@ -1591,13 +1756,19 @@ export interface components {
          *     simply a nullable field with a default.
          *
          *     `archived` is the simpler case: omitted and null both mean "leave it as it is", because
-         *     a three-valued boolean has no third meaning worth having.
+         *     a three-valued boolean has no third meaning worth having. `portfolio_id` is the same:
+         *     a wallet is always in a portfolio, so null has nothing to clear.
          */
         WalletUpdateRequest: {
             /** Archived */
             archived?: boolean | null;
             /** Label */
             label?: string | null;
+            /**
+             * Portfolio Id
+             * @description Move the wallet, with its history, to this portfolio.
+             */
+            portfolio_id?: number | null;
         };
         /**
          * WalletValueHistoryResponse
@@ -1726,6 +1897,8 @@ export interface operations {
             query?: {
                 /** @description The fiat currency to value holdings in. Case-sensitive; anything but the supported codes is refused rather than valued at nothing. */
                 quote_currency?: components["schemas"]["QuoteCurrency"];
+                /** @description Only this portfolio. Every portfolio together when omitted. */
+                portfolio?: number | null;
             };
             header?: never;
             path?: never;
@@ -1818,6 +1991,8 @@ export interface operations {
                 since?: string | null;
                 /** @description Only operations before this instant. Needs an offset. */
                 until?: string | null;
+                /** @description Only this portfolio. Every portfolio together when omitted. */
+                portfolio?: number | null;
             };
             header?: never;
             path?: never;
@@ -1911,6 +2086,39 @@ export interface operations {
             };
         };
     };
+    moveExchangeOperations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MoveOperationsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MoveOperationsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     deleteManualOperation: {
         parameters: {
             query?: never;
@@ -1982,7 +2190,10 @@ export interface operations {
     };
     readInvestment: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Only this portfolio. Every portfolio together when omitted. */
+                portfolio?: number | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -1998,11 +2209,23 @@ export interface operations {
                     "application/json": components["schemas"]["InvestmentResponse"];
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
     readPortfolioChanges: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Only this portfolio. Every portfolio together when omitted. */
+                portfolio?: number | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2018,6 +2241,15 @@ export interface operations {
                     "application/json": components["schemas"]["PortfolioChangesResponse"];
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
     readPortfolioHistory: {
@@ -2025,6 +2257,8 @@ export interface operations {
             query?: {
                 /** @description How far back: 30d, 90d, 1y, or all since the first reading. */
                 range?: components["schemas"]["HistoryRange"];
+                /** @description Only this portfolio. Every portfolio together when omitted. */
+                portfolio?: number | null;
             };
             header?: never;
             path?: never;
@@ -2054,7 +2288,10 @@ export interface operations {
     };
     readPortfolioSummary: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Only this portfolio. Every portfolio together when omitted. */
+                portfolio?: number | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2070,6 +2307,132 @@ export interface operations {
                     "application/json": components["schemas"]["PortfolioSummaryResponse"];
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    listPortfolios: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortfolioListResponse"];
+                };
+            };
+        };
+    };
+    createPortfolio: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PortfolioRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortfolioResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    deletePortfolio: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                portfolio_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    renamePortfolio: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                portfolio_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PortfolioRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortfolioResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
     listWallets: {
@@ -2077,6 +2440,8 @@ export interface operations {
             query?: {
                 /** @description Include wallets that have been archived. */
                 include_archived?: boolean;
+                /** @description Only this portfolio. Every portfolio together when omitted. */
+                portfolio?: number | null;
             };
             header?: never;
             path?: never;

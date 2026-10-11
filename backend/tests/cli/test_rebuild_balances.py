@@ -33,6 +33,7 @@ from tests.balance_harness import (
     stub_chain_providers,
 )
 from tests.offline_http import offline_http_client
+from tests.portfolio_harness import main_portfolio_sync
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -107,15 +108,22 @@ def plant(sync_engine: Engine, *wallets: tuple[ChainKey, str]) -> list[int]:
                 "VALUES ('owner', 'not-a-hash', '2026-01-01 00:00:00.000000') RETURNING id"
             )
         ).scalar_one()
+        portfolio_id = main_portfolio_sync(connection, user_id)
         return [
             connection.execute(
                 text(
                     "INSERT INTO wallets (user_id, chain_key, address_canonical, "
-                    "address_display, created_at, updated_at) VALUES (:user_id, :chain, "
-                    ":address, :address, '2026-01-01 00:00:00.000000', "
-                    "'2026-01-01 00:00:00.000000') RETURNING id"
+                    "address_display, created_at, updated_at, portfolio_id) VALUES (:user_id, "
+                    ":chain, :address, :address, '2026-01-01 00:00:00.000000', "
+                    "'2026-01-01 00:00:00.000000', "
+                    ":portfolio_id) RETURNING id"
                 ),
-                {"user_id": user_id, "chain": chain.value, "address": address},
+                {
+                    "portfolio_id": portfolio_id,
+                    "user_id": user_id,
+                    "chain": chain.value,
+                    "address": address,
+                },
             ).scalar_one()
             for chain, address in wallets
         ]

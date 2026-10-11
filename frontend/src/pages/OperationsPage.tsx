@@ -4,6 +4,7 @@ import { describeApiError } from '@/api/client';
 import {
   DEFAULT_OPERATIONS_PAGE_SIZE,
   OPERATIONS_PAGE_SIZES,
+  startOfDay,
   useCreateManualOperation,
   useDeleteOperation,
   useImportOperations,
@@ -13,12 +14,20 @@ import {
   type Operation,
   type OperationsPageSize,
 } from '@/api/operations';
+import { useMoveOperations, type Portfolio } from '@/api/portfolios';
 import { AbsoluteTime } from '@/components/AbsoluteTime';
 import { EmptyState } from '@/components/EmptyState';
 import { ErrorState } from '@/components/ErrorState';
+import {
+  PortfolioField,
+  PortfolioSelect,
+  portfolioBody,
+  usePortfolioTarget,
+} from '@/components/PortfolioField';
 import { Skeleton } from '@/components/Skeleton';
 import { formatQuantity } from '@/lib/investment';
 import { money } from '@/lib/money';
+import { usePortfolioScope } from '@/lib/portfolioScope';
 
 export const OPERATIONS_LOADING_LABEL = 'Loading the operations…';
 
@@ -54,6 +63,7 @@ export function describeFile(file: ImportFileReport): string {
  */
 function UploadForm() {
   const upload = useImportOperations();
+  const target = usePortfolioTarget();
   const [files, setFiles] = useState<readonly File[]>([]);
   const [reports, setReports] = useState<readonly ImportReport[]>([]);
 
@@ -63,7 +73,7 @@ function UploadForm() {
     const done: ImportReport[] = [];
     for (const file of files) {
       try {
-        done.push(await upload.mutateAsync(file));
+        done.push(await upload.mutateAsync({ file, ...portfolioBody(target) }));
       } catch {
         break;
       } finally {
@@ -99,6 +109,7 @@ function UploadForm() {
           }}
         />
       </div>
+      <PortfolioField id="operations-portfolio" target={target} />
       <button
         type="submit"
         className="button-primary"
@@ -148,6 +159,7 @@ function manualKindOf(value: string): ManualKind {
  */
 function ManualForm() {
   const create = useCreateManualOperation();
+  const target = usePortfolioTarget();
   const [venue, setVenue] = useState('Tangem');
   const [executedAt, setExecutedAt] = useState('');
   const [kind, setKind] = useState<ManualKind>('buy');
@@ -176,6 +188,7 @@ function ManualForm() {
           ? { quote_currency: quoteCurrency.trim(), quote_amount: quoteAmount.trim() }
           : {}),
         description: description.trim(),
+        ...portfolioBody(target),
       },
       {
         onSuccess: () => {
@@ -295,6 +308,7 @@ function ManualForm() {
           }}
         />
       </div>
+      <PortfolioField id="manual-portfolio" target={target} />
       <button type="submit" className="button-primary" disabled={!complete || create.isPending}>
         Add
       </button>
@@ -331,14 +345,19 @@ interface OperationRowProps {
   readonly operation: Operation;
   readonly onDelete: (id: number) => void;
   readonly deleting: boolean;
+  /** The portfolios, when the table shows which one each row is in; otherwise `undefined`. */
+  readonly portfolios: readonly Portfolio[] | undefined;
 }
 
-function OperationRow({ operation, onDelete, deleting }: OperationRowProps) {
+function OperationRow({ operation, onDelete, deleting, portfolios }: OperationRowProps) {
   return (
     <tr>
       <td>
         <AbsoluteTime value={operation.executed_at} />
       </td>
+      {portfolios !== undefined && (
+        <td>{portfolios.find((portfolio) => portfolio.id === operation.portfolio_id)?.name}</td>
+      )}
       <td>{operation.venue}</td>
       <td>{KIND_LABELS[operation.kind]}</td>
       <th scope="row">{operation.asset}</th>
@@ -472,17 +491,86 @@ function FilterBar({ filters, assets, venues, onChange }: FilterBarProps) {
   );
 }
 
+interface MoveBarProps {
+  readonly count: number;
+  readonly scope: number | null;
+  readonly filters: Filters;
+  readonly portfolios: readonly Portfolio[];
+}
+
+/**
+ * Moves every operation the filters keep, on every page, to another portfolio (spec 044, R7).
+ * It names how many before it runs, and moving them back is the same action.
+ */
+function MoveBar({ count, scope, filters, portfolios }: MoveBarProps) {
+  const move = useMoveOperations();
+  const choices = portfolios.filter((portfolio) => portfolio.id !== scope);
+  const [picked, setPicked] = useState<number | undefined>(undefined);
+  const target = choices.some((portfolio) => portfolio.id === picked) ? picked : choices[0]?.id;
+  const noun = count === 1 ? 'operation' : 'operations';
+
+  return (
+    <div className="operations-move" role="group" aria-label="Move to another portfolio">
+      <PortfolioSelect
+        id="operations-move-target"
+        label={`Move these ${String(count)} ${noun} to`}
+        portfolios={choices}
+        value={target}
+        onChange={(portfolio) => {
+          setPicked(portfolio);
+          move.reset();
+        }}
+        disabled={move.isPending}
+      />
+      <button
+        type="button"
+        disabled={target === undefined || move.isPending}
+        onClick={() => {
+          if (target === undefined) {
+            return;
+          }
+          move.mutate({
+            portfolio_id: target,
+            from_portfolio: scope,
+            asset: filters.asset === '' ? null : filters.asset,
+            venue: filters.venue === '' ? null : filters.venue,
+            since: filters.from === '' ? null : startOfDay(filters.from, 0),
+            until: filters.to === '' ? null : startOfDay(filters.to, 1),
+          });
+        }}
+      >
+        Move
+      </button>
+      {move.isSuccess && (
+        <p className="note" role="status">
+          Moved {move.data.moved} {move.data.moved === 1 ? 'operation' : 'operations'}.
+        </p>
+      )}
+      {move.isError && (
+        <p className="note note-error" role="alert">
+          Not moved: {describeApiError(move.error, WRITE_FAILURE_FALLBACK)}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /**
  * The stored operations, every asset, newest first, a page at a time; four states. Filtered by
  * days, asset and venue, with the page size the owner picks; a filter that keeps nothing says
- * so beside the filters, never as "No operations yet".
+ * so beside the filters, never as "No operations yet". Narrowed to the selected portfolio, and
+ * with more than one portfolio, what the filters keep can be moved to another (spec 044).
  */
 function OperationsTable() {
+  const { scope, portfolios } = usePortfolioScope();
   const [filters, setFilters] = useState<Filters>(NO_FILTERS);
   const [pageSize, setPageSize] = useState<OperationsPageSize>(DEFAULT_OPERATIONS_PAGE_SIZE);
   const [page, setPage] = useState(0);
-  const operations = useOperations({ page, pageSize, ...filters });
+  const operations = useOperations({ portfolio: scope, page, pageSize, ...filters });
   const remove = useDeleteOperation();
+  const several = portfolios.length > 1;
+  // Which portfolio each row is in, when the table shows them all.
+  const named = several && scope === null ? portfolios : undefined;
 
   if (operations.isPending) {
     return <Skeleton label={OPERATIONS_LOADING_LABEL} />;
@@ -534,6 +622,9 @@ function OperationsTable() {
           setPage(0);
         }}
       />
+      {several && count > 0 && (
+        <MoveBar count={count} scope={scope} filters={filters} portfolios={portfolios} />
+      )}
       {remove.isError && (
         <p className="note note-error" role="alert">
           Not deleted: {describeApiError(remove.error, WRITE_FAILURE_FALLBACK)}
@@ -550,6 +641,7 @@ function OperationsTable() {
             <thead>
               <tr>
                 <th scope="col">When</th>
+                {named !== undefined && <th scope="col">Portfolio</th>}
                 <th scope="col">Where</th>
                 <th scope="col">Kind</th>
                 <th scope="col">Asset</th>
@@ -573,6 +665,7 @@ function OperationsTable() {
                 <OperationRow
                   key={operation.id}
                   operation={operation}
+                  portfolios={named}
                   deleting={remove.isPending}
                   onDelete={(id) => {
                     remove.mutate(id, {
@@ -647,6 +740,7 @@ function pageSizeOf(value: string): OperationsPageSize {
  * every stored operation in a table. The dashboard's Invested section is built from these.
  */
 export function OperationsPage() {
+  const { scope } = usePortfolioScope();
   return (
     <div className="page">
       <div className="page-head">
@@ -656,7 +750,8 @@ export function OperationsPage() {
         <UploadForm />
         <ManualForm />
       </div>
-      <OperationsTable />
+      {/* Keyed by the portfolio, so another one starts again from the first page, unfiltered. */}
+      <OperationsTable key={String(scope)} />
     </div>
   );
 }

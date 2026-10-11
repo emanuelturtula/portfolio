@@ -16,6 +16,7 @@ import {
 
 import { apiFetch, apiSend } from '@/api/client';
 import type { components } from '@/api/generated/schema';
+import { usePortfolioScope, withPortfolio } from '@/lib/portfolioScope';
 
 export type Wallet = components['schemas']['WalletResponse'];
 export type ChainKey = components['schemas']['ChainKey'];
@@ -26,14 +27,18 @@ const WALLETS_PATH = '/api/wallets';
 /** Query key root every wallet mutation invalidates by, per the spec's query table. */
 export const WALLETS_QUERY_KEY_ROOT = 'wallets' as const;
 
-export function walletsQueryKey(includeArchived: boolean) {
-  return [WALLETS_QUERY_KEY_ROOT, { includeArchived }] as const;
+export function walletsQueryKey(includeArchived: boolean, scope: number | null = null) {
+  return [WALLETS_QUERY_KEY_ROOT, { includeArchived, scope }] as const;
 }
 
-async function fetchWallets(includeArchived: boolean, signal: AbortSignal): Promise<Wallet[]> {
+async function fetchWallets(
+  includeArchived: boolean,
+  scope: number | null,
+  signal: AbortSignal,
+): Promise<Wallet[]> {
   const query = includeArchived ? '?include_archived=true' : '';
   const response = await apiFetch<components['schemas']['WalletListResponse']>(
-    `${WALLETS_PATH}${query}`,
+    withPortfolio(`${WALLETS_PATH}${query}`, scope),
     { signal },
   );
   return response.wallets;
@@ -45,9 +50,10 @@ async function fetchWallets(includeArchived: boolean, signal: AbortSignal): Prom
  * archived row in text rather than filtering by request.
  */
 export function useWallets(includeArchived: boolean): UseQueryResult<Wallet[]> {
+  const { scope } = usePortfolioScope();
   return useQuery({
-    queryKey: walletsQueryKey(includeArchived),
-    queryFn: ({ signal }) => fetchWallets(includeArchived, signal),
+    queryKey: walletsQueryKey(includeArchived, scope),
+    queryFn: ({ signal }) => fetchWallets(includeArchived, scope, signal),
   });
 }
 
@@ -60,6 +66,8 @@ async function invalidateWalletsAndBalances(queryClient: QueryClient): Promise<v
     queryClient.invalidateQueries({ queryKey: [WALLETS_QUERY_KEY_ROOT] }),
     queryClient.invalidateQueries({ queryKey: ['balances'] }),
     queryClient.invalidateQueries({ queryKey: ['portfolio'] }),
+    // A portfolio's count of wallets (spec 044).
+    queryClient.invalidateQueries({ queryKey: ['portfolios'] }),
   ]);
 }
 
@@ -116,5 +124,29 @@ export function useRestoreWallet(
       await invalidateWalletsAndBalances(queryClient);
       options.onSuccess?.();
     },
+  });
+}
+
+/**
+ * Moves a wallet, with its whole history, to another portfolio (spec 044, R6). Every figure can
+ * change, so every query is invalidated, as for the other wallet mutations.
+ */
+export function useMoveWallet(): UseMutationResult<
+  Wallet,
+  unknown,
+  { readonly walletId: number; readonly portfolioId: number }
+> {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ walletId, portfolioId }) =>
+      apiFetch<Wallet>(`${WALLETS_PATH}/${String(walletId)}`, {
+        method: 'PATCH',
+        body: { portfolio_id: portfolioId },
+      }),
+    onSuccess: () =>
+      Promise.all([
+        invalidateWalletsAndBalances(queryClient),
+        queryClient.invalidateQueries({ queryKey: ['operations'] }),
+      ]),
   });
 }

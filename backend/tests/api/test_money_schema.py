@@ -413,6 +413,10 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         "/api/exchange-operations/imports",
         "/api/exchange-operations/{operation_id}",
         "/api/investment",
+        # Portfolios (spec 044): names and counts, no money; moving operations answers a count.
+        "/api/portfolios",
+        "/api/portfolios/{portfolio_id}",
+        "/api/exchange-operations/move",
     }
 
 

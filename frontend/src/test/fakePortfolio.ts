@@ -469,6 +469,7 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
         archived: false,
         created_at: NOW,
         updated_at: NOW,
+        portfolio_id: 1,
       };
       wallets = [...wallets, created];
       canonicalOf.set(created.id, address);
@@ -477,7 +478,8 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
     }),
 
     http.patch(WALLET_PATH, async ({ request, params }) => {
-      const body = (await record(request)) as { archived?: unknown; label?: unknown } | undefined;
+      const body = (await record(request)) as
+        { archived?: unknown; label?: unknown; portfolio_id?: unknown } | undefined;
       await waitFor(body?.archived === false ? 'restore' : 'archive');
 
       const refusal = refuseNonJsonWrite(request);
@@ -494,6 +496,8 @@ export function fakePortfolio(options: FakePortfolioOptions = {}): FakePortfolio
         ...target,
         archived: typeof body?.archived === 'boolean' ? body.archived : target.archived,
         label: body !== undefined && 'label' in body ? (body.label as string | null) : target.label,
+        portfolio_id:
+          typeof body?.portfolio_id === 'number' ? body.portfolio_id : target.portfolio_id,
         updated_at: NOW,
       };
       wallets = wallets.map((row) => (row.id === target.id ? updated : row));

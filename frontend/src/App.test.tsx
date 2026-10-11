@@ -99,7 +99,7 @@ describe('App', () => {
       within(nav)
         .getAllByRole('link')
         .map((link) => link.textContent),
-    ).toEqual(['Dashboard', 'Wallets', 'Operations']);
+    ).toEqual(['Dashboard', 'Wallets', 'Operations', 'Portfolios']);
     // The current page is marked for assistive technology, not by colour alone.
     expect(dashboard).toHaveAttribute('aria-current', 'page');
     expect(wallets).not.toHaveAttribute('aria-current');

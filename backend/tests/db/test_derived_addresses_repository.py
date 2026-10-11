@@ -28,6 +28,7 @@ from portfolio.repositories.wallets import WalletRepository
 from tests.balance_harness import insert_user, sqlite_timestamp
 from tests.extended_key_harness import insert_key_wallet
 from tests.extended_key_vectors import BIP32_TV1_M, SCAN_CHANGE, SCAN_KEY, SCAN_RECEIVE
+from tests.portfolio_harness import main_portfolio
 from tests.sqlite_harness import migrated_sessionmaker
 
 if TYPE_CHECKING:
@@ -317,6 +318,7 @@ async def test_a_wallet_is_an_address_unless_it_is_added_as_a_key(
 ) -> None:
     async with sessions() as session:
         user_id = await insert_user(session)
+        portfolio_id = await main_portfolio(session, user_id)
         repository = WalletRepository(session)
         address = await repository.add(
             user_id=user_id,
@@ -325,6 +327,7 @@ async def test_a_wallet_is_an_address_unless_it_is_added_as_a_key(
             address_display=SCAN_RECEIVE[0],
             label=None,
             created_at=CREATED_AT,
+            portfolio_id=portfolio_id,
         )
         key = await repository.add(
             user_id=user_id,
@@ -333,6 +336,7 @@ async def test_a_wallet_is_an_address_unless_it_is_added_as_a_key(
             address_display=SCAN_KEY,
             label=None,
             created_at=CREATED_AT,
+            portfolio_id=portfolio_id,
             kind="extended_key",
         )
         await session.commit()

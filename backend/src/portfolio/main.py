@@ -25,6 +25,7 @@ from portfolio.api.routers import (
     health,
     history,
     portfolio,
+    portfolios,
     wallets,
 )
 from portfolio.config import get_settings
@@ -738,6 +739,9 @@ def create_app() -> FastAPI:
     app.include_router(history.router, prefix=API_PREFIX)
     # Spec 042: the uploaded exchange operations, and the invested figures built on them.
     app.include_router(exchange_operations.router, prefix=API_PREFIX)
+    # Spec 044: the named groups every wallet and operation is filed in. `/portfolios` beside
+    # the dashboard's `/portfolio/...`, none colliding.
+    app.include_router(portfolios.router, prefix=API_PREFIX)
 
     # Mounted last and at the root: it matches every path outside `/api`, so a route
     # registered after it there would be unreachable. It never matches one under `/api`,

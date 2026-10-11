@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from portfolio.db.models import ExchangeImport, ExchangeOperation
 
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from datetime import datetime
     from decimal import Decimal
 
-    from sqlalchemy import Select
+    from sqlalchemy import ColumnElement, Select
     from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = ["ExchangeOperationRepository", "NewOperation", "OperationFilter"]
@@ -55,24 +55,33 @@ class OperationFilter:
     """Which operations a listing keeps. Each field narrows it; `None` keeps every value.
 
     `since` is inclusive and `until` exclusive, so consecutive days never share an instant.
+    `portfolio_id` keeps one portfolio's (spec 044).
     """
 
+    portfolio_id: int | None = None
     asset: str | None = None
     venue: str | None = None
     since: datetime | None = None
     until: datetime | None = None
 
+    def conditions(self) -> list[ColumnElement[bool]]:
+        """This filter's conditions, for a `SELECT` or an `UPDATE` alike."""
+        found: list[ColumnElement[bool]] = []
+        if self.portfolio_id is not None:
+            found.append(ExchangeOperation.portfolio_id == self.portfolio_id)
+        if self.asset is not None:
+            found.append(ExchangeOperation.asset == self.asset)
+        if self.venue is not None:
+            found.append(ExchangeOperation.venue == self.venue)
+        if self.since is not None:
+            found.append(ExchangeOperation.executed_at >= self.since)
+        if self.until is not None:
+            found.append(ExchangeOperation.executed_at < self.until)
+        return found
+
     def apply(self, statement: Select[Any]) -> Select[Any]:
         """`statement` with this filter's conditions added."""
-        if self.asset is not None:
-            statement = statement.where(ExchangeOperation.asset == self.asset)
-        if self.venue is not None:
-            statement = statement.where(ExchangeOperation.venue == self.venue)
-        if self.since is not None:
-            statement = statement.where(ExchangeOperation.executed_at >= self.since)
-        if self.until is not None:
-            statement = statement.where(ExchangeOperation.executed_at < self.until)
-        return statement
+        return statement.where(*self.conditions())
 
 
 class ExchangeOperationRepository:
@@ -125,6 +134,7 @@ class ExchangeOperationRepository:
         self,
         *,
         user_id: int,
+        portfolio_id: int,
         operations: Sequence[NewOperation],
         import_id: int | None,
         created_at: datetime,
@@ -151,6 +161,7 @@ class ExchangeOperationRepository:
                 description=operation.description,
                 import_id=import_id,
                 created_at=created_at,
+                portfolio_id=portfolio_id,
             )
             for operation in operations
         ]
@@ -188,34 +199,56 @@ class ExchangeOperationRepository:
         )
         return list(rows)
 
-    async def assets(self, user_id: int) -> list[str]:
-        """Every asset the owner has an operation in, alphabetically: a text column."""
+    async def assets(self, user_id: int, portfolio_id: int | None = None) -> list[str]:
+        """Every asset the owner has an operation in, alphabetically: a text column. Only one
+        portfolio's when it is named."""
         rows = await self._session.scalars(
-            select(ExchangeOperation.asset)
-            .where(ExchangeOperation.user_id == user_id)
+            OperationFilter(portfolio_id=portfolio_id)
+            .apply(select(ExchangeOperation.asset).where(ExchangeOperation.user_id == user_id))
             .distinct()
             .order_by(ExchangeOperation.asset)
         )
         return list(rows)
 
-    async def venues(self, user_id: int) -> list[str]:
-        """Every venue the owner has an operation from, alphabetically."""
+    async def venues(self, user_id: int, portfolio_id: int | None = None) -> list[str]:
+        """Every venue the owner has an operation from, alphabetically. Only one portfolio's
+        when it is named."""
         rows = await self._session.scalars(
-            select(ExchangeOperation.venue)
-            .where(ExchangeOperation.user_id == user_id)
+            OperationFilter(portfolio_id=portfolio_id)
+            .apply(select(ExchangeOperation.venue).where(ExchangeOperation.user_id == user_id))
             .distinct()
             .order_by(ExchangeOperation.venue)
         )
         return list(rows)
 
-    async def all_for(self, user_id: int) -> list[ExchangeOperation]:
-        """Every operation the owner has stored, oldest first."""
+    async def all_for(
+        self, user_id: int, *, portfolio_id: int | None = None
+    ) -> list[ExchangeOperation]:
+        """Every operation the owner has stored, oldest first; only one portfolio's when it
+        is named."""
         rows = await self._session.scalars(
-            select(ExchangeOperation)
-            .where(ExchangeOperation.user_id == user_id)
+            OperationFilter(portfolio_id=portfolio_id)
+            .apply(select(ExchangeOperation).where(ExchangeOperation.user_id == user_id))
             .order_by(ExchangeOperation.executed_at, ExchangeOperation.id)
         )
         return list(rows)
+
+    async def move(self, user_id: int, filters: OperationFilter, portfolio_id: int) -> int:
+        """File every operation `filters` keeps in `portfolio_id`, and say how many moved.
+        Those already there are not counted. Flushes and does not commit (spec 044, R7)."""
+        statement = (
+            update(ExchangeOperation)
+            .where(
+                ExchangeOperation.user_id == user_id,
+                ExchangeOperation.portfolio_id != portfolio_id,
+            )
+            .where(*filters.conditions())
+            .values(portfolio_id=portfolio_id)
+            .execution_options(synchronize_session=False)
+        )
+        result = await self._session.execute(statement)
+        await self._session.flush()
+        return int(result.rowcount)  # type: ignore[attr-defined]
 
     async def get(self, user_id: int, operation_id: int) -> ExchangeOperation | None:
         """One of the owner's operations, or `None` -- for another owner's too."""
