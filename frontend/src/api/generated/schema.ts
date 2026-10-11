@@ -257,6 +257,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/exports/months/{month}/done": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mark a month's exchange exports as done
+         * @description Mark `month` done and answer what is still owed. Marking it twice changes nothing.
+         *
+         *     A month that has not ended yet, or that is before the first reminded month, is a `409`.
+         */
+        post: operations["markExportMonthDone"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/exports/reminder": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The closed months whose exchange exports are not marked done
+         * @description Every month from the first reminded one that has ended and is not marked done.
+         */
+        get: operations["readExportReminder"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/health": {
         parameters: {
             query?: never;
@@ -774,6 +816,18 @@ export interface components {
          * @enum {string}
          */
         ExportFormat: "bitget_spot_order_details" | "bitget_spot_transactions" | "bingx_spot_order_history" | "bingx_futures_order_history" | "bingx_fund_account" | "binance_transaction_history" | "nexo_transactions" | "buenbit_history";
+        /**
+         * ExportReminderResponse
+         * @description The months whose exports are still owed, oldest first, and the exchanges to export.
+         *
+         *     An empty `months` means nothing is owed and the dashboard shows no reminder.
+         */
+        ExportReminderResponse: {
+            /** Exchanges */
+            exchanges: string[];
+            /** Months */
+            months: string[];
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -2144,6 +2198,58 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    markExportMonthDone: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The month, YYYY-MM, in Argentina time. */
+                month: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportReminderResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    readExportReminder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExportReminderResponse"];
                 };
             };
         };

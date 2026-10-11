@@ -417,6 +417,10 @@ def test_the_shipped_application_serves_exactly_these_operations(app: FastAPI) -
         "/api/portfolios",
         "/api/portfolios/{portfolio_id}",
         "/api/exchange-operations/move",
+        # The monthly export reminder (spec 040): months as `YYYY-MM` and exchange names. No
+        # money crosses it.
+        "/api/exports/reminder",
+        "/api/exports/months/{month}/done",
     }
 
 

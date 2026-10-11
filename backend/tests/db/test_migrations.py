@@ -93,6 +93,8 @@ APPLICATION_TABLES = frozenset(
         "exchange_operations",
         # Spec 044. The named groups every wallet and operation is filed in.
         "portfolios",
+        # Spec 040. The months whose manual exchange exports the owner marked done.
+        "export_months",
     }
 )
 """Every table the application owns, compared **exactly** rather than with `>=`.
@@ -172,6 +174,9 @@ HOURLY_TABLES = frozenset({"price_hourly"})
 OPERATION_TABLES = frozenset({"exchange_imports", "exchange_operations"})
 #: Spec 044's table, which every revision below `0018_portfolios` lacks.
 PORTFOLIO_TABLES = frozenset({"portfolios"})
+#: Spec 040's one. Its revision sits on top of `0018_portfolios`, so every single-step reversal
+#: below `0019_export_months` takes it down as well, and each test subtracts it.
+EXPORT_MONTH_TABLES = frozenset({"export_months"})
 
 #: Spec 036's revision, and the one below it: the last schema that has the tables it drops.
 DROP_REVISION = "0012_drop_exchanges_accounting"
@@ -290,6 +295,13 @@ EXPECTED_CONSTRAINT_NAMES = {
         "pk_portfolios",
         "uq_portfolios_user_name",
         "fk_portfolios_user_id_users",
+    },
+    # Spec 040. No CHECK: the domain decides what a month is. The unique key leads with
+    # `user_id`, so it is also the index every read uses.
+    "export_months": {
+        "pk_export_months",
+        "uq_export_months_user_month",
+        "fk_export_months_user_id_users",
     },
     "derived_addresses": {
         "pk_derived_addresses",
@@ -576,6 +588,7 @@ def test_the_prices_migration_reverses_on_its_own_and_leaves_the_rest_standing(
         - HOURLY_TABLES
         - OPERATION_TABLES
         - PORTFOLIO_TABLES
+        - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -615,6 +628,7 @@ def test_the_balances_migration_reverses_on_its_own_and_leaves_the_rest_standing
         - HOURLY_TABLES
         - OPERATION_TABLES
         - PORTFOLIO_TABLES
+        - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -691,6 +705,7 @@ def test_the_exchanges_migration_reverses_on_its_own_and_leaves_the_rest_standin
         - HOURLY_TABLES
         - OPERATION_TABLES
         - PORTFOLIO_TABLES
+        - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
     with sync_engine.connect() as connection:
@@ -946,6 +961,7 @@ def test_the_dropped_tables_carry_the_convention_names_below_the_drop(
             - HOURLY_TABLES
             - OPERATION_TABLES
             - PORTFOLIO_TABLES
+            - EXPORT_MONTH_TABLES
         )
         | DROPPED_TABLES
         | {STAMP_TABLE}
@@ -1179,6 +1195,7 @@ def test_the_price_history_migration_reverses_on_its_own(
         - HOURLY_TABLES
         - OPERATION_TABLES
         - PORTFOLIO_TABLES
+        - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -1231,6 +1248,7 @@ def test_the_reconstructed_balances_migration_reverses_on_its_own(
         - HOURLY_TABLES
         - OPERATION_TABLES
         - PORTFOLIO_TABLES
+        - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
 
     upgrade_to_head(database_url)
@@ -1271,7 +1289,11 @@ def test_the_price_hourly_migration_reverses_on_its_own(
     command.downgrade(build_alembic_config(database_url), "0014_reconstructed_balances")
 
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - HOURLY_TABLES - OPERATION_TABLES - PORTFOLIO_TABLES
+        APPLICATION_TABLES
+        - HOURLY_TABLES
+        - OPERATION_TABLES
+        - PORTFOLIO_TABLES
+        - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
 
@@ -1366,9 +1388,29 @@ def test_the_exchange_operations_migration_reverses_on_its_own(
     command.downgrade(build_alembic_config(database_url), "0015_price_hourly")
 
     assert table_names(sync_engine) == (
-        APPLICATION_TABLES - OPERATION_TABLES - PORTFOLIO_TABLES
+        APPLICATION_TABLES - OPERATION_TABLES - PORTFOLIO_TABLES - EXPORT_MONTH_TABLES
     ) | {STAMP_TABLE}
     assert seed_rows(sync_engine) == EXPECTED_SEED_ROWS
+
+    upgrade_to_head(database_url)
+
+    assert table_names(sync_engine) == APPLICATION_TABLES | {STAMP_TABLE}
+
+
+def test_the_export_months_migration_reverses_on_its_own(
+    database_url: str,
+    sync_engine: Engine,
+) -> None:
+    """One step down drops `export_months` and nothing else; the upgrade restores it."""
+    upgrade_to_head(database_url)
+    revisions = [
+        script.revision for script in ScriptDirectory(str(MIGRATIONS_DIR)).walk_revisions()
+    ]
+    assert revisions.index("0019_export_months") == revisions.index("0018_portfolios") - 1
+
+    command.downgrade(build_alembic_config(database_url), "0018_portfolios")
+
+    assert table_names(sync_engine) == (APPLICATION_TABLES - EXPORT_MONTH_TABLES) | {STAMP_TABLE}
 
     upgrade_to_head(database_url)
 

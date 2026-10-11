@@ -37,6 +37,10 @@ from portfolio.services.exchange_operations import (
     ExchangeOperationService,
     build_exchange_operation_service,
 )
+from portfolio.services.export_reminders import (
+    ExportReminderService,
+    build_export_reminder_service,
+)
 from portfolio.services.health import (
     HealthService,
     SchedulerName,
@@ -262,6 +266,17 @@ async def get_portfolio_scope(
     if not await registry.exists(principal.user_id, portfolio):
         raise NotFoundError(str(PortfolioNotFoundError()))
     return portfolio
+
+
+async def get_export_reminder_service(request: Request) -> AsyncIterator[ExportReminderService]:
+    """Open a session for this request and hand the router the export reminder service.
+
+    The same shape as `get_wallet_service`: marking a month done writes, and the service
+    commits. The service's clock is the default one.
+    """
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.db_sessionmaker
+    async with sessionmaker() as session:
+        yield build_export_reminder_service(session)
 
 
 def get_backup_service(request: Request) -> BackupService:

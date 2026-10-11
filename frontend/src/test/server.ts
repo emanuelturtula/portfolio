@@ -2,6 +2,7 @@ import { http, HttpResponse, type HttpHandler } from 'msw';
 import { setupServer } from 'msw/node';
 
 import { HEALTH_DETAIL_PATH, healthDetail } from './backupFixtures';
+import { EXPORT_REMINDER_PATH, nothingOwed } from './exportFixtures';
 
 /** Body the default `GET /api/health` handler answers with. */
 export const healthFixture = {
@@ -193,6 +194,9 @@ async function readJsonBody(request: Request): Promise<unknown> {
  * The backup detail (spec 029) answers `ok`, the state that renders nothing on the
  * dashboard: every dashboard and Health page test reads it, and a test about the backups
  * replaces it with `serveBackup(...)` from `backupFixtures.ts`.
+ *
+ * The export reminder (spec 040) answers "nothing owed", which also renders nothing; a test
+ * about the reminder replaces it.
  */
 export const PORTFOLIOS_PATH = '/api/portfolios';
 
@@ -211,6 +215,7 @@ export const handlers: HttpHandler[] = [
   // read is for all portfolios, as before spec 044. A test about portfolios replaces it.
   http.get(PORTFOLIOS_PATH, () => HttpResponse.json({ portfolios: [mainPortfolio] })),
   http.get(HEALTH_DETAIL_PATH, () => HttpResponse.json(healthDetail())),
+  http.get(EXPORT_REMINDER_PATH, () => HttpResponse.json(nothingOwed)),
   http.get(SESSION_PATH, () => unauthorized()),
 ];
 
