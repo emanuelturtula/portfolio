@@ -51,7 +51,7 @@ jobs:
       - name: Join the tailnet (OIDC, ephemeral node)
         # Federated identity rather than a long-lived auth key: nothing reusable is stored
         # in this public repository's secrets.
-        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf # v4.3.0
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           audience: ${{ secrets.TS_AUDIENCE }}
